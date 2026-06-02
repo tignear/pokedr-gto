@@ -1,8 +1,8 @@
 use crate::blinds::{BlindClock, BlindLevel};
 use crate::death_race::{DeathRaceState, death_race_value};
 use crate::equity::{
-    EquityCache, EquityPot, heads_up_equity_vs_range_cached, multi_way_showdown_payouts,
-    three_way_equity_vs_ranges_cached,
+    EquityCache, EquityPot, heads_up_equity_vs_range_cached, multi_way_range_showdown_payouts,
+    multi_way_showdown_payouts, three_way_equity_vs_ranges_cached,
 };
 use crate::hand_class::{HandClass, all_hand_classes};
 use crate::structure::orbit_cost;
@@ -62,12 +62,20 @@ pub struct CallSpot {
     pub required_equity: f64,
     pub range: Vec<HandResult>,
     pub patterns: Vec<CallPattern>,
+    pub next_response: Option<ResponseNode>,
 }
 
 #[derive(Debug, Clone)]
 pub struct CallPattern {
     pub callers: Vec<u8>,
     pub probability: f64,
+    pub range: Vec<HandResult>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ResponseNode {
+    pub actor_seat: u8,
+    pub prior_callers: Vec<u8>,
     pub range: Vec<HandResult>,
 }
 
@@ -344,6 +352,20 @@ fn analyze_call_spots(
             cache,
         );
         let range = tree_result.range;
+        let next_response = next_response_node(
+            classes,
+            &solution
+                .shove_range
+                .iter()
+                .map(|result| result.hand)
+                .collect::<Vec<_>>(),
+            &range.iter().map(|result| result.hand).collect::<Vec<_>>(),
+            config,
+            stacks,
+            dead_pot,
+            opener_seat,
+            caller_seat,
+        );
 
         spots.push(CallSpot {
             opener_seat: opener_seat as u8,
@@ -353,6 +375,7 @@ fn analyze_call_spots(
             required_equity,
             range,
             patterns: tree_result.patterns,
+            next_response,
         });
     }
 
@@ -465,6 +488,127 @@ fn profitable_tree_call_range(
         range: results,
         patterns: pattern_outputs,
     }
+}
+
+fn next_response_node(
+    classes: &[HandClass],
+    opener_range: &[HandClass],
+    caller_range: &[HandClass],
+    config: &ShortStackConfig,
+    stacks: &[u32],
+    dead_pot: u32,
+    opener_seat: usize,
+    caller_seat: usize,
+) -> Option<ResponseNode> {
+    let actor_seat = caller_seat + 1;
+    if actor_seat >= stacks.len() || caller_range.is_empty() || opener_range.is_empty() {
+        return None;
+    }
+
+    let prior_callers = vec![caller_seat];
+    let prior_ranges = vec![sample_range(caller_range, config.range_sample_limit.min(4))];
+    let sampled_opener_range = sample_range(
+        &sample_range(opener_range, config.range_sample_limit),
+        config.range_sample_limit.min(4),
+    );
+    let range = response_node_range(
+        classes,
+        &sampled_opener_range,
+        &prior_ranges,
+        config,
+        stacks,
+        dead_pot,
+        actor_seat,
+        opener_seat,
+        &prior_callers,
+    );
+
+    Some(ResponseNode {
+        actor_seat: actor_seat as u8,
+        prior_callers: prior_callers.into_iter().map(|seat| seat as u8).collect(),
+        range,
+    })
+}
+
+fn response_node_range(
+    classes: &[HandClass],
+    sampled_opener_range: &[HandClass],
+    prior_ranges: &[Vec<HandClass>],
+    config: &ShortStackConfig,
+    stacks: &[u32],
+    dead_pot: u32,
+    actor_seat: usize,
+    opener_seat: usize,
+    prior_callers: &[usize],
+) -> Vec<HandResult> {
+    let posted = posted_stacks(config.level, stacks);
+    let clock = BlindClock {
+        current_level: config.level.level,
+        elapsed_in_level_seconds: config.elapsed_in_level_seconds,
+    };
+    let future_patterns = downstream_call_patterns(classes, stacks, actor_seat);
+    let fold_value = future_patterns
+        .iter()
+        .map(|pattern| {
+            pattern.probability
+                * folded_response_value(
+                    config,
+                    clock,
+                    &posted,
+                    dead_pot,
+                    actor_seat,
+                    opener_seat,
+                    prior_callers,
+                    stacks,
+                    sampled_opener_range,
+                    prior_ranges,
+                    pattern,
+                )
+        })
+        .sum::<f64>();
+
+    let mut range: Vec<_> = classes
+        .par_iter()
+        .copied()
+        .filter_map(|hand| {
+            let mut hero_share = 0.0;
+            let mut call_value = 0.0;
+
+            for pattern in &future_patterns {
+                let outcome = response_pattern_outcome(
+                    hand,
+                    sampled_opener_range,
+                    prior_ranges,
+                    config,
+                    clock,
+                    &posted,
+                    dead_pot,
+                    actor_seat,
+                    opener_seat,
+                    prior_callers,
+                    stacks,
+                    pattern,
+                );
+                hero_share += pattern.probability * outcome.hero_share;
+                call_value += pattern.probability * outcome.value;
+            }
+
+            let ev = call_value - fold_value;
+            (ev >= 0.0).then_some(HandResult {
+                hand,
+                equity: hero_share,
+                ev,
+            })
+        })
+        .collect();
+
+    range.sort_by(|left, right| {
+        right
+            .ev
+            .total_cmp(&left.ev)
+            .then_with(|| right.equity.total_cmp(&left.equity))
+    });
+    range
 }
 
 struct DownstreamPattern {
@@ -624,6 +768,116 @@ fn pattern_outcome(
         },
         value,
     }
+}
+
+fn response_pattern_outcome(
+    hand: HandClass,
+    sampled_opener_range: &[HandClass],
+    prior_ranges: &[Vec<HandClass>],
+    config: &ShortStackConfig,
+    clock: BlindClock,
+    posted: &[u32],
+    dead_pot: u32,
+    actor_seat: usize,
+    opener_seat: usize,
+    prior_callers: &[usize],
+    stacks: &[u32],
+    pattern: &DownstreamPattern,
+) -> PatternOutcome {
+    let tree_sample_limit = config.range_sample_limit.min(4);
+    let mut opponent_ranges = Vec::with_capacity(prior_ranges.len() + pattern.ranges.len() + 1);
+    opponent_ranges.push(sampled_opener_range.to_vec());
+    opponent_ranges.extend(prior_ranges.iter().cloned());
+    opponent_ranges.extend(
+        pattern
+            .ranges
+            .iter()
+            .map(|range| sample_range(range, tree_sample_limit)),
+    );
+
+    let mut participants = vec![actor_seat, opener_seat];
+    participants.extend(prior_callers.iter().copied());
+    participants.extend(pattern.callers.iter().copied());
+    let commitments = all_in_commitments(config.level, stacks, &participants);
+    let pots = side_pots(dead_pot, &commitments);
+    let total_pot = pots.iter().map(|pot| pot.amount).sum::<f64>();
+    let payouts =
+        multi_way_showdown_payouts(hand, &opponent_ranges, &pots, config.max_boards_per_combo);
+    let mut hero_payout = 0.0;
+    let mut value = 0.0;
+
+    for payout in &payouts {
+        hero_payout += payout.first().copied().unwrap_or(0.0);
+        value += state_value(
+            clock,
+            config.hand_duration_seconds,
+            &showdown_stacks_from_payouts(posted, &participants, &commitments, payout),
+            actor_seat,
+        );
+    }
+
+    if !payouts.is_empty() {
+        hero_payout /= payouts.len() as f64;
+        value /= payouts.len() as f64;
+    }
+
+    PatternOutcome {
+        hero_share: if total_pot > 0.0 {
+            hero_payout / total_pot
+        } else {
+            0.0
+        },
+        value,
+    }
+}
+
+fn folded_response_value(
+    config: &ShortStackConfig,
+    clock: BlindClock,
+    posted: &[u32],
+    dead_pot: u32,
+    actor_seat: usize,
+    opener_seat: usize,
+    prior_callers: &[usize],
+    stacks: &[u32],
+    sampled_opener_range: &[HandClass],
+    prior_ranges: &[Vec<HandClass>],
+    pattern: &DownstreamPattern,
+) -> f64 {
+    let tree_sample_limit = config.range_sample_limit.min(4);
+    let mut participants = vec![opener_seat];
+    participants.extend(prior_callers.iter().copied());
+    participants.extend(pattern.callers.iter().copied());
+    let mut player_ranges = Vec::with_capacity(participants.len());
+    player_ranges.push(sampled_opener_range.to_vec());
+    player_ranges.extend(prior_ranges.iter().cloned());
+    player_ranges.extend(
+        pattern
+            .ranges
+            .iter()
+            .map(|range| sample_range(range, tree_sample_limit)),
+    );
+    let commitments = all_in_commitments(config.level, stacks, &participants);
+    let pots = side_pots(dead_pot, &commitments);
+    let payouts =
+        multi_way_range_showdown_payouts(&player_ranges, &pots, config.max_boards_per_combo);
+
+    if payouts.is_empty() {
+        return state_value(clock, config.hand_duration_seconds, posted, actor_seat);
+    }
+
+    payouts
+        .iter()
+        .map(|payout| {
+            state_value(
+                clock,
+                config.hand_duration_seconds,
+                &showdown_stacks_from_payouts(posted, &participants, &commitments, payout),
+                actor_seat,
+            )
+        })
+        .sum::<f64>()
+        / payouts.len() as f64
 }
 
 fn pattern_participants(

@@ -371,6 +371,64 @@ pub fn multi_way_showdown_payouts(
     payouts
 }
 
+pub fn multi_way_range_showdown_payouts(
+    player_ranges: &[Vec<HandClass>],
+    pots: &[EquityPot],
+    samples: usize,
+) -> Vec<Vec<f64>> {
+    let samples = samples.max(MIN_SAMPLED_BOARDS_PER_COMBO);
+    let mut payouts = Vec::new();
+    let mut rng = SplitMix64::new(player_ranges.len() as u64 ^ 0x9e37_79b9_7f4a_7c15);
+
+    'sample: for _ in 0..samples {
+        let mut used_mask = 0;
+        let mut combos = Vec::with_capacity(player_ranges.len());
+
+        for range in player_ranges {
+            let Some(combo) = sample_non_overlapping_combo(range, used_mask, &mut rng) else {
+                continue 'sample;
+            };
+            used_mask |= combo_mask(combo);
+            combos.push(combo);
+        }
+
+        let available = available_cards(used_mask);
+        let board = sample_board(&available, &mut rng);
+        let values: Vec<_> = combos
+            .iter()
+            .map(|combo| {
+                evaluate_seven([
+                    combo[0], combo[1], board[0], board[1], board[2], board[3], board[4],
+                ])
+            })
+            .collect();
+        let mut payout = vec![0.0; player_ranges.len()];
+
+        for pot in pots {
+            let best = pot
+                .eligible
+                .iter()
+                .map(|&index| values[index])
+                .max()
+                .expect("pot has at least one eligible player");
+            let winners: Vec<_> = pot
+                .eligible
+                .iter()
+                .copied()
+                .filter(|&index| values[index] == best)
+                .collect();
+            let share = pot.amount / winners.len() as f64;
+            for winner in winners {
+                payout[winner] += share;
+            }
+        }
+
+        payouts.push(payout);
+    }
+
+    payouts
+}
+
 fn heads_up_combo_equity_cached(
     hero: [Card; 2],
     villain: [Card; 2],

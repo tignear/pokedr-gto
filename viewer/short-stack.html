@@ -245,15 +245,45 @@
             <div class="metric"><b>Call Range</b>${rangeSummary(spot.range)}</div>
             <div class="metric"><b>Branches</b>${patterns.length}</div>
           </div>
-          ${renderRangeBlock(`Seat ${caller.seat_index} call range`, spot.range)}
+          ${renderRangeBlock(`Seat ${caller.seat_index} call range at this node`, spot.range)}
+          ${spot.next_response ? renderResponseNode(opener, caller, spot.next_response, alivePlayers) : ''}
           <details open>
-            <summary>Branches after Seat ${caller.seat_index} calls</summary>
+            <summary>Outcome branches after Seat ${caller.seat_index} calls</summary>
             <div class="branch-grid">
               ${patterns.map(pattern => renderBranch(opener, caller, pattern, alivePlayers)).join('')}
             </div>
           </details>
         </section>
       `;
+    }
+
+    function renderResponseNode(opener, caller, node, alivePlayers) {
+      const prior = node.prior_callers.length ? node.prior_callers.map(seat => `Seat ${seat}`).join(', ') : 'none';
+      const path = responsePath(opener.seat_index, caller.seat_index, node.actor_seat);
+      return `
+        <section class="decision">
+          <h3>Next Node: Seat ${node.actor_seat} responds after Seat ${opener.seat_index} and ${prior} are AI</h3>
+          <div class="summary">
+            <div class="metric"><b>Path</b>${escapeHtml(path)}</div>
+            <div class="metric"><b>Prior Callers</b>${escapeHtml(prior)}</div>
+            <div class="metric"><b>Call Range</b>${rangeSummary(node.range)}</div>
+          </div>
+          ${renderRangeBlock(`Seat ${node.actor_seat} overcall range`, node.range)}
+        </section>
+      `;
+    }
+
+    function responsePath(openerSeat, callerSeat, actorSeat) {
+      const actions = [`Seat ${openerSeat}: AI`];
+      for (let seat = openerSeat + 1; seat < callerSeat; seat++) {
+        actions.push(`Seat ${seat}: fold`);
+      }
+      actions.push(`Seat ${callerSeat}: call AI`);
+      for (let seat = callerSeat + 1; seat < actorSeat; seat++) {
+        actions.push(`Seat ${seat}: fold`);
+      }
+      actions.push(`Seat ${actorSeat}: decision`);
+      return actions.join(' -> ');
     }
 
     function renderBranch(opener, caller, pattern, alivePlayers) {
@@ -264,11 +294,7 @@
           <div class="summary">
             <div class="metric"><b>Path</b>${escapeHtml(path)}</div>
             <div class="metric"><b>Probability</b>${pct(pattern.probability)}</div>
-            <div class="metric"><b>Range</b>${rangeSummary(pattern.range)}</div>
-          </div>
-          ${renderLegend()}
-          <div class="matrix">
-            ${renderMatrix(pattern.range)}
+            <div class="metric"><b>Callers</b>${pattern.callers.length ? pattern.callers.map(seat => `Seat ${seat}`).join(', ') : 'none'}</div>
           </div>
         </section>
       `;

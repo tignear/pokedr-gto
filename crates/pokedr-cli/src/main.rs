@@ -161,6 +161,13 @@ fn print_report(level: u8, stacks: &[u32], players_behind: u8, report: &ShortSta
             );
             print_range("    range", &spot.range, 40);
             println!("    patterns: {}", spot.patterns.len());
+            if let Some(next_response) = &spot.next_response {
+                print_range(
+                    &format!("    next seat {} response range", next_response.actor_seat),
+                    &next_response.range,
+                    40,
+                );
+            }
         }
         if report.overcall_analyzed {
             print_range("  overcall range vs jam+call", &seat.overcall_range, 40);
@@ -267,7 +274,8 @@ fn print_json_report(level: u8, stacks: &[u32], players_behind: u8, report: &Sho
                 print_json_range("range", &pattern.range, false, 14);
                 println!("            }}{pattern_comma}");
             }
-            println!("          ]");
+            println!("          ],");
+            print_json_response_node("next_response", spot.next_response.as_ref(), false, 10);
             println!("        }}{spot_comma}");
         }
         println!("      ],");
@@ -280,6 +288,35 @@ fn print_json_report(level: u8, stacks: &[u32], players_behind: u8, report: &Sho
     }
     println!("  ]");
     println!("}}");
+}
+
+fn print_json_response_node(
+    name: &str,
+    node: Option<&pokedr_core::short_stack::ResponseNode>,
+    trailing_comma: bool,
+    indent: usize,
+) {
+    let pad = " ".repeat(indent);
+    let Some(node) = node else {
+        println!(
+            "{pad}\"{name}\": null{}",
+            if trailing_comma { "," } else { "" }
+        );
+        return;
+    };
+
+    println!("{pad}\"{name}\": {{");
+    println!("{pad}  \"actor_seat\": {},", node.actor_seat);
+    println!(
+        "{pad}  \"prior_callers\": [{}],",
+        node.prior_callers
+            .iter()
+            .map(|seat| seat.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    print_json_range("range", &node.range, false, indent + 2);
+    println!("{pad}}}{}", if trailing_comma { "," } else { "" });
 }
 
 fn print_json_range(
