@@ -5,6 +5,7 @@ use crate::equity::{
 };
 use crate::hand_class::{HandClass, all_hand_classes};
 use crate::structure::orbit_cost;
+use rayon::prelude::*;
 
 #[derive(Debug, Clone)]
 pub struct ShortStackConfig {
@@ -358,7 +359,7 @@ fn profitable_tree_call_range(
     opener_seat: usize,
     effective_cost: u32,
     heads_up_range: Vec<HandResult>,
-    cache: &mut EquityCache,
+    _cache: &mut EquityCache,
 ) -> Vec<HandResult> {
     let downstream = downstream_overcall_model(classes, stacks, caller_seat, opener_seat);
     if downstream.probability == 0.0 || downstream.range.is_empty() {
@@ -439,41 +440,46 @@ fn profitable_tree_call_range(
     let sampled_opener_range = sample_range(&sampled_opener_range, tree_sample_limit);
     let sampled_overcall_range = sample_range(&downstream.range, tree_sample_limit);
     let no_overcall_probability = 1.0 - downstream.probability;
-    let mut results = Vec::new();
-
-    for hand in heads_up_range.into_iter().map(|result| result.hand) {
-        let heads_up_equity = heads_up_equity_vs_range_cached(
-            hand,
-            &sampled_opener_range,
-            config.max_boards_per_combo,
-            cache,
-        )
-        .share();
-        let multiway_equity = three_way_equity_vs_ranges_cached(
-            hand,
-            &sampled_opener_range,
-            &sampled_overcall_range,
-            config.max_boards_per_combo,
-            cache,
-        )
-        .share();
-        let call_value = no_overcall_probability
-            * (heads_up_equity * heads_up_win_value
-                + (1.0 - heads_up_equity) * heads_up_lose_value)
-            + downstream.probability
-                * (multiway_equity * multiway_win_value
-                    + (1.0 - multiway_equity) * multiway_lose_value);
-        let ev = call_value - fold_value;
-
-        if ev >= 0.0 {
-            results.push(HandResult {
+    let mut results: Vec<_> = heads_up_range
+        .into_par_iter()
+        .map(|result| result.hand)
+        .filter_map(|hand| {
+            let mut cache = EquityCache::new();
+            let heads_up_equity = heads_up_equity_vs_range_cached(
                 hand,
-                equity: no_overcall_probability * heads_up_equity
-                    + downstream.probability * multiway_equity,
-                ev,
-            });
-        }
-    }
+                &sampled_opener_range,
+                config.max_boards_per_combo,
+                &mut cache,
+            )
+            .share();
+            let multiway_equity = three_way_equity_vs_ranges_cached(
+                hand,
+                &sampled_opener_range,
+                &sampled_overcall_range,
+                config.max_boards_per_combo,
+                &mut cache,
+            )
+            .share();
+            let call_value = no_overcall_probability
+                * (heads_up_equity * heads_up_win_value
+                    + (1.0 - heads_up_equity) * heads_up_lose_value)
+                + downstream.probability
+                    * (multiway_equity * multiway_win_value
+                        + (1.0 - multiway_equity) * multiway_lose_value);
+            let ev = call_value - fold_value;
+
+            if ev >= 0.0 {
+                Some(HandResult {
+                    hand,
+                    equity: no_overcall_probability * heads_up_equity
+                        + downstream.probability * multiway_equity,
+                    ev,
+                })
+            } else {
+                None
+            }
+        })
+        .collect();
 
     results.sort_by(|left, right| {
         right
@@ -702,7 +708,7 @@ fn profitable_shove_results(
     dead_pot: u32,
     all_in_cost: u32,
     hero_seat: usize,
-    cache: &mut EquityCache,
+    _cache: &mut EquityCache,
 ) -> Vec<HandResult> {
     let call_probability = combo_fraction(call_range);
     let sampled_call_range = sample_range(call_range, config.range_sample_limit);
@@ -750,36 +756,45 @@ fn profitable_shove_results(
         hero_seat,
     );
 
-    let mut results = Vec::new();
-
     if sampled_call_range.is_empty() || called_probability == 0.0 {
         let ev = steal_value - fold_value;
         if ev >= 0.0 {
-            results.extend(classes.iter().copied().map(|hand| HandResult {
+            return classes
+                .iter()
+                .copied()
+                .map(|hand| HandResult {
+                    hand,
+                    equity: 0.0,
+                    ev,
+                })
+                .collect();
+        }
+        return Vec::new();
+    }
+
+    let mut results: Vec<_> = classes
+        .par_iter()
+        .copied()
+        .filter_map(|hand| {
+            let mut cache = EquityCache::new();
+            let equity = heads_up_equity_vs_range_cached(
                 hand,
-                equity: 0.0,
-                ev,
-            }));
-        }
-        return results;
-    }
+                &sampled_call_range,
+                config.max_boards_per_combo,
+                &mut cache,
+            )
+            .share();
+            let shove_value = fold_probability * steal_value
+                + called_probability * (equity * win_value + (1.0 - equity) * lose_value);
+            let ev = shove_value - fold_value;
 
-    for &hand in classes {
-        let equity = heads_up_equity_vs_range_cached(
-            hand,
-            &sampled_call_range,
-            config.max_boards_per_combo,
-            cache,
-        )
-        .share();
-        let shove_value = fold_probability * steal_value
-            + called_probability * (equity * win_value + (1.0 - equity) * lose_value);
-        let ev = shove_value - fold_value;
-
-        if ev >= 0.0 {
-            results.push(HandResult { hand, equity, ev });
-        }
-    }
+            if ev >= 0.0 {
+                Some(HandResult { hand, equity, ev })
+            } else {
+                None
+            }
+        })
+        .collect();
 
     results.sort_by(|left, right| {
         right
@@ -796,42 +811,51 @@ fn profitable_call_range(
     required_equity: f64,
     max_boards_per_combo: usize,
     range_sample_limit: usize,
-    cache: &mut EquityCache,
+    _cache: &mut EquityCache,
 ) -> Vec<HandResult> {
-    let mut results = Vec::new();
     let sampled_shove_range = sample_range(shove_range, range_sample_limit);
 
     if sampled_shove_range.is_empty() {
-        return results;
+        return Vec::new();
     }
 
     if required_equity <= 0.0 {
-        results.extend(classes.iter().copied().map(|hand| HandResult {
-            hand,
-            equity: 0.0,
-            ev: 0.0,
-        }));
-        return results;
+        return classes
+            .iter()
+            .copied()
+            .map(|hand| HandResult {
+                hand,
+                equity: 0.0,
+                ev: 0.0,
+            })
+            .collect();
     }
 
     if required_equity >= 1.0 {
-        return results;
+        return Vec::new();
     }
 
-    for &hand in classes {
-        let equity = heads_up_equity_vs_range_cached(
-            hand,
-            &sampled_shove_range,
-            max_boards_per_combo,
-            cache,
-        )
-        .share();
-        let ev = equity - required_equity;
+    let mut results: Vec<_> = classes
+        .par_iter()
+        .copied()
+        .filter_map(|hand| {
+            let mut cache = EquityCache::new();
+            let equity = heads_up_equity_vs_range_cached(
+                hand,
+                &sampled_shove_range,
+                max_boards_per_combo,
+                &mut cache,
+            )
+            .share();
+            let ev = equity - required_equity;
 
-        if ev >= 0.0 {
-            results.push(HandResult { hand, equity, ev });
-        }
-    }
+            if ev >= 0.0 {
+                Some(HandResult { hand, equity, ev })
+            } else {
+                None
+            }
+        })
+        .collect();
 
     results.sort_by(|left, right| right.equity.total_cmp(&left.equity));
     results
@@ -844,28 +868,33 @@ fn profitable_overcall_range(
     required_equity: f64,
     max_boards_per_combo: usize,
     range_sample_limit: usize,
-    cache: &mut EquityCache,
+    _cache: &mut EquityCache,
 ) -> Vec<HandResult> {
-    let mut results = Vec::new();
     let candidate_classes = top_fraction_by_heuristic(classes, 0.2);
     let sampled_shove_range = sample_range(shove_range, range_sample_limit);
     let sampled_call_range = sample_range(call_range, range_sample_limit);
 
-    for hand in candidate_classes {
-        let equity = three_way_equity_vs_ranges_cached(
-            hand,
-            &sampled_shove_range,
-            &sampled_call_range,
-            max_boards_per_combo,
-            cache,
-        )
-        .share();
-        let ev = equity - required_equity;
+    let mut results: Vec<_> = candidate_classes
+        .into_par_iter()
+        .filter_map(|hand| {
+            let mut cache = EquityCache::new();
+            let equity = three_way_equity_vs_ranges_cached(
+                hand,
+                &sampled_shove_range,
+                &sampled_call_range,
+                max_boards_per_combo,
+                &mut cache,
+            )
+            .share();
+            let ev = equity - required_equity;
 
-        if ev >= 0.0 {
-            results.push(HandResult { hand, equity, ev });
-        }
-    }
+            if ev >= 0.0 {
+                Some(HandResult { hand, equity, ev })
+            } else {
+                None
+            }
+        })
+        .collect();
 
     results.sort_by(|left, right| right.equity.total_cmp(&left.equity));
     results
