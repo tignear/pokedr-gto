@@ -30,6 +30,9 @@ pub struct ShortStackReport {
 pub struct SeatRanges {
     pub seat_index: u8,
     pub players_behind: u8,
+    pub posted_amount: u32,
+    pub call_required_equity: f64,
+    pub overcall_required_equity: f64,
     pub shove_range: Vec<HandResult>,
     pub call_range: Vec<HandResult>,
     pub overcall_range: Vec<HandResult>,
@@ -66,8 +69,6 @@ pub fn analyze_short_stack(config: &ShortStackConfig) -> ShortStackReport {
                 config,
                 &classes,
                 dead_pot,
-                single_call_required_equity,
-                overcall_required_equity,
                 seat_index,
                 players_behind,
                 &mut cache,
@@ -89,8 +90,6 @@ fn analyze_seat(
     config: &ShortStackConfig,
     classes: &[HandClass],
     dead_pot: u32,
-    single_call_required_equity: f64,
-    overcall_required_equity: f64,
     seat_index: u8,
     players_behind: u8,
     cache: &mut EquityCache,
@@ -99,15 +98,27 @@ fn analyze_seat(
         players_behind,
         ..config.clone()
     };
+    let posted_amount = posted_amount(config.level, config.alive_players, seat_index);
+    let all_in_cost = config.stack.saturating_sub(posted_amount);
+    let called_pot = dead_pot + all_in_cost.saturating_mul(2);
+    let overcall_pot = dead_pot + all_in_cost.saturating_mul(3);
+    let call_required_equity = required_equity(all_in_cost, called_pot);
+    let overcall_required_equity = required_equity(all_in_cost, overcall_pot);
     let mut call_range = top_fraction_by_heuristic(classes, 0.25);
 
     for _ in 0..config.iterations {
-        let shove_range =
-            profitable_shove_range(classes, &call_range, &seat_config, dead_pot, cache);
+        let shove_range = profitable_shove_range(
+            classes,
+            &call_range,
+            &seat_config,
+            dead_pot,
+            all_in_cost,
+            cache,
+        );
         call_range = profitable_call_range(
             classes,
             &shove_range,
-            single_call_required_equity,
+            call_required_equity,
             config.max_boards_per_combo,
             cache,
         )
@@ -116,8 +127,14 @@ fn analyze_seat(
         .collect();
     }
 
-    let modeled_shove_range =
-        profitable_shove_results(classes, &call_range, &seat_config, dead_pot, cache);
+    let modeled_shove_range = profitable_shove_results(
+        classes,
+        &call_range,
+        &seat_config,
+        dead_pot,
+        all_in_cost,
+        cache,
+    );
     let displayed_shove_range = if players_behind == 0 {
         Vec::new()
     } else {
@@ -129,7 +146,7 @@ fn analyze_seat(
             .iter()
             .map(|result| result.hand)
             .collect::<Vec<_>>(),
-        single_call_required_equity,
+        call_required_equity,
         config.max_boards_per_combo,
         cache,
     );
@@ -149,6 +166,9 @@ fn analyze_seat(
     SeatRanges {
         seat_index,
         players_behind,
+        posted_amount,
+        call_required_equity,
+        overcall_required_equity,
         shove_range: displayed_shove_range,
         call_range: call_range_results,
         overcall_range,
@@ -160,9 +180,10 @@ fn profitable_shove_range(
     call_range: &[HandClass],
     config: &ShortStackConfig,
     dead_pot: u32,
+    all_in_cost: u32,
     cache: &mut EquityCache,
 ) -> Vec<HandClass> {
-    profitable_shove_results(classes, call_range, config, dead_pot, cache)
+    profitable_shove_results(classes, call_range, config, dead_pot, all_in_cost, cache)
         .into_iter()
         .map(|result| result.hand)
         .collect()
@@ -173,14 +194,15 @@ fn profitable_shove_results(
     call_range: &[HandClass],
     config: &ShortStackConfig,
     dead_pot: u32,
+    all_in_cost: u32,
     cache: &mut EquityCache,
 ) -> Vec<HandResult> {
     let call_probability = combo_fraction(call_range);
     let sampled_call_range = sample_range(call_range, config.range_sample_limit);
     let fold_probability = (1.0 - call_probability).powi(config.players_behind as i32);
     let called_probability = 1.0 - fold_probability;
-    let called_pot = (dead_pot + config.stack.saturating_mul(2)) as f64;
-    let risk = config.stack as f64;
+    let called_pot = (dead_pot + all_in_cost.saturating_mul(2)) as f64;
+    let risk = all_in_cost as f64;
 
     let mut results = Vec::new();
 
@@ -318,6 +340,28 @@ fn combo_fraction(range: &[HandClass]) -> f64 {
     range.iter().map(|hand| hand.combos().len()).sum::<usize>() as f64 / 1326.0
 }
 
+fn posted_amount(level: BlindLevel, alive_players: u8, seat_index: u8) -> u32 {
+    let ante = level.per_player_ante;
+    let small_blind_seat = alive_players.saturating_sub(2);
+    let big_blind_seat = alive_players.saturating_sub(1);
+
+    if seat_index == big_blind_seat {
+        ante.saturating_add(level.big_blind)
+    } else if seat_index == small_blind_seat {
+        ante.saturating_add(level.small_blind)
+    } else {
+        ante
+    }
+}
+
+fn required_equity(call_cost: u32, pot_after_call: u32) -> f64 {
+    if pot_after_call == 0 {
+        0.0
+    } else {
+        call_cost as f64 / pot_after_call as f64
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -347,5 +391,14 @@ mod tests {
         assert_eq!(report.seats[0].players_behind, 2);
         assert_eq!(report.seats[1].players_behind, 1);
         assert_eq!(report.seats[2].players_behind, 0);
+    }
+
+    #[test]
+    fn posted_amount_accounts_for_blinds_and_antes() {
+        let level = crate::blinds::blind_level(11).expect("level 11 exists");
+
+        assert_eq!(posted_amount(level, 6, 0), 2_200);
+        assert_eq!(posted_amount(level, 6, 4), 6_500);
+        assert_eq!(posted_amount(level, 6, 5), 10_800);
     }
 }

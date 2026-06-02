@@ -77,8 +77,13 @@ fn print_report(
     println!();
     for seat in &report.seats {
         println!(
-            "seat {}: players behind for first-in shove {}",
-            seat.seat_index, seat.players_behind
+            "seat {}: players behind {}, posted {}",
+            seat.seat_index, seat.players_behind, seat.posted_amount
+        );
+        println!(
+            "  required equity: call {:.1}%, overcall {:.1}%",
+            seat.call_required_equity * 100.0,
+            seat.overcall_required_equity * 100.0
         );
         if seat.players_behind == 0 {
             println!("  first-in all-in range: n/a (no players behind)");
@@ -127,6 +132,15 @@ fn print_json_report(
         println!("    {{");
         println!("      \"seat_index\": {},", seat.seat_index);
         println!("      \"players_behind\": {},", seat.players_behind);
+        println!("      \"posted_amount\": {},", seat.posted_amount);
+        println!(
+            "      \"call_required_equity\": {:.6},",
+            seat.call_required_equity
+        );
+        println!(
+            "      \"overcall_required_equity\": {:.6},",
+            seat.overcall_required_equity
+        );
         println!("      \"ranges\": {{");
         print_json_range("first_in_all_in", &seat.shove_range, true, 8);
         print_json_range("call_vs_one_all_in", &seat.call_range, true, 8);
