@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use crate::cards::{Card, deck};
 use crate::hand_class::HandClass;
 use crate::hand_eval::evaluate_seven;
@@ -19,10 +21,40 @@ impl Equity {
     }
 }
 
+#[derive(Debug, Default)]
+pub struct EquityCache {
+    heads_up: HashMap<(u64, u64, usize), Equity>,
+    three_way: HashMap<(u64, u64, u64, usize), Equity>,
+}
+
+impl EquityCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn len(&self) -> usize {
+        self.heads_up.len() + self.three_way.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.heads_up.is_empty() && self.three_way.is_empty()
+    }
+}
+
 pub fn heads_up_equity_vs_range(
     hero: HandClass,
     villain_range: &[HandClass],
     max_boards_per_combo: usize,
+) -> Equity {
+    let mut cache = EquityCache::new();
+    heads_up_equity_vs_range_cached(hero, villain_range, max_boards_per_combo, &mut cache)
+}
+
+pub fn heads_up_equity_vs_range_cached(
+    hero: HandClass,
+    villain_range: &[HandClass],
+    max_boards_per_combo: usize,
+    cache: &mut EquityCache,
 ) -> Equity {
     let mut equity = Equity {
         win: 0.0,
@@ -40,8 +72,12 @@ pub fn heads_up_equity_vs_range(
                     continue;
                 }
 
-                let combo_equity =
-                    heads_up_combo_equity(hero_combo, villain_combo, max_boards_per_combo);
+                let combo_equity = heads_up_combo_equity_cached(
+                    hero_combo,
+                    villain_combo,
+                    max_boards_per_combo,
+                    cache,
+                );
                 equity.win += combo_equity.win;
                 equity.tie += combo_equity.tie;
                 equity.total += combo_equity.total;
@@ -57,6 +93,23 @@ pub fn three_way_equity_vs_ranges(
     first_range: &[HandClass],
     second_range: &[HandClass],
     max_boards_per_combo: usize,
+) -> Equity {
+    let mut cache = EquityCache::new();
+    three_way_equity_vs_ranges_cached(
+        hero,
+        first_range,
+        second_range,
+        max_boards_per_combo,
+        &mut cache,
+    )
+}
+
+pub fn three_way_equity_vs_ranges_cached(
+    hero: HandClass,
+    first_range: &[HandClass],
+    second_range: &[HandClass],
+    max_boards_per_combo: usize,
+    cache: &mut EquityCache,
 ) -> Equity {
     let mut equity = Equity {
         win: 0.0,
@@ -86,6 +139,7 @@ pub fn three_way_equity_vs_ranges(
                             first_combo,
                             second_combo,
                             max_boards_per_combo,
+                            cache,
                         );
                         equity.win += combo_equity.win;
                         equity.tie += combo_equity.tie;
@@ -96,6 +150,23 @@ pub fn three_way_equity_vs_ranges(
         }
     }
 
+    equity
+}
+
+fn heads_up_combo_equity_cached(
+    hero: [Card; 2],
+    villain: [Card; 2],
+    max_boards: usize,
+    cache: &mut EquityCache,
+) -> Equity {
+    let key = (combo_mask(hero), combo_mask(villain), max_boards);
+
+    if let Some(&equity) = cache.heads_up.get(&key) {
+        return equity;
+    }
+
+    let equity = heads_up_combo_equity(hero, villain, max_boards);
+    cache.heads_up.insert(key, equity);
     equity
 }
 
@@ -166,6 +237,29 @@ fn heads_up_combo_equity(hero: [Card; 2], villain: [Card; 2], max_boards: usize)
 }
 
 fn three_way_combo_equity(
+    hero: [Card; 2],
+    first: [Card; 2],
+    second: [Card; 2],
+    max_boards: usize,
+    cache: &mut EquityCache,
+) -> Equity {
+    let key = (
+        combo_mask(hero),
+        combo_mask(first),
+        combo_mask(second),
+        max_boards,
+    );
+
+    if let Some(&equity) = cache.three_way.get(&key) {
+        return equity;
+    }
+
+    let equity = three_way_combo_equity_uncached(hero, first, second, max_boards);
+    cache.three_way.insert(key, equity);
+    equity
+}
+
+fn three_way_combo_equity_uncached(
     hero: [Card; 2],
     first: [Card; 2],
     second: [Card; 2],
@@ -258,6 +352,10 @@ fn three_way_combo_equity(
     }
 
     equity
+}
+
+fn combo_mask(combo: [Card; 2]) -> u64 {
+    combo[0].mask() | combo[1].mask()
 }
 
 fn available_cards(dead_mask: u64) -> Vec<Card> {

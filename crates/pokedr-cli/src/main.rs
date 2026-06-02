@@ -13,6 +13,7 @@ fn main() {
     let max_boards_per_combo = parse_arg(&args, "--boards").unwrap_or(4) as usize;
     let range_sample_limit = parse_arg(&args, "--range-sample").unwrap_or(18) as usize;
     let iterations = parse_arg(&args, "--iterations").unwrap_or(2) as usize;
+    let format = parse_string_arg(&args, "--format").unwrap_or("text");
 
     let Some(level) = blind_level(level as u8) else {
         eprintln!("invalid --level; expected 1..=16");
@@ -29,13 +30,26 @@ fn main() {
         iterations,
     });
 
-    print_report(level.level, stack, alive_players, players_behind, &report);
+    match format {
+        "json" => print_json_report(level.level, stack, alive_players, players_behind, &report),
+        "text" => print_report(level.level, stack, alive_players, players_behind, &report),
+        _ => {
+            eprintln!("invalid --format; expected text or json");
+            std::process::exit(2);
+        }
+    }
 }
 
 fn parse_arg(args: &[String], name: &str) -> Option<u32> {
     args.windows(2)
         .find(|window| window[0] == name)
         .and_then(|window| window[1].parse().ok())
+}
+
+fn parse_string_arg<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
+    args.windows(2)
+        .find(|window| window[0] == name)
+        .map(|window| window[1].as_str())
 }
 
 fn print_report(
@@ -64,6 +78,69 @@ fn print_report(
     print_range("first-in all-in range", &report.shove_range, 40);
     print_range("call vs one all-in range", &report.call_range, 40);
     print_range("overcall range vs jam+call", &report.overcall_range, 40);
+}
+
+fn print_json_report(
+    level: u8,
+    stack: u32,
+    alive_players: u8,
+    players_behind: u8,
+    report: &ShortStackReport,
+) {
+    println!("{{");
+    println!("  \"level\": {level},");
+    println!("  \"stack\": {stack},");
+    println!(
+        "  \"stack_in_big_blinds\": {:.6},",
+        report.stack_in_big_blinds
+    );
+    println!("  \"alive_players\": {alive_players},");
+    println!("  \"players_behind\": {players_behind},");
+    println!("  \"dead_pot\": {},", report.dead_pot);
+    println!("  \"orbit_cost\": {},", report.orbit_cost);
+    println!(
+        "  \"single_call_required_equity\": {:.6},",
+        report.single_call_required_equity
+    );
+    println!(
+        "  \"overcall_required_equity\": {:.6},",
+        report.overcall_required_equity
+    );
+    println!("  \"ranges\": {{");
+    print_json_range("first_in_all_in", &report.shove_range, true);
+    print_json_range("call_vs_one_all_in", &report.call_range, true);
+    print_json_range("overcall_vs_jam_call", &report.overcall_range, false);
+    println!("  }}");
+    println!("}}");
+}
+
+fn print_json_range(
+    name: &str,
+    range: &[pokedr_core::short_stack::HandResult],
+    trailing_comma: bool,
+) {
+    let combo_count: usize = range.iter().map(|result| result.hand.combos().len()).sum();
+    println!("    \"{name}\": {{");
+    println!("      \"classes\": {},", range.len());
+    println!("      \"combos\": {combo_count},");
+    println!(
+        "      \"combo_fraction\": {:.6},",
+        combo_count as f64 / 1326.0
+    );
+    println!("      \"hands\": [");
+
+    for (index, result) in range.iter().enumerate() {
+        let comma = if index + 1 == range.len() { "" } else { "," };
+        println!(
+            "        {{\"hand\":\"{}\",\"equity\":{:.6},\"ev\":{:.6}}}{comma}",
+            result.hand.label(),
+            result.equity,
+            result.ev
+        );
+    }
+
+    println!("      ]");
+    println!("    }}{}", if trailing_comma { "," } else { "" });
 }
 
 fn print_range(title: &str, range: &[pokedr_core::short_stack::HandResult], limit: usize) {

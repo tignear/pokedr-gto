@@ -1,0 +1,160 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Pokedr Short Stack Viewer</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: Canvas;
+      color: CanvasText;
+    }
+    body {
+      margin: 0;
+      padding: 24px;
+    }
+    main {
+      max-width: 1180px;
+      margin: 0 auto;
+      display: grid;
+      gap: 18px;
+    }
+    textarea {
+      width: 100%;
+      min-height: 180px;
+      box-sizing: border-box;
+      font: 13px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      padding: 12px;
+      border: 1px solid color-mix(in srgb, CanvasText 22%, Canvas);
+      border-radius: 6px;
+      background: Canvas;
+      color: CanvasText;
+    }
+    button {
+      width: fit-content;
+      padding: 8px 12px;
+      border: 1px solid color-mix(in srgb, CanvasText 24%, Canvas);
+      border-radius: 6px;
+      background: Canvas;
+      color: CanvasText;
+      cursor: pointer;
+    }
+    .summary {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+      gap: 10px;
+    }
+    .metric {
+      border: 1px solid color-mix(in srgb, CanvasText 18%, Canvas);
+      border-radius: 6px;
+      padding: 10px;
+    }
+    .metric b {
+      display: block;
+      font-size: 12px;
+      opacity: .7;
+      margin-bottom: 4px;
+    }
+    .ranges {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      gap: 14px;
+    }
+    .range {
+      border: 1px solid color-mix(in srgb, CanvasText 18%, Canvas);
+      border-radius: 6px;
+      padding: 12px;
+    }
+    .range h2 {
+      font-size: 15px;
+      margin: 0 0 8px;
+    }
+    .hands {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 5px;
+    }
+    .hand {
+      font: 12px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      border: 1px solid color-mix(in srgb, CanvasText 18%, Canvas);
+      border-radius: 4px;
+      padding: 3px 5px;
+    }
+    .error {
+      color: #b42318;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <textarea id="input" spellcheck="false" placeholder="Paste `pokedr-cli --format json` output here"></textarea>
+    <button id="render">Render</button>
+    <section id="output"></section>
+  </main>
+  <script>
+    const input = document.getElementById('input');
+    const output = document.getElementById('output');
+    document.getElementById('render').addEventListener('click', render);
+
+    function render() {
+      let data;
+      try {
+        data = JSON.parse(input.value);
+      } catch (error) {
+        output.innerHTML = `<p class="error">${escapeHtml(error.message)}</p>`;
+        return;
+      }
+
+      const metrics = [
+        ['Level', data.level],
+        ['Stack', `${data.stack} (${data.stack_in_big_blinds.toFixed(2)} BB)`],
+        ['Alive', data.alive_players],
+        ['Dead Pot', data.dead_pot],
+        ['Orbit Cost', data.orbit_cost],
+        ['Call Eq', pct(data.single_call_required_equity)],
+        ['Overcall Eq', pct(data.overcall_required_equity)],
+      ];
+
+      output.innerHTML = `
+        <section class="summary">
+          ${metrics.map(([label, value]) => `<div class="metric"><b>${label}</b>${value}</div>`).join('')}
+        </section>
+        <section class="ranges">
+          ${Object.entries(data.ranges).map(([name, range]) => renderRange(name, range)).join('')}
+        </section>
+      `;
+    }
+
+    function renderRange(name, range) {
+      return `
+        <article class="range">
+          <h2>${title(name)}: ${range.classes} classes, ${range.combos} combos (${pct(range.combo_fraction)})</h2>
+          <div class="hands">
+            ${range.hands.map(hand => `<span class="hand" title="equity ${pct(hand.equity)}, ev ${hand.ev.toFixed(4)}">${escapeHtml(hand.hand)}</span>`).join('')}
+          </div>
+        </article>
+      `;
+    }
+
+    function pct(value) {
+      return `${(value * 100).toFixed(1)}%`;
+    }
+
+    function title(value) {
+      return value.replaceAll('_', ' ');
+    }
+
+    function escapeHtml(value) {
+      return String(value).replace(/[&<>"']/g, char => ({
+        '&': '&amp;',
+        '<': '&lt;',
+        '>': '&gt;',
+        '"': '&quot;',
+        "'": '&#39;',
+      }[char]));
+    }
+  </script>
+</body>
+</html>

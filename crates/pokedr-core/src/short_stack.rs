@@ -1,5 +1,7 @@
 use crate::blinds::BlindLevel;
-use crate::equity::{heads_up_equity_vs_range, three_way_equity_vs_ranges};
+use crate::equity::{
+    EquityCache, heads_up_equity_vs_range_cached, three_way_equity_vs_ranges_cached,
+};
 use crate::hand_class::{HandClass, all_hand_classes};
 use crate::structure::orbit_cost;
 
@@ -48,26 +50,30 @@ pub fn analyze_short_stack(config: &ShortStackConfig) -> ShortStackReport {
     let classes = all_hand_classes();
     let mut call_range = top_fraction_by_heuristic(&classes, 0.25);
     let mut shove_range = classes.clone();
+    let mut cache = EquityCache::new();
 
     for _ in 0..config.iterations {
-        shove_range = profitable_shove_range(&classes, &call_range, config, dead_pot);
+        shove_range = profitable_shove_range(&classes, &call_range, config, dead_pot, &mut cache);
         call_range = profitable_call_range(
             &classes,
             &shove_range,
             single_call_required_equity,
             config.max_boards_per_combo,
+            &mut cache,
         )
         .into_iter()
         .map(|result| result.hand)
         .collect();
     }
 
-    let shove_results = profitable_shove_results(&classes, &call_range, config, dead_pot);
+    let shove_results =
+        profitable_shove_results(&classes, &call_range, config, dead_pot, &mut cache);
     let call_results = profitable_call_range(
         &classes,
         &shove_range,
         single_call_required_equity,
         config.max_boards_per_combo,
+        &mut cache,
     );
     let overcall_results = profitable_overcall_range(
         &classes,
@@ -76,6 +82,7 @@ pub fn analyze_short_stack(config: &ShortStackConfig) -> ShortStackReport {
         overcall_required_equity,
         config.max_boards_per_combo,
         config.range_sample_limit,
+        &mut cache,
     );
 
     ShortStackReport {
@@ -95,8 +102,9 @@ fn profitable_shove_range(
     call_range: &[HandClass],
     config: &ShortStackConfig,
     dead_pot: u32,
+    cache: &mut EquityCache,
 ) -> Vec<HandClass> {
-    profitable_shove_results(classes, call_range, config, dead_pot)
+    profitable_shove_results(classes, call_range, config, dead_pot, cache)
         .into_iter()
         .map(|result| result.hand)
         .collect()
@@ -107,6 +115,7 @@ fn profitable_shove_results(
     call_range: &[HandClass],
     config: &ShortStackConfig,
     dead_pot: u32,
+    cache: &mut EquityCache,
 ) -> Vec<HandResult> {
     let call_probability = combo_fraction(call_range);
     let sampled_call_range = sample_range(call_range, config.range_sample_limit);
@@ -118,9 +127,13 @@ fn profitable_shove_results(
     let mut results = Vec::new();
 
     for &hand in classes {
-        let equity =
-            heads_up_equity_vs_range(hand, &sampled_call_range, config.max_boards_per_combo)
-                .share();
+        let equity = heads_up_equity_vs_range_cached(
+            hand,
+            &sampled_call_range,
+            config.max_boards_per_combo,
+            cache,
+        )
+        .share();
         let ev =
             fold_probability * dead_pot as f64 + called_probability * (equity * called_pot - risk);
 
@@ -143,13 +156,19 @@ fn profitable_call_range(
     shove_range: &[HandClass],
     required_equity: f64,
     max_boards_per_combo: usize,
+    cache: &mut EquityCache,
 ) -> Vec<HandResult> {
     let mut results = Vec::new();
     let sampled_shove_range = sample_range(shove_range, 32);
 
     for &hand in classes {
-        let equity =
-            heads_up_equity_vs_range(hand, &sampled_shove_range, max_boards_per_combo).share();
+        let equity = heads_up_equity_vs_range_cached(
+            hand,
+            &sampled_shove_range,
+            max_boards_per_combo,
+            cache,
+        )
+        .share();
         let ev = equity - required_equity;
 
         if ev >= 0.0 {
@@ -168,6 +187,7 @@ fn profitable_overcall_range(
     required_equity: f64,
     max_boards_per_combo: usize,
     range_sample_limit: usize,
+    cache: &mut EquityCache,
 ) -> Vec<HandResult> {
     let mut results = Vec::new();
     let candidate_classes = top_fraction_by_heuristic(classes, 0.2);
@@ -175,11 +195,12 @@ fn profitable_overcall_range(
     let sampled_call_range = sample_range(call_range, range_sample_limit);
 
     for hand in candidate_classes {
-        let equity = three_way_equity_vs_ranges(
+        let equity = three_way_equity_vs_ranges_cached(
             hand,
             &sampled_shove_range,
             &sampled_call_range,
             max_boards_per_combo,
+            cache,
         )
         .share();
         let ev = equity - required_equity;
