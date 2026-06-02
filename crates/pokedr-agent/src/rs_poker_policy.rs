@@ -272,12 +272,9 @@ fn cfr_postflop_action(
             && strategy.player == root_player
             && strategy.combo.mask == hero_mask
     })?;
-    let best = root
-        .actions
-        .iter()
-        .max_by(|left, right| left.frequency.total_cmp(&right.frequency))?;
+    let action = sample_strategy_action(game_state, idx, root.actions.as_slice())?;
 
-    Some(match best.action {
+    Some(match action {
         ActionKind::Fold => AgentAction::Fold,
         ActionKind::Check | ActionKind::Call => {
             if to_call <= 0.0 {
@@ -293,6 +290,45 @@ fn cfr_postflop_action(
             AgentAction::Bet(capped as f32)
         }
     })
+}
+
+fn sample_strategy_action(
+    game_state: &GameState,
+    idx: usize,
+    actions: &[pokedr_core::subgame::SubgameActionFrequency],
+) -> Option<ActionKind> {
+    let total: f64 = actions.iter().map(|action| action.frequency.max(0.0)).sum();
+    if total <= 0.0 {
+        return actions.first().map(|action| action.action);
+    }
+
+    let mut threshold = deterministic_action_roll(game_state, idx) * total;
+    for action in actions {
+        threshold -= action.frequency.max(0.0);
+        if threshold <= 0.0 {
+            return Some(action.action);
+        }
+    }
+    actions.last().map(|action| action.action)
+}
+
+fn deterministic_action_roll(game_state: &GameState, idx: usize) -> f64 {
+    let mut value = idx as u64 + 0x9e37_79b9_7f4a_7c15;
+    value ^= (game_state.total_pot.to_bits() as u64).rotate_left(7);
+    value ^= (game_state.round_data.bet.to_bits() as u64).rotate_left(17);
+    value ^= (game_state.round as u8 as u64).rotate_left(23);
+    for card in &game_state.board {
+        value ^= (u8::from(*card) as u64).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        value = value.rotate_left(11);
+    }
+    for card in game_state.hands[idx].iter() {
+        value ^= (u8::from(card) as u64).wrapping_mul(0x94d0_49bb_1331_11eb);
+        value = value.rotate_left(13);
+    }
+    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    let mixed = value ^ (value >> 31);
+    (mixed as f64) / (u64::MAX as f64)
 }
 
 fn cfr_action_abstraction(game_state: &GameState) -> ActionAbstraction {
