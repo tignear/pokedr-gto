@@ -2,7 +2,7 @@ use std::env;
 use std::time::Instant;
 
 use pokedr_core::blinds::blind_level;
-use pokedr_core::cfr::{KuhnCfrResult, KuhnCfrSolver};
+use pokedr_core::cfr::{CfrResult, KuhnCfrSolver, LeducCfrSolver};
 use pokedr_core::short_stack::{
     ShortStackConfig, ShortStackReport, analyze_open_2bb_defense, analyze_short_stack,
 };
@@ -19,6 +19,7 @@ const DEFAULT_FLAT_CALL_FRACTION: f64 = 0.25;
 fn main() {
     let args: Vec<String> = env::args().collect();
     let solve_kuhn = has_flag(&args, "--solve-kuhn");
+    let solve_leduc = has_flag(&args, "--solve-leduc");
     let scan_open2bb = has_flag(&args, "--scan-open2bb");
     let scan_defense2bb = has_flag(&args, "--scan-defense2bb");
     let level = parse_arg(&args, "--level").unwrap_or(DEFAULT_LEVEL);
@@ -63,15 +64,20 @@ fn main() {
     let include_overcall = has_flag(&args, "--overcall");
     let format = parse_string_arg(&args, "--format").unwrap_or("text");
 
-    if solve_kuhn {
+    if solve_kuhn || solve_leduc {
         let iterations = parse_arg(&args, "--cfr-iterations").unwrap_or(100_000) as usize;
         let started_at = Instant::now();
-        let mut solver = KuhnCfrSolver::new();
-        let result = solver.train(iterations);
+        let result = if solve_leduc {
+            let mut solver = LeducCfrSolver::new();
+            solver.train(iterations)
+        } else {
+            let mut solver = KuhnCfrSolver::new();
+            solver.train(iterations)
+        };
         let elapsed = started_at.elapsed();
         match format {
-            "json" => print_kuhn_json(&result, elapsed.as_secs_f64()),
-            "text" => print_kuhn_report(&result, elapsed.as_secs_f64()),
+            "json" => print_cfr_json(&result, elapsed.as_secs_f64()),
+            "text" => print_cfr_report(&result, elapsed.as_secs_f64()),
             _ => {
                 eprintln!("invalid --format; expected text or json");
                 std::process::exit(2);
@@ -182,30 +188,35 @@ fn parse_stacks(args: &[String]) -> Option<Vec<u32>> {
     (!stacks.is_empty()).then_some(stacks)
 }
 
-fn print_kuhn_report(result: &KuhnCfrResult, elapsed_seconds: f64) {
+fn print_cfr_report(result: &CfrResult, elapsed_seconds: f64) {
     let iterations_per_second = if elapsed_seconds > 0.0 {
         result.iterations as f64 / elapsed_seconds
     } else {
         0.0
     };
 
-    println!("Kuhn poker CFR");
+    println!("{} poker CFR", result.game);
     println!("iterations: {}", result.iterations);
-    println!("expected value P0: {:.6}", result.expected_value);
-    println!("known value P0: {:.6}", -1.0 / 18.0);
+    println!("expected value P0: {:.6}", result.expected_value_p0);
+    if result.game == "kuhn" {
+        println!("known value P0: {:.6}", -1.0 / 18.0);
+    }
     println!("elapsed seconds: {:.6}", elapsed_seconds);
     println!("iterations/sec: {:.0}", iterations_per_second);
     println!();
-    println!("infoset,check_or_fold,bet_or_call");
+    println!("infoset,actions");
     for strategy in &result.infosets {
-        println!(
-            "{},{:.6},{:.6}",
-            strategy.key, strategy.check_or_fold, strategy.bet_or_call
-        );
+        let actions = strategy
+            .actions
+            .iter()
+            .map(|action| format!("{}={:.6}", action.label, action.probability))
+            .collect::<Vec<_>>()
+            .join(" ");
+        println!("{},{}", strategy.key, actions);
     }
 }
 
-fn print_kuhn_json(result: &KuhnCfrResult, elapsed_seconds: f64) {
+fn print_cfr_json(result: &CfrResult, elapsed_seconds: f64) {
     let iterations_per_second = if elapsed_seconds > 0.0 {
         result.iterations as f64 / elapsed_seconds
     } else {
@@ -213,10 +224,12 @@ fn print_kuhn_json(result: &KuhnCfrResult, elapsed_seconds: f64) {
     };
 
     println!("{{");
-    println!("  \"game\": \"kuhn\",");
+    println!("  \"game\": \"{}\",", result.game);
     println!("  \"iterations\": {},", result.iterations);
-    println!("  \"expected_value_p0\": {:.9},", result.expected_value);
-    println!("  \"known_value_p0\": {:.9},", -1.0 / 18.0);
+    println!("  \"expected_value_p0\": {:.9},", result.expected_value_p0);
+    if result.game == "kuhn" {
+        println!("  \"known_value_p0\": {:.9},", -1.0 / 18.0);
+    }
     println!("  \"elapsed_seconds\": {:.9},", elapsed_seconds);
     println!("  \"iterations_per_second\": {:.3},", iterations_per_second);
     println!("  \"infosets\": [");
@@ -226,10 +239,19 @@ fn print_kuhn_json(result: &KuhnCfrResult, elapsed_seconds: f64) {
         } else {
             ","
         };
-        println!(
-            "    {{\"key\":\"{}\",\"check_or_fold\":{:.9},\"bet_or_call\":{:.9}}}{}",
-            strategy.key, strategy.check_or_fold, strategy.bet_or_call, comma
-        );
+        println!("    {{\"key\":\"{}\",\"actions\":[", strategy.key);
+        for (action_index, action) in strategy.actions.iter().enumerate() {
+            let action_comma = if action_index + 1 == strategy.actions.len() {
+                ""
+            } else {
+                ","
+            };
+            println!(
+                "      {{\"label\":\"{}\",\"probability\":{:.9}}}{}",
+                action.label, action.probability, action_comma
+            );
+        }
+        println!("    ]}}{}", comma);
     }
     println!("  ]");
     println!("}}");
