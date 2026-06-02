@@ -187,9 +187,11 @@ fn analyze_seat(
     let call_required_equity = state_required_equity(fold_value, call_win_value, call_lose_value);
     let overcall_required_equity =
         state_required_equity(fold_value, overcall_win_value, overcall_lose_value);
+    let response_required_equity =
+        first_response_required_equity(config, stacks, dead_pot, seat_index as usize, all_in_cost);
     let solution = solve_shove_response(
         classes,
-        call_required_equity,
+        response_required_equity,
         &seat_config,
         stacks,
         dead_pot,
@@ -270,11 +272,6 @@ fn analyze_call_spots(
         stacks.len() as u8,
         caller_seat as u8,
     ));
-    let clock = BlindClock {
-        current_level: config.level.level,
-        elapsed_in_level_seconds: config.elapsed_in_level_seconds,
-    };
-
     for opener_seat in 0..caller_seat {
         let opener_cost = stacks[opener_seat].saturating_sub(posted_amount(
             config.level,
@@ -290,20 +287,14 @@ fn analyze_call_spots(
             players_behind: stacks.len().saturating_sub(opener_seat).saturating_sub(1) as u8,
             ..config.clone()
         };
-        let fold_value = state_value(clock, config.hand_duration_seconds, &posted, caller_seat);
-        let win_value = state_value(
-            clock,
-            config.hand_duration_seconds,
-            &call_win_stacks(&posted, caller_seat, opener_seat, dead_pot, effective_cost),
+        let required_equity = call_required_equity_for(
+            config,
+            &posted,
+            dead_pot,
             caller_seat,
+            opener_seat,
+            effective_cost,
         );
-        let lose_value = state_value(
-            clock,
-            config.hand_duration_seconds,
-            &call_lose_stacks(&posted, caller_seat, opener_seat, dead_pot, effective_cost),
-            caller_seat,
-        );
-        let required_equity = state_required_equity(fold_value, win_value, lose_value);
         let solution = solve_shove_response(
             classes,
             required_equity,
@@ -339,6 +330,82 @@ fn analyze_call_spots(
     }
 
     spots
+}
+
+fn first_response_required_equity(
+    config: &ShortStackConfig,
+    stacks: &[u32],
+    dead_pot: u32,
+    opener_seat: usize,
+    opener_cost: u32,
+) -> f64 {
+    if opener_seat + 1 >= stacks.len() {
+        return 1.0;
+    }
+
+    let posted = posted_stacks(config.level, stacks);
+    let caller_seat = caller_seat(opener_seat, stacks.len());
+    let caller_cost = stacks[caller_seat].saturating_sub(posted_amount(
+        config.level,
+        stacks.len() as u8,
+        caller_seat as u8,
+    ));
+    let effective_cost = opener_cost.min(caller_cost);
+
+    call_required_equity_for(
+        config,
+        &posted,
+        dead_pot,
+        caller_seat,
+        opener_seat,
+        effective_cost,
+    )
+}
+
+fn call_required_equity_for(
+    config: &ShortStackConfig,
+    posted_stacks: &[u32],
+    dead_pot: u32,
+    caller_seat: usize,
+    opener_seat: usize,
+    effective_cost: u32,
+) -> f64 {
+    let clock = BlindClock {
+        current_level: config.level.level,
+        elapsed_in_level_seconds: config.elapsed_in_level_seconds,
+    };
+    let fold_value = state_value(
+        clock,
+        config.hand_duration_seconds,
+        posted_stacks,
+        caller_seat,
+    );
+    let win_value = state_value(
+        clock,
+        config.hand_duration_seconds,
+        &call_win_stacks(
+            posted_stacks,
+            caller_seat,
+            opener_seat,
+            dead_pot,
+            effective_cost,
+        ),
+        caller_seat,
+    );
+    let lose_value = state_value(
+        clock,
+        config.hand_duration_seconds,
+        &call_lose_stacks(
+            posted_stacks,
+            caller_seat,
+            opener_seat,
+            dead_pot,
+            effective_cost,
+        ),
+        caller_seat,
+    );
+
+    state_required_equity(fold_value, win_value, lose_value)
 }
 
 struct ShoveResponseSolution {
