@@ -6,7 +6,7 @@ use pokedr_core::hand_class::HandClass;
 use rs_poker::{
     arena::{
         AgentGenerator, CloneAgentGenerator, CloneGameStateGenerator,
-        agent::RandomPotControlAgent,
+        agent::{CallingAgent, RandomAgent, RandomPotControlAgent},
         competition::{HoldemCompetition, StandardSimulationIterator},
         game_state::GameState,
     },
@@ -68,11 +68,48 @@ fn rs_poker_ranked_river_policy_smoke_does_not_get_crushed() {
 
 #[test]
 fn rs_poker_arena_policy_smoke_does_not_get_crushed_by_pot_control() {
-    let agent_gens: Vec<Box<dyn AgentGenerator>> = vec![
+    let hero_bb_per_hand = run_heads_up_smoke(
         Box::new(CloneAgentGenerator::new(EquityPolicyAgent::default())),
         Box::new(CloneAgentGenerator::new(RandomPotControlAgent::new(vec![
             0.35, 0.25,
         ]))),
+        400,
+    );
+    eprintln!("vs pot-control hero_bb_per_hand={hero_bb_per_hand:.3}");
+
+    assert!(
+        hero_bb_per_hand > -0.75,
+        "rs_poker arena smoke policy is losing too much: {hero_bb_per_hand:.3} bb/hand"
+    );
+}
+
+#[test]
+fn rs_poker_arena_policy_beats_weaker_baselines() {
+    let vs_calling = run_heads_up_smoke(
+        Box::new(CloneAgentGenerator::new(EquityPolicyAgent::default())),
+        Box::new(CloneAgentGenerator::new(CallingAgent)),
+        400,
+    );
+    let vs_random = run_heads_up_smoke(
+        Box::new(CloneAgentGenerator::new(EquityPolicyAgent::default())),
+        Box::new(CloneAgentGenerator::new(RandomAgent::default())),
+        400,
+    );
+    eprintln!("vs calling hero_bb_per_hand={vs_calling:.3}");
+    eprintln!("vs random hero_bb_per_hand={vs_random:.3}");
+
+    assert!(vs_calling > 0.0, "should beat calling baseline");
+    assert!(vs_random > 0.0, "should beat random baseline");
+}
+
+fn run_heads_up_smoke(
+    hero: Box<dyn AgentGenerator>,
+    villain: Box<dyn AgentGenerator>,
+    hands: usize,
+) -> f64 {
+    let agent_gens: Vec<Box<dyn AgentGenerator>> = vec![
+        hero,
+        villain,
     ];
     let game_state = GameState::new_starting(vec![1_000.0, 1_000.0], 10.0, 5.0, 0.0, 0);
     let simulation_gen = StandardSimulationIterator::new(
@@ -82,14 +119,8 @@ fn rs_poker_arena_policy_smoke_does_not_get_crushed_by_pot_control() {
     );
     let mut competition = HoldemCompetition::new(simulation_gen);
 
-    competition.run(400).expect("rs_poker arena should run");
-    let hero_bb_per_hand = competition.total_change[0] as f64 / competition.num_rounds as f64;
-    eprintln!("rs_poker arena smoke hero_bb_per_hand={hero_bb_per_hand:.3}");
-
-    assert!(
-        hero_bb_per_hand > -0.75,
-        "rs_poker arena smoke policy is losing too much: {hero_bb_per_hand:.3} bb/hand"
-    );
+    competition.run(hands).expect("rs_poker arena should run");
+    competition.total_change[0] as f64 / competition.num_rounds as f64
 }
 
 fn river_battle_ev(hero: &str, villain: &str, board: &str, hand_index: usize) -> f64 {
