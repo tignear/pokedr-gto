@@ -4,7 +4,10 @@ use std::time::Instant;
 use pokedr_core::blinds::blind_level;
 use pokedr_core::cards::Card;
 use pokedr_core::cfr::{CfrResult, KuhnCfrSolver, LeducCfrSolver};
-use pokedr_core::river::{river_blocker_reports, river_combos};
+use pokedr_core::river::{
+    RiverCfrConfig, RiverCfrResult, RiverNode, RiverRole, river_blocker_reports, river_combos,
+    solve_river_check_bet,
+};
 use pokedr_core::short_stack::{
     ShortStackConfig, ShortStackReport, analyze_open_2bb_defense, analyze_short_stack,
 };
@@ -23,6 +26,7 @@ fn main() {
     let solve_kuhn = has_flag(&args, "--solve-kuhn");
     let solve_leduc = has_flag(&args, "--solve-leduc");
     let river_blockers = has_flag(&args, "--river-blockers");
+    let solve_river = has_flag(&args, "--solve-river");
     let scan_open2bb = has_flag(&args, "--scan-open2bb");
     let scan_defense2bb = has_flag(&args, "--scan-defense2bb");
     let level = parse_arg(&args, "--level").unwrap_or(DEFAULT_LEVEL);
@@ -89,14 +93,28 @@ fn main() {
         return;
     }
 
-    if river_blockers {
+    if river_blockers || solve_river {
         let Some(board) = parse_board_arg(&args) else {
             eprintln!("invalid --board; expected ten chars like AsKsQsJs2d");
             std::process::exit(2);
         };
         let top_fraction = parse_f64_arg(&args, "--top-fraction").unwrap_or(0.05);
         let limit = parse_arg(&args, "--limit").unwrap_or(40) as usize;
-        print_river_blockers(board, top_fraction, limit, format);
+        if solve_river {
+            let cfr_iterations = parse_arg(&args, "--cfr-iterations").unwrap_or(100_000) as usize;
+            let pot = parse_f64_arg(&args, "--pot").unwrap_or(100.0);
+            let bet = parse_f64_arg(&args, "--bet").unwrap_or(pot * 0.75);
+            let result = solve_river_check_bet(RiverCfrConfig {
+                board,
+                pot,
+                bet,
+                iterations: cfr_iterations,
+                top_fraction,
+            });
+            print_river_solution(&result, limit, format);
+        } else {
+            print_river_blockers(board, top_fraction, limit, format);
+        }
         return;
     }
 
@@ -316,6 +334,121 @@ fn print_river_blockers(board: [Card; 5], top_fraction: f64, limit: usize, forma
             eprintln!("invalid --format; expected text or json");
             std::process::exit(2);
         }
+    }
+}
+
+fn print_river_solution(result: &RiverCfrResult, limit: usize, format: &str) {
+    let mut strategies = result.strategies.clone();
+    strategies.sort_by(|left, right| {
+        river_action_frequency(right, "bet")
+            .total_cmp(&river_action_frequency(left, "bet"))
+            .then_with(|| {
+                river_action_frequency(right, "call")
+                    .total_cmp(&river_action_frequency(left, "call"))
+            })
+            .then_with(|| right.blocked_top_combos.cmp(&left.blocked_top_combos))
+            .then_with(|| right.combo.value.cmp(&left.combo.value))
+            .then_with(|| left.combo.label().cmp(&right.combo.label()))
+    });
+
+    match format {
+        "json" => {
+            println!("{{");
+            println!("  \"game\": \"river-check-bet\",");
+            println!("  \"iterations\": {},", result.iterations);
+            println!(
+                "  \"expected_value_oop\": {:.9},",
+                result.expected_value_oop
+            );
+            println!("  \"pot\": {:.6},", result.pot);
+            println!("  \"bet\": {:.6},", result.bet);
+            println!("  \"combo_count\": {},", result.combo_count);
+            println!("  \"strategies\": [");
+            for (index, strategy) in strategies.iter().take(limit).enumerate() {
+                let comma = if index + 1 == limit.min(strategies.len()) {
+                    ""
+                } else {
+                    ","
+                };
+                println!(
+                    "    {{\"role\":\"{}\",\"node\":\"{}\",\"combo\":\"{}\",\"hand_value\":{},\"blocked_top_combos\":{},\"top_villain_combos\":{},\"actions\":[",
+                    river_role_label(strategy.role),
+                    river_node_label(strategy.node),
+                    strategy.combo.label(),
+                    strategy.combo.value,
+                    strategy.blocked_top_combos,
+                    strategy.top_villain_combos
+                );
+                for (action_index, action) in strategy.actions.iter().enumerate() {
+                    let action_comma = if action_index + 1 == strategy.actions.len() {
+                        ""
+                    } else {
+                        ","
+                    };
+                    println!(
+                        "      {{\"action\":\"{}\",\"frequency\":{:.9}}}{}",
+                        action.action, action.frequency, action_comma
+                    );
+                }
+                println!("    ]}}{}", comma);
+            }
+            println!("  ]");
+            println!("}}");
+        }
+        "text" => {
+            println!("river check-bet CFR");
+            println!("iterations: {}", result.iterations);
+            println!("expected value OOP: {:.6}", result.expected_value_oop);
+            println!("pot: {:.3}", result.pot);
+            println!("bet: {:.3}", result.bet);
+            println!("combo count: {}", result.combo_count);
+            println!("role,node,combo,hand_value,blocked_top,total_top,actions");
+            for strategy in strategies.iter().take(limit) {
+                let actions = strategy
+                    .actions
+                    .iter()
+                    .map(|action| format!("{}={:.6}", action.action, action.frequency))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                println!(
+                    "{},{},{},{},{},{},{}",
+                    river_role_label(strategy.role),
+                    river_node_label(strategy.node),
+                    strategy.combo.label(),
+                    strategy.combo.value,
+                    strategy.blocked_top_combos,
+                    strategy.top_villain_combos,
+                    actions
+                );
+            }
+        }
+        _ => {
+            eprintln!("invalid --format; expected text or json");
+            std::process::exit(2);
+        }
+    }
+}
+
+fn river_action_frequency(strategy: &pokedr_core::river::RiverComboStrategy, action: &str) -> f64 {
+    strategy
+        .actions
+        .iter()
+        .find(|frequency| frequency.action == action)
+        .map(|frequency| frequency.frequency)
+        .unwrap_or(0.0)
+}
+
+fn river_role_label(role: RiverRole) -> &'static str {
+    match role {
+        RiverRole::Oop => "OOP",
+        RiverRole::Ip => "IP",
+    }
+}
+
+fn river_node_label(node: RiverNode) -> &'static str {
+    match node {
+        RiverNode::FacingBet => "facing-bet",
+        RiverNode::AfterCheck => "after-check",
     }
 }
 
