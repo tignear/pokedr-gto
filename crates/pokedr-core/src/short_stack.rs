@@ -555,6 +555,33 @@ fn decision_node_range_from_strategy(
         stacks.len(),
         config.range_sample_limit,
     );
+    let fold_patterns: Vec<_> = fold_patterns
+        .into_iter()
+        .map(|pattern| {
+            prepare_fold_pattern(
+                config.level,
+                stacks,
+                dead_pot,
+                opener_seat,
+                prior_callers,
+                pattern,
+            )
+        })
+        .collect();
+    let call_patterns: Vec<_> = call_patterns
+        .into_iter()
+        .map(|pattern| {
+            prepare_call_pattern(
+                config.level,
+                stacks,
+                dead_pot,
+                actor_seat,
+                opener_seat,
+                prior_callers,
+                pattern,
+            )
+        })
+        .collect();
     let evaluate_hand = |hand: HandClass| {
         let mut hero_share = 0.0;
         let mut call_value = 0.0;
@@ -568,10 +595,7 @@ fn decision_node_range_from_strategy(
                     config.max_boards_per_combo,
                     clock,
                     &posted,
-                    dead_pot,
                     actor_seat,
-                    opener_seat,
-                    prior_callers,
                     stacks,
                     sampled_opener_range,
                     prior_ranges,
@@ -588,10 +612,7 @@ fn decision_node_range_from_strategy(
                 config.max_boards_per_combo,
                 clock,
                 &posted,
-                dead_pot,
                 actor_seat,
-                opener_seat,
-                prior_callers,
                 stacks,
                 pattern,
             );
@@ -614,10 +635,7 @@ fn decision_node_range_from_strategy(
                         adaptive_boards,
                         clock,
                         &posted,
-                        dead_pot,
                         actor_seat,
-                        opener_seat,
-                        prior_callers,
                         stacks,
                         sampled_opener_range,
                         prior_ranges,
@@ -634,10 +652,7 @@ fn decision_node_range_from_strategy(
                     adaptive_boards,
                     clock,
                     &posted,
-                    dead_pot,
                     actor_seat,
-                    opener_seat,
-                    prior_callers,
                     stacks,
                     pattern,
                 );
@@ -1028,6 +1043,12 @@ struct DownstreamPattern {
     ranges: Vec<Vec<HandClass>>,
 }
 
+struct PreparedPattern {
+    probability: f64,
+    ranges: Vec<Vec<HandClass>>,
+    context: PatternContext,
+}
+
 fn pattern_range(
     candidate_hands: &[HandClass],
     sampled_opener_range: &[HandClass],
@@ -1092,6 +1113,64 @@ struct PatternOutcome {
     value: f64,
 }
 
+struct PatternContext {
+    participants: Vec<usize>,
+    commitments: Vec<(usize, u32)>,
+    pots: Vec<EquityPot>,
+    total_pot: f64,
+}
+
+impl PatternContext {
+    fn new(level: BlindLevel, stacks: &[u32], dead_pot: u32, participants: Vec<usize>) -> Self {
+        let commitments = all_in_commitments(level, stacks, &participants);
+        let pots = side_pots(dead_pot, &commitments);
+        let total_pot = pots.iter().map(|pot| pot.amount).sum::<f64>();
+        Self {
+            participants,
+            commitments,
+            pots,
+            total_pot,
+        }
+    }
+}
+
+fn prepare_fold_pattern(
+    level: BlindLevel,
+    stacks: &[u32],
+    dead_pot: u32,
+    opener_seat: usize,
+    prior_callers: &[usize],
+    pattern: DownstreamPattern,
+) -> PreparedPattern {
+    let mut participants = vec![opener_seat];
+    participants.extend(prior_callers.iter().copied());
+    participants.extend(pattern.callers.iter().copied());
+    PreparedPattern {
+        probability: pattern.probability,
+        ranges: pattern.ranges,
+        context: PatternContext::new(level, stacks, dead_pot, participants),
+    }
+}
+
+fn prepare_call_pattern(
+    level: BlindLevel,
+    stacks: &[u32],
+    dead_pot: u32,
+    actor_seat: usize,
+    opener_seat: usize,
+    prior_callers: &[usize],
+    pattern: DownstreamPattern,
+) -> PreparedPattern {
+    let mut participants = vec![actor_seat, opener_seat];
+    participants.extend(prior_callers.iter().copied());
+    participants.extend(pattern.callers.iter().copied());
+    PreparedPattern {
+        probability: pattern.probability,
+        ranges: pattern.ranges,
+        context: PatternContext::new(level, stacks, dead_pot, participants),
+    }
+}
+
 fn pattern_outcome(
     hand: HandClass,
     sampled_opener_range: &[HandClass],
@@ -1115,18 +1194,29 @@ fn pattern_outcome(
             .map(|range| sample_range(range, tree_sample_limit)),
     );
 
-    let participants = pattern_participants(caller_seat, opener_seat, pattern);
-    let commitments = all_in_commitments(config.level, stacks, &participants);
-    let pots = side_pots(dead_pot, &commitments);
-    let total_pot = pots.iter().map(|pot| pot.amount).sum::<f64>();
-    let payouts =
-        multi_way_showdown_payouts(hand, &opponent_ranges, &pots, config.max_boards_per_combo);
+    let context = PatternContext::new(
+        config.level,
+        stacks,
+        dead_pot,
+        pattern_participants(caller_seat, opener_seat, pattern),
+    );
+    let payouts = multi_way_showdown_payouts(
+        hand,
+        &opponent_ranges,
+        &context.pots,
+        config.max_boards_per_combo,
+    );
     let mut hero_payout = 0.0;
     let mut value = 0.0;
 
     for payout in &payouts {
         hero_payout += payout.first().copied().unwrap_or(0.0);
-        let next_stacks = showdown_stacks_from_payouts(posted, &participants, &commitments, payout);
+        let next_stacks = showdown_stacks_from_payouts(
+            posted,
+            &context.participants,
+            &context.commitments,
+            payout,
+        );
         value += showdown_state_value(
             clock,
             hand_duration_seconds,
@@ -1142,8 +1232,8 @@ fn pattern_outcome(
     }
 
     PatternOutcome {
-        hero_share: if total_pot > 0.0 {
-            hero_payout / total_pot
+        hero_share: if context.total_pot > 0.0 {
+            hero_payout / context.total_pot
         } else {
             0.0
         },
@@ -1159,12 +1249,9 @@ fn response_pattern_outcome(
     max_boards_per_combo: usize,
     clock: BlindClock,
     posted: &[u32],
-    dead_pot: u32,
     actor_seat: usize,
-    opener_seat: usize,
-    prior_callers: &[usize],
     stacks: &[u32],
-    pattern: &DownstreamPattern,
+    pattern: &PreparedPattern,
 ) -> PatternOutcome {
     let tree_sample_limit = config.range_sample_limit;
     let mut opponent_ranges = Vec::with_capacity(prior_ranges.len() + pattern.ranges.len() + 1);
@@ -1177,19 +1264,23 @@ fn response_pattern_outcome(
             .map(|range| sample_range(range, tree_sample_limit)),
     );
 
-    let mut participants = vec![actor_seat, opener_seat];
-    participants.extend(prior_callers.iter().copied());
-    participants.extend(pattern.callers.iter().copied());
-    let commitments = all_in_commitments(config.level, stacks, &participants);
-    let pots = side_pots(dead_pot, &commitments);
-    let total_pot = pots.iter().map(|pot| pot.amount).sum::<f64>();
-    let payouts = multi_way_showdown_payouts(hand, &opponent_ranges, &pots, max_boards_per_combo);
+    let payouts = multi_way_showdown_payouts(
+        hand,
+        &opponent_ranges,
+        &pattern.context.pots,
+        max_boards_per_combo,
+    );
     let mut hero_payout = 0.0;
     let mut value = 0.0;
 
     for payout in &payouts {
         hero_payout += payout.first().copied().unwrap_or(0.0);
-        let next_stacks = showdown_stacks_from_payouts(posted, &participants, &commitments, payout);
+        let next_stacks = showdown_stacks_from_payouts(
+            posted,
+            &pattern.context.participants,
+            &pattern.context.commitments,
+            payout,
+        );
         value += showdown_state_value(
             clock,
             config.hand_duration_seconds,
@@ -1205,8 +1296,8 @@ fn response_pattern_outcome(
     }
 
     PatternOutcome {
-        hero_share: if total_pot > 0.0 {
-            hero_payout / total_pot
+        hero_share: if pattern.context.total_pot > 0.0 {
+            hero_payout / pattern.context.total_pot
         } else {
             0.0
         },
@@ -1220,20 +1311,14 @@ fn folded_response_value(
     max_boards_per_combo: usize,
     clock: BlindClock,
     posted: &[u32],
-    dead_pot: u32,
     actor_seat: usize,
-    opener_seat: usize,
-    prior_callers: &[usize],
     stacks: &[u32],
     sampled_opener_range: &[HandClass],
     prior_ranges: &[Vec<HandClass>],
-    pattern: &DownstreamPattern,
+    pattern: &PreparedPattern,
 ) -> f64 {
     let tree_sample_limit = config.range_sample_limit;
-    let mut participants = vec![opener_seat];
-    participants.extend(prior_callers.iter().copied());
-    participants.extend(pattern.callers.iter().copied());
-    let mut player_ranges = Vec::with_capacity(participants.len());
+    let mut player_ranges = Vec::with_capacity(pattern.context.participants.len());
     player_ranges.push(sampled_opener_range.to_vec());
     player_ranges.extend(prior_ranges.iter().cloned());
     player_ranges.extend(
@@ -1242,21 +1327,23 @@ fn folded_response_value(
             .iter()
             .map(|range| sample_range(range, tree_sample_limit)),
     );
-    let commitments = all_in_commitments(config.level, stacks, &participants);
-    let pots = side_pots(dead_pot, &commitments);
     let mut values = Vec::new();
 
     for folded_combo in folded_hand.combos() {
         let dead_mask = folded_combo[0].mask() | folded_combo[1].mask();
         let payouts = multi_way_range_showdown_payouts_with_dead_mask(
             &player_ranges,
-            &pots,
+            &pattern.context.pots,
             max_boards_per_combo,
             dead_mask,
         );
         values.extend(payouts.iter().map(|payout| {
-            let next_stacks =
-                showdown_stacks_from_payouts(posted, &participants, &commitments, payout);
+            let next_stacks = showdown_stacks_from_payouts(
+                posted,
+                &pattern.context.participants,
+                &pattern.context.commitments,
+                payout,
+            );
             showdown_state_value(
                 clock,
                 config.hand_duration_seconds,
