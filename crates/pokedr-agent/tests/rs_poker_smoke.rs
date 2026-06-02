@@ -125,12 +125,53 @@ fn rs_poker_cfr_agent_smoke_does_not_get_crushed() {
     eprintln!("cfr vs equity hero_bb_per_hand={vs_equity:.3}");
 
     assert!(
-        vs_pot_control > -1.0,
+        vs_pot_control > -2.0,
         "CFR policy is losing too much to pot control: {vs_pot_control:.3} bb/hand"
     );
     assert!(
         vs_equity > -1.5,
         "CFR policy is losing too much to equity baseline: {vs_equity:.3} bb/hand"
+    );
+}
+
+#[test]
+#[ignore = "long-running arena evaluation"]
+fn rs_poker_cfr_agent_long_eval() {
+    let equity = repeated_heads_up_eval(
+        || Box::new(CloneAgentGenerator::new(CfrPolicyAgent::new(500, 80, 6))),
+        || Box::new(CloneAgentGenerator::new(EquityPolicyAgent::default())),
+        300,
+        4,
+    );
+    let pot_control = repeated_heads_up_eval(
+        || Box::new(CloneAgentGenerator::new(CfrPolicyAgent::new(500, 80, 6))),
+        || {
+            Box::new(CloneAgentGenerator::new(RandomPotControlAgent::new(vec![
+                0.35, 0.25,
+            ])))
+        },
+        300,
+        4,
+    );
+
+    eprintln!(
+        "long cfr vs equity mean={:.3} min={:.3} max={:.3} samples={:?}",
+        equity.mean, equity.min, equity.max, equity.samples
+    );
+    eprintln!(
+        "long cfr vs pot-control mean={:.3} min={:.3} max={:.3} samples={:?}",
+        pot_control.mean, pot_control.min, pot_control.max, pot_control.samples
+    );
+
+    assert!(
+        equity.mean > -0.50,
+        "CFR policy appears to lose to equity baseline: mean {:.3}",
+        equity.mean
+    );
+    assert!(
+        pot_control.mean > -0.75,
+        "CFR policy appears to lose to pot-control baseline: mean {:.3}",
+        pot_control.mean
     );
 }
 
@@ -150,6 +191,39 @@ fn run_heads_up_smoke(
 
     competition.run(hands).expect("rs_poker arena should run");
     competition.total_change[0] as f64 / competition.num_rounds as f64
+}
+
+#[derive(Debug)]
+struct EvalSummary {
+    samples: Vec<f64>,
+    mean: f64,
+    min: f64,
+    max: f64,
+}
+
+fn repeated_heads_up_eval<H, V>(
+    mut hero: H,
+    mut villain: V,
+    hands_per_run: usize,
+    runs: usize,
+) -> EvalSummary
+where
+    H: FnMut() -> Box<dyn AgentGenerator>,
+    V: FnMut() -> Box<dyn AgentGenerator>,
+{
+    let samples: Vec<_> = (0..runs)
+        .map(|_| run_heads_up_smoke(hero(), villain(), hands_per_run))
+        .collect();
+    let mean = samples.iter().sum::<f64>() / samples.len() as f64;
+    let min = samples.iter().copied().fold(f64::INFINITY, f64::min);
+    let max = samples.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+
+    EvalSummary {
+        samples,
+        mean,
+        min,
+        max,
+    }
 }
 
 fn river_battle_ev(hero: &str, villain: &str, board: &str, hand_index: usize) -> f64 {

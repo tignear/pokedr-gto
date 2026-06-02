@@ -612,9 +612,16 @@ struct SubgameCfrTrainer<'a> {
     tree: &'a ActionTree,
     oop_range: &'a [PostflopCombo],
     ip_range: &'a [PostflopCombo],
-    nodes: HashMap<String, SubgameCfrNode>,
+    nodes: HashMap<SubgameInfoKey, SubgameCfrNode>,
     equity_cache: HashMap<(u64, u64, u64), f64>,
     average_weight: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct SubgameInfoKey {
+    node: NodeId,
+    player: Player,
+    combo_mask: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -643,7 +650,7 @@ impl SubgameCfrTrainer<'_> {
                 ..
             } => {
                 let player_index = player.index();
-                let key = self.infoset_key(node_id, *player, history, oop_index, ip_index);
+                let key = self.infoset_key(node_id, *player, oop_index, ip_index);
                 let strategy = self.strategy_for(
                     &key, node_id, *player, history, actions, oop_index, ip_index,
                 );
@@ -709,26 +716,23 @@ impl SubgameCfrTrainer<'_> {
         &self,
         node_id: NodeId,
         player: Player,
-        history: &[ActionKind],
         oop_index: usize,
         ip_index: usize,
-    ) -> String {
-        let combo = match player {
-            Player::Oop => self.oop_range[oop_index].label(),
-            Player::Ip => self.ip_range[ip_index].label(),
+    ) -> SubgameInfoKey {
+        let combo_mask = match player {
+            Player::Oop => self.oop_range[oop_index].mask,
+            Player::Ip => self.ip_range[ip_index].mask,
         };
-        format!(
-            "{:?}:{}:{}:{combo}:{}",
+        SubgameInfoKey {
+            node: node_id,
             player,
-            node_id.0,
-            board_label(&self.spec.board),
-            history_label(history)
-        )
+            combo_mask,
+        }
     }
 
     fn strategy_for(
         &mut self,
-        key: &str,
+        key: &SubgameInfoKey,
         node_id: NodeId,
         player: Player,
         history: &[ActionKind],
@@ -761,7 +765,7 @@ impl SubgameCfrTrainer<'_> {
             strategy_sum: vec![0.0; actions.len()],
         };
         let strategy = node.strategy();
-        self.nodes.insert(key.to_string(), node);
+        self.nodes.insert(*key, node);
         strategy
     }
 
@@ -970,25 +974,6 @@ fn sampled_index(iteration: usize, len: usize) -> usize {
 
 fn board_mask(board: &[Card]) -> u64 {
     board.iter().fold(0_u64, |mask, card| mask | card.mask())
-}
-
-fn board_label(board: &[Card]) -> String {
-    board.iter().map(|card| format!("{:02}", card.0)).collect()
-}
-
-fn history_label(history: &[ActionKind]) -> String {
-    history
-        .iter()
-        .map(|action| match action {
-            ActionKind::Check => "x".to_string(),
-            ActionKind::Fold => "f".to_string(),
-            ActionKind::Call => "c".to_string(),
-            ActionKind::Bet(amount) => format!("b{amount:.2}"),
-            ActionKind::Raise(amount) => format!("r{amount:.2}"),
-            ActionKind::AllIn(amount) => format!("a{amount:.2}"),
-        })
-        .collect::<Vec<_>>()
-        .join("-")
 }
 
 fn player_key(player: Player) -> u8 {
