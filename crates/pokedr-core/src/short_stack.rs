@@ -533,7 +533,12 @@ fn sample_range(range: &[HandClass], limit: usize) -> Vec<HandClass> {
         return range.to_vec();
     }
 
-    range.iter().take(limit).copied().collect()
+    (0..limit)
+        .map(|index| {
+            let sampled_index = (index * range.len() + range.len() / (limit * 2)) / limit;
+            range[sampled_index.min(range.len() - 1)]
+        })
+        .collect()
 }
 
 fn heuristic_strength(hand: HandClass) -> f64 {

@@ -4,6 +4,11 @@ use crate::cards::{Card, deck};
 use crate::hand_class::HandClass;
 use crate::hand_eval::evaluate_seven;
 
+#[cfg(not(test))]
+const MIN_SAMPLED_BOARDS_PER_COMBO: usize = 64;
+#[cfg(test)]
+const MIN_SAMPLED_BOARDS_PER_COMBO: usize = 1;
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Equity {
     pub win: f64,
@@ -180,6 +185,7 @@ fn heads_up_combo_equity(hero: [Card; 2], villain: [Card; 2], max_boards: usize)
     };
 
     if max_boards > 0 {
+        let max_boards = max_boards.max(MIN_SAMPLED_BOARDS_PER_COMBO);
         let mut rng = SplitMix64::new(dead_mask ^ 0x9e37_79b9_7f4a_7c15);
         for _ in 0..max_boards {
             let board = sample_board(&available, &mut rng);
@@ -279,6 +285,7 @@ fn three_way_combo_equity_uncached(
     };
 
     if max_boards > 0 {
+        let max_boards = max_boards.max(MIN_SAMPLED_BOARDS_PER_COMBO);
         let mut rng = SplitMix64::new(dead_mask ^ 0xbf58_476d_1ce4_e5b9);
         for _ in 0..max_boards {
             let board = sample_board(&available, &mut rng);
