@@ -132,6 +132,15 @@
       border-radius: 4px;
       opacity: .35;
       background: color-mix(in srgb, CanvasText 4%, Canvas);
+      cursor: pointer;
+      user-select: none;
+    }
+    .cell:focus-visible {
+      outline: 2px solid color-mix(in srgb, CanvasText 70%, Canvas);
+      outline-offset: 2px;
+    }
+    .cell.selected {
+      box-shadow: 0 0 0 2px CanvasText inset;
     }
     .cell.in {
       opacity: 1;
@@ -171,6 +180,18 @@
     .error {
       color: #b42318;
     }
+    .hand-panel {
+      border: 1px solid color-mix(in srgb, CanvasText 16%, Canvas);
+      border-radius: 6px;
+      padding: 10px;
+      margin: -4px 0 14px;
+      min-height: 22px;
+      font: 13px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      background: color-mix(in srgb, CanvasText 3%, Canvas);
+    }
+    .hand-panel .muted {
+      opacity: .65;
+    }
   </style>
 </head>
 <body>
@@ -182,7 +203,25 @@
   <script>
     const input = document.getElementById('input');
     const output = document.getElementById('output');
+    let rangeBlockId = 0;
     document.getElementById('render').addEventListener('click', render);
+    output.addEventListener('click', event => {
+      const cell = event.target.closest('.cell');
+      if (cell) {
+        selectHand(cell);
+      }
+    });
+    output.addEventListener('keydown', event => {
+      if (event.key !== 'Enter' && event.key !== ' ') {
+        return;
+      }
+      const cell = event.target.closest('.cell');
+      if (!cell) {
+        return;
+      }
+      event.preventDefault();
+      selectHand(cell);
+    });
 
     function render() {
       let data;
@@ -193,6 +232,7 @@
         return;
       }
 
+      rangeBlockId = 0;
       const metrics = [
         ['Level', data.level],
         ['Stack', `${data.stack} (${data.stack_in_big_blinds.toFixed(2)} BB)`],
@@ -341,13 +381,15 @@
     }
 
     function renderRangeBlock(name, range) {
+      const blockId = `range-${rangeBlockId++}`;
       return `
-        <section>
+        <section class="range-block" data-range-block="${blockId}">
           <h4>${title(name)}: ${rangeSummary(range)}</h4>
           ${renderLegend()}
           <div class="matrix">
-            ${renderMatrix(range)}
+            ${renderMatrix(range, blockId)}
           </div>
+          <div class="hand-panel" id="${blockId}-detail"><span class="muted">Select a hand</span></div>
         </section>
       `;
     }
@@ -362,7 +404,7 @@
       `;
     }
 
-    function renderMatrix(range) {
+    function renderMatrix(range, blockId) {
       const ranks = ['A', 'K', 'Q', 'J', 'T', '9', '8', '7', '6', '5', '4', '3', '2'];
       const byHand = new Map(range.hands.map(hand => [hand.hand, hand]));
       const cells = [];
@@ -373,11 +415,23 @@
           const result = byHand.get(hand);
           const kind = hand.length === 2 ? 'pair' : hand.endsWith('s') ? 'suited' : 'offsuit';
           const cellTitle = result ? handDetail(hand, result) : hand;
-          cells.push(`<span class="cell ${kind}${result ? ' in' : ''}" title="${escapeHtml(cellTitle)}">${hand}</span>`);
+          cells.push(`<span class="cell ${kind}${result ? ' in' : ''}" role="button" tabindex="0" title="${escapeHtml(cellTitle)}" data-detail-target="${blockId}-detail" data-detail="${escapeHtml(cellTitle)}">${hand}</span>`);
         }
       }
 
       return cells.join('');
+    }
+
+    function selectHand(cell) {
+      const detail = document.getElementById(cell.dataset.detailTarget);
+      if (!detail) {
+        return;
+      }
+
+      const block = cell.closest('.range-block');
+      block?.querySelectorAll('.cell.selected').forEach(selected => selected.classList.remove('selected'));
+      cell.classList.add('selected');
+      detail.textContent = cell.dataset.detail;
     }
 
     function handDetail(hand, result) {
