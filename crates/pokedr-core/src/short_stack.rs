@@ -9,6 +9,7 @@ use crate::hand_class::{HandClass, all_hand_classes};
 use crate::scoring::rank_points;
 use crate::structure::orbit_cost;
 use rayon::prelude::*;
+use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
 pub struct ShortStackConfig {
@@ -342,7 +343,7 @@ fn analyze_call_spots(
             config.range_sample_limit,
             cache,
         );
-        let tree_result = profitable_tree_call_range(
+        let tree_result = solve_call_tree(
             classes,
             &solution
                 .shove_range
@@ -355,45 +356,37 @@ fn analyze_call_spots(
             caller_seat,
             opener_seat,
             range,
-            cache,
-        );
-        let range = tree_result.range;
-        let next_response = next_response_node(
-            classes,
-            &solution
-                .shove_range
-                .iter()
-                .map(|result| result.hand)
-                .collect::<Vec<_>>(),
-            &range.iter().map(|result| result.hand).collect::<Vec<_>>(),
-            config,
-            stacks,
-            dead_pot,
-            opener_seat,
-            caller_seat,
         );
 
         spots.push(CallSpot {
             opener_seat: opener_seat as u8,
             effective_all_in_cost: effective_cost,
             iterations_run: solution.iterations_run,
-            converged: solution.converged,
+            converged: solution.converged && tree_result.converged,
             required_equity,
-            range,
+            range: tree_result.range,
             patterns: tree_result.patterns,
-            next_response,
+            next_response: tree_result.next_response,
         });
     }
 
     spots
 }
 
-struct TreeCallResult {
+struct SolvedCallTree {
     range: Vec<HandResult>,
     patterns: Vec<CallPattern>,
+    next_response: Option<ResponseNode>,
+    converged: bool,
 }
 
-fn profitable_tree_call_range(
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct DecisionKey {
+    actor_seat: usize,
+    prior_callers: Vec<usize>,
+}
+
+fn solve_call_tree(
     classes: &[HandClass],
     opener_range: &[HandClass],
     config: &ShortStackConfig,
@@ -402,211 +395,141 @@ fn profitable_tree_call_range(
     caller_seat: usize,
     opener_seat: usize,
     heads_up_range: Vec<HandResult>,
-    _cache: &mut EquityCache,
-) -> TreeCallResult {
-    let downstream_patterns = downstream_call_patterns(classes, stacks, caller_seat);
-
-    let posted = posted_stacks(config.level, stacks);
-    let clock = BlindClock {
-        current_level: config.level.level,
-        elapsed_in_level_seconds: config.elapsed_in_level_seconds,
-    };
-    let hand_duration_seconds = config.hand_duration_seconds;
-    let fold_value = state_value(
-        clock,
-        hand_duration_seconds,
-        &steal_stacks(&posted, opener_seat, dead_pot),
-        caller_seat,
-    );
-    let sampled_opener_range = sample_range(opener_range, config.range_sample_limit);
-    let tree_sample_limit = config.range_sample_limit;
-    let sampled_opener_range = sample_range(&sampled_opener_range, tree_sample_limit);
-    let candidate_hands: Vec<_> = heads_up_range
-        .into_iter()
-        .map(|result| result.hand)
-        .collect();
-    let mut pattern_outputs = Vec::new();
-
-    for pattern in &downstream_patterns {
-        let range = pattern_range(
-            &candidate_hands,
-            &sampled_opener_range,
-            config,
-            &posted,
-            dead_pot,
-            caller_seat,
-            opener_seat,
-            stacks,
-            pattern,
-        );
-        pattern_outputs.push(CallPattern {
-            callers: pattern.callers.iter().map(|&seat| seat as u8).collect(),
-            probability: pattern.probability,
-            range,
-        });
-    }
-
-    let mut results: Vec<_> = candidate_hands
-        .into_par_iter()
-        .filter_map(|hand| {
-            let mut equity_acc = 0.0;
-            let mut call_value = 0.0;
-
-            for pattern in &downstream_patterns {
-                let outcome = pattern_outcome(
-                    hand,
-                    &sampled_opener_range,
-                    config,
-                    clock,
-                    hand_duration_seconds,
-                    &posted,
-                    dead_pot,
-                    caller_seat,
-                    opener_seat,
-                    stacks,
-                    pattern,
-                );
-                equity_acc += pattern.probability * outcome.hero_share;
-                call_value += pattern.probability * outcome.value;
-            }
-
-            let ev = call_value - fold_value;
-
-            if ev >= 0.0 {
-                Some(HandResult {
-                    hand,
-                    equity: equity_acc,
-                    ev,
-                    call_value: Some(call_value),
-                    fold_value: Some(fold_value),
-                })
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    results.sort_by(|left, right| {
-        right
-            .ev
-            .total_cmp(&left.ev)
-            .then_with(|| right.equity.total_cmp(&left.equity))
-    });
-    TreeCallResult {
-        range: results,
-        patterns: pattern_outputs,
-    }
-}
-
-fn next_response_node(
-    classes: &[HandClass],
-    opener_range: &[HandClass],
-    caller_range: &[HandClass],
-    config: &ShortStackConfig,
-    stacks: &[u32],
-    dead_pot: u32,
-    opener_seat: usize,
-    caller_seat: usize,
-) -> Option<ResponseNode> {
-    if caller_range.is_empty() || opener_range.is_empty() {
-        return None;
-    }
-
+) -> SolvedCallTree {
     let sampled_opener_range = sample_range(
         &sample_range(opener_range, config.range_sample_limit),
         config.range_sample_limit,
     );
-    response_node_from_prior(
-        classes,
-        &sampled_opener_range,
-        vec![sample_range(caller_range, config.range_sample_limit)],
-        config,
-        stacks,
-        dead_pot,
-        opener_seat,
-        caller_seat + 1,
-        vec![caller_seat],
-    )
-}
+    let mut keys = Vec::new();
+    collect_decision_keys(caller_seat, Vec::new(), stacks.len(), &mut keys);
+    keys.sort_by(|left, right| {
+        right
+            .actor_seat
+            .cmp(&left.actor_seat)
+            .then_with(|| right.prior_callers.len().cmp(&left.prior_callers.len()))
+    });
 
-fn response_node_from_prior(
-    classes: &[HandClass],
-    sampled_opener_range: &[HandClass],
-    prior_ranges: Vec<Vec<HandClass>>,
-    config: &ShortStackConfig,
-    stacks: &[u32],
-    dead_pot: u32,
-    opener_seat: usize,
-    actor_seat: usize,
-    prior_callers: Vec<usize>,
-) -> Option<ResponseNode> {
-    if actor_seat >= stacks.len()
-        || sampled_opener_range.is_empty()
-        || prior_ranges.iter().any(|range| range.is_empty())
-    {
-        return None;
+    let root_key = DecisionKey {
+        actor_seat: caller_seat,
+        prior_callers: Vec::new(),
+    };
+    let mut ranges: HashMap<DecisionKey, Vec<HandResult>> = keys
+        .iter()
+        .cloned()
+        .map(|key| {
+            let range = if key == root_key {
+                heads_up_range.clone()
+            } else {
+                hand_results_from_classes(top_fraction_by_heuristic(classes, 0.2))
+            };
+            (key, range)
+        })
+        .collect();
+
+    let iterations = config.spot_iterations.max(1);
+    let mut converged = false;
+    for _ in 0..iterations {
+        let mut next_ranges = ranges.clone();
+        let mut changed = false;
+
+        for key in &keys {
+            let prior_ranges = prior_ranges_for_callers(&ranges, &key.prior_callers);
+            let new_range = decision_node_range_from_strategy(
+                classes,
+                &sampled_opener_range,
+                &prior_ranges,
+                &ranges,
+                config,
+                stacks,
+                dead_pot,
+                key.actor_seat,
+                opener_seat,
+                &key.prior_callers,
+            );
+            let old_classes = ranges
+                .get(key)
+                .map(|range| hand_classes(range))
+                .unwrap_or_default();
+            let new_classes = hand_classes(&new_range);
+            if old_classes != new_classes {
+                changed = true;
+            }
+            next_ranges.insert(key.clone(), new_range);
+        }
+
+        ranges = next_ranges;
+        if !changed {
+            converged = true;
+            break;
+        }
     }
 
-    let range = response_node_range(
-        classes,
-        sampled_opener_range,
-        &prior_ranges,
-        config,
-        stacks,
-        dead_pot,
-        actor_seat,
-        opener_seat,
-        &prior_callers,
-    );
-    let next_response = if range.is_empty() {
-        None
-    } else {
-        let mut next_prior_callers = prior_callers.clone();
-        next_prior_callers.push(actor_seat);
-        let mut next_prior_ranges = prior_ranges.clone();
-        next_prior_ranges.push(sample_range(
-            &range.iter().map(|result| result.hand).collect::<Vec<_>>(),
-            config.range_sample_limit,
-        ));
-        response_node_from_prior(
-            classes,
-            sampled_opener_range,
-            next_prior_ranges,
-            config,
-            stacks,
-            dead_pot,
-            opener_seat,
-            actor_seat + 1,
-            next_prior_callers,
-        )
-        .map(Box::new)
-    };
-    let fold_response = response_node_from_prior(
-        classes,
-        sampled_opener_range,
-        prior_ranges,
-        config,
-        stacks,
-        dead_pot,
-        opener_seat,
-        actor_seat + 1,
-        prior_callers.clone(),
+    let root_range = ranges.get(&root_key).cloned().unwrap_or_default();
+    let patterns = future_patterns_from_strategy(
+        &ranges,
+        caller_seat + 1,
+        vec![caller_seat],
+        stacks.len(),
+        config.range_sample_limit,
     )
-    .map(Box::new);
-
-    Some(ResponseNode {
-        actor_seat: actor_seat as u8,
-        prior_callers: prior_callers.into_iter().map(|seat| seat as u8).collect(),
-        range,
-        next_response,
-        fold_response,
+    .into_iter()
+    .map(|pattern| CallPattern {
+        callers: pattern.callers.iter().map(|&seat| seat as u8).collect(),
+        probability: pattern.probability,
+        range: pattern_range(
+            &hand_classes(&root_range),
+            &sampled_opener_range,
+            config,
+            &posted_stacks(config.level, stacks),
+            dead_pot,
+            caller_seat,
+            opener_seat,
+            stacks,
+            &pattern,
+        ),
     })
+    .collect();
+    let next_response = build_response_tree_from_strategy(
+        &ranges,
+        caller_seat + 1,
+        vec![caller_seat],
+        stacks.len(),
+    );
+
+    SolvedCallTree {
+        range: root_range,
+        patterns,
+        next_response,
+        converged,
+    }
 }
 
-fn response_node_range(
+fn collect_decision_keys(
+    actor_seat: usize,
+    prior_callers: Vec<usize>,
+    player_count: usize,
+    keys: &mut Vec<DecisionKey>,
+) {
+    if actor_seat >= player_count {
+        return;
+    }
+
+    keys.push(DecisionKey {
+        actor_seat,
+        prior_callers: prior_callers.clone(),
+    });
+    collect_decision_keys(actor_seat + 1, prior_callers.clone(), player_count, keys);
+
+    let mut call_prior = prior_callers;
+    call_prior.push(actor_seat);
+    collect_decision_keys(actor_seat + 1, call_prior, player_count, keys);
+}
+
+fn decision_node_range_from_strategy(
     classes: &[HandClass],
     sampled_opener_range: &[HandClass],
     prior_ranges: &[Vec<HandClass>],
+    strategy_ranges: &HashMap<DecisionKey, Vec<HandResult>>,
     config: &ShortStackConfig,
     stacks: &[u32],
     dead_pot: u32,
@@ -619,7 +542,22 @@ fn response_node_range(
         current_level: config.level.level,
         elapsed_in_level_seconds: config.elapsed_in_level_seconds,
     };
-    let future_patterns = downstream_call_patterns(classes, stacks, actor_seat);
+    let fold_patterns = future_patterns_from_strategy(
+        strategy_ranges,
+        actor_seat + 1,
+        prior_callers.to_vec(),
+        stacks.len(),
+        config.range_sample_limit,
+    );
+    let mut call_prior_callers = prior_callers.to_vec();
+    call_prior_callers.push(actor_seat);
+    let call_patterns = future_patterns_from_strategy(
+        strategy_ranges,
+        actor_seat + 1,
+        call_prior_callers,
+        stacks.len(),
+        config.range_sample_limit,
+    );
     let mut range: Vec<_> = classes
         .par_iter()
         .copied()
@@ -628,7 +566,7 @@ fn response_node_range(
             let mut call_value = 0.0;
             let mut fold_value = 0.0;
 
-            for pattern in &future_patterns {
+            for pattern in &fold_patterns {
                 fold_value += pattern.probability
                     * folded_response_value(
                         hand,
@@ -644,6 +582,9 @@ fn response_node_range(
                         prior_ranges,
                         pattern,
                     );
+            }
+
+            for pattern in &call_patterns {
                 let outcome = response_pattern_outcome(
                     hand,
                     sampled_opener_range,
@@ -682,45 +623,176 @@ fn response_node_range(
     range
 }
 
+fn future_patterns_from_strategy(
+    strategy_ranges: &HashMap<DecisionKey, Vec<HandResult>>,
+    actor_seat: usize,
+    prior_callers: Vec<usize>,
+    player_count: usize,
+    range_sample_limit: usize,
+) -> Vec<DownstreamPattern> {
+    fn walk(
+        strategy_ranges: &HashMap<DecisionKey, Vec<HandResult>>,
+        actor_seat: usize,
+        prior_callers: Vec<usize>,
+        player_count: usize,
+        range_sample_limit: usize,
+        probability: f64,
+        callers: Vec<usize>,
+        ranges: Vec<Vec<HandClass>>,
+        patterns: &mut Vec<DownstreamPattern>,
+    ) {
+        if actor_seat >= player_count {
+            patterns.push(DownstreamPattern {
+                probability,
+                callers,
+                ranges,
+            });
+            return;
+        }
+
+        let key = DecisionKey {
+            actor_seat,
+            prior_callers: prior_callers.clone(),
+        };
+        let range = strategy_ranges.get(&key).cloned().unwrap_or_default();
+        let range_classes = sample_range(&hand_classes(&range), range_sample_limit);
+        let call_probability = combo_fraction(&range_classes).clamp(0.0, 1.0);
+
+        if call_probability < 1.0 {
+            walk(
+                strategy_ranges,
+                actor_seat + 1,
+                prior_callers.clone(),
+                player_count,
+                range_sample_limit,
+                probability * (1.0 - call_probability),
+                callers.clone(),
+                ranges.clone(),
+                patterns,
+            );
+        }
+        if call_probability > 0.0 && !range_classes.is_empty() {
+            let mut next_prior_callers = prior_callers;
+            next_prior_callers.push(actor_seat);
+            let mut next_callers = callers;
+            next_callers.push(actor_seat);
+            let mut next_ranges = ranges;
+            next_ranges.push(range_classes);
+            walk(
+                strategy_ranges,
+                actor_seat + 1,
+                next_prior_callers,
+                player_count,
+                range_sample_limit,
+                probability * call_probability,
+                next_callers,
+                next_ranges,
+                patterns,
+            );
+        }
+    }
+
+    let mut patterns = Vec::new();
+    walk(
+        strategy_ranges,
+        actor_seat,
+        prior_callers,
+        player_count,
+        range_sample_limit,
+        1.0,
+        Vec::new(),
+        Vec::new(),
+        &mut patterns,
+    );
+    patterns
+}
+
+fn build_response_tree_from_strategy(
+    strategy_ranges: &HashMap<DecisionKey, Vec<HandResult>>,
+    actor_seat: usize,
+    prior_callers: Vec<usize>,
+    player_count: usize,
+) -> Option<ResponseNode> {
+    if actor_seat >= player_count {
+        return None;
+    }
+
+    let key = DecisionKey {
+        actor_seat,
+        prior_callers: prior_callers.clone(),
+    };
+    let range = strategy_ranges.get(&key).cloned().unwrap_or_default();
+    let next_response = if range.is_empty() {
+        None
+    } else {
+        let mut next_prior_callers = prior_callers.clone();
+        next_prior_callers.push(actor_seat);
+        build_response_tree_from_strategy(
+            strategy_ranges,
+            actor_seat + 1,
+            next_prior_callers,
+            player_count,
+        )
+        .map(Box::new)
+    };
+    let fold_response = build_response_tree_from_strategy(
+        strategy_ranges,
+        actor_seat + 1,
+        prior_callers.clone(),
+        player_count,
+    )
+    .map(Box::new);
+
+    Some(ResponseNode {
+        actor_seat: actor_seat as u8,
+        prior_callers: prior_callers.into_iter().map(|seat| seat as u8).collect(),
+        range,
+        next_response,
+        fold_response,
+    })
+}
+
+fn prior_ranges_for_callers(
+    strategy_ranges: &HashMap<DecisionKey, Vec<HandResult>>,
+    prior_callers: &[usize],
+) -> Vec<Vec<HandClass>> {
+    prior_callers
+        .iter()
+        .enumerate()
+        .map(|(index, &actor_seat)| {
+            let key = DecisionKey {
+                actor_seat,
+                prior_callers: prior_callers[..index].to_vec(),
+            };
+            strategy_ranges
+                .get(&key)
+                .map(|range| hand_classes(range))
+                .unwrap_or_default()
+        })
+        .collect()
+}
+
+fn hand_results_from_classes(classes: Vec<HandClass>) -> Vec<HandResult> {
+    classes
+        .into_iter()
+        .map(|hand| HandResult {
+            hand,
+            equity: 0.0,
+            ev: 0.0,
+            call_value: None,
+            fold_value: None,
+        })
+        .collect()
+}
+
+fn hand_classes(range: &[HandResult]) -> Vec<HandClass> {
+    range.iter().map(|result| result.hand).collect()
+}
+
 struct DownstreamPattern {
     probability: f64,
     callers: Vec<usize>,
     ranges: Vec<Vec<HandClass>>,
-}
-
-fn downstream_call_patterns(
-    classes: &[HandClass],
-    stacks: &[u32],
-    caller_seat: usize,
-) -> Vec<DownstreamPattern> {
-    let seats: Vec<_> = ((caller_seat + 1)..stacks.len()).collect();
-    let range = top_fraction_by_heuristic(classes, 0.2);
-    let call_probability = combo_fraction(&range);
-    let pattern_count = 1_usize << seats.len();
-
-    (0..pattern_count)
-        .map(|mask| {
-            let mut probability = 1.0;
-            let mut callers = Vec::new();
-            let mut ranges = Vec::new();
-
-            for (index, &seat) in seats.iter().enumerate() {
-                if mask & (1 << index) == 0 {
-                    probability *= 1.0 - call_probability;
-                } else {
-                    probability *= call_probability;
-                    callers.push(seat);
-                    ranges.push(range.clone());
-                }
-            }
-
-            DownstreamPattern {
-                probability,
-                callers,
-                ranges,
-            }
-        })
-        .collect()
 }
 
 fn pattern_range(
