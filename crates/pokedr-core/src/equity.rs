@@ -16,6 +16,12 @@ pub struct Equity {
     pub total: f64,
 }
 
+#[derive(Debug, Clone)]
+pub struct EquityPot {
+    pub amount: f64,
+    pub eligible: Vec<usize>,
+}
+
 impl Equity {
     pub fn share(self) -> f64 {
         if self.total == 0.0 {
@@ -293,6 +299,76 @@ pub fn multi_way_showdown_shares(
     }
 
     shares
+}
+
+pub fn multi_way_showdown_payouts(
+    hero: HandClass,
+    opponent_ranges: &[Vec<HandClass>],
+    pots: &[EquityPot],
+    samples: usize,
+) -> Vec<Vec<f64>> {
+    let samples = samples.max(MIN_SAMPLED_BOARDS_PER_COMBO);
+    let hero_combos = hero.combos();
+    let mut payouts = Vec::new();
+
+    for hero_combo in hero_combos {
+        let hero_mask = combo_mask(hero_combo);
+        let mut rng = SplitMix64::new(hero_mask ^ ((opponent_ranges.len() as u64) << 40));
+
+        'sample: for _ in 0..samples {
+            let mut used_mask = hero_mask;
+            let mut opponent_combos = Vec::with_capacity(opponent_ranges.len());
+
+            for range in opponent_ranges {
+                let Some(combo) = sample_non_overlapping_combo(range, used_mask, &mut rng) else {
+                    continue 'sample;
+                };
+                used_mask |= combo_mask(combo);
+                opponent_combos.push(combo);
+            }
+
+            let available = available_cards(used_mask);
+            let board = sample_board(&available, &mut rng);
+            let mut values = Vec::with_capacity(opponent_combos.len() + 1);
+            values.push(evaluate_seven([
+                hero_combo[0],
+                hero_combo[1],
+                board[0],
+                board[1],
+                board[2],
+                board[3],
+                board[4],
+            ]));
+            values.extend(opponent_combos.iter().map(|combo| {
+                evaluate_seven([
+                    combo[0], combo[1], board[0], board[1], board[2], board[3], board[4],
+                ])
+            }));
+
+            let mut payout = vec![0.0; opponent_ranges.len() + 1];
+            for pot in pots {
+                let best = pot
+                    .eligible
+                    .iter()
+                    .map(|&index| values[index])
+                    .max()
+                    .expect("pot has at least one eligible player");
+                let winners: Vec<_> = pot
+                    .eligible
+                    .iter()
+                    .copied()
+                    .filter(|&index| values[index] == best)
+                    .collect();
+                let share = pot.amount / winners.len() as f64;
+                for winner in winners {
+                    payout[winner] += share;
+                }
+            }
+            payouts.push(payout);
+        }
+    }
+
+    payouts
 }
 
 fn heads_up_combo_equity_cached(

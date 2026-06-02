@@ -57,27 +57,27 @@
       opacity: .7;
       margin-bottom: 4px;
     }
-    .ranges {
+    .roots {
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
+      grid-template-columns: 1fr;
       gap: 14px;
     }
-    .range {
+    .root {
       border: 1px solid color-mix(in srgb, CanvasText 18%, Canvas);
       border-radius: 6px;
       padding: 12px;
     }
-    .range h2 {
+    .root h2 {
       font-size: 15px;
       margin: 0 0 8px;
     }
-    .spot {
+    .decision {
       border-top: 1px solid color-mix(in srgb, CanvasText 14%, Canvas);
       margin-top: 14px;
       padding-top: 12px;
     }
-    .spot h3,
-    .spot h4 {
+    .decision h3,
+    .decision h4 {
       font-size: 14px;
       margin: 0 0 8px;
     }
@@ -92,18 +92,18 @@
       font-size: 13px;
       font-weight: 700;
     }
-    .tree-grid {
+    .branch-grid {
       display: grid;
       grid-template-columns: repeat(auto-fit, minmax(310px, 1fr));
       gap: 10px;
       margin-top: 10px;
     }
-    .tree {
+    .branch {
       border: 1px solid color-mix(in srgb, CanvasText 12%, Canvas);
       border-radius: 6px;
       padding: 10px;
     }
-    .tree h4 {
+    .branch h4 {
       font-size: 13px;
       margin: 0 0 8px;
     }
@@ -197,55 +197,72 @@
         <section class="summary">
           ${metrics.map(([label, value]) => `<div class="metric"><b>${label}</b>${value}</div>`).join('')}
         </section>
-        <section class="ranges">
-          ${data.seats.map(renderSeat).join('')}
+        <section class="roots">
+          ${buildRoots(data).map(root => renderRoot(root, data.alive_players)).join('')}
         </section>
       `;
     }
 
-    function renderSeat(seat) {
+    function buildRoots(data) {
+      return data.seats
+        .filter(seat => seat.players_behind > 0)
+        .map(opener => ({
+          opener,
+          decisions: data.seats
+            .flatMap(seat => (seat.call_spots || []).map(spot => ({ caller: seat, spot })))
+            .filter(decision => decision.spot.opener_seat === opener.seat_index)
+            .sort((left, right) => left.caller.seat_index - right.caller.seat_index),
+        }));
+    }
+
+    function renderRoot(root, alivePlayers) {
+      const opener = root.opener;
       return `
-        <article class="range">
-          <h2>Seat ${seat.seat_index} (${seat.players_behind} behind)</h2>
+        <article class="root">
+          <h2>Root: Seat ${opener.seat_index} open AI</h2>
           <div class="summary">
-            <div class="metric"><b>Posted</b>${seat.posted_amount}</div>
-            <div class="metric"><b>Death Call Eq</b>${pct(seat.call_required_equity)}</div>
-            <div class="metric"><b>Death Overcall Eq</b>${pct(seat.overcall_required_equity)}</div>
+            <div class="metric"><b>Posted</b>${opener.posted_amount}</div>
+            <div class="metric"><b>Behind</b>${opener.players_behind}</div>
+            <div class="metric"><b>Open Range</b>${rangeSummary(opener.ranges.first_in_all_in)}</div>
+            <div class="metric"><b>Response Nodes</b>${root.decisions.length}</div>
           </div>
-          ${seat.call_spots.map(renderCallSpot).join('')}
-          ${Object.entries(seat.ranges).map(([name, range]) => renderRange(name, range)).join('')}
+          ${renderRangeBlock('open AI range', opener.ranges.first_in_all_in)}
+          ${root.decisions.map(decision => renderDecision(opener, decision, alivePlayers)).join('')}
         </article>
       `;
     }
 
-    function renderCallSpot(spot) {
+    function renderDecision(opener, decision, alivePlayers) {
+      const spot = decision.spot;
+      const caller = decision.caller;
       const patterns = spot.patterns || [];
       return `
-        <section class="spot">
-          <h3>Call vs Seat ${spot.opener_seat} AI</h3>
+        <section class="decision">
+          <h3>Node: Seat ${caller.seat_index} responds to Seat ${opener.seat_index} open AI</h3>
           <div class="summary">
             <div class="metric"><b>Effective</b>${spot.effective_all_in_cost}</div>
             <div class="metric"><b>Required</b>${pct(spot.required_equity)}</div>
-            <div class="metric"><b>Aggregate</b>${rangeSummary(spot.range)}</div>
-            <div class="metric"><b>Trees</b>${patterns.length}</div>
+            <div class="metric"><b>Call Range</b>${rangeSummary(spot.range)}</div>
+            <div class="metric"><b>Branches</b>${patterns.length}</div>
           </div>
-          ${renderRangeBlock('aggregate call range', spot.range)}
+          ${renderRangeBlock(`Seat ${caller.seat_index} call range`, spot.range)}
           <details open>
-            <summary>Tree ranges</summary>
-            <div class="tree-grid">
-              ${patterns.map(pattern => renderPattern(spot, pattern)).join('')}
+            <summary>Branches after Seat ${caller.seat_index} calls</summary>
+            <div class="branch-grid">
+              ${patterns.map(pattern => renderBranch(opener, caller, pattern, alivePlayers)).join('')}
             </div>
           </details>
         </section>
       `;
     }
 
-    function renderPattern(spot, pattern) {
-      const callers = pattern.callers.length ? pattern.callers.map(seat => `Seat ${seat}`).join(', ') : 'none';
+    function renderBranch(opener, caller, pattern, alivePlayers) {
+      const path = branchPath(opener.seat_index, caller.seat_index, pattern.callers, alivePlayers);
       return `
-        <section class="tree">
-          <h4>${pattern.way}-way: opener Seat ${spot.opener_seat}, caller hero, later callers ${callers}</h4>
+        <section class="branch">
+          <h4>${pattern.way}-way branch</h4>
           <div class="summary">
+            <div class="metric"><b>Path</b>${escapeHtml(path)}</div>
             <div class="metric"><b>Probability</b>${pct(pattern.probability)}</div>
             <div class="metric"><b>Range</b>${rangeSummary(pattern.range)}</div>
           </div>
@@ -257,16 +274,16 @@
       `;
     }
 
-    function renderRange(name, range) {
-      return `
-        <section>
-          <h2>${title(name)}: ${range.classes} classes, ${range.combos} combos (${pct(range.combo_fraction)})</h2>
-          ${renderLegend()}
-          <div class="matrix">
-            ${renderMatrix(range)}
-          </div>
-        </section>
-      `;
+    function branchPath(openerSeat, callerSeat, laterCallers, alivePlayers) {
+      const actions = [`Seat ${openerSeat}: AI`];
+      for (let seat = openerSeat + 1; seat < callerSeat; seat++) {
+        actions.push(`Seat ${seat}: fold`);
+      }
+      actions.push(`Seat ${callerSeat}: call AI`);
+      for (let seat = callerSeat + 1; seat < alivePlayers; seat++) {
+        actions.push(`Seat ${seat}: ${laterCallers.includes(seat) ? 'call AI' : 'fold'}`);
+      }
+      return actions.join(' -> ');
     }
 
     function renderRangeBlock(name, range) {

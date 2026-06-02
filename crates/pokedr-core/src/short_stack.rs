@@ -1,7 +1,7 @@
 use crate::blinds::{BlindClock, BlindLevel};
 use crate::death_race::{DeathRaceState, death_race_value};
 use crate::equity::{
-    EquityCache, heads_up_equity_vs_range_cached, multi_way_showdown_shares,
+    EquityCache, EquityPot, heads_up_equity_vs_range_cached, multi_way_showdown_payouts,
     three_way_equity_vs_ranges_cached,
 };
 use crate::hand_class::{HandClass, all_hand_classes};
@@ -340,7 +340,6 @@ fn analyze_call_spots(
             dead_pot,
             caller_seat,
             opener_seat,
-            effective_cost,
             range,
             cache,
         );
@@ -373,7 +372,6 @@ fn profitable_tree_call_range(
     dead_pot: u32,
     caller_seat: usize,
     opener_seat: usize,
-    effective_cost: u32,
     heads_up_range: Vec<HandResult>,
     _cache: &mut EquityCache,
 ) -> TreeCallResult {
@@ -409,7 +407,7 @@ fn profitable_tree_call_range(
             dead_pot,
             caller_seat,
             opener_seat,
-            effective_cost,
+            stacks,
             pattern,
         );
         pattern_outputs.push(CallPattern {
@@ -436,7 +434,7 @@ fn profitable_tree_call_range(
                     dead_pot,
                     caller_seat,
                     opener_seat,
-                    effective_cost,
+                    stacks,
                     pattern,
                 );
                 equity_acc += pattern.probability * outcome.hero_share;
@@ -518,7 +516,7 @@ fn pattern_range(
     dead_pot: u32,
     caller_seat: usize,
     opener_seat: usize,
-    effective_cost: u32,
+    stacks: &[u32],
     pattern: &DownstreamPattern,
 ) -> Vec<HandResult> {
     let mut range: Vec<_> = candidate_hands
@@ -539,7 +537,7 @@ fn pattern_range(
                 dead_pot,
                 caller_seat,
                 opener_seat,
-                effective_cost,
+                stacks,
                 pattern,
             );
             let fold_value = state_value(
@@ -581,7 +579,7 @@ fn pattern_outcome(
     dead_pot: u32,
     caller_seat: usize,
     opener_seat: usize,
-    effective_cost: u32,
+    stacks: &[u32],
     pattern: &DownstreamPattern,
 ) -> PatternOutcome {
     let tree_sample_limit = config.range_sample_limit.min(4);
@@ -594,61 +592,142 @@ fn pattern_outcome(
             .map(|range| sample_range(range, tree_sample_limit)),
     );
 
-    let shares = multi_way_showdown_shares(hand, &opponent_ranges, config.max_boards_per_combo);
-    let mut winner_seats = Vec::with_capacity(pattern.callers.len() + 2);
-    winner_seats.push(caller_seat);
-    winner_seats.push(opener_seat);
-    winner_seats.extend(pattern.callers.iter().copied());
+    let participants = pattern_participants(caller_seat, opener_seat, pattern);
+    let commitments = all_in_commitments(config.level, stacks, &participants);
+    let pots = side_pots(dead_pot, &commitments);
+    let total_pot = pots.iter().map(|pot| pot.amount).sum::<f64>();
+    let payouts =
+        multi_way_showdown_payouts(hand, &opponent_ranges, &pots, config.max_boards_per_combo);
+    let mut hero_payout = 0.0;
+    let mut value = 0.0;
 
-    let value = shares
-        .iter()
-        .zip(winner_seats)
-        .map(|(share, winner_seat)| {
-            share
-                * pattern_value(
-                    clock,
-                    hand_duration_seconds,
-                    posted,
-                    dead_pot,
-                    caller_seat,
-                    opener_seat,
-                    effective_cost,
-                    pattern,
-                    winner_seat,
-                )
-        })
-        .sum();
+    for payout in &payouts {
+        hero_payout += payout.first().copied().unwrap_or(0.0);
+        value += state_value(
+            clock,
+            hand_duration_seconds,
+            &showdown_stacks_from_payouts(posted, &participants, &commitments, payout),
+            caller_seat,
+        );
+    }
+
+    if !payouts.is_empty() {
+        hero_payout /= payouts.len() as f64;
+        value /= payouts.len() as f64;
+    }
 
     PatternOutcome {
-        hero_share: shares.first().copied().unwrap_or(0.0),
+        hero_share: if total_pot > 0.0 {
+            hero_payout / total_pot
+        } else {
+            0.0
+        },
         value,
     }
 }
 
-fn pattern_value(
-    clock: BlindClock,
-    hand_duration_seconds: u32,
-    posted: &[u32],
-    dead_pot: u32,
+fn pattern_participants(
     caller_seat: usize,
     opener_seat: usize,
-    effective_cost: u32,
     pattern: &DownstreamPattern,
-    winner_seat: usize,
-) -> f64 {
-    let mut participants = vec![opener_seat, caller_seat];
+) -> Vec<usize> {
+    let mut participants = vec![caller_seat, opener_seat];
     participants.extend(pattern.callers.iter().copied());
-    let mut commitments = vec![(opener_seat, effective_cost), (caller_seat, effective_cost)];
-    for &seat in &pattern.callers {
-        commitments.push((seat, effective_cost));
+    participants
+}
+
+fn all_in_commitments(
+    level: BlindLevel,
+    stacks: &[u32],
+    participants: &[usize],
+) -> Vec<(usize, u32)> {
+    let full_commitments: Vec<_> = participants
+        .iter()
+        .map(|&seat| {
+            (
+                seat,
+                stacks[seat].saturating_sub(posted_amount(level, stacks.len() as u8, seat as u8)),
+            )
+        })
+        .collect();
+
+    full_commitments
+        .iter()
+        .enumerate()
+        .map(|(index, &(seat, amount))| {
+            let max_called = full_commitments
+                .iter()
+                .enumerate()
+                .filter(|(other_index, _)| *other_index != index)
+                .map(|(_, &(_, other_amount))| other_amount)
+                .max()
+                .unwrap_or(0);
+            (seat, amount.min(max_called))
+        })
+        .collect()
+}
+
+fn side_pots(dead_pot: u32, commitments: &[(usize, u32)]) -> Vec<EquityPot> {
+    let mut levels: Vec<_> = commitments
+        .iter()
+        .map(|&(_, amount)| amount)
+        .filter(|&amount| amount > 0)
+        .collect();
+    levels.sort_unstable();
+    levels.dedup();
+
+    let mut previous = 0;
+    let mut dead_pot_left = dead_pot as f64;
+    let mut pots = Vec::new();
+
+    for level in levels {
+        let eligible: Vec<_> = commitments
+            .iter()
+            .enumerate()
+            .filter_map(|(index, &(_, amount))| (amount >= level).then_some(index))
+            .collect();
+        let layer = level.saturating_sub(previous);
+        previous = level;
+
+        if eligible.len() < 2 || layer == 0 {
+            continue;
+        }
+
+        let mut amount = layer as f64 * eligible.len() as f64;
+        if dead_pot_left > 0.0 {
+            amount += dead_pot_left;
+            dead_pot_left = 0.0;
+        }
+        pots.push(EquityPot { amount, eligible });
     }
 
-    state_value(
-        clock,
-        hand_duration_seconds,
-        &showdown_stacks(posted, winner_seat, &participants, &commitments, dead_pot),
-        caller_seat,
-    )
+    if dead_pot_left > 0.0 {
+        pots.push(EquityPot {
+            amount: dead_pot_left,
+            eligible: (0..commitments.len()).collect(),
+        });
+    }
+
+    pots
+}
+
+fn showdown_stacks_from_payouts(
+    stacks: &[u32],
+    participants: &[usize],
+    commitments: &[(usize, u32)],
+    payouts: &[f64],
+) -> Vec<u32> {
+    let mut next = stacks.to_vec();
+
+    for &(seat, amount) in commitments {
+        next[seat] = next[seat].saturating_sub(amount);
+    }
+
+    for (&seat, payout) in participants.iter().zip(payouts) {
+        next[seat] = next[seat].saturating_add(payout.round() as u32);
+    }
+
+    next
 }
 
 fn first_response_required_equity(
@@ -1139,39 +1218,6 @@ fn steal_stacks(stacks: &[u32], hero_seat: usize, dead_pot: u32) -> Vec<u32> {
     next
 }
 
-fn showdown_stacks(
-    stacks: &[u32],
-    winner_seat: usize,
-    participants: &[usize],
-    commitments: &[(usize, u32)],
-    dead_pot: u32,
-) -> Vec<u32> {
-    let mut next = stacks.to_vec();
-    let mut prize = dead_pot;
-
-    for &(seat, amount) in commitments {
-        if seat == winner_seat {
-            continue;
-        }
-        prize = prize.saturating_add(amount);
-    }
-
-    for &seat in participants {
-        if seat == winner_seat {
-            continue;
-        }
-        if let Some((_, amount)) = commitments
-            .iter()
-            .find(|(committed_seat, _)| *committed_seat == seat)
-        {
-            next[seat] = next[seat].saturating_sub(*amount);
-        }
-    }
-
-    next[winner_seat] = next[winner_seat].saturating_add(prize);
-    next
-}
-
 fn call_win_stacks(
     stacks: &[u32],
     hero_seat: usize,
@@ -1253,6 +1299,31 @@ mod tests {
         assert_eq!(posted_amount(level, 6, 0), 2_200);
         assert_eq!(posted_amount(level, 6, 4), 6_500);
         assert_eq!(posted_amount(level, 6, 5), 10_800);
+    }
+
+    #[test]
+    fn side_pots_exclude_uncalled_all_in_excess() {
+        let commitments = vec![(0, 50), (1, 50), (2, 20)];
+        let pots = side_pots(10, &commitments);
+
+        assert_eq!(pots.len(), 2);
+        assert_eq!(pots[0].amount, 70.0);
+        assert_eq!(pots[0].eligible, vec![0, 1, 2]);
+        assert_eq!(pots[1].amount, 60.0);
+        assert_eq!(pots[1].eligible, vec![0, 1]);
+    }
+
+    #[test]
+    fn all_in_commitments_cap_the_covering_stack_at_the_largest_called_amount() {
+        let level = BlindLevel {
+            level: 1,
+            big_blind: 0,
+            small_blind: 0,
+            per_player_ante: 0,
+        };
+        let commitments = all_in_commitments(level, &[100, 50, 20], &[0, 1, 2]);
+
+        assert_eq!(commitments, vec![(0, 50), (1, 50), (2, 20)]);
     }
 
     #[test]
