@@ -9,7 +9,7 @@ use crate::hand_class::{HandClass, all_hand_classes};
 use crate::scoring::rank_points;
 use crate::structure::orbit_cost;
 use rayon::prelude::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone)]
 pub struct ShortStackConfig {
@@ -555,19 +555,63 @@ fn decision_node_range_from_strategy(
         stacks.len(),
         config.range_sample_limit,
     );
-    let mut range: Vec<_> = classes
-        .par_iter()
-        .copied()
-        .map(|hand| {
-            let mut hero_share = 0.0;
-            let mut call_value = 0.0;
-            let mut fold_value = 0.0;
+    let evaluate_hand = |hand: HandClass| {
+        let mut hero_share = 0.0;
+        let mut call_value = 0.0;
+        let mut fold_value = 0.0;
+
+        for pattern in &fold_patterns {
+            fold_value += pattern.probability
+                * folded_response_value(
+                    hand,
+                    config,
+                    config.max_boards_per_combo,
+                    clock,
+                    &posted,
+                    dead_pot,
+                    actor_seat,
+                    opener_seat,
+                    prior_callers,
+                    stacks,
+                    sampled_opener_range,
+                    prior_ranges,
+                    pattern,
+                );
+        }
+
+        for pattern in &call_patterns {
+            let outcome = response_pattern_outcome(
+                hand,
+                sampled_opener_range,
+                prior_ranges,
+                config,
+                config.max_boards_per_combo,
+                clock,
+                &posted,
+                dead_pot,
+                actor_seat,
+                opener_seat,
+                prior_callers,
+                stacks,
+                pattern,
+            );
+            hero_share += pattern.probability * outcome.hero_share;
+            call_value += pattern.probability * outcome.value;
+        }
+
+        let mut ev = call_value - fold_value;
+        if is_borderline_ev(ev) {
+            hero_share = 0.0;
+            call_value = 0.0;
+            fold_value = 0.0;
+            let adaptive_boards = adaptive_boards_per_combo(config.max_boards_per_combo);
 
             for pattern in &fold_patterns {
                 fold_value += pattern.probability
                     * folded_response_value(
                         hand,
                         config,
+                        adaptive_boards,
                         clock,
                         &posted,
                         dead_pot,
@@ -587,6 +631,7 @@ fn decision_node_range_from_strategy(
                     sampled_opener_range,
                     prior_ranges,
                     config,
+                    adaptive_boards,
                     clock,
                     &posted,
                     dead_pot,
@@ -600,17 +645,48 @@ fn decision_node_range_from_strategy(
                 call_value += pattern.probability * outcome.value;
             }
 
-            let ev = call_value - fold_value;
-            HandResult {
-                hand,
-                equity: hero_share,
-                ev,
-                frequency: 0.0,
-                call_value: Some(call_value),
-                fold_value: Some(fold_value),
-            }
+            ev = call_value - fold_value;
+        }
+        HandResult {
+            hand,
+            equity: hero_share,
+            ev,
+            frequency: 0.0,
+            call_value: Some(call_value),
+            fold_value: Some(fold_value),
+        }
+    };
+
+    let suited_or_pair: Vec<_> = classes
+        .iter()
+        .copied()
+        .filter(|hand| hand.high == hand.low || hand.suited)
+        .collect();
+    let mut range: Vec<_> = suited_or_pair
+        .par_iter()
+        .copied()
+        .map(&evaluate_hand)
+        .collect();
+    let dominated_offsuit: HashSet<_> = range
+        .iter()
+        .filter(|result| result.hand.suited && result.ev < -1.0)
+        .map(|result| (result.hand.high, result.hand.low))
+        .collect();
+    let offsuit_candidates: Vec<_> = classes
+        .iter()
+        .copied()
+        .filter(|hand| {
+            hand.high != hand.low
+                && !hand.suited
+                && !dominated_offsuit.contains(&(hand.high, hand.low))
         })
         .collect();
+    let offsuit_results: Vec<_> = offsuit_candidates
+        .par_iter()
+        .copied()
+        .map(evaluate_hand)
+        .collect();
+    range.extend(offsuit_results);
 
     range.sort_by(|left, right| {
         right
@@ -917,6 +993,14 @@ fn ranges_equivalent(left: &[HandResult], right: &[HandResult]) -> bool {
     })
 }
 
+fn is_borderline_ev(ev: f64) -> bool {
+    ev.abs() <= 1.0
+}
+
+fn adaptive_boards_per_combo(base: usize) -> usize {
+    base.max(1).saturating_mul(4)
+}
+
 fn sample_hand_results(range: &[HandResult], limit: usize) -> Vec<HandResult> {
     if limit == 0 || range.len() <= limit {
         return range.to_vec();
@@ -1072,6 +1156,7 @@ fn response_pattern_outcome(
     sampled_opener_range: &[HandClass],
     prior_ranges: &[Vec<HandClass>],
     config: &ShortStackConfig,
+    max_boards_per_combo: usize,
     clock: BlindClock,
     posted: &[u32],
     dead_pot: u32,
@@ -1098,8 +1183,7 @@ fn response_pattern_outcome(
     let commitments = all_in_commitments(config.level, stacks, &participants);
     let pots = side_pots(dead_pot, &commitments);
     let total_pot = pots.iter().map(|pot| pot.amount).sum::<f64>();
-    let payouts =
-        multi_way_showdown_payouts(hand, &opponent_ranges, &pots, config.max_boards_per_combo);
+    let payouts = multi_way_showdown_payouts(hand, &opponent_ranges, &pots, max_boards_per_combo);
     let mut hero_payout = 0.0;
     let mut value = 0.0;
 
@@ -1133,6 +1217,7 @@ fn response_pattern_outcome(
 fn folded_response_value(
     folded_hand: HandClass,
     config: &ShortStackConfig,
+    max_boards_per_combo: usize,
     clock: BlindClock,
     posted: &[u32],
     dead_pot: u32,
@@ -1166,7 +1251,7 @@ fn folded_response_value(
         let payouts = multi_way_range_showdown_payouts_with_dead_mask(
             &player_ranges,
             &pots,
-            config.max_boards_per_combo,
+            max_boards_per_combo,
             dead_mask,
         );
         values.extend(payouts.iter().map(|payout| {
