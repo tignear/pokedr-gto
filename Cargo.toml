@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/pokedr-core", "crates/pokedr-cli"]
+members = ["crates/pokedr-core", "crates/pokedr-agent", "crates/pokedr-cli"]
 resolver = "3"
 
 [workspace.package]

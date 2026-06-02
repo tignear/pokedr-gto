@@ -1,16 +1,16 @@
 use std::cmp::Ordering;
 
+use pokedr_agent::rs_poker_policy::{EquityPolicyAgent, PreflopRanges};
 use pokedr_core::{cards::Card as PokedrCard, hand_eval::evaluate_seven};
+use pokedr_core::hand_class::HandClass;
 use rs_poker::{
     arena::{
         AgentGenerator, CloneAgentGenerator, CloneGameStateGenerator,
-        action::AgentAction,
-        agent::{Agent, RandomPotControlAgent},
+        agent::RandomPotControlAgent,
         competition::{HoldemCompetition, StandardSimulationIterator},
-        game_state::{GameState, Round},
+        game_state::GameState,
     },
     core::{Hand, Rank, Rankable},
-    holdem::MonteCarloGame,
 };
 
 #[test]
@@ -28,6 +28,19 @@ fn hand_ordering_matches_rs_poker_on_sampled_showdowns() {
         let rs_order = rs_poker_value(left).cmp(&rs_poker_value(right));
         assert_eq!(pokedr_order, rs_order, "{left} vs {right}");
     }
+}
+
+#[test]
+fn baseline_preflop_range_is_explicit_and_wide_button_style() {
+    let ranges = PreflopRanges::default();
+
+    assert!((70..=85).contains(&ranges.open_class_count()));
+    assert!(ranges.opens(HandClass::new(14, 14, false)));
+    assert!(ranges.opens(HandClass::new(14, 2, true)));
+    assert!(ranges.opens(HandClass::new(13, 8, false)));
+    assert!(!ranges.opens(HandClass::new(9, 2, false)));
+    assert!(ranges.value_raises(HandClass::new(14, 13, true)));
+    assert!(ranges.continues_vs_raise(HandClass::new(12, 11, true)));
 }
 
 #[test]
@@ -56,7 +69,7 @@ fn rs_poker_ranked_river_policy_smoke_does_not_get_crushed() {
 #[test]
 fn rs_poker_arena_policy_smoke_does_not_get_crushed_by_pot_control() {
     let agent_gens: Vec<Box<dyn AgentGenerator>> = vec![
-        Box::new(CloneAgentGenerator::new(EquityPolicyAgent)),
+        Box::new(CloneAgentGenerator::new(EquityPolicyAgent::default())),
         Box::new(CloneAgentGenerator::new(RandomPotControlAgent::new(vec![
             0.35, 0.25,
         ]))),
@@ -77,103 +90,6 @@ fn rs_poker_arena_policy_smoke_does_not_get_crushed_by_pot_control() {
         hero_bb_per_hand > -0.75,
         "rs_poker arena smoke policy is losing too much: {hero_bb_per_hand:.3} bb/hand"
     );
-}
-
-#[derive(Clone)]
-struct EquityPolicyAgent;
-
-impl Agent for EquityPolicyAgent {
-    fn act(&mut self, _id: u128, game_state: &GameState) -> AgentAction {
-        let idx = game_state.round_data.to_act_idx;
-        let to_call = (game_state.round_data.bet - game_state.round_data.player_bet[idx]).max(0.0);
-        let stack = game_state.stacks[idx];
-        let equity = estimate_equity(game_state, idx).unwrap_or(0.0);
-
-        if game_state.round == Round::Preflop {
-            return preflop_action(game_state, idx, to_call, stack, equity);
-        }
-
-        let strength = made_hand_strength(game_state, idx);
-        if to_call <= 0.0 {
-            if strength >= 2 || equity >= 0.62 {
-                let size = (game_state.total_pot * 0.75).max(game_state.big_blind * 2.0);
-                AgentAction::Bet((game_state.round_data.bet + size).min(stack))
-            } else {
-                AgentAction::Call
-            }
-        } else if strength >= 2 || equity * (game_state.total_pot + to_call) >= to_call {
-            AgentAction::Call
-        } else {
-            AgentAction::Fold
-        }
-    }
-}
-
-fn preflop_action(
-    game_state: &GameState,
-    idx: usize,
-    to_call: f32,
-    stack: f32,
-    equity: f32,
-) -> AgentAction {
-    let mut cards = game_state.hands[idx].iter();
-    let Some(first) = cards.next() else {
-        return AgentAction::Call;
-    };
-    let Some(second) = cards.next() else {
-        return AgentAction::Call;
-    };
-    let high = u8::from(first.value).max(u8::from(second.value));
-    let low = u8::from(first.value).min(u8::from(second.value));
-    let pair = high == low;
-    let suited = first.suit == second.suit;
-    let playable = pair
-        || high >= 10 && low >= 8
-        || suited && high >= 9 && low >= 6
-        || high >= 12 && low >= 5
-        || equity >= 0.53;
-    let premium = pair && high >= 8 || high >= 11 && low >= 9 || suited && high >= 10 && low >= 8;
-
-    if to_call <= 0.0 && premium {
-        AgentAction::Bet((game_state.big_blind * 3.0).min(stack))
-    } else if to_call <= game_state.big_blind || playable {
-        AgentAction::Call
-    } else {
-        AgentAction::Fold
-    }
-}
-
-fn estimate_equity(game_state: &GameState, idx: usize) -> Option<f32> {
-    let mut default_hand = Hand::new();
-    default_hand.extend(game_state.board.iter().copied());
-    let hands = game_state
-        .hands
-        .iter()
-        .enumerate()
-        .map(|(hand_idx, hand)| {
-            if hand_idx == idx {
-                *hand
-            } else {
-                default_hand
-            }
-        })
-        .collect();
-    let mut monte = MonteCarloGame::new(hands).ok()?;
-    monte.estimate_equity(400).get(idx).copied()
-}
-
-fn made_hand_strength(game_state: &GameState, idx: usize) -> u8 {
-    if game_state.board.len() + game_state.hands[idx].count() < 5 {
-        return 0;
-    }
-    rank_category(combined_hand_rank(game_state, idx))
-}
-
-fn combined_hand_rank(game_state: &GameState, idx: usize) -> Rank {
-    let mut hand = Hand::new();
-    hand.extend(game_state.board.iter().copied());
-    hand.extend(game_state.hands[idx].iter());
-    hand.rank()
 }
 
 fn river_battle_ev(hero: &str, villain: &str, board: &str, hand_index: usize) -> f64 {
