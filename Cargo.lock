@@ -414,6 +414,7 @@ name = "pokedr-agent"
 version = "0.1.0"
 dependencies = [
  "pokedr-core",
+ "rayon",
  "rs_poker",
 ]
 

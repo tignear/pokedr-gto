@@ -6,9 +6,10 @@ use pokedr_core::hand_class::HandClass;
 use pokedr_core::hand_class::all_hand_classes;
 use pokedr_core::river::Combo;
 use pokedr_core::subgame::{
-    ActionAbstraction, ActionKind, BetSize, ChancePolicy, Player, PotState, RangeState,
+    ActionAbstraction, ActionKind, BetSize, CfrVariant, ChancePolicy, Player, PotState, RangeState,
     SubgameSolveRequest, SubgameSpec,
 };
+use rayon::prelude::*;
 use rs_poker::{
     arena::{
         action::AgentAction,
@@ -448,6 +449,7 @@ fn cfr_postflop_action(
             focused_oop_combo_mask: (root_player == Player::Oop).then_some(hero_mask),
             focused_ip_combo_mask: (root_player == Player::Ip).then_some(hero_mask),
             focused_sampling_rate: 0.5,
+            variant: CfrVariant::CfrPlus,
         })
         .ok()?;
     store_cfr_likelihoods(
@@ -821,24 +823,18 @@ fn mc_range_prior(
     let board_mask = board.iter().fold(0_u64, |mask, card| mask | card.mask());
     let dead_mask = board_mask | extra_dead_mask;
     let opponent_idx = heads_up_opponent(game_state, idx).unwrap_or(idx);
-    let scored: Vec<_> = all_hand_classes()
+    let candidate_combos: Vec<_> = all_hand_classes()
         .into_iter()
-        .flat_map(|class| {
-            class
-                .combos()
-                .into_iter()
-                .filter(move |cards| cards.iter().all(|card| card.mask() & dead_mask == 0))
-                .filter_map(move |cards| {
-                    let combo = Combo::new(cards[0], cards[1])?;
-                    let equity = estimate_class_equity_on_board(
-                        game_state,
-                        board,
-                        idx,
-                        opponent_idx,
-                        cards,
-                    )?;
-                    Some((combo, equity))
-                })
+        .flat_map(|class| class.combos())
+        .filter(|cards| cards.iter().all(|card| card.mask() & dead_mask == 0))
+        .filter_map(|cards| Combo::new(cards[0], cards[1]).map(|combo| (combo, cards)))
+        .collect();
+    let scored: Vec<_> = candidate_combos
+        .par_iter()
+        .filter_map(|(combo, cards)| {
+            let equity =
+                estimate_class_equity_on_board(game_state, board, idx, opponent_idx, *cards)?;
+            Some((*combo, equity))
         })
         .collect();
 

@@ -7,4 +7,5 @@ repository.workspace = true
 
 [dependencies]
 pokedr-core = { path = "../pokedr-core" }
+rayon = "1.12.0"
 rs_poker = "4.1.0"

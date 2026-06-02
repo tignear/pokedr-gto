@@ -327,6 +327,7 @@ impl SubgameSpec {
             focused_oop_combo_mask: None,
             focused_ip_combo_mask: None,
             focused_sampling_rate: 0.0,
+            variant: CfrVariant::default(),
         })
     }
 
@@ -367,10 +368,13 @@ impl SubgameSpec {
             nodes: HashMap::new(),
             equity_cache: HashMap::new(),
             average_weight: 1.0,
+            iteration: 1,
+            variant: request.variant,
         };
         let mut utility_sum = 0.0;
         for iteration in 0..request.iterations {
-            trainer.average_weight = iteration as f64 + 1.0;
+            trainer.iteration = iteration + 1;
+            trainer.average_weight = average_strategy_weight(request.variant, iteration + 1);
             let focused = !focused_deals.is_empty()
                 && should_sample_focused(iteration, request.focused_sampling_rate);
             let deal_pool = if focused { &focused_deals } else { &deals };
@@ -400,6 +404,19 @@ pub struct SubgameSolveRequest {
     pub focused_oop_combo_mask: Option<u64>,
     pub focused_ip_combo_mask: Option<u64>,
     pub focused_sampling_rate: f64,
+    pub variant: CfrVariant,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CfrVariant {
+    CfrPlus,
+    DcfrPlus,
+}
+
+impl Default for CfrVariant {
+    fn default() -> Self {
+        Self::CfrPlus
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -769,6 +786,8 @@ struct SubgameCfrTrainer<'a> {
     nodes: HashMap<SubgameInfoKey, SubgameCfrNode>,
     equity_cache: HashMap<(u64, u64, u64), f64>,
     average_weight: f64,
+    iteration: usize,
+    variant: CfrVariant,
 }
 
 #[derive(Debug, Clone)]
@@ -835,8 +854,8 @@ impl SubgameCfrTrainer<'_> {
                     } else {
                         node_value - action_values[action]
                     };
-                    node.regret_sum[action] =
-                        (node.regret_sum[action] + opponent_reach * regret).max(0.0);
+                    let instant_regret = opponent_reach * regret;
+                    node.update_regret(action, instant_regret, self.iteration, self.variant);
                     node.strategy_sum[action] +=
                         self.average_weight * reach[player_index] * strategy[action];
                 }
@@ -968,6 +987,18 @@ impl SubgameCfrTrainer<'_> {
 }
 
 impl SubgameCfrNode {
+    fn update_regret(
+        &mut self,
+        action: usize,
+        instant_regret: f64,
+        iteration: usize,
+        variant: CfrVariant,
+    ) {
+        let discounted =
+            self.regret_sum[action] * regret_discount(self.regret_sum[action], iteration, variant);
+        self.regret_sum[action] = (discounted + instant_regret).max(0.0);
+    }
+
     fn strategy(&self) -> Vec<f64> {
         let positive: Vec<_> = self
             .regret_sum
@@ -996,6 +1027,27 @@ impl SubgameCfrNode {
                 SubgameActionFrequency { action, frequency }
             })
             .collect()
+    }
+}
+
+fn regret_discount(regret: f64, iteration: usize, variant: CfrVariant) -> f64 {
+    match variant {
+        CfrVariant::CfrPlus => 1.0,
+        CfrVariant::DcfrPlus => {
+            let t = iteration as f64;
+            let alpha = if regret >= 0.0 { 1.5 } else { 0.0 };
+            t.powf(alpha) / (t.powf(alpha) + 1.0)
+        }
+    }
+}
+
+fn average_strategy_weight(variant: CfrVariant, iteration: usize) -> f64 {
+    match variant {
+        CfrVariant::CfrPlus => iteration as f64,
+        CfrVariant::DcfrPlus => {
+            let t = iteration as f64;
+            t * t
+        }
     }
 }
 
@@ -1382,6 +1434,7 @@ mod tests {
                 focused_oop_combo_mask: Some(focused_mask),
                 focused_ip_combo_mask: None,
                 focused_sampling_rate: 1.0,
+                variant: CfrVariant::default(),
             })
             .unwrap();
 
@@ -1413,6 +1466,7 @@ mod tests {
                 focused_oop_combo_mask: None,
                 focused_ip_combo_mask: Some(focused_mask),
                 focused_sampling_rate: 1.0,
+                variant: CfrVariant::default(),
             })
             .unwrap();
 
