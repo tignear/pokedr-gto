@@ -5,6 +5,7 @@ pub mod death_race;
 pub mod equity;
 pub mod hand_class;
 pub mod hand_eval;
+pub mod river;
 pub mod scoring;
 pub mod short_stack;
 pub mod structure;

@@ -2,7 +2,9 @@ use std::env;
 use std::time::Instant;
 
 use pokedr_core::blinds::blind_level;
+use pokedr_core::cards::Card;
 use pokedr_core::cfr::{CfrResult, KuhnCfrSolver, LeducCfrSolver};
+use pokedr_core::river::{river_blocker_reports, river_combos};
 use pokedr_core::short_stack::{
     ShortStackConfig, ShortStackReport, analyze_open_2bb_defense, analyze_short_stack,
 };
@@ -20,6 +22,7 @@ fn main() {
     let args: Vec<String> = env::args().collect();
     let solve_kuhn = has_flag(&args, "--solve-kuhn");
     let solve_leduc = has_flag(&args, "--solve-leduc");
+    let river_blockers = has_flag(&args, "--river-blockers");
     let scan_open2bb = has_flag(&args, "--scan-open2bb");
     let scan_defense2bb = has_flag(&args, "--scan-defense2bb");
     let level = parse_arg(&args, "--level").unwrap_or(DEFAULT_LEVEL);
@@ -83,6 +86,17 @@ fn main() {
                 std::process::exit(2);
             }
         }
+        return;
+    }
+
+    if river_blockers {
+        let Some(board) = parse_board_arg(&args) else {
+            eprintln!("invalid --board; expected ten chars like AsKsQsJs2d");
+            std::process::exit(2);
+        };
+        let top_fraction = parse_f64_arg(&args, "--top-fraction").unwrap_or(0.05);
+        let limit = parse_arg(&args, "--limit").unwrap_or(40) as usize;
+        print_river_blockers(board, top_fraction, limit, format);
         return;
     }
 
@@ -186,6 +200,123 @@ fn parse_stacks(args: &[String]) -> Option<Vec<u32>> {
         .collect();
 
     (!stacks.is_empty()).then_some(stacks)
+}
+
+fn parse_board_arg(args: &[String]) -> Option<[Card; 5]> {
+    let value = parse_string_arg(args, "--board")?;
+    parse_board(value)
+}
+
+fn parse_board(value: &str) -> Option<[Card; 5]> {
+    if value.len() != 10 {
+        return None;
+    }
+
+    let chars: Vec<_> = value.chars().collect();
+    let mut cards = Vec::with_capacity(5);
+    for index in (0..chars.len()).step_by(2) {
+        cards.push(parse_card(chars[index], chars[index + 1])?);
+    }
+
+    let mut mask = 0_u64;
+    for card in &cards {
+        if mask & card.mask() != 0 {
+            return None;
+        }
+        mask |= card.mask();
+    }
+
+    Some([cards[0], cards[1], cards[2], cards[3], cards[4]])
+}
+
+fn parse_card(rank: char, suit: char) -> Option<Card> {
+    let rank = match rank.to_ascii_uppercase() {
+        'A' => 14,
+        'K' => 13,
+        'Q' => 12,
+        'J' => 11,
+        'T' => 10,
+        '9' => 9,
+        '8' => 8,
+        '7' => 7,
+        '6' => 6,
+        '5' => 5,
+        '4' => 4,
+        '3' => 3,
+        '2' => 2,
+        _ => return None,
+    };
+    let suit = match suit.to_ascii_lowercase() {
+        'c' => 0,
+        'd' => 1,
+        'h' => 2,
+        's' => 3,
+        _ => return None,
+    };
+    Some(Card::new(rank, suit))
+}
+
+fn print_river_blockers(board: [Card; 5], top_fraction: f64, limit: usize, format: &str) {
+    let combos = river_combos(board);
+    let reports = river_blocker_reports(board, &combos, &combos, top_fraction);
+    let mut reports = reports;
+    reports.sort_by(|left, right| {
+        right
+            .blocked_top_combos
+            .cmp(&left.blocked_top_combos)
+            .then_with(|| right.hero.value.cmp(&left.hero.value))
+            .then_with(|| left.hero.label().cmp(&right.hero.label()))
+    });
+
+    match format {
+        "json" => {
+            println!("{{");
+            println!("  \"game\": \"river-blockers\",");
+            println!("  \"combo_count\": {},", combos.len());
+            println!("  \"top_fraction\": {:.6},", top_fraction);
+            println!("  \"reports\": [");
+            for (index, report) in reports.iter().take(limit).enumerate() {
+                let comma = if index + 1 == limit.min(reports.len()) {
+                    ""
+                } else {
+                    ","
+                };
+                println!(
+                    "    {{\"combo\":\"{}\",\"hand_value\":{},\"blocked_villain_combos\":{},\"blocked_top_combos\":{},\"total_villain_combos\":{},\"top_villain_combos\":{}}}{}",
+                    report.hero.label(),
+                    report.hero.value,
+                    report.blocked_villain_combos,
+                    report.blocked_top_combos,
+                    report.total_villain_combos,
+                    report.top_villain_combos,
+                    comma
+                );
+            }
+            println!("  ]");
+            println!("}}");
+        }
+        "text" => {
+            println!("river blocker report");
+            println!("combo count: {}", combos.len());
+            println!("top fraction: {:.3}", top_fraction);
+            println!("combo,hand_value,blocked_top,total_top,blocked_all,total_all");
+            for report in reports.iter().take(limit) {
+                println!(
+                    "{},{},{},{},{},{}",
+                    report.hero.label(),
+                    report.hero.value,
+                    report.blocked_top_combos,
+                    report.top_villain_combos,
+                    report.blocked_villain_combos,
+                    report.total_villain_combos
+                );
+            }
+        }
+        _ => {
+            eprintln!("invalid --format; expected text or json");
+            std::process::exit(2);
+        }
+    }
 }
 
 fn print_cfr_report(result: &CfrResult, elapsed_seconds: f64) {
