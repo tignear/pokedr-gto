@@ -107,6 +107,15 @@ fn print_report(level: u8, stacks: &[u32], players_behind: u8, report: &ShortSta
             print_range("  first-in all-in range", &seat.shove_range, 40);
         }
         print_range("  call vs one all-in range", &seat.call_range, 40);
+        for spot in &seat.call_spots {
+            println!(
+                "  call vs seat {} AI: effective {}, required {:.1}%",
+                spot.opener_seat,
+                spot.effective_all_in_cost,
+                spot.required_equity * 100.0
+            );
+            print_range("    range", &spot.range, 40);
+        }
         print_range("  overcall range vs jam+call", &seat.overcall_range, 40);
     }
 }
@@ -159,6 +168,27 @@ fn print_json_report(level: u8, stacks: &[u32], players_behind: u8, report: &Sho
             "      \"overcall_required_equity\": {:.6},",
             seat.overcall_required_equity
         );
+        println!("      \"call_spots\": [");
+        for (spot_index, spot) in seat.call_spots.iter().enumerate() {
+            let spot_comma = if spot_index + 1 == seat.call_spots.len() {
+                ""
+            } else {
+                ","
+            };
+            println!("        {{");
+            println!("          \"opener_seat\": {},", spot.opener_seat);
+            println!(
+                "          \"effective_all_in_cost\": {},",
+                spot.effective_all_in_cost
+            );
+            println!(
+                "          \"required_equity\": {:.6},",
+                spot.required_equity
+            );
+            print_json_range("range", &spot.range, false, 10);
+            println!("        }}{spot_comma}");
+        }
+        println!("      ],");
         println!("      \"ranges\": {{");
         print_json_range("first_in_all_in", &seat.shove_range, true, 8);
         print_json_range("call_vs_one_all_in", &seat.call_range, true, 8);

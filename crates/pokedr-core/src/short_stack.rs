@@ -39,7 +39,16 @@ pub struct SeatRanges {
     pub overcall_required_equity: f64,
     pub shove_range: Vec<HandResult>,
     pub call_range: Vec<HandResult>,
+    pub call_spots: Vec<CallSpot>,
     pub overcall_range: Vec<HandResult>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CallSpot {
+    pub opener_seat: u8,
+    pub effective_all_in_cost: u32,
+    pub required_equity: f64,
+    pub range: Vec<HandResult>,
 }
 
 #[derive(Debug, Clone)]
@@ -211,6 +220,14 @@ fn analyze_seat(
         config.max_boards_per_combo,
         cache,
     );
+    let call_spots = analyze_call_spots(
+        config,
+        stacks,
+        classes,
+        dead_pot,
+        seat_index as usize,
+        cache,
+    );
     let overcall_range = profitable_overcall_range(
         classes,
         &modeled_shove_range
@@ -232,8 +249,89 @@ fn analyze_seat(
         overcall_required_equity,
         shove_range: displayed_shove_range,
         call_range: call_range_results,
+        call_spots,
         overcall_range,
     }
+}
+
+fn analyze_call_spots(
+    config: &ShortStackConfig,
+    stacks: &[u32],
+    classes: &[HandClass],
+    dead_pot: u32,
+    caller_seat: usize,
+    cache: &mut EquityCache,
+) -> Vec<CallSpot> {
+    let mut spots = Vec::new();
+    let posted = posted_stacks(config.level, stacks);
+    let caller_cost = stacks[caller_seat].saturating_sub(posted_amount(
+        config.level,
+        stacks.len() as u8,
+        caller_seat as u8,
+    ));
+    let clock = BlindClock {
+        current_level: config.level.level,
+        elapsed_in_level_seconds: config.elapsed_in_level_seconds,
+    };
+
+    for opener_seat in 0..caller_seat {
+        let opener_cost = stacks[opener_seat].saturating_sub(posted_amount(
+            config.level,
+            stacks.len() as u8,
+            opener_seat as u8,
+        ));
+        let effective_cost = caller_cost.min(opener_cost);
+        if effective_cost == 0 {
+            continue;
+        }
+
+        let opener_config = ShortStackConfig {
+            players_behind: stacks.len().saturating_sub(opener_seat).saturating_sub(1) as u8,
+            ..config.clone()
+        };
+        let baseline_call_range = top_fraction_by_heuristic(classes, 0.25);
+        let opener_range = profitable_shove_range(
+            classes,
+            &baseline_call_range,
+            &opener_config,
+            stacks,
+            dead_pot,
+            opener_cost,
+            opener_seat,
+            cache,
+        );
+
+        let fold_value = state_value(clock, config.hand_duration_seconds, &posted, caller_seat);
+        let win_value = state_value(
+            clock,
+            config.hand_duration_seconds,
+            &call_win_stacks(&posted, caller_seat, opener_seat, dead_pot, effective_cost),
+            caller_seat,
+        );
+        let lose_value = state_value(
+            clock,
+            config.hand_duration_seconds,
+            &call_lose_stacks(&posted, caller_seat, opener_seat, dead_pot, effective_cost),
+            caller_seat,
+        );
+        let required_equity = state_required_equity(fold_value, win_value, lose_value);
+        let range = profitable_call_range(
+            classes,
+            &opener_range,
+            required_equity,
+            config.max_boards_per_combo,
+            cache,
+        );
+
+        spots.push(CallSpot {
+            opener_seat: opener_seat as u8,
+            effective_all_in_cost: effective_cost,
+            required_equity,
+            range,
+        });
+    }
+
+    spots
 }
 
 fn profitable_shove_range(
@@ -277,6 +375,9 @@ fn profitable_shove_results(
     let called_probability = 1.0 - fold_probability;
     let posted_stacks = posted_stacks(config.level, stacks);
     let caller_seat = caller_seat(hero_seat, stacks.len());
+    let caller_posted = posted_amount(config.level, stacks.len() as u8, caller_seat as u8);
+    let caller_cost = stacks[caller_seat].saturating_sub(caller_posted);
+    let effective_cost = all_in_cost.min(caller_cost);
     let clock = BlindClock {
         current_level: config.level.level,
         elapsed_in_level_seconds: config.elapsed_in_level_seconds,
@@ -297,7 +398,7 @@ fn profitable_shove_results(
             hero_seat,
             caller_seat,
             dead_pot,
-            all_in_cost,
+            effective_cost,
         ),
         hero_seat,
     );
@@ -309,7 +410,7 @@ fn profitable_shove_results(
             hero_seat,
             caller_seat,
             dead_pot,
-            all_in_cost,
+            effective_cost,
         ),
         hero_seat,
     );
@@ -537,7 +638,7 @@ fn call_lose_stacks(
     all_in_cost: u32,
 ) -> Vec<u32> {
     let mut next = stacks.to_vec();
-    next[hero_seat] = 0;
+    next[hero_seat] = next[hero_seat].saturating_sub(all_in_cost);
     next[opponent_seat] = next[opponent_seat]
         .saturating_add(dead_pot)
         .saturating_add(all_in_cost);
@@ -635,5 +736,14 @@ mod tests {
         let hero_dead = state_value(clock, 20, &[40_000, 1], 1);
 
         assert!(hero_safe > hero_dead);
+    }
+
+    #[test]
+    fn covered_all_in_loss_does_not_eliminate_covering_player() {
+        let stacks = vec![80_000, 20_000];
+        let next = call_lose_stacks(&stacks, 0, 1, 10_000, 20_000);
+
+        assert_eq!(next[0], 60_000);
+        assert_eq!(next[1], 50_000);
     }
 }
