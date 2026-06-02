@@ -1,8 +1,8 @@
 use std::cmp::Ordering;
 
-use pokedr_agent::rs_poker_policy::{BaselinePreflopRanges, EquityPolicyAgent};
-use pokedr_core::hand_class::HandClass;
+use pokedr_agent::rs_poker_policy::{EquityPolicyAgent, PreflopRanges};
 use pokedr_core::{cards::Card as PokedrCard, hand_eval::evaluate_seven};
+use pokedr_core::hand_class::HandClass;
 use rs_poker::{
     arena::{
         AgentGenerator, CloneAgentGenerator, CloneGameStateGenerator,
@@ -31,8 +31,8 @@ fn hand_ordering_matches_rs_poker_on_sampled_showdowns() {
 }
 
 #[test]
-fn baseline_preflop_filter_is_explicit_and_wide_button_style() {
-    let ranges = BaselinePreflopRanges::default();
+fn baseline_preflop_range_is_explicit_and_wide_button_style() {
+    let ranges = PreflopRanges::default();
 
     assert!((70..=85).contains(&ranges.open_class_count()));
     assert!(ranges.opens(HandClass::new(14, 14, false)));
