@@ -4,6 +4,9 @@ use std::time::Instant;
 use pokedr_core::blinds::blind_level;
 use pokedr_core::cards::Card;
 use pokedr_core::cfr::{CfrResult, KuhnCfrSolver, LeducCfrSolver};
+use pokedr_core::postflop::{
+    PostflopEquityReport, parse_range, postflop_combos, postflop_equity_reports,
+};
 use pokedr_core::river::{
     RiverCfrConfig, RiverCfrResult, RiverNode, RiverRole, river_blocker_reports, river_combos,
     solve_river_check_bet,
@@ -27,6 +30,7 @@ fn main() {
     let solve_leduc = has_flag(&args, "--solve-leduc");
     let river_blockers = has_flag(&args, "--river-blockers");
     let solve_river = has_flag(&args, "--solve-river");
+    let postflop_equity = has_flag(&args, "--postflop-equity");
     let scan_open2bb = has_flag(&args, "--scan-open2bb");
     let scan_defense2bb = has_flag(&args, "--scan-defense2bb");
     let level = parse_arg(&args, "--level").unwrap_or(DEFAULT_LEVEL);
@@ -115,6 +119,29 @@ fn main() {
         } else {
             print_river_blockers(board, top_fraction, limit, format);
         }
+        return;
+    }
+
+    if postflop_equity {
+        let Some(board) = parse_cards_arg(&args, "--board") else {
+            eprintln!("invalid --board; expected 3 to 5 cards like AhKd7c");
+            std::process::exit(2);
+        };
+        if !(3..=5).contains(&board.len()) {
+            eprintln!("invalid --board; expected 3 to 5 cards");
+            std::process::exit(2);
+        }
+        let Some(oop_range) = parse_string_arg(&args, "--oop-range") else {
+            eprintln!("missing --oop-range");
+            std::process::exit(2);
+        };
+        let Some(ip_range) = parse_string_arg(&args, "--ip-range") else {
+            eprintln!("missing --ip-range");
+            std::process::exit(2);
+        };
+        let max_runouts = parse_arg(&args, "--runouts").unwrap_or(256) as usize;
+        let limit = parse_arg(&args, "--limit").unwrap_or(40) as usize;
+        print_postflop_equity(&board, oop_range, ip_range, max_runouts, limit, format);
         return;
     }
 
@@ -222,16 +249,22 @@ fn parse_stacks(args: &[String]) -> Option<Vec<u32>> {
 
 fn parse_board_arg(args: &[String]) -> Option<[Card; 5]> {
     let value = parse_string_arg(args, "--board")?;
-    parse_board(value)
+    let cards = parse_cards(value)?;
+    (cards.len() == 5).then_some([cards[0], cards[1], cards[2], cards[3], cards[4]])
 }
 
-fn parse_board(value: &str) -> Option<[Card; 5]> {
-    if value.len() != 10 {
+fn parse_cards_arg(args: &[String], name: &str) -> Option<Vec<Card>> {
+    let value = parse_string_arg(args, name)?;
+    parse_cards(value)
+}
+
+fn parse_cards(value: &str) -> Option<Vec<Card>> {
+    if value.len() % 2 != 0 {
         return None;
     }
 
     let chars: Vec<_> = value.chars().collect();
-    let mut cards = Vec::with_capacity(5);
+    let mut cards = Vec::with_capacity(chars.len() / 2);
     for index in (0..chars.len()).step_by(2) {
         cards.push(parse_card(chars[index], chars[index + 1])?);
     }
@@ -244,7 +277,7 @@ fn parse_board(value: &str) -> Option<[Card; 5]> {
         mask |= card.mask();
     }
 
-    Some([cards[0], cards[1], cards[2], cards[3], cards[4]])
+    Some(cards)
 }
 
 fn parse_card(rank: char, suit: char) -> Option<Card> {
@@ -334,6 +367,104 @@ fn print_river_blockers(board: [Card; 5], top_fraction: f64, limit: usize, forma
             eprintln!("invalid --format; expected text or json");
             std::process::exit(2);
         }
+    }
+}
+
+fn print_postflop_equity(
+    board: &[Card],
+    oop_range: &str,
+    ip_range: &str,
+    max_runouts: usize,
+    limit: usize,
+    format: &str,
+) {
+    let oop_classes = match parse_range(oop_range) {
+        Ok(classes) => classes,
+        Err(_) => {
+            eprintln!("invalid --oop-range");
+            std::process::exit(2);
+        }
+    };
+    let ip_classes = match parse_range(ip_range) {
+        Ok(classes) => classes,
+        Err(_) => {
+            eprintln!("invalid --ip-range");
+            std::process::exit(2);
+        }
+    };
+    let oop_combos = postflop_combos(&oop_classes, board);
+    let ip_combos = postflop_combos(&ip_classes, board);
+    let oop_reports = postflop_equity_reports(board, &oop_combos, &ip_combos, max_runouts);
+    let ip_reports = postflop_equity_reports(board, &ip_combos, &oop_combos, max_runouts);
+
+    match format {
+        "json" => {
+            println!("{{");
+            println!("  \"game\": \"postflop-equity\",");
+            println!("  \"board_cards\": {},", board.len());
+            println!("  \"oop_combo_count\": {},", oop_combos.len());
+            println!("  \"ip_combo_count\": {},", ip_combos.len());
+            println!("  \"max_runouts\": {},", max_runouts);
+            println!("  \"oop\": [");
+            print_postflop_json_reports(&oop_reports, limit, "    ");
+            println!("  ],");
+            println!("  \"ip\": [");
+            print_postflop_json_reports(&ip_reports, limit, "    ");
+            println!("  ]");
+            println!("}}");
+        }
+        "text" => {
+            println!("postflop equity");
+            println!("board cards: {}", board.len());
+            println!("OOP combos: {}", oop_combos.len());
+            println!("IP combos: {}", ip_combos.len());
+            println!("max runouts per matchup: {}", max_runouts);
+            println!();
+            println!("OOP");
+            print_postflop_text_reports(&oop_reports, limit);
+            println!();
+            println!("IP");
+            print_postflop_text_reports(&ip_reports, limit);
+        }
+        _ => {
+            eprintln!("invalid --format; expected text or json");
+            std::process::exit(2);
+        }
+    }
+}
+
+fn print_postflop_text_reports(reports: &[PostflopEquityReport], limit: usize) {
+    println!("combo,class,equity,win,tie,total");
+    for report in reports.iter().take(limit) {
+        println!(
+            "{},{},{:.6},{:.0},{:.0},{:.0}",
+            report.combo.label(),
+            report.combo.class.label(),
+            report.equity,
+            report.win,
+            report.tie,
+            report.total
+        );
+    }
+}
+
+fn print_postflop_json_reports(reports: &[PostflopEquityReport], limit: usize, indent: &str) {
+    for (index, report) in reports.iter().take(limit).enumerate() {
+        let comma = if index + 1 == limit.min(reports.len()) {
+            ""
+        } else {
+            ","
+        };
+        println!(
+            "{indent}{{\"combo\":\"{}\",\"class\":\"{}\",\"equity\":{:.9},\"win\":{:.0},\"tie\":{:.0},\"total\":{:.0}}}{}",
+            report.combo.label(),
+            report.combo.class.label(),
+            report.equity,
+            report.win,
+            report.tie,
+            report.total,
+            comma
+        );
     }
 }
 
