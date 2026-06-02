@@ -27,6 +27,7 @@ pub struct ShortStackConfig {
     pub include_overcall: bool,
     pub postflop_realization: f64,
     pub flat_call_fraction: f64,
+    pub defender_jam_fraction_override: Option<f64>,
 }
 
 #[derive(Debug, Clone)]
@@ -40,6 +41,7 @@ pub struct ShortStackReport {
     pub overcall_analyzed: bool,
     pub postflop_realization: f64,
     pub flat_call_fraction: f64,
+    pub defender_jam_fraction_override: Option<f64>,
     pub single_call_required_equity: f64,
     pub overcall_required_equity: f64,
     pub seats: Vec<SeatRanges>,
@@ -146,6 +148,7 @@ pub fn analyze_short_stack(config: &ShortStackConfig) -> ShortStackReport {
         overcall_analyzed: config.include_overcall,
         postflop_realization: config.postflop_realization,
         flat_call_fraction: config.flat_call_fraction,
+        defender_jam_fraction_override: config.defender_jam_fraction_override,
         single_call_required_equity,
         overcall_required_equity,
         seats,
@@ -1802,7 +1805,10 @@ fn open_raise_value_results(
     opened_stacks[opener_seat] = opened_stacks[opener_seat].saturating_sub(open_amount);
     let open_pot = dead_pot.saturating_add(open_amount);
 
-    let jam_probability_per_player = weighted_combo_fraction(jam_range).clamp(0.0, 1.0);
+    let jam_probability_per_player = config
+        .defender_jam_fraction_override
+        .unwrap_or_else(|| weighted_combo_fraction(jam_range))
+        .clamp(0.0, 1.0);
     let flat_probability_per_player = config
         .flat_call_fraction
         .clamp(0.0, 1.0 - jam_probability_per_player);
@@ -2408,6 +2414,7 @@ mod tests {
             include_overcall: false,
             postflop_realization: 0.4,
             flat_call_fraction: 0.25,
+            defender_jam_fraction_override: None,
         });
 
         assert_eq!(report.seats.len(), 3);

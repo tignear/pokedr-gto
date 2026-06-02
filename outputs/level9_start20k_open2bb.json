@@ -11,6 +11,7 @@
   "overcall_analyzed": false,
   "postflop_realization": 0.400000,
   "flat_call_fraction": 0.250000,
+  "defender_jam_fraction_override": null,
   "dead_pot": 11400,
   "orbit_cost": 11400,
   "single_call_required_equity": 0.389105,

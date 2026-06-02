@@ -53,6 +53,7 @@ fn main() {
         parse_f64_arg(&args, "--postflop-realization").unwrap_or(DEFAULT_POSTFLOP_REALIZATION);
     let flat_call_fraction =
         parse_f64_arg(&args, "--flat-call-fraction").unwrap_or(DEFAULT_FLAT_CALL_FRACTION);
+    let defender_jam_fraction_override = parse_f64_arg(&args, "--defender-jam-fraction");
     let include_overcall = has_flag(&args, "--overcall");
     let format = parse_string_arg(&args, "--format").unwrap_or("text");
 
@@ -91,6 +92,7 @@ fn main() {
         include_overcall,
         postflop_realization,
         flat_call_fraction,
+        defender_jam_fraction_override,
     });
 
     match format {
@@ -175,9 +177,10 @@ fn print_open2bb_scan(
     let stack_bbs = parse_f64_list(args, "--scan-bbs", &[3.0, 4.0, 5.0, 6.0, 8.0, 10.0]);
     let realizations = parse_f64_list(args, "--scan-realizations", &[0.4]);
     let flat_fractions = parse_f64_list(args, "--scan-flat-fractions", &[0.0, 0.25]);
+    let jam_fractions = parse_scan_jam_fractions(args);
 
     println!(
-        "level,stack,stack_bb,postflop_realization,flat_call_fraction,seat,posted,open2bb_wfrac,ai_wfrac,fold_wfrac,open2bb_classes,ai_classes,top_open2bb,top_ai"
+        "level,stack,stack_bb,postflop_realization,flat_call_fraction,defender_jam_fraction,seat,posted,open2bb_wfrac,ai_wfrac,fold_wfrac,open2bb_classes,ai_classes,top_open2bb,top_ai"
     );
 
     for level_number in levels {
@@ -189,50 +192,84 @@ fn print_open2bb_scan(
             let stacks = vec![stack; alive_players as usize];
             for &postflop_realization in &realizations {
                 for &flat_call_fraction in &flat_fractions {
-                    let report = analyze_short_stack(&ShortStackConfig {
-                        level,
-                        alive_players,
-                        stack,
-                        stacks: stacks.clone(),
-                        players_behind: alive_players.saturating_sub(1),
-                        elapsed_in_level_seconds,
-                        hand_duration_seconds,
-                        max_boards_per_combo,
-                        range_sample_limit,
-                        iterations,
-                        spot_iterations,
-                        include_overcall,
-                        postflop_realization,
-                        flat_call_fraction,
-                    });
-
-                    for seat in report.seats.iter().filter(|seat| seat.players_behind > 0) {
-                        let open_wfrac =
-                            clean_fraction(weighted_combo_fraction(&seat.open_2bb_range));
-                        let ai_wfrac = clean_fraction(weighted_combo_fraction(&seat.shove_range));
-                        let fold_wfrac = clean_fraction(1.0 - open_wfrac - ai_wfrac);
-                        println!(
-                            "{},{},{:.3},{:.3},{:.3},{},{},{:.6},{:.6},{:.6},{},{},{},{}",
-                            level.level,
+                    for &jam_fraction in &jam_fractions {
+                        let report = analyze_short_stack(&ShortStackConfig {
+                            level,
+                            alive_players,
                             stack,
-                            *stack_bb,
+                            stacks: stacks.clone(),
+                            players_behind: alive_players.saturating_sub(1),
+                            elapsed_in_level_seconds,
+                            hand_duration_seconds,
+                            max_boards_per_combo,
+                            range_sample_limit,
+                            iterations,
+                            spot_iterations,
+                            include_overcall,
                             postflop_realization,
                             flat_call_fraction,
-                            seat.seat_index,
-                            seat.posted_amount,
-                            open_wfrac,
-                            ai_wfrac,
-                            fold_wfrac,
-                            seat.open_2bb_range.len(),
-                            seat.shove_range.len(),
-                            top_hands(&seat.open_2bb_range, 5),
-                            top_hands(&seat.shove_range, 5)
-                        );
+                            defender_jam_fraction_override: jam_fraction,
+                        });
+
+                        for seat in report.seats.iter().filter(|seat| seat.players_behind > 0) {
+                            let open_wfrac =
+                                clean_fraction(weighted_combo_fraction(&seat.open_2bb_range));
+                            let ai_wfrac =
+                                clean_fraction(weighted_combo_fraction(&seat.shove_range));
+                            let fold_wfrac = clean_fraction(1.0 - open_wfrac - ai_wfrac);
+                            println!(
+                                "{},{},{:.3},{:.3},{:.3},{},{},{},{:.6},{:.6},{:.6},{},{},{},{}",
+                                level.level,
+                                stack,
+                                *stack_bb,
+                                postflop_realization,
+                                flat_call_fraction,
+                                jam_fraction_label(jam_fraction),
+                                seat.seat_index,
+                                seat.posted_amount,
+                                open_wfrac,
+                                ai_wfrac,
+                                fold_wfrac,
+                                seat.open_2bb_range.len(),
+                                seat.shove_range.len(),
+                                top_hands(&seat.open_2bb_range, 5),
+                                top_hands(&seat.shove_range, 5)
+                            );
+                        }
                     }
                 }
             }
         }
     }
+}
+
+fn parse_scan_jam_fractions(args: &[String]) -> Vec<Option<f64>> {
+    let Some(value) = parse_string_arg(args, "--scan-jam-fractions") else {
+        return vec![None, Some(0.0), Some(0.05), Some(0.1), Some(0.2)];
+    };
+    let values: Vec<_> = value
+        .split(',')
+        .filter_map(|part| {
+            let part = part.trim();
+            if part.eq_ignore_ascii_case("solver") {
+                Some(None)
+            } else {
+                part.parse().ok().map(Some)
+            }
+        })
+        .collect();
+
+    if values.is_empty() {
+        vec![None]
+    } else {
+        values
+    }
+}
+
+fn jam_fraction_label(value: Option<f64>) -> String {
+    value
+        .map(|value| format!("{value:.3}"))
+        .unwrap_or_else(|| "solver".to_string())
 }
 
 fn weighted_combo_fraction(range: &[pokedr_core::short_stack::HandResult]) -> f64 {
@@ -285,6 +322,13 @@ fn print_report(level: u8, stacks: &[u32], players_behind: u8, report: &ShortSta
         "postflop realization: {:.2}, flat call fraction: {:.1}%",
         report.postflop_realization,
         report.flat_call_fraction * 100.0
+    );
+    println!(
+        "defender jam fraction: {}",
+        report
+            .defender_jam_fraction_override
+            .map(|value| format!("{:.1}%", value * 100.0))
+            .unwrap_or_else(|| "solver".to_string())
     );
     println!("dead pot: {}", report.dead_pot);
     println!(
@@ -389,6 +433,10 @@ fn print_json_report(level: u8, stacks: &[u32], players_behind: u8, report: &Sho
     println!(
         "  \"flat_call_fraction\": {:.6},",
         report.flat_call_fraction
+    );
+    println!(
+        "  \"defender_jam_fraction_override\": {},",
+        json_optional_f64(report.defender_jam_fraction_override)
     );
     println!("  \"dead_pot\": {},", report.dead_pot);
     println!("  \"orbit_cost\": {},", report.orbit_cost);
