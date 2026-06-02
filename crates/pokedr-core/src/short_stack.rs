@@ -25,6 +25,8 @@ pub struct ShortStackConfig {
     pub iterations: usize,
     pub spot_iterations: usize,
     pub include_overcall: bool,
+    pub postflop_realization: f64,
+    pub flat_call_fraction: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -36,6 +38,8 @@ pub struct ShortStackReport {
     pub max_iterations: usize,
     pub max_spot_iterations: usize,
     pub overcall_analyzed: bool,
+    pub postflop_realization: f64,
+    pub flat_call_fraction: f64,
     pub single_call_required_equity: f64,
     pub overcall_required_equity: f64,
     pub seats: Vec<SeatRanges>,
@@ -51,6 +55,7 @@ pub struct SeatRanges {
     pub call_required_equity: f64,
     pub overcall_required_equity: f64,
     pub shove_range: Vec<HandResult>,
+    pub open_2bb_range: Vec<HandResult>,
     pub call_range: Vec<HandResult>,
     pub call_spots: Vec<CallSpot>,
     pub overcall_range: Vec<HandResult>,
@@ -139,6 +144,8 @@ pub fn analyze_short_stack(config: &ShortStackConfig) -> ShortStackReport {
         max_iterations: config.iterations,
         max_spot_iterations: config.spot_iterations,
         overcall_analyzed: config.include_overcall,
+        postflop_realization: config.postflop_realization,
+        flat_call_fraction: config.flat_call_fraction,
         single_call_required_equity,
         overcall_required_equity,
         seats,
@@ -227,10 +234,29 @@ fn analyze_seat(
         cache,
     );
     let modeled_shove_range = solution.shove_range;
-    let displayed_shove_range = if players_behind == 0 {
-        Vec::new()
+    let (open_2bb_range, displayed_shove_range) = if players_behind == 0 {
+        (Vec::new(), Vec::new())
     } else {
-        modeled_shove_range.clone()
+        let open_values = open_raise_value_results(
+            classes,
+            &solution.call_range,
+            &seat_config,
+            stacks,
+            dead_pot,
+            seat_index as usize,
+            cache,
+        );
+        let shove_values = shove_value_results(
+            classes,
+            &solution.call_range,
+            &seat_config,
+            stacks,
+            dead_pot,
+            all_in_cost,
+            seat_index as usize,
+            cache,
+        );
+        mix_root_action_ranges(open_values, shove_values)
     };
     let call_range_results = solution.call_range.clone();
     let call_spots = analyze_call_spots(
@@ -267,6 +293,7 @@ fn analyze_seat(
         call_required_equity,
         overcall_required_equity,
         shove_range: displayed_shove_range,
+        open_2bb_range,
         call_range: call_range_results,
         call_spots,
         overcall_range,
@@ -1747,6 +1774,244 @@ fn shove_value_results(
     results
 }
 
+fn open_raise_value_results(
+    classes: &[HandClass],
+    jam_range: &[HandResult],
+    config: &ShortStackConfig,
+    stacks: &[u32],
+    dead_pot: u32,
+    opener_seat: usize,
+    _cache: &mut EquityCache,
+) -> Vec<HandResult> {
+    let players_behind = config.players_behind as i32;
+    if players_behind <= 0 {
+        return Vec::new();
+    }
+
+    let posted_stacks = posted_stacks(config.level, stacks);
+    let opener_posted = posted_amount(config.level, stacks.len() as u8, opener_seat as u8);
+    let open_to = config.level.big_blind.saturating_mul(2);
+    let open_amount = open_to
+        .saturating_sub(opener_posted)
+        .min(posted_stacks[opener_seat]);
+    if open_amount == 0 {
+        return Vec::new();
+    }
+
+    let mut opened_stacks = posted_stacks.clone();
+    opened_stacks[opener_seat] = opened_stacks[opener_seat].saturating_sub(open_amount);
+    let open_pot = dead_pot.saturating_add(open_amount);
+
+    let jam_probability_per_player = weighted_combo_fraction(jam_range).clamp(0.0, 1.0);
+    let flat_probability_per_player = config
+        .flat_call_fraction
+        .clamp(0.0, 1.0 - jam_probability_per_player);
+    let jam_probability = 1.0 - (1.0 - jam_probability_per_player).powi(players_behind);
+    let no_jam_probability = 1.0 - jam_probability;
+    let no_flat_probability = (1.0 - flat_probability_per_player).powi(players_behind);
+    let fold_probability = no_jam_probability * no_flat_probability;
+    let flat_probability = no_jam_probability * (1.0 - no_flat_probability);
+
+    let clock = BlindClock {
+        current_level: config.level.level,
+        elapsed_in_level_seconds: config.elapsed_in_level_seconds,
+    };
+    let fold_value = state_value(
+        clock,
+        config.hand_duration_seconds,
+        &posted_stacks,
+        opener_seat,
+    );
+    let steal_value = state_value(
+        clock,
+        config.hand_duration_seconds,
+        &award_pot_stacks(&opened_stacks, opener_seat, open_pot),
+        opener_seat,
+    );
+
+    let responder_seat = caller_seat(opener_seat, stacks.len());
+    let responder_posted = posted_amount(config.level, stacks.len() as u8, responder_seat as u8);
+    let responder_flat_amount = open_to
+        .saturating_sub(responder_posted)
+        .min(posted_stacks[responder_seat]);
+    let mut flat_stacks = opened_stacks.clone();
+    flat_stacks[responder_seat] = flat_stacks[responder_seat].saturating_sub(responder_flat_amount);
+    let flat_pot = open_pot.saturating_add(responder_flat_amount);
+    let flat_current_value = state_value(
+        clock,
+        config.hand_duration_seconds,
+        &flat_stacks,
+        opener_seat,
+    );
+
+    let sampled_jam_range =
+        hand_classes(&sample_hand_results(jam_range, config.range_sample_limit));
+    let flat_range = top_fraction_by_heuristic(classes, config.flat_call_fraction.clamp(0.0, 1.0));
+    let sampled_flat_range = sample_range(&flat_range, config.range_sample_limit);
+
+    let jam_fold_stacks = award_pot_stacks(&opened_stacks, responder_seat, open_pot);
+    let jam_fold_value = state_value(
+        clock,
+        config.hand_duration_seconds,
+        &jam_fold_stacks,
+        opener_seat,
+    );
+    let jam_remaining_cost = opened_stacks[opener_seat].min(posted_stacks[responder_seat]);
+    let jam_call_dead_pot = open_pot;
+    let jam_win_value = showdown_state_value(
+        clock,
+        config.hand_duration_seconds,
+        &call_win_stacks(
+            &opened_stacks,
+            opener_seat,
+            responder_seat,
+            jam_call_dead_pot,
+            jam_remaining_cost,
+        ),
+        opener_seat,
+        stacks,
+    );
+    let jam_lose_value = showdown_state_value(
+        clock,
+        config.hand_duration_seconds,
+        &call_lose_stacks(
+            &opened_stacks,
+            opener_seat,
+            responder_seat,
+            jam_call_dead_pot,
+            jam_remaining_cost,
+        ),
+        opener_seat,
+        stacks,
+    );
+
+    let realization = config.postflop_realization.clamp(0.0, 1.0);
+    let mut results: Vec<_> = classes
+        .par_iter()
+        .copied()
+        .map(|hand| {
+            let mut cache = EquityCache::new();
+            let jam_equity = if sampled_jam_range.is_empty() {
+                0.0
+            } else {
+                heads_up_equity_vs_range_cached(
+                    hand,
+                    &sampled_jam_range,
+                    config.max_boards_per_combo,
+                    &mut cache,
+                )
+                .share()
+            };
+            let jam_call_value = jam_equity * jam_win_value + (1.0 - jam_equity) * jam_lose_value;
+            let jam_response_value = jam_fold_value.max(jam_call_value);
+
+            let flat_equity = if sampled_flat_range.is_empty() {
+                0.0
+            } else {
+                heads_up_equity_vs_range_cached(
+                    hand,
+                    &sampled_flat_range,
+                    config.max_boards_per_combo,
+                    &mut cache,
+                )
+                .share()
+            };
+            let flat_win_value = showdown_state_value(
+                clock,
+                config.hand_duration_seconds,
+                &award_pot_stacks(&flat_stacks, opener_seat, flat_pot),
+                opener_seat,
+                stacks,
+            );
+            let flat_lose_value = showdown_state_value(
+                clock,
+                config.hand_duration_seconds,
+                &award_pot_stacks(&flat_stacks, responder_seat, flat_pot),
+                opener_seat,
+                stacks,
+            );
+            let flat_showdown_value =
+                flat_equity * flat_win_value + (1.0 - flat_equity) * flat_lose_value;
+            let flat_value =
+                (1.0 - realization) * flat_current_value + realization * flat_showdown_value;
+
+            let open_value = fold_probability * steal_value
+                + jam_probability * jam_response_value
+                + flat_probability * flat_value;
+            let ev = open_value - fold_value;
+
+            HandResult {
+                hand,
+                equity: flat_probability * flat_equity + jam_probability * jam_equity,
+                ev,
+                frequency: 0.0,
+                call_value: Some(open_value),
+                fold_value: Some(fold_value),
+            }
+        })
+        .collect();
+
+    results.sort_by(|left, right| {
+        right
+            .ev
+            .total_cmp(&left.ev)
+            .then_with(|| right.equity.total_cmp(&left.equity))
+    });
+    results
+}
+
+fn mix_root_action_ranges(
+    open_values: Vec<HandResult>,
+    shove_values: Vec<HandResult>,
+) -> (Vec<HandResult>, Vec<HandResult>) {
+    let shove_by_hand: HashMap<_, _> = shove_values
+        .into_iter()
+        .map(|result| (result.hand, result))
+        .collect();
+    let mut open_range = Vec::new();
+    let mut shove_range = Vec::new();
+
+    for mut open in open_values {
+        let Some(mut shove) = shove_by_hand.get(&open.hand).cloned() else {
+            continue;
+        };
+        let fold_value = open.fold_value.unwrap_or(0.0);
+        let open_edge = (open.call_value.unwrap_or(fold_value) - fold_value).max(0.0);
+        let shove_edge = (shove.call_value.unwrap_or(fold_value) - fold_value).max(0.0);
+        let edge_sum = open_edge + shove_edge;
+
+        if edge_sum <= 0.0 {
+            continue;
+        }
+
+        if open_edge > 0.0 {
+            open.frequency = open_edge / edge_sum;
+            open_range.push(open);
+        }
+        if shove_edge > 0.0 {
+            shove.frequency = shove_edge / edge_sum;
+            shove_range.push(shove);
+        }
+    }
+
+    open_range.sort_by(|left, right| {
+        right
+            .ev
+            .total_cmp(&left.ev)
+            .then_with(|| right.frequency.total_cmp(&left.frequency))
+            .then_with(|| right.equity.total_cmp(&left.equity))
+    });
+    shove_range.sort_by(|left, right| {
+        right
+            .ev
+            .total_cmp(&left.ev)
+            .then_with(|| right.frequency.total_cmp(&left.frequency))
+            .then_with(|| right.equity.total_cmp(&left.equity))
+    });
+
+    (open_range, shove_range)
+}
+
 fn profitable_call_range(
     classes: &[HandClass],
     shove_range: &[HandClass],
@@ -2063,6 +2328,12 @@ fn steal_stacks(stacks: &[u32], hero_seat: usize, dead_pot: u32) -> Vec<u32> {
     next
 }
 
+fn award_pot_stacks(stacks: &[u32], winner_seat: usize, pot: u32) -> Vec<u32> {
+    let mut next = stacks.to_vec();
+    next[winner_seat] = next[winner_seat].saturating_add(pot);
+    next
+}
+
 fn call_win_stacks(
     stacks: &[u32],
     hero_seat: usize,
@@ -2129,6 +2400,8 @@ mod tests {
             iterations: 0,
             spot_iterations: 0,
             include_overcall: false,
+            postflop_realization: 0.4,
+            flat_call_fraction: 0.25,
         });
 
         assert_eq!(report.seats.len(), 3);

@@ -9,6 +9,8 @@ const DEFAULT_RANGE_SAMPLE_LIMIT: usize = 8;
 const DEFAULT_MAX_ITERATIONS: usize = 8;
 const DEFAULT_MAX_SPOT_ITERATIONS: usize = 2;
 const DEFAULT_LEVEL: u32 = 9;
+const DEFAULT_POSTFLOP_REALIZATION: f64 = 0.4;
+const DEFAULT_FLAT_CALL_FRACTION: f64 = 0.25;
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -28,6 +30,10 @@ fn main() {
         .unwrap_or(DEFAULT_MAX_SPOT_ITERATIONS as u32) as usize;
     let elapsed_in_level_seconds = parse_arg(&args, "--elapsed").unwrap_or(0);
     let hand_duration_seconds = parse_arg(&args, "--hand-seconds").unwrap_or(20);
+    let postflop_realization =
+        parse_f64_arg(&args, "--postflop-realization").unwrap_or(DEFAULT_POSTFLOP_REALIZATION);
+    let flat_call_fraction =
+        parse_f64_arg(&args, "--flat-call-fraction").unwrap_or(DEFAULT_FLAT_CALL_FRACTION);
     let include_overcall = has_flag(&args, "--overcall");
     let format = parse_string_arg(&args, "--format").unwrap_or("text");
 
@@ -49,6 +55,8 @@ fn main() {
         iterations,
         spot_iterations,
         include_overcall,
+        postflop_realization,
+        flat_call_fraction,
     });
 
     match format {
@@ -62,6 +70,12 @@ fn main() {
 }
 
 fn parse_arg(args: &[String], name: &str) -> Option<u32> {
+    args.windows(2)
+        .find(|window| window[0] == name)
+        .and_then(|window| window[1].parse().ok())
+}
+
+fn parse_f64_arg(args: &[String], name: &str) -> Option<f64> {
     args.windows(2)
         .find(|window| window[0] == name)
         .and_then(|window| window[1].parse().ok())
@@ -108,6 +122,11 @@ fn print_report(level: u8, stacks: &[u32], players_behind: u8, report: &ShortSta
     println!("max iterations: {}", report.max_iterations);
     println!("max spot iterations: {}", report.max_spot_iterations);
     println!("overcall analyzed: {}", report.overcall_analyzed);
+    println!(
+        "postflop realization: {:.2}, flat call fraction: {:.1}%",
+        report.postflop_realization,
+        report.flat_call_fraction * 100.0
+    );
     println!("dead pot: {}", report.dead_pot);
     println!(
         "orbit cost if everyone folds: {} ({:.1}% of stack)",
@@ -145,6 +164,7 @@ fn print_report(level: u8, stacks: &[u32], players_behind: u8, report: &ShortSta
             println!();
         } else {
             print_range("  first-in all-in range", &seat.shove_range, 40);
+            print_range("  first-in open 2bb range", &seat.open_2bb_range, 40);
         }
         print_range("  call vs one all-in range", &seat.call_range, 40);
         for spot in &seat.call_spots {
@@ -203,6 +223,14 @@ fn print_json_report(level: u8, stacks: &[u32], players_behind: u8, report: &Sho
     println!("  \"max_iterations\": {},", report.max_iterations);
     println!("  \"max_spot_iterations\": {},", report.max_spot_iterations);
     println!("  \"overcall_analyzed\": {},", report.overcall_analyzed);
+    println!(
+        "  \"postflop_realization\": {:.6},",
+        report.postflop_realization
+    );
+    println!(
+        "  \"flat_call_fraction\": {:.6},",
+        report.flat_call_fraction
+    );
     println!("  \"dead_pot\": {},", report.dead_pot);
     println!("  \"orbit_cost\": {},", report.orbit_cost);
     println!(
@@ -283,6 +311,7 @@ fn print_json_report(level: u8, stacks: &[u32], players_behind: u8, report: &Sho
         println!("      ],");
         println!("      \"ranges\": {{");
         print_json_range("first_in_all_in", &seat.shove_range, true, 8);
+        print_json_range("first_in_open_2bb", &seat.open_2bb_range, true, 8);
         print_json_range("call_vs_one_all_in", &seat.call_range, true, 8);
         print_json_range("overcall_vs_jam_call", &seat.overcall_range, false, 8);
         println!("      }}");

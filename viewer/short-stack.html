@@ -281,17 +281,21 @@
 
     function renderRoot(root, alivePlayers) {
       const opener = root.opener;
+      const openAi = opener.ranges.first_in_all_in;
+      const open2bb = opener.ranges.first_in_open_2bb ?? emptyRange();
       return `
         <details class="root">
-          <summary>Root: Seat ${opener.seat_index} open AI <span class="muted">${rangeSummary(opener.ranges.first_in_all_in)} / ${root.decisions.length} response nodes</span></summary>
+          <summary>Root: Seat ${opener.seat_index} first-in <span class="muted">2bb ${rangeSummary(open2bb)} / AI ${rangeSummary(openAi)}</span></summary>
           <div class="node-body">
             <div class="summary">
               <div class="metric"><b>Posted</b>${opener.posted_amount}</div>
               <div class="metric"><b>Behind</b>${opener.players_behind}</div>
-              <div class="metric"><b>Open Range</b>${rangeSummary(opener.ranges.first_in_all_in)}</div>
+              <div class="metric"><b>Open 2bb</b>${rangeSummary(open2bb)}</div>
+              <div class="metric"><b>Open AI</b>${rangeSummary(openAi)}</div>
               <div class="metric"><b>Response Nodes</b>${root.decisions.length}</div>
             </div>
-            ${renderRangeBlock('open AI range', opener.ranges.first_in_all_in)}
+            ${renderRangeBlock('open 2bb range', open2bb)}
+            ${renderRangeBlock('open AI range', openAi)}
             ${root.decisions.map(decision => renderDecision(opener, decision, alivePlayers)).join('')}
           </div>
         </details>
@@ -489,6 +493,17 @@
       const weightedFraction = range.weighted_combo_fraction ?? range.combo_fraction;
       const weightedCombos = range.weighted_combos ?? range.combos;
       return `${range.classes} classes, ${weightedCombos.toFixed(1)} w-combos (${pct(weightedFraction)})`;
+    }
+
+    function emptyRange() {
+      return {
+        classes: 0,
+        combos: 0,
+        combo_fraction: 0,
+        weighted_combos: 0,
+        weighted_combo_fraction: 0,
+        hands: [],
+      };
     }
 
     function title(value) {
