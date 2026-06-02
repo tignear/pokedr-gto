@@ -5,6 +5,7 @@ use crate::hand_class::HandClass;
 use crate::hand_eval::evaluate_seven;
 use crate::postflop::PostflopCombo;
 use crate::river::Combo;
+use rayon::prelude::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Street {
@@ -359,6 +360,16 @@ impl SubgameSpec {
                 )
             })
             .unwrap_or_default();
+        let deal_equity = precompute_sampled_deal_equity(
+            &self.board,
+            &oop_range,
+            &ip_range,
+            &deals,
+            &focused_deals,
+            request.iterations,
+            request.focused_sampling_rate,
+            self.chance.max_runouts(),
+        );
 
         let mut trainer = SubgameCfrTrainer {
             spec: self,
@@ -366,7 +377,7 @@ impl SubgameSpec {
             oop_range: &oop_range,
             ip_range: &ip_range,
             nodes: HashMap::new(),
-            equity_cache: HashMap::new(),
+            deal_equity,
             average_weight: 1.0,
             iteration: 1,
             variant: request.variant,
@@ -784,7 +795,7 @@ struct SubgameCfrTrainer<'a> {
     oop_range: &'a [WeightedPostflopCombo],
     ip_range: &'a [WeightedPostflopCombo],
     nodes: HashMap<SubgameInfoKey, SubgameCfrNode>,
-    equity_cache: HashMap<(u64, u64, u64), f64>,
+    deal_equity: HashMap<(usize, usize), f64>,
     average_weight: f64,
     iteration: usize,
     variant: CfrVariant,
@@ -948,16 +959,18 @@ impl SubgameCfrTrainer<'_> {
         strategy
     }
 
-    fn combo_equity(&mut self, oop_index: usize, ip_index: usize) -> f64 {
-        let oop = &self.oop_range[oop_index];
-        let ip = &self.ip_range[ip_index];
-        let key = (board_mask(&self.spec.board), oop.combo.mask, ip.combo.mask);
-        if let Some(&equity) = self.equity_cache.get(&key) {
-            return equity;
-        }
-        let equity = combo_equity(&self.spec.board, oop, ip, self.spec.chance.max_runouts());
-        self.equity_cache.insert(key, equity);
-        equity
+    fn combo_equity(&self, oop_index: usize, ip_index: usize) -> f64 {
+        self.deal_equity
+            .get(&(oop_index, ip_index))
+            .copied()
+            .unwrap_or_else(|| {
+                combo_equity(
+                    &self.spec.board,
+                    &self.oop_range[oop_index],
+                    &self.ip_range[ip_index],
+                    self.spec.chance.max_runouts(),
+                )
+            })
     }
 
     fn combo_strategies(&mut self) -> Vec<SubgameComboStrategy> {
@@ -1077,6 +1090,51 @@ fn legal_deals(
         }
     }
     with_cumulative_weights(deals)
+}
+
+fn precompute_sampled_deal_equity(
+    board: &[Card],
+    oop_range: &[WeightedPostflopCombo],
+    ip_range: &[WeightedPostflopCombo],
+    deals: &[LegalDeal],
+    focused_deals: &[LegalDeal],
+    iterations: usize,
+    focused_sampling_rate: f64,
+    max_runouts: usize,
+) -> HashMap<(usize, usize), f64> {
+    let sampled_pairs = sampled_deal_pairs(iterations, deals, focused_deals, focused_sampling_rate);
+    sampled_pairs
+        .par_iter()
+        .map(|&(oop_index, ip_index)| {
+            let equity = combo_equity(
+                board,
+                &oop_range[oop_index],
+                &ip_range[ip_index],
+                max_runouts,
+            );
+            ((oop_index, ip_index), equity)
+        })
+        .collect()
+}
+
+fn sampled_deal_pairs(
+    iterations: usize,
+    deals: &[LegalDeal],
+    focused_deals: &[LegalDeal],
+    focused_sampling_rate: f64,
+) -> Vec<(usize, usize)> {
+    let mut seen = HashSet::new();
+    let mut sampled = Vec::new();
+    for iteration in 0..iterations {
+        let focused =
+            !focused_deals.is_empty() && should_sample_focused(iteration, focused_sampling_rate);
+        let deal_pool = if focused { focused_deals } else { deals };
+        let pair = sample_weighted_deal(iteration, deal_pool);
+        if seen.insert(pair) {
+            sampled.push(pair);
+        }
+    }
+    sampled
 }
 
 fn focused_deals(
