@@ -127,6 +127,12 @@ pub struct Open2bbDefenseResult {
     pub jam_value: f64,
     pub flat_equity: f64,
     pub jam_equity: f64,
+    pub bb_win_bb_delta: f64,
+    pub bb_win_opener_delta: f64,
+    pub bb_win_others_delta: f64,
+    pub bb_lose_bb_delta: f64,
+    pub bb_lose_opener_delta: f64,
+    pub bb_lose_others_delta: f64,
 }
 
 pub fn analyze_short_stack(config: &ShortStackConfig) -> ShortStackReport {
@@ -236,13 +242,54 @@ pub fn analyze_open_2bb_defense(
         current_level: config.level.level,
         elapsed_in_level_seconds: config.elapsed_in_level_seconds,
     };
-    let fold_value = state_value_from_next_small_blind(
+    let fold_stacks = award_pot_stacks(&opened_stacks, opener_seat, open_pot);
+    let fold_values = table_state_values_from_next_small_blind(
         clock,
         config.hand_duration_seconds,
-        &award_pot_stacks(&opened_stacks, opener_seat, open_pot),
-        defender_seat,
+        &fold_stacks,
+        &stacks,
         0,
+        false,
     );
+    let fold_value = fold_values[defender_seat];
+    let jam_win_stacks = call_win_stacks(
+        &opened_stacks,
+        defender_seat,
+        opener_seat,
+        open_pot,
+        opened_stacks[defender_seat].min(opened_stacks[opener_seat]),
+    );
+    let jam_lose_stacks = call_lose_stacks(
+        &opened_stacks,
+        defender_seat,
+        opener_seat,
+        open_pot,
+        opened_stacks[defender_seat].min(opened_stacks[opener_seat]),
+    );
+    let jam_win_values = table_state_values_from_next_small_blind(
+        clock,
+        config.hand_duration_seconds,
+        &jam_win_stacks,
+        &stacks,
+        0,
+        true,
+    );
+    let jam_lose_values = table_state_values_from_next_small_blind(
+        clock,
+        config.hand_duration_seconds,
+        &jam_lose_stacks,
+        &stacks,
+        0,
+        true,
+    );
+    let bb_win_bb_delta = jam_win_values[defender_seat] - fold_values[defender_seat];
+    let bb_win_opener_delta = jam_win_values[opener_seat] - fold_values[opener_seat];
+    let bb_win_others_delta =
+        table_others_delta(&jam_win_values, &fold_values, opener_seat, defender_seat);
+    let bb_lose_bb_delta = jam_lose_values[defender_seat] - fold_values[defender_seat];
+    let bb_lose_opener_delta = jam_lose_values[opener_seat] - fold_values[opener_seat];
+    let bb_lose_others_delta =
+        table_others_delta(&jam_lose_values, &fold_values, opener_seat, defender_seat);
     let flat_current_value = state_value_from_next_small_blind(
         clock,
         config.hand_duration_seconds,
@@ -273,17 +320,10 @@ pub fn analyze_open_2bb_defense(
         defender_seat,
         0,
     );
-    let jam_cost = opened_stacks[defender_seat].min(opened_stacks[opener_seat]);
     let jam_win_value = showdown_state_value_from_next_small_blind(
         clock,
         config.hand_duration_seconds,
-        &call_win_stacks(
-            &opened_stacks,
-            defender_seat,
-            opener_seat,
-            open_pot,
-            jam_cost,
-        ),
+        &jam_win_stacks,
         defender_seat,
         &stacks,
         0,
@@ -291,13 +331,7 @@ pub fn analyze_open_2bb_defense(
     let jam_lose_value = showdown_state_value_from_next_small_blind(
         clock,
         config.hand_duration_seconds,
-        &call_lose_stacks(
-            &opened_stacks,
-            defender_seat,
-            opener_seat,
-            open_pot,
-            jam_cost,
-        ),
+        &jam_lose_stacks,
         defender_seat,
         &stacks,
         0,
@@ -355,6 +389,12 @@ pub fn analyze_open_2bb_defense(
                 jam_value,
                 flat_equity,
                 jam_equity,
+                bb_win_bb_delta,
+                bb_win_opener_delta,
+                bb_win_others_delta,
+                bb_lose_bb_delta,
+                bb_lose_opener_delta,
+                bb_lose_others_delta,
             }
         })
         .collect();
@@ -2538,6 +2578,53 @@ fn state_value_from_next_small_blind(
         },
         hero_seat,
     )
+}
+
+fn table_state_values_from_next_small_blind(
+    clock: BlindClock,
+    hand_duration_seconds: u32,
+    stacks: &[u32],
+    hand_start_stacks: &[u32],
+    next_small_blind_seat: usize,
+    showdown: bool,
+) -> Vec<f64> {
+    (0..stacks.len())
+        .map(|seat| {
+            if showdown {
+                showdown_state_value_from_next_small_blind(
+                    clock,
+                    hand_duration_seconds,
+                    stacks,
+                    seat,
+                    hand_start_stacks,
+                    next_small_blind_seat,
+                )
+            } else {
+                state_value_from_next_small_blind(
+                    clock,
+                    hand_duration_seconds,
+                    stacks,
+                    seat,
+                    next_small_blind_seat,
+                )
+            }
+        })
+        .collect()
+}
+
+fn table_others_delta(
+    values: &[f64],
+    baseline: &[f64],
+    opener_seat: usize,
+    defender_seat: usize,
+) -> f64 {
+    values
+        .iter()
+        .zip(baseline)
+        .enumerate()
+        .filter(|(seat, _)| *seat != opener_seat && *seat != defender_seat)
+        .map(|(_, (value, baseline))| value - baseline)
+        .sum()
 }
 
 fn showdown_state_value(

@@ -330,7 +330,7 @@ fn print_defense2bb_scan(
     };
 
     println!(
-        "level,stack,stack_bb,opener_seat,defender_seat,opener_open_fraction,opener_call_fraction,defender_flat_realization,hand,best_action,fold_value,flat_value,jam_value,flat_ev,jam_ev,flat_equity,jam_equity"
+        "level,stack,stack_bb,opener_seat,defender_seat,opener_open_fraction,opener_call_fraction,defender_flat_realization,hand,best_action,fold_value,flat_value,jam_value,flat_ev,jam_ev,flat_equity,jam_equity,bb_win_bb_delta,bb_win_opener_delta,bb_win_others_delta,bb_lose_bb_delta,bb_lose_opener_delta,bb_lose_others_delta"
     );
     let stack_bbs = parse_f64_list(args, "--scan-defense-bbs", &[]);
     let stack_points: Vec<(u32, f64)> = if stack_bbs.is_empty() {
@@ -382,7 +382,7 @@ fn print_defense2bb_scan(
                         defender_flat_realization,
                     ) {
                         println!(
-                            "{},{},{:.3},{},{},{:.3},{:.3},{:.3},{},{},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6}",
+                            "{},{},{:.3},{},{},{:.3},{:.3},{:.3},{},{},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6}",
                             level.level,
                             scan_stack,
                             stack_bb,
@@ -399,7 +399,13 @@ fn print_defense2bb_scan(
                             result.flat_value - result.fold_value,
                             result.jam_value - result.fold_value,
                             result.flat_equity,
-                            result.jam_equity
+                            result.jam_equity,
+                            result.bb_win_bb_delta,
+                            result.bb_win_opener_delta,
+                            result.bb_win_others_delta,
+                            result.bb_lose_bb_delta,
+                            result.bb_lose_opener_delta,
+                            result.bb_lose_others_delta
                         );
                     }
                 }
