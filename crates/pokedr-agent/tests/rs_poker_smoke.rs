@@ -1,6 +1,6 @@
 use std::cmp::Ordering;
 
-use pokedr_agent::rs_poker_policy::{EquityPolicyAgent, PreflopRanges};
+use pokedr_agent::rs_poker_policy::{CfrPolicyAgent, EquityPolicyAgent, PreflopRanges};
 use pokedr_core::hand_class::HandClass;
 use pokedr_core::{cards::Card as PokedrCard, hand_eval::evaluate_seven};
 use rs_poker::{
@@ -105,6 +105,33 @@ fn rs_poker_arena_policy_beats_weaker_baselines() {
 
     assert!(vs_calling > 0.0, "should beat calling baseline");
     assert!(vs_random > 0.0, "should beat random baseline");
+}
+
+#[test]
+fn rs_poker_cfr_agent_smoke_does_not_get_crushed() {
+    let vs_pot_control = run_heads_up_smoke(
+        Box::new(CloneAgentGenerator::new(CfrPolicyAgent::new(300, 64, 4))),
+        Box::new(CloneAgentGenerator::new(RandomPotControlAgent::new(vec![
+            0.35, 0.25,
+        ]))),
+        120,
+    );
+    let vs_equity = run_heads_up_smoke(
+        Box::new(CloneAgentGenerator::new(CfrPolicyAgent::new(300, 64, 4))),
+        Box::new(CloneAgentGenerator::new(EquityPolicyAgent::default())),
+        120,
+    );
+    eprintln!("cfr vs pot-control hero_bb_per_hand={vs_pot_control:.3}");
+    eprintln!("cfr vs equity hero_bb_per_hand={vs_equity:.3}");
+
+    assert!(
+        vs_pot_control > -1.0,
+        "CFR policy is losing too much to pot control: {vs_pot_control:.3} bb/hand"
+    );
+    assert!(
+        vs_equity > -1.5,
+        "CFR policy is losing too much to equity baseline: {vs_equity:.3} bb/hand"
+    );
 }
 
 fn run_heads_up_smoke(

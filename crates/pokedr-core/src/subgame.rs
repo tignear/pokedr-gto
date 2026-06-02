@@ -179,6 +179,17 @@ impl SubgameSpec {
     }
 
     pub fn solve_cfr(&self, iterations: usize) -> Result<SubgameCfrResult, SubgameBuildError> {
+        self.solve_cfr_with_request(SubgameSolveRequest {
+            iterations,
+            focused_oop_combo_mask: None,
+            focused_sampling_rate: 0.0,
+        })
+    }
+
+    pub fn solve_cfr_with_request(
+        &self,
+        request: SubgameSolveRequest,
+    ) -> Result<SubgameCfrResult, SubgameBuildError> {
         let tree = self.build_action_tree()?;
         let oop_range = postflop_combos(&self.ranges.oop, &self.board);
         let ip_range = postflop_combos(&self.ranges.ip, &self.board);
@@ -190,6 +201,10 @@ impl SubgameSpec {
         if deals.is_empty() {
             return Err(SubgameBuildError::NoLegalDeals);
         }
+        let focused_deals = request
+            .focused_oop_combo_mask
+            .map(|mask| focused_oop_deals(&oop_range, &deals, mask))
+            .unwrap_or_default();
 
         let mut trainer = SubgameCfrTrainer {
             spec: self,
@@ -201,18 +216,21 @@ impl SubgameSpec {
             average_weight: 1.0,
         };
         let mut utility_sum = 0.0;
-        for iteration in 0..iterations {
+        for iteration in 0..request.iterations {
             trainer.average_weight = iteration as f64 + 1.0;
-            let (oop_index, ip_index) = deals[sampled_index(iteration, deals.len())];
+            let focused = !focused_deals.is_empty()
+                && should_sample_focused(iteration, request.focused_sampling_rate);
+            let deal_pool = if focused { &focused_deals } else { &deals };
+            let (oop_index, ip_index) = deal_pool[sampled_index(iteration, deal_pool.len())];
             utility_sum += trainer.cfr(tree.root, oop_index, ip_index, [1.0, 1.0]);
         }
 
         Ok(SubgameCfrResult {
-            iterations,
-            expected_value_oop: if iterations == 0 {
+            iterations: request.iterations,
+            expected_value_oop: if request.iterations == 0 {
                 0.0
             } else {
-                utility_sum / iterations as f64
+                utility_sum / request.iterations as f64
             },
             root: tree.root,
             node_count: tree.nodes.len(),
@@ -221,6 +239,13 @@ impl SubgameSpec {
             strategies: trainer.combo_strategies(),
         })
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct SubgameSolveRequest {
+    pub iterations: usize,
+    pub focused_oop_combo_mask: Option<u64>,
+    pub focused_sampling_rate: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -663,15 +688,19 @@ impl SubgameCfrTrainer<'_> {
     ) -> f64 {
         match terminal {
             TerminalKind::Fold { winner } => {
+                let oop_added = pot.committed[Player::Oop.index()]
+                    - self.spec.pot.committed[Player::Oop.index()];
                 if winner == Player::Oop {
-                    pot.pot - pot.committed[Player::Oop.index()]
+                    pot.pot - oop_added
                 } else {
-                    -pot.committed[Player::Oop.index()]
+                    -oop_added
                 }
             }
             TerminalKind::Showdown => {
                 let equity = self.combo_equity(oop_index, ip_index);
-                equity * pot.pot - pot.committed[Player::Oop.index()]
+                let oop_added = pot.committed[Player::Oop.index()]
+                    - self.spec.pot.committed[Player::Oop.index()];
+                equity * pot.pot - oop_added
             }
         }
     }
@@ -816,6 +845,29 @@ fn legal_deals(oop_range: &[PostflopCombo], ip_range: &[PostflopCombo]) -> Vec<(
         }
     }
     deals
+}
+
+fn focused_oop_deals(
+    oop_range: &[PostflopCombo],
+    deals: &[(usize, usize)],
+    focused_mask: u64,
+) -> Vec<(usize, usize)> {
+    deals
+        .iter()
+        .copied()
+        .filter(|(oop_index, _)| oop_range[*oop_index].mask == focused_mask)
+        .collect()
+}
+
+fn should_sample_focused(iteration: usize, focused_sampling_rate: f64) -> bool {
+    if focused_sampling_rate <= 0.0 {
+        return false;
+    }
+    if focused_sampling_rate >= 1.0 {
+        return true;
+    }
+    let threshold = (focused_sampling_rate * 10_000.0).round() as usize;
+    sampled_index(iteration, 10_000) < threshold
 }
 
 fn combo_equity(
@@ -1056,6 +1108,43 @@ mod tests {
                 .actions
                 .iter()
                 .any(|action| action.action == ActionKind::Raise(250.0))
+        }));
+    }
+
+    #[test]
+    fn focused_sampling_visits_requested_oop_combo() {
+        let board = vec![c(14, 0), c(13, 1), c(2, 2)];
+        let spec = SubgameSpec::postflop(
+            board,
+            PotState::new(100.0, [1_000.0, 1_000.0]),
+            RangeState::new(
+                parse_range("AA,AKs,AKo,AQs").unwrap(),
+                parse_range("QQ,JJ,AQs,KQs").unwrap(),
+            ),
+            ActionAbstraction {
+                bet_sizes: vec![BetSize::PotFraction(0.5), BetSize::PotFraction(1.0)],
+                raise_sizes: vec![BetSize::CurrentBetMultiple(2.5)],
+                reraise_sizes: vec![BetSize::CurrentBetMultiple(2.0)],
+                allow_all_in: false,
+                max_raises: 2,
+            },
+            ChancePolicy::Sample(8),
+        )
+        .unwrap();
+        let focused_mask = Card::new(14, 1).mask() | Card::new(12, 1).mask();
+
+        let result = spec
+            .solve_cfr_with_request(SubgameSolveRequest {
+                iterations: 8,
+                focused_oop_combo_mask: Some(focused_mask),
+                focused_sampling_rate: 1.0,
+            })
+            .unwrap();
+
+        assert!(result.strategies.iter().any(|strategy| {
+            strategy.node == result.root
+                && strategy.player == Player::Oop
+                && strategy.combo.mask == focused_mask
         }));
     }
 }
