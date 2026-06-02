@@ -5,6 +5,7 @@ use crate::equity::{
     multi_way_showdown_payouts, three_way_equity_vs_ranges_cached,
 };
 use crate::hand_class::{HandClass, all_hand_classes};
+use crate::scoring::rank_points;
 use crate::structure::orbit_cost;
 use rayon::prelude::*;
 
@@ -814,11 +815,13 @@ fn pattern_outcome(
 
     for payout in &payouts {
         hero_payout += payout.first().copied().unwrap_or(0.0);
-        value += state_value(
+        let next_stacks = showdown_stacks_from_payouts(posted, &participants, &commitments, payout);
+        value += showdown_state_value(
             clock,
             hand_duration_seconds,
-            &showdown_stacks_from_payouts(posted, &participants, &commitments, payout),
+            &next_stacks,
             caller_seat,
+            stacks,
         );
     }
 
@@ -875,11 +878,13 @@ fn response_pattern_outcome(
 
     for payout in &payouts {
         hero_payout += payout.first().copied().unwrap_or(0.0);
-        value += state_value(
+        let next_stacks = showdown_stacks_from_payouts(posted, &participants, &commitments, payout);
+        value += showdown_state_value(
             clock,
             config.hand_duration_seconds,
-            &showdown_stacks_from_payouts(posted, &participants, &commitments, payout),
+            &next_stacks,
             actor_seat,
+            stacks,
         );
     }
 
@@ -936,11 +941,14 @@ fn folded_response_value(
     payouts
         .iter()
         .map(|payout| {
-            state_value(
+            let next_stacks =
+                showdown_stacks_from_payouts(posted, &participants, &commitments, payout);
+            showdown_state_value(
                 clock,
                 config.hand_duration_seconds,
-                &showdown_stacks_from_payouts(posted, &participants, &commitments, payout),
+                &next_stacks,
                 actor_seat,
+                stacks,
             )
         })
         .sum::<f64>()
@@ -1533,6 +1541,37 @@ fn state_value(
     )
 }
 
+fn showdown_state_value(
+    clock: BlindClock,
+    hand_duration_seconds: u32,
+    stacks: &[u32],
+    hero_seat: usize,
+    hand_start_stacks: &[u32],
+) -> f64 {
+    if stacks.get(hero_seat).copied().unwrap_or_default() > 0 {
+        return state_value(clock, hand_duration_seconds, stacks, hero_seat);
+    }
+
+    let alive = stacks.iter().filter(|&&stack| stack > 0).count();
+    let mut busted: Vec<_> = stacks
+        .iter()
+        .enumerate()
+        .filter_map(|(seat, &stack)| {
+            (stack == 0).then_some((
+                seat,
+                hand_start_stacks.get(seat).copied().unwrap_or_default(),
+            ))
+        })
+        .collect();
+    busted.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+
+    let Some(position) = busted.iter().position(|&(seat, _)| seat == hero_seat) else {
+        return 0.0;
+    };
+    let rank = alive + position + 1;
+    rank_points(rank as u8).unwrap_or(0) as f64
+}
+
 fn steal_stacks(stacks: &[u32], hero_seat: usize, dead_pot: u32) -> Vec<u32> {
     let mut next = stacks.to_vec();
     next[hero_seat] = next[hero_seat].saturating_add(dead_pot);
@@ -1687,6 +1726,25 @@ mod tests {
         let hero_dead = state_value(clock, 20, &[40_000, 1], 1);
 
         assert!(hero_safe > hero_dead);
+    }
+
+    #[test]
+    fn showdown_state_value_orders_simultaneous_busts_by_starting_stack() {
+        let clock = BlindClock {
+            current_level: 11,
+            elapsed_in_level_seconds: 0,
+        };
+        let stacks_after_showdown = vec![0, 0, 100_000, 40_000, 40_000, 40_000];
+        let hand_start_stacks = vec![40_000, 12_000, 90_000, 40_000, 40_000, 40_000];
+
+        assert_eq!(
+            showdown_state_value(clock, 20, &stacks_after_showdown, 0, &hand_start_stacks),
+            -21.0
+        );
+        assert_eq!(
+            showdown_state_value(clock, 20, &stacks_after_showdown, 1, &hand_start_stacks),
+            -35.0
+        );
     }
 
     #[test]
