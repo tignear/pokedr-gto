@@ -173,8 +173,8 @@
           <h2>Seat ${seat.seat_index} (${seat.players_behind} behind)</h2>
           <div class="summary">
             <div class="metric"><b>Posted</b>${seat.posted_amount}</div>
-            <div class="metric"><b>Call Eq</b>${pct(seat.call_required_equity)}</div>
-            <div class="metric"><b>Overcall Eq</b>${pct(seat.overcall_required_equity)}</div>
+            <div class="metric"><b>Surv Call Eq</b>${pct(seat.call_required_equity)}</div>
+            <div class="metric"><b>Surv Overcall Eq</b>${pct(seat.overcall_required_equity)}</div>
           </div>
           ${Object.entries(seat.ranges).map(([name, range]) => renderRange(name, range)).join('')}
         </article>

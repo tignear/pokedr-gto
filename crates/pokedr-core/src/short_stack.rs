@@ -102,8 +102,10 @@ fn analyze_seat(
     let all_in_cost = config.stack.saturating_sub(posted_amount);
     let called_pot = dead_pot + all_in_cost.saturating_mul(2);
     let overcall_pot = dead_pot + all_in_cost.saturating_mul(3);
-    let call_required_equity = required_equity(all_in_cost, called_pot);
-    let overcall_required_equity = required_equity(all_in_cost, overcall_pot);
+    let fold_stack = config.stack.saturating_sub(posted_amount);
+    let orbit_cost = orbit_cost(config.level, config.alive_players);
+    let call_required_equity = survival_required_equity(fold_stack, called_pot, orbit_cost);
+    let overcall_required_equity = survival_required_equity(fold_stack, overcall_pot, orbit_cost);
     let mut call_range = top_fraction_by_heuristic(classes, 0.25);
 
     for _ in 0..config.iterations {
@@ -354,12 +356,23 @@ fn posted_amount(level: BlindLevel, alive_players: u8, seat_index: u8) -> u32 {
     }
 }
 
-fn required_equity(call_cost: u32, pot_after_call: u32) -> f64 {
-    if pot_after_call == 0 {
-        0.0
+fn survival_required_equity(fold_stack: u32, win_stack: u32, orbit_cost: u32) -> f64 {
+    let fold_value = stack_survival_value(fold_stack, orbit_cost);
+    let win_value = stack_survival_value(win_stack, orbit_cost);
+
+    if win_value <= 0.0 {
+        1.0
     } else {
-        call_cost as f64 / pot_after_call as f64
+        (fold_value / win_value).clamp(0.0, 1.0)
     }
+}
+
+fn stack_survival_value(stack: u32, orbit_cost: u32) -> f64 {
+    if stack == 0 || orbit_cost == 0 {
+        return 0.0;
+    }
+
+    (1.0 + stack as f64 / orbit_cost as f64).ln()
 }
 
 #[cfg(test)]
@@ -400,5 +413,19 @@ mod tests {
         assert_eq!(posted_amount(level, 6, 0), 2_200);
         assert_eq!(posted_amount(level, 6, 4), 6_500);
         assert_eq!(posted_amount(level, 6, 5), 10_800);
+    }
+
+    #[test]
+    fn survival_required_equity_charges_fold_value() {
+        let level = crate::blinds::blind_level(11).expect("level 11 exists");
+        let orbit_cost = orbit_cost(level, 6);
+        let posted = posted_amount(level, 6, 5);
+        let fold_stack = 40_000 - posted;
+        let all_in_cost = 40_000 - posted;
+        let dead_pot = level.small_blind + level.big_blind + level.per_player_ante * 6;
+        let pot_after_call = dead_pot + all_in_cost * 2;
+        let pot_odds = all_in_cost as f64 / pot_after_call as f64;
+
+        assert!(survival_required_equity(fold_stack, pot_after_call, orbit_cost) > pot_odds);
     }
 }

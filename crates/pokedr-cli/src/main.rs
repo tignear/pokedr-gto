@@ -70,7 +70,7 @@ fn print_report(
         report.orbit_cost as f64 / stack as f64 * 100.0
     );
     println!(
-        "required equity: call {:.1}%, overcall {:.1}%",
+        "chip pot odds: call {:.1}%, overcall {:.1}%",
         report.single_call_required_equity * 100.0,
         report.overcall_required_equity * 100.0
     );
@@ -81,7 +81,7 @@ fn print_report(
             seat.seat_index, seat.players_behind, seat.posted_amount
         );
         println!(
-            "  required equity: call {:.1}%, overcall {:.1}%",
+            "  survival-adjusted required equity: call {:.1}%, overcall {:.1}%",
             seat.call_required_equity * 100.0,
             seat.overcall_required_equity * 100.0
         );
