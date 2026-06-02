@@ -8,11 +8,14 @@ fn main() {
     let level = parse_arg(&args, "--level").unwrap_or(11);
     let stack = parse_arg(&args, "--stack").unwrap_or(40_000);
     let alive_players = parse_arg(&args, "--alive").unwrap_or(6) as u8;
+    let stacks = parse_stacks(&args).unwrap_or_else(|| vec![stack; alive_players as usize]);
     let players_behind =
         parse_arg(&args, "--behind").unwrap_or(alive_players.saturating_sub(1) as u32) as u8;
     let max_boards_per_combo = parse_arg(&args, "--boards").unwrap_or(4) as usize;
     let range_sample_limit = parse_arg(&args, "--range-sample").unwrap_or(18) as usize;
     let iterations = parse_arg(&args, "--iterations").unwrap_or(2) as usize;
+    let elapsed_in_level_seconds = parse_arg(&args, "--elapsed").unwrap_or(0);
+    let hand_duration_seconds = parse_arg(&args, "--hand-seconds").unwrap_or(20);
     let format = parse_string_arg(&args, "--format").unwrap_or("text");
 
     let Some(level) = blind_level(level as u8) else {
@@ -22,17 +25,20 @@ fn main() {
 
     let report = analyze_short_stack(&ShortStackConfig {
         level,
-        alive_players,
+        alive_players: stacks.len() as u8,
         stack,
+        stacks: stacks.clone(),
         players_behind,
+        elapsed_in_level_seconds,
+        hand_duration_seconds,
         max_boards_per_combo,
         range_sample_limit,
         iterations,
     });
 
     match format {
-        "json" => print_json_report(level.level, stack, alive_players, players_behind, &report),
-        "text" => print_report(level.level, stack, alive_players, players_behind, &report),
+        "json" => print_json_report(level.level, &stacks, players_behind, &report),
+        "text" => print_report(level.level, &stacks, players_behind, &report),
         _ => {
             eprintln!("invalid --format; expected text or json");
             std::process::exit(2);
@@ -52,16 +58,25 @@ fn parse_string_arg<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
         .map(|window| window[1].as_str())
 }
 
-fn print_report(
-    level: u8,
-    stack: u32,
-    alive_players: u8,
-    players_behind: u8,
-    report: &ShortStackReport,
-) {
+fn parse_stacks(args: &[String]) -> Option<Vec<u32>> {
+    let value = parse_string_arg(args, "--stacks")?;
+    let stacks: Vec<u32> = value
+        .split(',')
+        .filter_map(|part| part.trim().parse().ok())
+        .collect();
+
+    (!stacks.is_empty()).then_some(stacks)
+}
+
+fn print_report(level: u8, stacks: &[u32], players_behind: u8, report: &ShortStackReport) {
+    let stack = stacks.first().copied().unwrap_or_default();
     println!("level: {level}");
-    println!("stack: {stack} ({:.2} BB)", report.stack_in_big_blinds);
-    println!("alive players: {alive_players}");
+    println!("stacks: {:?}", stacks);
+    println!(
+        "seat 0 stack: {stack} ({:.2} BB)",
+        report.stack_in_big_blinds
+    );
+    println!("alive players: {}", stacks.len());
     println!("players behind for first-in shove: {players_behind}");
     println!("dead pot: {}", report.dead_pot);
     println!(
@@ -81,7 +96,7 @@ fn print_report(
             seat.seat_index, seat.players_behind, seat.posted_amount
         );
         println!(
-            "  survival-adjusted required equity: call {:.1}%, overcall {:.1}%",
+            "  death-race required equity: call {:.1}%, overcall {:.1}%",
             seat.call_required_equity * 100.0,
             seat.overcall_required_equity * 100.0
         );
@@ -96,21 +111,24 @@ fn print_report(
     }
 }
 
-fn print_json_report(
-    level: u8,
-    stack: u32,
-    alive_players: u8,
-    players_behind: u8,
-    report: &ShortStackReport,
-) {
+fn print_json_report(level: u8, stacks: &[u32], players_behind: u8, report: &ShortStackReport) {
+    let stack = stacks.first().copied().unwrap_or_default();
     println!("{{");
     println!("  \"level\": {level},");
     println!("  \"stack\": {stack},");
     println!(
+        "  \"stacks\": [{}],",
+        stacks
+            .iter()
+            .map(|stack| stack.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    println!(
         "  \"stack_in_big_blinds\": {:.6},",
         report.stack_in_big_blinds
     );
-    println!("  \"alive_players\": {alive_players},");
+    println!("  \"alive_players\": {},", stacks.len());
     println!("  \"players_behind\": {players_behind},");
     println!("  \"dead_pot\": {},", report.dead_pot);
     println!("  \"orbit_cost\": {},", report.orbit_cost);
