@@ -232,17 +232,7 @@ fn analyze_seat(
     } else {
         modeled_shove_range.clone()
     };
-    let call_range_results = profitable_call_range(
-        classes,
-        &modeled_shove_range
-            .iter()
-            .map(|result| result.hand)
-            .collect::<Vec<_>>(),
-        call_required_equity,
-        config.max_boards_per_combo,
-        config.range_sample_limit,
-        cache,
-    );
+    let call_range_results = solution.call_range.clone();
     let call_spots = analyze_call_spots(
         config,
         stacks,
@@ -258,7 +248,7 @@ fn analyze_seat(
                 .iter()
                 .map(|result| result.hand)
                 .collect::<Vec<_>>(),
-            &solution.call_range,
+            &hand_classes(&solution.call_range),
             overcall_required_equity,
             config.max_boards_per_combo,
             config.range_sample_limit,
@@ -682,6 +672,71 @@ fn current_frequency(range: &[HandResult], hand: HandClass) -> f64 {
         .find(|result| result.hand == hand)
         .map(|result| result.frequency)
         .unwrap_or(0.0)
+}
+
+fn apply_binary_regret_matching(
+    values: &[HandResult],
+    current: &[HandResult],
+    regrets: &mut HashMap<HandClass, RegretState>,
+    call_value: impl Fn(&HandResult) -> f64,
+    fold_value: impl Fn(&HandResult) -> f64,
+) -> Vec<HandResult> {
+    let mut range: Vec<_> = values
+        .iter()
+        .filter_map(|result| {
+            let call = call_value(result);
+            let fold = fold_value(result);
+            let current_frequency = current_frequency(current, result.hand);
+            let strategy_value = current_frequency * call + (1.0 - current_frequency) * fold;
+            let state = regrets.entry(result.hand).or_default();
+            state.call = (state.call * 0.75 + call - strategy_value).max(0.0);
+            state.fold = (state.fold * 0.75 + fold - strategy_value).max(0.0);
+            let regret_sum = state.call + state.fold;
+            let frequency = if regret_sum > 0.0 {
+                state.call / regret_sum
+            } else {
+                current_frequency
+            };
+
+            (frequency > 0.001).then_some(HandResult {
+                frequency,
+                ..result.clone()
+            })
+        })
+        .collect();
+    sort_strategy_results(&mut range);
+    range
+}
+
+fn apply_final_binary_strategy(
+    values: &[HandResult],
+    current: &[HandResult],
+    call_value: impl Fn(&HandResult) -> f64,
+    fold_value: impl Fn(&HandResult) -> f64,
+) -> Vec<HandResult> {
+    let mut range: Vec<_> = values
+        .iter()
+        .filter_map(|result| {
+            let frequency = current_frequency(current, result.hand);
+            (frequency > 0.001).then_some(HandResult {
+                ev: call_value(result) - fold_value(result),
+                frequency,
+                ..result.clone()
+            })
+        })
+        .collect();
+    sort_strategy_results(&mut range);
+    range
+}
+
+fn sort_strategy_results(range: &mut [HandResult]) {
+    range.sort_by(|left, right| {
+        right
+            .frequency
+            .total_cmp(&left.frequency)
+            .then_with(|| right.ev.total_cmp(&left.ev))
+            .then_with(|| right.equity.total_cmp(&left.equity))
+    });
 }
 
 fn future_patterns_from_strategy(
@@ -1316,7 +1371,7 @@ fn call_required_equity_for(
 
 struct ShoveResponseSolution {
     shove_range: Vec<HandResult>,
-    call_range: Vec<HandClass>,
+    call_range: Vec<HandResult>,
     iterations_run: usize,
     converged: bool,
 }
@@ -1332,12 +1387,15 @@ fn solve_shove_response(
     max_iterations: usize,
     cache: &mut EquityCache,
 ) -> ShoveResponseSolution {
-    let mut call_range = top_fraction_by_heuristic(classes, 0.25);
+    let mut shove_range = hand_results_from_classes(top_fraction_by_heuristic(classes, 0.1));
+    let mut call_range = hand_results_from_classes(top_fraction_by_heuristic(classes, 0.25));
+    let mut shove_regrets: HashMap<HandClass, RegretState> = HashMap::new();
+    let mut call_regrets: HashMap<HandClass, RegretState> = HashMap::new();
     let mut iterations_run = 0;
     let mut converged = false;
 
     for _ in 0..max_iterations {
-        let shove_range = profitable_shove_range(
+        let shove_values = shove_value_results(
             classes,
             &call_range,
             config,
@@ -1347,28 +1405,43 @@ fn solve_shove_response(
             hero_seat,
             cache,
         );
-        let next_call_range = profitable_call_range(
-            classes,
+        let next_shove_range = apply_binary_regret_matching(
+            &shove_values,
             &shove_range,
+            &mut shove_regrets,
+            |result| result.call_value.unwrap_or(0.0),
+            |result| result.fold_value.unwrap_or(0.0),
+        );
+        let call_values = call_value_results(
+            classes,
+            &next_shove_range,
             response_required_equity,
             config.max_boards_per_combo,
             config.range_sample_limit,
             cache,
-        )
-        .into_iter()
-        .map(|result| result.hand)
-        .collect();
+        );
+        let next_call_range = apply_binary_regret_matching(
+            &call_values,
+            &call_range,
+            &mut call_regrets,
+            |result| result.call_value.unwrap_or(0.0),
+            |result| result.fold_value.unwrap_or(0.0),
+        );
 
         iterations_run += 1;
-        if next_call_range == call_range {
+        if ranges_equivalent(&next_shove_range, &shove_range)
+            && ranges_equivalent(&next_call_range, &call_range)
+        {
+            shove_range = next_shove_range;
             call_range = next_call_range;
             converged = true;
             break;
         }
+        shove_range = next_shove_range;
         call_range = next_call_range;
     }
 
-    let shove_range = profitable_shove_results(
+    let shove_values = shove_value_results(
         classes,
         &call_range,
         config,
@@ -1377,6 +1450,12 @@ fn solve_shove_response(
         all_in_cost,
         hero_seat,
         cache,
+    );
+    let shove_range = apply_final_binary_strategy(
+        &shove_values,
+        &shove_range,
+        |result| result.call_value.unwrap_or(0.0),
+        |result| result.fold_value.unwrap_or(0.0),
     );
 
     ShoveResponseSolution {
@@ -1387,34 +1466,9 @@ fn solve_shove_response(
     }
 }
 
-fn profitable_shove_range(
+fn shove_value_results(
     classes: &[HandClass],
-    call_range: &[HandClass],
-    config: &ShortStackConfig,
-    stacks: &[u32],
-    dead_pot: u32,
-    all_in_cost: u32,
-    hero_seat: usize,
-    cache: &mut EquityCache,
-) -> Vec<HandClass> {
-    profitable_shove_results(
-        classes,
-        call_range,
-        config,
-        stacks,
-        dead_pot,
-        all_in_cost,
-        hero_seat,
-        cache,
-    )
-    .into_iter()
-    .map(|result| result.hand)
-    .collect()
-}
-
-fn profitable_shove_results(
-    classes: &[HandClass],
-    call_range: &[HandClass],
+    call_range: &[HandResult],
     config: &ShortStackConfig,
     stacks: &[u32],
     dead_pot: u32,
@@ -1422,8 +1476,9 @@ fn profitable_shove_results(
     hero_seat: usize,
     _cache: &mut EquityCache,
 ) -> Vec<HandResult> {
-    let call_probability = combo_fraction(call_range);
-    let sampled_call_range = sample_range(call_range, config.range_sample_limit);
+    let call_probability = weighted_combo_fraction(call_range);
+    let sampled_call_range =
+        hand_classes(&sample_hand_results(call_range, config.range_sample_limit));
     let fold_probability = (1.0 - call_probability).powi(config.players_behind as i32);
     let called_probability = 1.0 - fold_probability;
     let posted_stacks = posted_stacks(config.level, stacks);
@@ -1470,27 +1525,24 @@ fn profitable_shove_results(
 
     if sampled_call_range.is_empty() || called_probability == 0.0 {
         let ev = steal_value - fold_value;
-        if ev >= 0.0 {
-            return classes
-                .iter()
-                .copied()
-                .map(|hand| HandResult {
-                    hand,
-                    equity: 0.0,
-                    ev,
-                    frequency: 1.0,
-                    call_value: None,
-                    fold_value: None,
-                })
-                .collect();
-        }
-        return Vec::new();
+        return classes
+            .iter()
+            .copied()
+            .map(|hand| HandResult {
+                hand,
+                equity: 0.0,
+                ev,
+                frequency: 0.0,
+                call_value: Some(steal_value),
+                fold_value: Some(fold_value),
+            })
+            .collect();
     }
 
     let mut results: Vec<_> = classes
         .par_iter()
         .copied()
-        .filter_map(|hand| {
+        .map(|hand| {
             let mut cache = EquityCache::new();
             let equity = heads_up_equity_vs_range_cached(
                 hand,
@@ -1503,17 +1555,13 @@ fn profitable_shove_results(
                 + called_probability * (equity * win_value + (1.0 - equity) * lose_value);
             let ev = shove_value - fold_value;
 
-            if ev >= 0.0 {
-                Some(HandResult {
-                    hand,
-                    equity,
-                    ev,
-                    frequency: 1.0,
-                    call_value: None,
-                    fold_value: None,
-                })
-            } else {
-                None
+            HandResult {
+                hand,
+                equity,
+                ev,
+                frequency: 0.0,
+                call_value: Some(shove_value),
+                fold_value: Some(fold_value),
             }
         })
         .collect();
@@ -1590,6 +1638,69 @@ fn profitable_call_range(
         .collect();
 
     results.sort_by(|left, right| right.equity.total_cmp(&left.equity));
+    results
+}
+
+fn call_value_results(
+    classes: &[HandClass],
+    shove_range: &[HandResult],
+    required_equity: f64,
+    max_boards_per_combo: usize,
+    range_sample_limit: usize,
+    _cache: &mut EquityCache,
+) -> Vec<HandResult> {
+    let sampled_shove_range = hand_classes(&sample_hand_results(shove_range, range_sample_limit));
+
+    if sampled_shove_range.is_empty() || required_equity >= 1.0 {
+        return Vec::new();
+    }
+
+    if required_equity <= 0.0 {
+        return classes
+            .iter()
+            .copied()
+            .map(|hand| HandResult {
+                hand,
+                equity: 0.0,
+                ev: 1.0,
+                frequency: 0.0,
+                call_value: Some(1.0),
+                fold_value: Some(0.0),
+            })
+            .collect();
+    }
+
+    let mut results: Vec<_> = classes
+        .par_iter()
+        .copied()
+        .map(|hand| {
+            let mut cache = EquityCache::new();
+            let equity = heads_up_equity_vs_range_cached(
+                hand,
+                &sampled_shove_range,
+                max_boards_per_combo,
+                &mut cache,
+            )
+            .share();
+            let ev = equity - required_equity;
+
+            HandResult {
+                hand,
+                equity,
+                ev,
+                frequency: 0.0,
+                call_value: Some(equity),
+                fold_value: Some(required_equity),
+            }
+        })
+        .collect();
+
+    results.sort_by(|left, right| {
+        right
+            .ev
+            .total_cmp(&left.ev)
+            .then_with(|| right.equity.total_cmp(&left.equity))
+    });
     results
 }
 
@@ -1684,10 +1795,6 @@ fn heuristic_strength(hand: HandClass) -> f64 {
     let gap = hand.high - hand.low - 1;
 
     high * 4.0 + low * 1.5 + if hand.suited { 3.0 } else { 0.0 } - gap as f64 * 2.0
-}
-
-fn combo_fraction(range: &[HandClass]) -> f64 {
-    range.iter().map(|hand| hand.combos().len()).sum::<usize>() as f64 / 1326.0
 }
 
 fn normalized_stacks(config: &ShortStackConfig) -> Vec<u32> {
