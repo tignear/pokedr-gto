@@ -5,7 +5,8 @@ use pokedr_core::blinds::blind_level;
 use pokedr_core::cards::Card;
 use pokedr_core::cfr::{CfrResult, KuhnCfrSolver, LeducCfrSolver};
 use pokedr_core::postflop::{
-    PostflopEquityReport, parse_range, postflop_combos, postflop_equity_reports,
+    PostflopCfrConfig, PostflopCfrResult, PostflopEquityReport, PostflopNode, PostflopRole,
+    parse_range, postflop_combos, postflop_equity_reports, solve_postflop_check_bet,
 };
 use pokedr_core::river::{
     RiverCfrConfig, RiverCfrResult, RiverNode, RiverRole, river_blocker_reports, river_combos,
@@ -31,6 +32,7 @@ fn main() {
     let river_blockers = has_flag(&args, "--river-blockers");
     let solve_river = has_flag(&args, "--solve-river");
     let postflop_equity = has_flag(&args, "--postflop-equity");
+    let solve_postflop = has_flag(&args, "--solve-postflop");
     let scan_open2bb = has_flag(&args, "--scan-open2bb");
     let scan_defense2bb = has_flag(&args, "--scan-defense2bb");
     let level = parse_arg(&args, "--level").unwrap_or(DEFAULT_LEVEL);
@@ -122,7 +124,7 @@ fn main() {
         return;
     }
 
-    if postflop_equity {
+    if postflop_equity || solve_postflop {
         let Some(board) = parse_cards_arg(&args, "--board") else {
             eprintln!("invalid --board; expected 3 to 5 cards like AhKd7c");
             std::process::exit(2);
@@ -141,7 +143,24 @@ fn main() {
         };
         let max_runouts = parse_arg(&args, "--runouts").unwrap_or(256) as usize;
         let limit = parse_arg(&args, "--limit").unwrap_or(40) as usize;
-        print_postflop_equity(&board, oop_range, ip_range, max_runouts, limit, format);
+        if solve_postflop {
+            let cfr_iterations = parse_arg(&args, "--cfr-iterations").unwrap_or(100_000) as usize;
+            let pot = parse_f64_arg(&args, "--pot").unwrap_or(100.0);
+            let bet = parse_f64_arg(&args, "--bet").unwrap_or(pot * 0.75);
+            print_postflop_solution(
+                &board,
+                oop_range,
+                ip_range,
+                max_runouts,
+                cfr_iterations,
+                pot,
+                bet,
+                limit,
+                format,
+            );
+        } else {
+            print_postflop_equity(&board, oop_range, ip_range, max_runouts, limit, format);
+        }
         return;
     }
 
@@ -430,6 +449,163 @@ fn print_postflop_equity(
             eprintln!("invalid --format; expected text or json");
             std::process::exit(2);
         }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn print_postflop_solution(
+    board: &[Card],
+    oop_range: &str,
+    ip_range: &str,
+    max_runouts: usize,
+    iterations: usize,
+    pot: f64,
+    bet: f64,
+    limit: usize,
+    format: &str,
+) {
+    let oop_classes = match parse_range(oop_range) {
+        Ok(classes) => classes,
+        Err(_) => {
+            eprintln!("invalid --oop-range");
+            std::process::exit(2);
+        }
+    };
+    let ip_classes = match parse_range(ip_range) {
+        Ok(classes) => classes,
+        Err(_) => {
+            eprintln!("invalid --ip-range");
+            std::process::exit(2);
+        }
+    };
+    let result = solve_postflop_check_bet(PostflopCfrConfig {
+        board: board.to_vec(),
+        oop_range: postflop_combos(&oop_classes, board),
+        ip_range: postflop_combos(&ip_classes, board),
+        pot,
+        bet,
+        iterations,
+        max_runouts,
+    });
+    print_postflop_solution_result(&result, limit, format);
+}
+
+fn print_postflop_solution_result(result: &PostflopCfrResult, limit: usize, format: &str) {
+    let mut strategies = result.strategies.clone();
+    strategies.sort_by(|left, right| {
+        postflop_action_frequency(right, "bet")
+            .total_cmp(&postflop_action_frequency(left, "bet"))
+            .then_with(|| {
+                postflop_action_frequency(right, "call")
+                    .total_cmp(&postflop_action_frequency(left, "call"))
+            })
+            .then_with(|| right.equity.total_cmp(&left.equity))
+            .then_with(|| left.combo.label().cmp(&right.combo.label()))
+    });
+
+    match format {
+        "json" => {
+            println!("{{");
+            println!("  \"game\": \"postflop-check-bet\",");
+            println!("  \"iterations\": {},", result.iterations);
+            println!(
+                "  \"expected_value_oop\": {:.9},",
+                result.expected_value_oop
+            );
+            println!("  \"pot\": {:.6},", result.pot);
+            println!("  \"bet\": {:.6},", result.bet);
+            println!("  \"board_cards\": {},", result.board_cards);
+            println!("  \"oop_combo_count\": {},", result.oop_combo_count);
+            println!("  \"ip_combo_count\": {},", result.ip_combo_count);
+            println!("  \"strategies\": [");
+            for (index, strategy) in strategies.iter().take(limit).enumerate() {
+                let comma = if index + 1 == limit.min(strategies.len()) {
+                    ""
+                } else {
+                    ","
+                };
+                println!(
+                    "    {{\"role\":\"{}\",\"node\":\"{}\",\"combo\":\"{}\",\"class\":\"{}\",\"equity\":{:.9},\"actions\":[",
+                    postflop_role_label(strategy.role),
+                    postflop_node_label(strategy.node),
+                    strategy.combo.label(),
+                    strategy.combo.class.label(),
+                    strategy.equity
+                );
+                for (action_index, action) in strategy.actions.iter().enumerate() {
+                    let action_comma = if action_index + 1 == strategy.actions.len() {
+                        ""
+                    } else {
+                        ","
+                    };
+                    println!(
+                        "      {{\"action\":\"{}\",\"frequency\":{:.9}}}{}",
+                        action.action, action.frequency, action_comma
+                    );
+                }
+                println!("    ]}}{}", comma);
+            }
+            println!("  ]");
+            println!("}}");
+        }
+        "text" => {
+            println!("postflop check-bet CFR");
+            println!("iterations: {}", result.iterations);
+            println!("expected value OOP: {:.6}", result.expected_value_oop);
+            println!("pot: {:.3}", result.pot);
+            println!("bet: {:.3}", result.bet);
+            println!("board cards: {}", result.board_cards);
+            println!("OOP combos: {}", result.oop_combo_count);
+            println!("IP combos: {}", result.ip_combo_count);
+            println!("role,node,combo,class,equity,actions");
+            for strategy in strategies.iter().take(limit) {
+                let actions = strategy
+                    .actions
+                    .iter()
+                    .map(|action| format!("{}={:.6}", action.action, action.frequency))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                println!(
+                    "{},{},{},{},{:.6},{}",
+                    postflop_role_label(strategy.role),
+                    postflop_node_label(strategy.node),
+                    strategy.combo.label(),
+                    strategy.combo.class.label(),
+                    strategy.equity,
+                    actions
+                );
+            }
+        }
+        _ => {
+            eprintln!("invalid --format; expected text or json");
+            std::process::exit(2);
+        }
+    }
+}
+
+fn postflop_action_frequency(
+    strategy: &pokedr_core::postflop::PostflopComboStrategy,
+    action: &str,
+) -> f64 {
+    strategy
+        .actions
+        .iter()
+        .find(|frequency| frequency.action == action)
+        .map(|frequency| frequency.frequency)
+        .unwrap_or(0.0)
+}
+
+fn postflop_role_label(role: PostflopRole) -> &'static str {
+    match role {
+        PostflopRole::Oop => "OOP",
+        PostflopRole::Ip => "IP",
+    }
+}
+
+fn postflop_node_label(node: PostflopNode) -> &'static str {
+    match node {
+        PostflopNode::FacingBet => "facing-bet",
+        PostflopNode::AfterCheck => "after-check",
     }
 }
 
