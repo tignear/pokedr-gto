@@ -372,14 +372,28 @@
           const hand = matrixHand(ranks, row, col);
           const result = byHand.get(hand);
           const kind = hand.length === 2 ? 'pair' : hand.endsWith('s') ? 'suited' : 'offsuit';
-          const title = result
-            ? `${hand} equity ${pct(result.equity)}, ev ${result.ev.toFixed(4)}`
-            : hand;
-          cells.push(`<span class="cell ${kind}${result ? ' in' : ''}" title="${escapeHtml(title)}">${hand}</span>`);
+          const cellTitle = result ? handDetail(hand, result) : hand;
+          cells.push(`<span class="cell ${kind}${result ? ' in' : ''}" title="${escapeHtml(cellTitle)}">${hand}</span>`);
         }
       }
 
       return cells.join('');
+    }
+
+    function handDetail(hand, result) {
+      const parts = [
+        `${hand} equity ${pct(result.equity)}`,
+        `ev ${result.ev.toFixed(4)}`,
+      ];
+
+      if (result.call_value != null) {
+        parts.push(`call ${result.call_value.toFixed(4)}`);
+      }
+      if (result.fold_value != null) {
+        parts.push(`fold ${result.fold_value.toFixed(4)}`);
+      }
+
+      return parts.join(', ');
     }
 
     function matrixHand(ranks, row, col) {

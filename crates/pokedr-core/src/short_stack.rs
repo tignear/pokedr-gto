@@ -88,6 +88,8 @@ pub struct HandResult {
     pub hand: HandClass,
     pub equity: f64,
     pub ev: f64,
+    pub call_value: Option<f64>,
+    pub fold_value: Option<f64>,
 }
 
 pub fn analyze_short_stack(config: &ShortStackConfig) -> ShortStackReport {
@@ -475,6 +477,8 @@ fn profitable_tree_call_range(
                     hand,
                     equity: equity_acc,
                     ev,
+                    call_value: Some(call_value),
+                    fold_value: Some(fold_value),
                 })
             } else {
                 None
@@ -663,6 +667,8 @@ fn response_node_range(
                 hand,
                 equity: hero_share,
                 ev,
+                call_value: Some(call_value),
+                fold_value: Some(fold_value),
             })
         })
         .collect();
@@ -761,6 +767,8 @@ fn pattern_range(
                 hand,
                 equity: outcome.hero_share,
                 ev,
+                call_value: Some(outcome.value),
+                fold_value: Some(fold_value),
             })
         })
         .collect();
@@ -1303,6 +1311,8 @@ fn profitable_shove_results(
                     hand,
                     equity: 0.0,
                     ev,
+                    call_value: None,
+                    fold_value: None,
                 })
                 .collect();
         }
@@ -1326,7 +1336,13 @@ fn profitable_shove_results(
             let ev = shove_value - fold_value;
 
             if ev >= 0.0 {
-                Some(HandResult { hand, equity, ev })
+                Some(HandResult {
+                    hand,
+                    equity,
+                    ev,
+                    call_value: None,
+                    fold_value: None,
+                })
             } else {
                 None
             }
@@ -1364,6 +1380,8 @@ fn profitable_call_range(
                 hand,
                 equity: 0.0,
                 ev: 0.0,
+                call_value: None,
+                fold_value: None,
             })
             .collect();
     }
@@ -1387,7 +1405,13 @@ fn profitable_call_range(
             let ev = equity - required_equity;
 
             if ev >= 0.0 {
-                Some(HandResult { hand, equity, ev })
+                Some(HandResult {
+                    hand,
+                    equity,
+                    ev,
+                    call_value: None,
+                    fold_value: None,
+                })
             } else {
                 None
             }
@@ -1426,7 +1450,13 @@ fn profitable_overcall_range(
             let ev = equity - required_equity;
 
             if ev >= 0.0 {
-                Some(HandResult { hand, equity, ev })
+                Some(HandResult {
+                    hand,
+                    equity,
+                    ev,
+                    call_value: None,
+                    fold_value: None,
+                })
             } else {
                 None
             }

@@ -351,15 +351,23 @@ fn print_json_range(
     for (index, result) in range.iter().enumerate() {
         let comma = if index + 1 == range.len() { "" } else { "," };
         println!(
-            "{pad}    {{\"hand\":\"{}\",\"equity\":{:.6},\"ev\":{:.6}}}{comma}",
+            "{pad}    {{\"hand\":\"{}\",\"equity\":{:.6},\"ev\":{:.6},\"call_value\":{},\"fold_value\":{}}}{comma}",
             result.hand.label(),
             result.equity,
-            result.ev
+            result.ev,
+            json_optional_f64(result.call_value),
+            json_optional_f64(result.fold_value)
         );
     }
 
     println!("{pad}  ]");
     println!("{pad}}}{}", if trailing_comma { "," } else { "" });
+}
+
+fn json_optional_f64(value: Option<f64>) -> String {
+    value
+        .map(|value| format!("{value:.6}"))
+        .unwrap_or_else(|| "null".to_string())
 }
 
 fn print_range(title: &str, range: &[pokedr_core::short_stack::HandResult], limit: usize) {
