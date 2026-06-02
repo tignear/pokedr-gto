@@ -59,7 +59,7 @@
     }
     .ranges {
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
       gap: 14px;
     }
     .range {
@@ -71,16 +71,56 @@
       font-size: 15px;
       margin: 0 0 8px;
     }
-    .hands {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 5px;
+    .matrix {
+      display: grid;
+      grid-template-columns: repeat(13, minmax(22px, 1fr));
+      gap: 3px;
+      margin-bottom: 14px;
     }
-    .hand {
+    .cell {
+      aspect-ratio: 1;
+      display: grid;
+      place-items: center;
       font: 12px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-      border: 1px solid color-mix(in srgb, CanvasText 18%, Canvas);
+      border: 1px solid color-mix(in srgb, CanvasText 16%, Canvas);
       border-radius: 4px;
-      padding: 3px 5px;
+      opacity: .35;
+      background: color-mix(in srgb, CanvasText 4%, Canvas);
+    }
+    .cell.in {
+      opacity: 1;
+      color: #08111f;
+      border-color: transparent;
+    }
+    .cell.pair.in {
+      background: #f4c542;
+    }
+    .cell.suited.in {
+      background: #57c7a3;
+    }
+    .cell.offsuit.in {
+      background: #7aa7ff;
+    }
+    .legend {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      margin-bottom: 12px;
+      font-size: 12px;
+    }
+    .legend span {
+      border-radius: 4px;
+      padding: 3px 6px;
+      color: #08111f;
+    }
+    .legend .pair {
+      background: #f4c542;
+    }
+    .legend .suited {
+      background: #57c7a3;
+    }
+    .legend .offsuit {
+      background: #7aa7ff;
     }
     .error {
       color: #b42318;
@@ -122,20 +162,64 @@
           ${metrics.map(([label, value]) => `<div class="metric"><b>${label}</b>${value}</div>`).join('')}
         </section>
         <section class="ranges">
-          ${Object.entries(data.ranges).map(([name, range]) => renderRange(name, range)).join('')}
+          ${data.seats.map(renderSeat).join('')}
         </section>
+      `;
+    }
+
+    function renderSeat(seat) {
+      return `
+        <article class="range">
+          <h2>Seat ${seat.seat_index} (${seat.players_behind} behind)</h2>
+          ${Object.entries(seat.ranges).map(([name, range]) => renderRange(name, range)).join('')}
+        </article>
       `;
     }
 
     function renderRange(name, range) {
       return `
-        <article class="range">
+        <section>
           <h2>${title(name)}: ${range.classes} classes, ${range.combos} combos (${pct(range.combo_fraction)})</h2>
-          <div class="hands">
-            ${range.hands.map(hand => `<span class="hand" title="equity ${pct(hand.equity)}, ev ${hand.ev.toFixed(4)}">${escapeHtml(hand.hand)}</span>`).join('')}
+          <div class="legend">
+            <span class="pair">pair</span>
+            <span class="suited">suited</span>
+            <span class="offsuit">offsuit</span>
           </div>
-        </article>
+          <div class="matrix">
+            ${renderMatrix(range)}
+          </div>
+        </section>
       `;
+    }
+
+    function renderMatrix(range) {
+      const ranks = ['A', 'K', 'Q', 'J', 'T', '9', '8', '7', '6', '5', '4', '3', '2'];
+      const byHand = new Map(range.hands.map(hand => [hand.hand, hand]));
+      const cells = [];
+
+      for (let row = 0; row < ranks.length; row++) {
+        for (let col = 0; col < ranks.length; col++) {
+          const hand = matrixHand(ranks, row, col);
+          const result = byHand.get(hand);
+          const kind = hand.length === 2 ? 'pair' : hand.endsWith('s') ? 'suited' : 'offsuit';
+          const title = result
+            ? `${hand} equity ${pct(result.equity)}, ev ${result.ev.toFixed(4)}`
+            : hand;
+          cells.push(`<span class="cell ${kind}${result ? ' in' : ''}" title="${escapeHtml(title)}">${hand}</span>`);
+        }
+      }
+
+      return cells.join('');
+    }
+
+    function matrixHand(ranks, row, col) {
+      if (row === col) {
+        return `${ranks[row]}${ranks[col]}`;
+      }
+      if (row < col) {
+        return `${ranks[row]}${ranks[col]}s`;
+      }
+      return `${ranks[col]}${ranks[row]}o`;
     }
 
     function pct(value) {

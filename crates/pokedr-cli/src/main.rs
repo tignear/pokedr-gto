@@ -75,9 +75,20 @@ fn print_report(
         report.overcall_required_equity * 100.0
     );
     println!();
-    print_range("first-in all-in range", &report.shove_range, 40);
-    print_range("call vs one all-in range", &report.call_range, 40);
-    print_range("overcall range vs jam+call", &report.overcall_range, 40);
+    for seat in &report.seats {
+        println!(
+            "seat {}: players behind for first-in shove {}",
+            seat.seat_index, seat.players_behind
+        );
+        if seat.players_behind == 0 {
+            println!("  first-in all-in range: n/a (no players behind)");
+            println!();
+        } else {
+            print_range("  first-in all-in range", &seat.shove_range, 40);
+        }
+        print_range("  call vs one all-in range", &seat.call_range, 40);
+        print_range("  overcall range vs jam+call", &seat.overcall_range, 40);
+    }
 }
 
 fn print_json_report(
@@ -106,11 +117,24 @@ fn print_json_report(
         "  \"overcall_required_equity\": {:.6},",
         report.overcall_required_equity
     );
-    println!("  \"ranges\": {{");
-    print_json_range("first_in_all_in", &report.shove_range, true);
-    print_json_range("call_vs_one_all_in", &report.call_range, true);
-    print_json_range("overcall_vs_jam_call", &report.overcall_range, false);
-    println!("  }}");
+    println!("  \"seats\": [");
+    for (index, seat) in report.seats.iter().enumerate() {
+        let comma = if index + 1 == report.seats.len() {
+            ""
+        } else {
+            ","
+        };
+        println!("    {{");
+        println!("      \"seat_index\": {},", seat.seat_index);
+        println!("      \"players_behind\": {},", seat.players_behind);
+        println!("      \"ranges\": {{");
+        print_json_range("first_in_all_in", &seat.shove_range, true, 8);
+        print_json_range("call_vs_one_all_in", &seat.call_range, true, 8);
+        print_json_range("overcall_vs_jam_call", &seat.overcall_range, false, 8);
+        println!("      }}");
+        println!("    }}{comma}");
+    }
+    println!("  ]");
     println!("}}");
 }
 
@@ -118,29 +142,31 @@ fn print_json_range(
     name: &str,
     range: &[pokedr_core::short_stack::HandResult],
     trailing_comma: bool,
+    indent: usize,
 ) {
+    let pad = " ".repeat(indent);
     let combo_count: usize = range.iter().map(|result| result.hand.combos().len()).sum();
-    println!("    \"{name}\": {{");
-    println!("      \"classes\": {},", range.len());
-    println!("      \"combos\": {combo_count},");
+    println!("{pad}\"{name}\": {{");
+    println!("{pad}  \"classes\": {},", range.len());
+    println!("{pad}  \"combos\": {combo_count},");
     println!(
-        "      \"combo_fraction\": {:.6},",
+        "{pad}  \"combo_fraction\": {:.6},",
         combo_count as f64 / 1326.0
     );
-    println!("      \"hands\": [");
+    println!("{pad}  \"hands\": [");
 
     for (index, result) in range.iter().enumerate() {
         let comma = if index + 1 == range.len() { "" } else { "," };
         println!(
-            "        {{\"hand\":\"{}\",\"equity\":{:.6},\"ev\":{:.6}}}{comma}",
+            "{pad}    {{\"hand\":\"{}\",\"equity\":{:.6},\"ev\":{:.6}}}{comma}",
             result.hand.label(),
             result.equity,
             result.ev
         );
     }
 
-    println!("      ]");
-    println!("    }}{}", if trailing_comma { "," } else { "" });
+    println!("{pad}  ]");
+    println!("{pad}}}{}", if trailing_comma { "," } else { "" });
 }
 
 fn print_range(title: &str, range: &[pokedr_core::short_stack::HandResult], limit: usize) {
