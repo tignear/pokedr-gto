@@ -261,10 +261,14 @@ pub fn solve_postflop_check_bet(config: PostflopCfrConfig) -> PostflopCfrResult 
         reraise: config.reraise,
         max_runouts: config.max_runouts,
         nodes: HashMap::new(),
+        combo_equity_cache: HashMap::new(),
+        showdown_cache: HashMap::new(),
+        average_weight: 1.0,
     };
     let mut utility_sum = 0.0;
 
     for iteration in 0..config.iterations {
+        solver.average_weight = iteration as f64 + 1.0;
         let (oop_index, ip_index) = deals[sampled_index(iteration, deals.len())];
         utility_sum += solver.cfr(
             PostflopHistory::IpDecision,
@@ -315,6 +319,9 @@ struct PostflopCfrTrainer<'a> {
     reraise: f64,
     max_runouts: usize,
     nodes: HashMap<String, PostflopCfrNode>,
+    combo_equity_cache: HashMap<(u64, u64, u64), f64>,
+    showdown_cache: HashMap<(u64, usize, usize), std::cmp::Ordering>,
+    average_weight: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -440,8 +447,8 @@ impl PostflopCfrTrainer<'_> {
             } else {
                 node_value - action_values[action]
             };
-            node.regret_sum[action] += opponent_reach * regret;
-            node.strategy_sum[action] += reach[player] * strategy[action];
+            node.regret_sum[action] = (node.regret_sum[action] + opponent_reach * regret).max(0.0);
+            node.strategy_sum[action] += self.average_weight * reach[player] * strategy[action];
         }
 
         node_value
@@ -488,12 +495,34 @@ impl PostflopCfrTrainer<'_> {
     }
 
     fn showdown_utility(
-        &self,
+        &mut self,
         board: &[Card],
         oop_index: usize,
         ip_index: usize,
         win_amount: f64,
     ) -> f64 {
+        let key = (board_mask(board), oop_index, ip_index);
+        let ordering = if let Some(&ordering) = self.showdown_cache.get(&key) {
+            ordering
+        } else {
+            let ordering = self.showdown_ordering(board, oop_index, ip_index);
+            self.showdown_cache.insert(key, ordering);
+            ordering
+        };
+
+        match ordering {
+            std::cmp::Ordering::Greater => win_amount,
+            std::cmp::Ordering::Less => -win_amount,
+            std::cmp::Ordering::Equal => 0.0,
+        }
+    }
+
+    fn showdown_ordering(
+        &self,
+        board: &[Card],
+        oop_index: usize,
+        ip_index: usize,
+    ) -> std::cmp::Ordering {
         let oop = &self.oop_range[oop_index];
         let ip = &self.ip_range[ip_index];
         debug_assert_eq!(board.len(), 5);
@@ -515,11 +544,7 @@ impl PostflopCfrTrainer<'_> {
             board[3],
             board[4],
         ]);
-        match oop_value.cmp(&ip_value) {
-            std::cmp::Ordering::Greater => win_amount,
-            std::cmp::Ordering::Less => -win_amount,
-            std::cmp::Ordering::Equal => 0.0,
-        }
+        oop_value.cmp(&ip_value)
     }
 
     fn infoset_key(
@@ -567,12 +592,9 @@ impl PostflopCfrTrainer<'_> {
             return node.strategy();
         }
 
-        let oop_equity = combo_equity(
-            board,
-            &self.oop_range[oop_index],
-            &self.ip_range[ip_index],
-            self.max_runouts,
-        );
+        let oop_combo = self.oop_range[oop_index].clone();
+        let ip_combo = self.ip_range[ip_index].clone();
+        let oop_equity = self.combo_equity_cached(board, &oop_combo, &ip_combo);
         let node = match history {
             PostflopHistory::IpDecision => PostflopCfrNode {
                 board: board.to_vec(),
@@ -620,10 +642,10 @@ impl PostflopCfrTrainer<'_> {
         strategy
     }
 
-    fn combo_strategies(&self) -> Vec<PostflopComboStrategy> {
-        let mut strategies: Vec<_> = self
-            .nodes
-            .values()
+    fn combo_strategies(&mut self) -> Vec<PostflopComboStrategy> {
+        let nodes: Vec<_> = self.nodes.values().cloned().collect();
+        let mut strategies: Vec<_> = nodes
+            .iter()
             .map(|node| PostflopComboStrategy {
                 board: node.board.clone(),
                 combo: node.combo.clone(),
@@ -644,18 +666,19 @@ impl PostflopCfrTrainer<'_> {
         strategies
     }
 
-    fn range_equity(&self, node: &PostflopCfrNode) -> f64 {
-        let (hero, villains) = match node.role {
-            PostflopRole::Oop => (&node.combo, self.ip_range),
-            PostflopRole::Ip => (&node.combo, self.oop_range),
+    fn range_equity(&mut self, node: &PostflopCfrNode) -> f64 {
+        let hero = node.combo.clone();
+        let villains: Vec<_> = match node.role {
+            PostflopRole::Oop => self.ip_range.to_vec(),
+            PostflopRole::Ip => self.oop_range.to_vec(),
         };
         let mut total = 0.0;
         let mut count = 0.0;
-        for villain in villains {
+        for villain in &villains {
             if hero.mask & villain.mask != 0 {
                 continue;
             }
-            let equity = combo_equity(&node.board, hero, villain, self.max_runouts);
+            let equity = self.combo_equity_cached(&node.board, &hero, villain);
             total += match node.role {
                 PostflopRole::Oop => equity,
                 PostflopRole::Ip => 1.0 - equity,
@@ -667,6 +690,21 @@ impl PostflopCfrTrainer<'_> {
         } else {
             total / count
         }
+    }
+
+    fn combo_equity_cached(
+        &mut self,
+        board: &[Card],
+        hero: &PostflopCombo,
+        villain: &PostflopCombo,
+    ) -> f64 {
+        let key = (board_mask(board), hero.mask, villain.mask);
+        if let Some(&equity) = self.combo_equity_cache.get(&key) {
+            return equity;
+        }
+        let equity = combo_equity(board, hero, villain, self.max_runouts);
+        self.combo_equity_cache.insert(key, equity);
+        equity
     }
 }
 
@@ -838,6 +876,10 @@ fn action_frequency(strategy: &PostflopComboStrategy, action: &str) -> f64 {
         .find(|frequency| frequency.action == action)
         .map(|frequency| frequency.frequency)
         .unwrap_or(0.0)
+}
+
+fn board_mask(board: &[Card]) -> u64 {
+    board.iter().fold(0_u64, |mask, card| mask | card.mask())
 }
 
 fn combo_features(board: &[Card], combo: &PostflopCombo) -> PostflopComboFeatures {
