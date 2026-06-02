@@ -1,8 +1,8 @@
 use std::cmp::Ordering;
 
 use pokedr_agent::rs_poker_policy::{EquityPolicyAgent, PreflopRanges};
-use pokedr_core::{cards::Card as PokedrCard, hand_eval::evaluate_seven};
 use pokedr_core::hand_class::HandClass;
+use pokedr_core::{cards::Card as PokedrCard, hand_eval::evaluate_seven};
 use rs_poker::{
     arena::{
         AgentGenerator, CloneAgentGenerator, CloneGameStateGenerator,
@@ -51,10 +51,15 @@ fn rs_poker_ranked_river_policy_smoke_does_not_get_crushed() {
 
     for hand_index in 0..hands {
         let offset = (hand_index * 11) % deck.len();
-        let sample: Vec<_> = (0..9).map(|step| deck[(offset + step) % deck.len()]).collect();
+        let sample: Vec<_> = (0..9)
+            .map(|step| deck[(offset + step) % deck.len()])
+            .collect();
         let hero = format!("{}{}", sample[0], sample[1]);
         let villain = format!("{}{}", sample[2], sample[3]);
-        let board = format!("{}{}{}{}{}", sample[4], sample[5], sample[6], sample[7], sample[8]);
+        let board = format!(
+            "{}{}{}{}{}",
+            sample[4], sample[5], sample[6], sample[7], sample[8]
+        );
 
         hero_ev += river_battle_ev(&hero, &villain, &board, hand_index);
     }
@@ -107,10 +112,7 @@ fn run_heads_up_smoke(
     villain: Box<dyn AgentGenerator>,
     hands: usize,
 ) -> f64 {
-    let agent_gens: Vec<Box<dyn AgentGenerator>> = vec![
-        hero,
-        villain,
-    ];
+    let agent_gens: Vec<Box<dyn AgentGenerator>> = vec![hero, villain];
     let game_state = GameState::new_starting(vec![1_000.0, 1_000.0], 10.0, 5.0, 0.0, 0);
     let simulation_gen = StandardSimulationIterator::new(
         agent_gens,
@@ -179,63 +181,61 @@ fn deck_labels() -> Vec<&'static str> {
     ranks
         .iter()
         .flat_map(|rank| {
-            suits
-                .iter()
-                .map(move |suit| match (*rank, *suit) {
-                    ("A", "s") => "As",
-                    ("A", "h") => "Ah",
-                    ("A", "d") => "Ad",
-                    ("A", "c") => "Ac",
-                    ("K", "s") => "Ks",
-                    ("K", "h") => "Kh",
-                    ("K", "d") => "Kd",
-                    ("K", "c") => "Kc",
-                    ("Q", "s") => "Qs",
-                    ("Q", "h") => "Qh",
-                    ("Q", "d") => "Qd",
-                    ("Q", "c") => "Qc",
-                    ("J", "s") => "Js",
-                    ("J", "h") => "Jh",
-                    ("J", "d") => "Jd",
-                    ("J", "c") => "Jc",
-                    ("T", "s") => "Ts",
-                    ("T", "h") => "Th",
-                    ("T", "d") => "Td",
-                    ("T", "c") => "Tc",
-                    ("9", "s") => "9s",
-                    ("9", "h") => "9h",
-                    ("9", "d") => "9d",
-                    ("9", "c") => "9c",
-                    ("8", "s") => "8s",
-                    ("8", "h") => "8h",
-                    ("8", "d") => "8d",
-                    ("8", "c") => "8c",
-                    ("7", "s") => "7s",
-                    ("7", "h") => "7h",
-                    ("7", "d") => "7d",
-                    ("7", "c") => "7c",
-                    ("6", "s") => "6s",
-                    ("6", "h") => "6h",
-                    ("6", "d") => "6d",
-                    ("6", "c") => "6c",
-                    ("5", "s") => "5s",
-                    ("5", "h") => "5h",
-                    ("5", "d") => "5d",
-                    ("5", "c") => "5c",
-                    ("4", "s") => "4s",
-                    ("4", "h") => "4h",
-                    ("4", "d") => "4d",
-                    ("4", "c") => "4c",
-                    ("3", "s") => "3s",
-                    ("3", "h") => "3h",
-                    ("3", "d") => "3d",
-                    ("3", "c") => "3c",
-                    ("2", "s") => "2s",
-                    ("2", "h") => "2h",
-                    ("2", "d") => "2d",
-                    ("2", "c") => "2c",
-                    _ => unreachable!(),
-                })
+            suits.iter().map(move |suit| match (*rank, *suit) {
+                ("A", "s") => "As",
+                ("A", "h") => "Ah",
+                ("A", "d") => "Ad",
+                ("A", "c") => "Ac",
+                ("K", "s") => "Ks",
+                ("K", "h") => "Kh",
+                ("K", "d") => "Kd",
+                ("K", "c") => "Kc",
+                ("Q", "s") => "Qs",
+                ("Q", "h") => "Qh",
+                ("Q", "d") => "Qd",
+                ("Q", "c") => "Qc",
+                ("J", "s") => "Js",
+                ("J", "h") => "Jh",
+                ("J", "d") => "Jd",
+                ("J", "c") => "Jc",
+                ("T", "s") => "Ts",
+                ("T", "h") => "Th",
+                ("T", "d") => "Td",
+                ("T", "c") => "Tc",
+                ("9", "s") => "9s",
+                ("9", "h") => "9h",
+                ("9", "d") => "9d",
+                ("9", "c") => "9c",
+                ("8", "s") => "8s",
+                ("8", "h") => "8h",
+                ("8", "d") => "8d",
+                ("8", "c") => "8c",
+                ("7", "s") => "7s",
+                ("7", "h") => "7h",
+                ("7", "d") => "7d",
+                ("7", "c") => "7c",
+                ("6", "s") => "6s",
+                ("6", "h") => "6h",
+                ("6", "d") => "6d",
+                ("6", "c") => "6c",
+                ("5", "s") => "5s",
+                ("5", "h") => "5h",
+                ("5", "d") => "5d",
+                ("5", "c") => "5c",
+                ("4", "s") => "4s",
+                ("4", "h") => "4h",
+                ("4", "d") => "4d",
+                ("4", "c") => "4c",
+                ("3", "s") => "3s",
+                ("3", "h") => "3h",
+                ("3", "d") => "3d",
+                ("3", "c") => "3c",
+                ("2", "s") => "2s",
+                ("2", "h") => "2h",
+                ("2", "d") => "2d",
+                ("2", "c") => "2c",
+                _ => unreachable!(),
+            })
         })
         .collect()
 }
@@ -248,7 +248,9 @@ fn pokedr_value(cards: &str) -> u32 {
 }
 
 fn rs_poker_value(cards: &str) -> Rank {
-    Hand::new_from_str(cards).expect("valid rs_poker hand").rank()
+    Hand::new_from_str(cards)
+        .expect("valid rs_poker hand")
+        .rank()
 }
 
 fn parse_pokedr_cards(cards: &str) -> impl Iterator<Item = PokedrCard> + '_ {

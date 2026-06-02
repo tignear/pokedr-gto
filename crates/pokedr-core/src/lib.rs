@@ -10,3 +10,4 @@ pub mod river;
 pub mod scoring;
 pub mod short_stack;
 pub mod structure;
+pub mod subgame;

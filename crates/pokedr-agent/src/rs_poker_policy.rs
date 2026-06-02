@@ -43,18 +43,17 @@ impl Default for PreflopRanges {
         Self {
             open: hand_classes(&[
                 "22", "33", "44", "55", "66", "77", "88", "99", "TT", "JJ", "QQ", "KK", "AA",
-                "A2s", "A3s", "A4s", "A5s", "A6s", "A7s", "A8s", "A9s", "ATs", "AJs",
-                "AQs", "AKs", "K2s", "K3s", "K4s", "K5s", "K6s", "K7s", "K8s", "K9s",
-                "KTs", "KJs", "KQs", "Q5s", "Q6s", "Q7s", "Q8s", "Q9s", "QTs", "QJs",
-                "J7s", "J8s", "J9s", "JTs", "T7s", "T8s", "T9s", "97s", "98s", "87s",
-                "76s", "65s", "54s", "A2o", "A3o", "A4o", "A5o", "A6o", "A7o", "A8o",
-                "A9o", "ATo", "AJo", "AQo", "AKo", "K8o", "K9o", "KTo", "KJo", "KQo",
+                "A2s", "A3s", "A4s", "A5s", "A6s", "A7s", "A8s", "A9s", "ATs", "AJs", "AQs", "AKs",
+                "K2s", "K3s", "K4s", "K5s", "K6s", "K7s", "K8s", "K9s", "KTs", "KJs", "KQs", "Q5s",
+                "Q6s", "Q7s", "Q8s", "Q9s", "QTs", "QJs", "J7s", "J8s", "J9s", "JTs", "T7s", "T8s",
+                "T9s", "97s", "98s", "87s", "76s", "65s", "54s", "A2o", "A3o", "A4o", "A5o", "A6o",
+                "A7o", "A8o", "A9o", "ATo", "AJo", "AQo", "AKo", "K8o", "K9o", "KTo", "KJo", "KQo",
                 "Q9o", "QTo", "QJo", "J9o", "JTo", "T9o",
             ]),
             continue_vs_raise: hand_classes(&[
-                "55", "66", "77", "88", "99", "TT", "JJ", "QQ", "KK", "AA", "A8s", "A9s",
-                "ATs", "AJs", "AQs", "AKs", "KTs", "KJs", "KQs", "QJs", "JTs", "ATo",
-                "AJo", "AQo", "AKo", "KQo", "A5s", "A4s",
+                "55", "66", "77", "88", "99", "TT", "JJ", "QQ", "KK", "AA", "A8s", "A9s", "ATs",
+                "AJs", "AQs", "AKs", "KTs", "KJs", "KQs", "QJs", "JTs", "ATo", "AJo", "AQo", "AKo",
+                "KQo", "A5s", "A4s",
             ]),
             value_raise: hand_classes(&[
                 "TT", "JJ", "QQ", "KK", "AA", "AQs", "AKs", "AKo", "A5s", "A4s",
@@ -156,13 +155,11 @@ fn estimate_equity(game_state: &GameState, idx: usize) -> Option<f32> {
         .hands
         .iter()
         .enumerate()
-        .map(|(hand_idx, hand)| {
-            if hand_idx == idx {
-                *hand
-            } else {
-                default_hand
-            }
-        })
+        .map(
+            |(hand_idx, hand)| {
+                if hand_idx == idx { *hand } else { default_hand }
+            },
+        )
         .collect();
     let mut monte = MonteCarloGame::new(hands).ok()?;
     monte.estimate_equity(400).get(idx).copied()
@@ -204,11 +201,18 @@ fn hand_class(game_state: &GameState, idx: usize) -> Option<HandClass> {
     let second_rank = u8::from(second.value) + 2;
     let high = first_rank.max(second_rank);
     let low = first_rank.min(second_rank);
-    Some(HandClass::new(high, low, first.suit == second.suit && high != low))
+    Some(HandClass::new(
+        high,
+        low,
+        first.suit == second.suit && high != low,
+    ))
 }
 
 fn hand_classes(labels: &[&str]) -> HashSet<HandClass> {
-    labels.iter().map(|label| hand_class_from_label(label)).collect()
+    labels
+        .iter()
+        .map(|label| hand_class_from_label(label))
+        .collect()
 }
 
 fn hand_class_from_label(label: &str) -> HandClass {
