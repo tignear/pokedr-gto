@@ -101,6 +101,34 @@ pub struct HandResult {
     pub fold_value: Option<f64>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DefenseAction {
+    Fold,
+    Flat,
+    Jam,
+}
+
+impl DefenseAction {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Fold => "fold",
+            Self::Flat => "flat",
+            Self::Jam => "jam",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Open2bbDefenseResult {
+    pub hand: HandClass,
+    pub best_action: DefenseAction,
+    pub fold_value: f64,
+    pub flat_value: f64,
+    pub jam_value: f64,
+    pub flat_equity: f64,
+    pub jam_equity: f64,
+}
+
 pub fn analyze_short_stack(config: &ShortStackConfig) -> ShortStackReport {
     let stacks = normalized_stacks(config);
     let report_stack = stacks.first().copied().unwrap_or(config.stack);
@@ -152,6 +180,192 @@ pub fn analyze_short_stack(config: &ShortStackConfig) -> ShortStackReport {
         single_call_required_equity,
         overcall_required_equity,
         seats,
+    }
+}
+
+pub fn analyze_open_2bb_defense(
+    config: &ShortStackConfig,
+    opener_seat: usize,
+    defender_seat: usize,
+    opener_open_fraction: f64,
+    opener_call_fraction: f64,
+    defender_flat_realization: f64,
+) -> Vec<Open2bbDefenseResult> {
+    let stacks = normalized_stacks(config);
+    if opener_seat >= stacks.len() || defender_seat >= stacks.len() || opener_seat == defender_seat
+    {
+        return Vec::new();
+    }
+
+    let classes = all_hand_classes();
+    let opener_open_range =
+        top_fraction_by_heuristic(&classes, opener_open_fraction.clamp(0.0, 1.0));
+    let opener_call_range =
+        top_fraction_by_heuristic(&classes, opener_call_fraction.clamp(0.0, 1.0));
+    let sampled_open_range = sample_range(&opener_open_range, config.range_sample_limit);
+    let sampled_call_range = sample_range(&opener_call_range, config.range_sample_limit);
+
+    let posted_stacks = posted_stacks(config.level, &stacks);
+    let opener_posted = posted_amount(config.level, stacks.len() as u8, opener_seat as u8);
+    let defender_posted = posted_amount(config.level, stacks.len() as u8, defender_seat as u8);
+    let open_to = config.level.big_blind.saturating_mul(2);
+    let open_amount = open_to
+        .saturating_sub(opener_posted)
+        .min(posted_stacks[opener_seat]);
+    if open_amount == 0 {
+        return Vec::new();
+    }
+
+    let dead_pot = config.level.small_blind
+        + config.level.big_blind
+        + config
+            .level
+            .per_player_ante
+            .saturating_mul(stacks.len() as u32);
+    let mut opened_stacks = posted_stacks.clone();
+    opened_stacks[opener_seat] = opened_stacks[opener_seat].saturating_sub(open_amount);
+    let open_pot = dead_pot.saturating_add(open_amount);
+    let defender_flat_amount = open_to
+        .saturating_sub(defender_posted)
+        .min(posted_stacks[defender_seat]);
+    let mut flat_stacks = opened_stacks.clone();
+    flat_stacks[defender_seat] = flat_stacks[defender_seat].saturating_sub(defender_flat_amount);
+    let flat_pot = open_pot.saturating_add(defender_flat_amount);
+
+    let clock = BlindClock {
+        current_level: config.level.level,
+        elapsed_in_level_seconds: config.elapsed_in_level_seconds,
+    };
+    let fold_value = state_value(
+        clock,
+        config.hand_duration_seconds,
+        &award_pot_stacks(&opened_stacks, opener_seat, open_pot),
+        defender_seat,
+    );
+    let flat_current_value = state_value(
+        clock,
+        config.hand_duration_seconds,
+        &flat_stacks,
+        defender_seat,
+    );
+    let flat_win_value = showdown_state_value(
+        clock,
+        config.hand_duration_seconds,
+        &award_pot_stacks(&flat_stacks, defender_seat, flat_pot),
+        defender_seat,
+        &stacks,
+    );
+    let flat_lose_value = showdown_state_value(
+        clock,
+        config.hand_duration_seconds,
+        &award_pot_stacks(&flat_stacks, opener_seat, flat_pot),
+        defender_seat,
+        &stacks,
+    );
+    let jam_fold_value = state_value(
+        clock,
+        config.hand_duration_seconds,
+        &award_pot_stacks(&opened_stacks, defender_seat, open_pot),
+        defender_seat,
+    );
+    let jam_cost = opened_stacks[defender_seat].min(opened_stacks[opener_seat]);
+    let jam_win_value = showdown_state_value(
+        clock,
+        config.hand_duration_seconds,
+        &call_win_stacks(
+            &opened_stacks,
+            defender_seat,
+            opener_seat,
+            open_pot,
+            jam_cost,
+        ),
+        defender_seat,
+        &stacks,
+    );
+    let jam_lose_value = showdown_state_value(
+        clock,
+        config.hand_duration_seconds,
+        &call_lose_stacks(
+            &opened_stacks,
+            defender_seat,
+            opener_seat,
+            open_pot,
+            jam_cost,
+        ),
+        defender_seat,
+        &stacks,
+    );
+
+    let call_probability = opener_call_fraction.clamp(0.0, 1.0);
+    let realization = defender_flat_realization.clamp(0.0, 1.0);
+    let mut results: Vec<_> = classes
+        .par_iter()
+        .copied()
+        .map(|hand| {
+            let mut cache = EquityCache::new();
+            let flat_equity = if sampled_open_range.is_empty() {
+                0.0
+            } else {
+                heads_up_equity_vs_range_cached(
+                    hand,
+                    &sampled_open_range,
+                    config.max_boards_per_combo,
+                    &mut cache,
+                )
+                .share()
+            };
+            let jam_equity = if sampled_call_range.is_empty() {
+                0.0
+            } else {
+                heads_up_equity_vs_range_cached(
+                    hand,
+                    &sampled_call_range,
+                    config.max_boards_per_combo,
+                    &mut cache,
+                )
+                .share()
+            };
+            let flat_showdown_value =
+                flat_equity * flat_win_value + (1.0 - flat_equity) * flat_lose_value;
+            let flat_value =
+                (1.0 - realization) * flat_current_value + realization * flat_showdown_value;
+            let jam_call_value = jam_equity * jam_win_value + (1.0 - jam_equity) * jam_lose_value;
+            let jam_value =
+                (1.0 - call_probability) * jam_fold_value + call_probability * jam_call_value;
+            let best_action = if jam_value >= flat_value && jam_value >= fold_value {
+                DefenseAction::Jam
+            } else if flat_value >= fold_value {
+                DefenseAction::Flat
+            } else {
+                DefenseAction::Fold
+            };
+
+            Open2bbDefenseResult {
+                hand,
+                best_action,
+                fold_value,
+                flat_value,
+                jam_value,
+                flat_equity,
+                jam_equity,
+            }
+        })
+        .collect();
+
+    results.sort_by(|left, right| {
+        action_sort_key(right)
+            .total_cmp(&action_sort_key(left))
+            .then_with(|| right.jam_value.total_cmp(&left.jam_value))
+            .then_with(|| right.flat_value.total_cmp(&left.flat_value))
+    });
+    results
+}
+
+fn action_sort_key(result: &Open2bbDefenseResult) -> f64 {
+    match result.best_action {
+        DefenseAction::Jam => 3.0,
+        DefenseAction::Flat => 2.0,
+        DefenseAction::Fold => 1.0,
     }
 }
 

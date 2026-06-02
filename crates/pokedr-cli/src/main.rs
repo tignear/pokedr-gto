@@ -1,7 +1,9 @@
 use std::env;
 
 use pokedr_core::blinds::blind_level;
-use pokedr_core::short_stack::{ShortStackConfig, ShortStackReport, analyze_short_stack};
+use pokedr_core::short_stack::{
+    ShortStackConfig, ShortStackReport, analyze_open_2bb_defense, analyze_short_stack,
+};
 use pokedr_core::structure::STARTING_STACK;
 
 const DEFAULT_MAX_BOARDS_PER_COMBO: usize = 32;
@@ -15,28 +17,29 @@ const DEFAULT_FLAT_CALL_FRACTION: f64 = 0.25;
 fn main() {
     let args: Vec<String> = env::args().collect();
     let scan_open2bb = has_flag(&args, "--scan-open2bb");
+    let scan_defense2bb = has_flag(&args, "--scan-defense2bb");
     let level = parse_arg(&args, "--level").unwrap_or(DEFAULT_LEVEL);
     let stack = parse_arg(&args, "--stack").unwrap_or(STARTING_STACK);
     let alive_players = parse_arg(&args, "--alive").unwrap_or(6) as u8;
     let stacks = parse_stacks(&args).unwrap_or_else(|| vec![stack; alive_players as usize]);
     let players_behind =
         parse_arg(&args, "--behind").unwrap_or(alive_players.saturating_sub(1) as u32) as u8;
-    let default_boards = if scan_open2bb {
+    let default_boards = if scan_open2bb || scan_defense2bb {
         1
     } else {
         DEFAULT_MAX_BOARDS_PER_COMBO as u32
     };
-    let default_range_sample = if scan_open2bb {
+    let default_range_sample = if scan_open2bb || scan_defense2bb {
         1
     } else {
         DEFAULT_RANGE_SAMPLE_LIMIT as u32
     };
-    let default_iterations = if scan_open2bb {
+    let default_iterations = if scan_open2bb || scan_defense2bb {
         0
     } else {
         DEFAULT_MAX_ITERATIONS as u32
     };
-    let default_spot_iterations = if scan_open2bb {
+    let default_spot_iterations = if scan_open2bb || scan_defense2bb {
         0
     } else {
         DEFAULT_MAX_SPOT_ITERATIONS as u32
@@ -73,6 +76,28 @@ fn main() {
             elapsed_in_level_seconds,
             hand_duration_seconds,
             include_overcall,
+        );
+        return;
+    }
+
+    if scan_defense2bb {
+        print_defense2bb_scan(
+            &args,
+            level,
+            alive_players,
+            stack,
+            stacks.clone(),
+            players_behind,
+            max_boards_per_combo,
+            range_sample_limit,
+            iterations,
+            spot_iterations,
+            elapsed_in_level_seconds,
+            hand_duration_seconds,
+            include_overcall,
+            postflop_realization,
+            flat_call_fraction,
+            defender_jam_fraction_override,
         );
         return;
     }
@@ -270,6 +295,95 @@ fn jam_fraction_label(value: Option<f64>) -> String {
     value
         .map(|value| format!("{value:.3}"))
         .unwrap_or_else(|| "solver".to_string())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn print_defense2bb_scan(
+    args: &[String],
+    level: pokedr_core::blinds::BlindLevel,
+    alive_players: u8,
+    stack: u32,
+    stacks: Vec<u32>,
+    players_behind: u8,
+    max_boards_per_combo: usize,
+    range_sample_limit: usize,
+    iterations: usize,
+    spot_iterations: usize,
+    elapsed_in_level_seconds: u32,
+    hand_duration_seconds: u32,
+    include_overcall: bool,
+    postflop_realization: f64,
+    flat_call_fraction: f64,
+    defender_jam_fraction_override: Option<f64>,
+) {
+    let opener_seat = parse_arg(args, "--opener-seat").unwrap_or(0) as usize;
+    let defender_seat = parse_arg(args, "--defender-seat")
+        .unwrap_or(alive_players.saturating_sub(1) as u32) as usize;
+    let opener_open_fractions = parse_f64_list(args, "--opener-open-fractions", &[0.25, 0.5, 1.0]);
+    let opener_call_fractions =
+        parse_f64_list(args, "--opener-call-fractions", &[0.0, 0.05, 0.1, 0.2]);
+    let flat_realizations = parse_f64_list(args, "--defender-flat-realizations", &[0.2, 0.4, 0.6]);
+    let stacks = if stacks.is_empty() {
+        vec![stack; alive_players as usize]
+    } else {
+        stacks
+    };
+
+    println!(
+        "level,stack,opener_seat,defender_seat,opener_open_fraction,opener_call_fraction,defender_flat_realization,hand,best_action,fold_value,flat_value,jam_value,flat_ev,jam_ev,flat_equity,jam_equity"
+    );
+
+    for &opener_open_fraction in &opener_open_fractions {
+        for &opener_call_fraction in &opener_call_fractions {
+            for &defender_flat_realization in &flat_realizations {
+                let config = ShortStackConfig {
+                    level,
+                    alive_players: stacks.len() as u8,
+                    stack,
+                    stacks: stacks.clone(),
+                    players_behind,
+                    elapsed_in_level_seconds,
+                    hand_duration_seconds,
+                    max_boards_per_combo,
+                    range_sample_limit,
+                    iterations,
+                    spot_iterations,
+                    include_overcall,
+                    postflop_realization,
+                    flat_call_fraction,
+                    defender_jam_fraction_override,
+                };
+                for result in analyze_open_2bb_defense(
+                    &config,
+                    opener_seat,
+                    defender_seat,
+                    opener_open_fraction,
+                    opener_call_fraction,
+                    defender_flat_realization,
+                ) {
+                    println!(
+                        "{},{},{},{},{:.3},{:.3},{:.3},{},{},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6}",
+                        level.level,
+                        stacks.get(defender_seat).copied().unwrap_or(stack),
+                        opener_seat,
+                        defender_seat,
+                        opener_open_fraction,
+                        opener_call_fraction,
+                        defender_flat_realization,
+                        result.hand.label(),
+                        result.best_action.label(),
+                        result.fold_value,
+                        result.flat_value,
+                        result.jam_value,
+                        result.flat_value - result.fold_value,
+                        result.jam_value - result.fold_value,
+                        result.flat_equity,
+                        result.jam_equity
+                    );
+                }
+            }
+        }
+    }
 }
 
 fn weighted_combo_fraction(range: &[pokedr_core::short_stack::HandResult]) -> f64 {
