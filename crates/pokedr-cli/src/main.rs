@@ -149,6 +149,7 @@ fn main() {
             let pot = parse_f64_arg(&args, "--pot").unwrap_or(100.0);
             let bet = parse_f64_arg(&args, "--bet").unwrap_or(pot * 0.75);
             let raise = parse_f64_arg(&args, "--raise").unwrap_or(bet * 3.0);
+            let reraise = parse_f64_arg(&args, "--reraise").unwrap_or(raise * 2.0);
             print_postflop_solution(
                 &board,
                 oop_range,
@@ -158,6 +159,7 @@ fn main() {
                 pot,
                 bet,
                 raise,
+                reraise,
                 limit,
                 format,
             );
@@ -465,6 +467,7 @@ fn print_postflop_solution(
     pot: f64,
     bet: f64,
     raise: f64,
+    reraise: f64,
     limit: usize,
     format: &str,
 ) {
@@ -489,6 +492,7 @@ fn print_postflop_solution(
         pot,
         bet,
         raise,
+        reraise,
         iterations,
         max_runouts,
     });
@@ -520,6 +524,7 @@ fn print_postflop_solution_result(result: &PostflopCfrResult, limit: usize, form
             println!("  \"pot\": {:.6},", result.pot);
             println!("  \"bet\": {:.6},", result.bet);
             println!("  \"raise\": {:.6},", result.raise);
+            println!("  \"reraise\": {:.6},", result.reraise);
             println!("  \"board_cards\": {},", result.board_cards);
             println!("  \"oop_combo_count\": {},", result.oop_combo_count);
             println!("  \"ip_combo_count\": {},", result.ip_combo_count);
@@ -584,6 +589,7 @@ fn print_postflop_solution_result(result: &PostflopCfrResult, limit: usize, form
             println!("pot: {:.3}", result.pot);
             println!("bet: {:.3}", result.bet);
             println!("raise: {:.3}", result.raise);
+            println!("reraise: {:.3}", result.reraise);
             println!("board cards: {}", result.board_cards);
             println!("OOP combos: {}", result.oop_combo_count);
             println!("IP combos: {}", result.ip_combo_count);

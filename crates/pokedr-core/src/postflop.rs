@@ -29,6 +29,7 @@ pub struct PostflopCfrConfig {
     pub pot: f64,
     pub bet: f64,
     pub raise: f64,
+    pub reraise: f64,
     pub iterations: usize,
     pub max_runouts: usize,
 }
@@ -40,6 +41,7 @@ pub struct PostflopCfrResult {
     pub pot: f64,
     pub bet: f64,
     pub raise: f64,
+    pub reraise: f64,
     pub board_cards: usize,
     pub oop_combo_count: usize,
     pub ip_combo_count: usize,
@@ -242,6 +244,7 @@ pub fn solve_postflop_check_bet(config: PostflopCfrConfig) -> PostflopCfrResult 
             pot: config.pot,
             bet: config.bet,
             raise: config.raise,
+            reraise: config.reraise,
             board_cards: config.board.len(),
             oop_combo_count: config.oop_range.len(),
             ip_combo_count: config.ip_range.len(),
@@ -255,6 +258,7 @@ pub fn solve_postflop_check_bet(config: PostflopCfrConfig) -> PostflopCfrResult 
         ip_range: &config.ip_range,
         bet: config.bet,
         raise: config.raise,
+        reraise: config.reraise,
         max_runouts: config.max_runouts,
         nodes: HashMap::new(),
     };
@@ -285,6 +289,7 @@ pub fn solve_postflop_check_bet(config: PostflopCfrConfig) -> PostflopCfrResult 
         pot: config.pot,
         bet: config.bet,
         raise: config.raise,
+        reraise: config.reraise,
         board_cards: config.board.len(),
         oop_combo_count: config.oop_range.len(),
         ip_combo_count: config.ip_range.len(),
@@ -307,6 +312,7 @@ struct PostflopCfrTrainer<'a> {
     ip_range: &'a [PostflopCombo],
     bet: f64,
     raise: f64,
+    reraise: f64,
     max_runouts: usize,
     nodes: HashMap<String, PostflopCfrNode>,
 }
@@ -407,13 +413,12 @@ impl PostflopCfrTrainer<'_> {
                     }
                 }
                 PostflopHistory::OopFacingReraise => {
-                    let reraise = self.raise * 2.0;
                     if action == 0 {
                         -(pot * 0.5 + self.raise)
                     } else {
                         self.advance_or_showdown(
                             board,
-                            pot + reraise * 2.0,
+                            pot + self.reraise * 2.0,
                             oop_index,
                             ip_index,
                             next_reach,
@@ -886,7 +891,7 @@ fn postflop_limitations() -> Vec<&'static str> {
     vec![
         "chipEV only; no ICM or tournament utility",
         "single bet size only",
-        "one raise and one reraise are available after IP bets; no deeper raise chain yet",
+        "one raise and one reraise size are available after IP bets; no deeper raise chain yet",
         "no OOP donk bets, probes, overbets, or all-in sizing",
         "heads-up only",
         "chance nodes are sampled by --runouts, not fully enumerated when capped",
@@ -1236,6 +1241,7 @@ mod tests {
             pot: 100.0,
             bet: 75.0,
             raise: 225.0,
+            reraise: 600.0,
             iterations: 1_000,
             max_runouts: 8,
         });
