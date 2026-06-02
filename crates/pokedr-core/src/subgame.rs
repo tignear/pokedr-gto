@@ -4,6 +4,7 @@ use crate::cards::{Card, deck};
 use crate::hand_class::HandClass;
 use crate::hand_eval::evaluate_seven;
 use crate::postflop::PostflopCombo;
+use crate::river::Combo;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Street {
@@ -32,6 +33,7 @@ pub struct RangeState {
 #[derive(Debug, Clone, Copy)]
 pub struct RangeEntry {
     pub class: HandClass,
+    pub combo: Option<Combo>,
     pub weight: f64,
 }
 
@@ -49,12 +51,23 @@ impl RangeState {
             ip: weighted_range(ip),
         }
     }
+
+    pub fn weighted_combos(oop: Vec<(Combo, f64)>, ip: Vec<(Combo, f64)>) -> Self {
+        Self {
+            oop: weighted_combo_range(oop),
+            ip: weighted_combo_range(ip),
+        }
+    }
 }
 
 fn uniform_range(classes: Vec<HandClass>) -> Vec<RangeEntry> {
     classes
         .into_iter()
-        .map(|class| RangeEntry { class, weight: 1.0 })
+        .map(|class| RangeEntry {
+            class,
+            combo: None,
+            weight: 1.0,
+        })
         .collect()
 }
 
@@ -63,12 +76,43 @@ fn weighted_range(entries: Vec<(HandClass, f64)>) -> Vec<RangeEntry> {
         .into_iter()
         .filter_map(|(class, weight)| {
             if weight.is_finite() && weight > 0.0 {
-                Some(RangeEntry { class, weight })
+                Some(RangeEntry {
+                    class,
+                    combo: None,
+                    weight,
+                })
             } else {
                 None
             }
         })
         .collect()
+}
+
+fn weighted_combo_range(entries: Vec<(Combo, f64)>) -> Vec<RangeEntry> {
+    entries
+        .into_iter()
+        .filter_map(|(combo, weight)| {
+            if weight.is_finite() && weight > 0.0 {
+                Some(RangeEntry {
+                    class: combo_class(combo),
+                    combo: Some(combo),
+                    weight,
+                })
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn combo_class(combo: Combo) -> HandClass {
+    let first_rank = combo.first.rank();
+    let second_rank = combo.second.rank();
+    HandClass::new(
+        first_rank.max(second_rank),
+        first_rank.min(second_rank),
+        combo.first.suit() == combo.second.suit() && first_rank != second_rank,
+    )
 }
 
 fn weighted_postflop_combos(entries: &[RangeEntry], board: &[Card]) -> Vec<WeightedPostflopCombo> {
@@ -80,26 +124,51 @@ fn weighted_postflop_combos(entries: &[RangeEntry], board: &[Card]) -> Vec<Weigh
         if !(entry.weight.is_finite() && entry.weight > 0.0) {
             continue;
         }
-        for [first, second] in entry.class.combos() {
-            let Some(combo) = crate::river::Combo::new(first, second) else {
-                continue;
-            };
-            let mask = combo.mask();
-            if mask & board_mask != 0 || !seen.insert(mask) {
-                continue;
-            }
-            combos.push(WeightedPostflopCombo {
-                combo: PostflopCombo {
+        if let Some(combo) = entry.combo {
+            push_weighted_combo(
+                &mut combos,
+                &mut seen,
+                board_mask,
+                combo,
+                entry.class,
+                entry.weight,
+            );
+        } else {
+            for [first, second] in entry.class.combos() {
+                let Some(combo) = Combo::new(first, second) else {
+                    continue;
+                };
+                push_weighted_combo(
+                    &mut combos,
+                    &mut seen,
+                    board_mask,
                     combo,
-                    class: entry.class,
-                    mask,
-                },
-                weight: entry.weight,
-            });
+                    entry.class,
+                    entry.weight,
+                );
+            }
         }
     }
 
     combos
+}
+
+fn push_weighted_combo(
+    combos: &mut Vec<WeightedPostflopCombo>,
+    seen: &mut HashSet<u64>,
+    board_mask: u64,
+    combo: Combo,
+    class: HandClass,
+    weight: f64,
+) {
+    let mask = combo.mask();
+    if mask & board_mask != 0 || !seen.insert(mask) {
+        return;
+    }
+    combos.push(WeightedPostflopCombo {
+        combo: PostflopCombo { combo, class, mask },
+        weight,
+    });
 }
 
 #[derive(Debug, Clone, Copy)]
