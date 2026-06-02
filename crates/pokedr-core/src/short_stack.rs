@@ -318,6 +318,22 @@ fn analyze_call_spots(
             config.range_sample_limit,
             cache,
         );
+        let range = profitable_tree_call_range(
+            classes,
+            &solution
+                .shove_range
+                .iter()
+                .map(|result| result.hand)
+                .collect::<Vec<_>>(),
+            config,
+            stacks,
+            dead_pot,
+            caller_seat,
+            opener_seat,
+            effective_cost,
+            range,
+            cache,
+        );
 
         spots.push(CallSpot {
             opener_seat: opener_seat as u8,
@@ -330,6 +346,178 @@ fn analyze_call_spots(
     }
 
     spots
+}
+
+fn profitable_tree_call_range(
+    classes: &[HandClass],
+    opener_range: &[HandClass],
+    config: &ShortStackConfig,
+    stacks: &[u32],
+    dead_pot: u32,
+    caller_seat: usize,
+    opener_seat: usize,
+    effective_cost: u32,
+    heads_up_range: Vec<HandResult>,
+    cache: &mut EquityCache,
+) -> Vec<HandResult> {
+    let downstream = downstream_overcall_model(classes, stacks, caller_seat, opener_seat);
+    if downstream.probability == 0.0 || downstream.range.is_empty() {
+        return heads_up_range;
+    }
+
+    let posted = posted_stacks(config.level, stacks);
+    let clock = BlindClock {
+        current_level: config.level.level,
+        elapsed_in_level_seconds: config.elapsed_in_level_seconds,
+    };
+    let hand_duration_seconds = config.hand_duration_seconds;
+    let fold_value = state_value(
+        clock,
+        hand_duration_seconds,
+        &steal_stacks(&posted, opener_seat, dead_pot),
+        caller_seat,
+    );
+    let heads_up_win_value = state_value(
+        clock,
+        hand_duration_seconds,
+        &showdown_stacks(
+            &posted,
+            caller_seat,
+            &[opener_seat, caller_seat],
+            &[(opener_seat, effective_cost), (caller_seat, effective_cost)],
+            dead_pot,
+        ),
+        caller_seat,
+    );
+    let heads_up_lose_value = state_value(
+        clock,
+        hand_duration_seconds,
+        &showdown_stacks(
+            &posted,
+            opener_seat,
+            &[opener_seat, caller_seat],
+            &[(opener_seat, effective_cost), (caller_seat, effective_cost)],
+            dead_pot,
+        ),
+        caller_seat,
+    );
+    let overcaller_cost = downstream.effective_cost.min(effective_cost);
+    let multiway_win_value = state_value(
+        clock,
+        hand_duration_seconds,
+        &showdown_stacks(
+            &posted,
+            caller_seat,
+            &[opener_seat, caller_seat, downstream.seat],
+            &[
+                (opener_seat, effective_cost),
+                (caller_seat, effective_cost),
+                (downstream.seat, overcaller_cost),
+            ],
+            dead_pot,
+        ),
+        caller_seat,
+    );
+    let multiway_lose_value = state_value(
+        clock,
+        hand_duration_seconds,
+        &showdown_stacks(
+            &posted,
+            opener_seat,
+            &[opener_seat, caller_seat, downstream.seat],
+            &[
+                (opener_seat, effective_cost),
+                (caller_seat, effective_cost),
+                (downstream.seat, overcaller_cost),
+            ],
+            dead_pot,
+        ),
+        caller_seat,
+    );
+    let sampled_opener_range = sample_range(opener_range, config.range_sample_limit);
+    let tree_sample_limit = config.range_sample_limit.min(4);
+    let sampled_opener_range = sample_range(&sampled_opener_range, tree_sample_limit);
+    let sampled_overcall_range = sample_range(&downstream.range, tree_sample_limit);
+    let no_overcall_probability = 1.0 - downstream.probability;
+    let mut results = Vec::new();
+
+    for hand in heads_up_range.into_iter().map(|result| result.hand) {
+        let heads_up_equity = heads_up_equity_vs_range_cached(
+            hand,
+            &sampled_opener_range,
+            config.max_boards_per_combo,
+            cache,
+        )
+        .share();
+        let multiway_equity = three_way_equity_vs_ranges_cached(
+            hand,
+            &sampled_opener_range,
+            &sampled_overcall_range,
+            config.max_boards_per_combo,
+            cache,
+        )
+        .share();
+        let call_value = no_overcall_probability
+            * (heads_up_equity * heads_up_win_value
+                + (1.0 - heads_up_equity) * heads_up_lose_value)
+            + downstream.probability
+                * (multiway_equity * multiway_win_value
+                    + (1.0 - multiway_equity) * multiway_lose_value);
+        let ev = call_value - fold_value;
+
+        if ev >= 0.0 {
+            results.push(HandResult {
+                hand,
+                equity: no_overcall_probability * heads_up_equity
+                    + downstream.probability * multiway_equity,
+                ev,
+            });
+        }
+    }
+
+    results.sort_by(|left, right| {
+        right
+            .ev
+            .total_cmp(&left.ev)
+            .then_with(|| right.equity.total_cmp(&left.equity))
+    });
+    results
+}
+
+struct DownstreamOvercallModel {
+    probability: f64,
+    seat: usize,
+    effective_cost: u32,
+    range: Vec<HandClass>,
+}
+
+fn downstream_overcall_model(
+    classes: &[HandClass],
+    stacks: &[u32],
+    caller_seat: usize,
+    opener_seat: usize,
+) -> DownstreamOvercallModel {
+    let range = top_fraction_by_heuristic(classes, 0.2);
+    let range_probability = combo_fraction(&range);
+    let mut no_overcall_probability = 1.0;
+    let mut model_seat = caller_seat;
+    let mut model_cost = 0;
+
+    for seat in (caller_seat + 1)..stacks.len() {
+        no_overcall_probability *= 1.0 - range_probability;
+        let cost = stacks[seat].min(stacks[opener_seat]);
+        if cost > model_cost {
+            model_cost = cost;
+            model_seat = seat;
+        }
+    }
+
+    DownstreamOvercallModel {
+        probability: 1.0 - no_overcall_probability,
+        seat: model_seat,
+        effective_cost: model_cost,
+        range,
+    }
 }
 
 fn first_response_required_equity(
@@ -794,6 +982,39 @@ fn state_value(
 fn steal_stacks(stacks: &[u32], hero_seat: usize, dead_pot: u32) -> Vec<u32> {
     let mut next = stacks.to_vec();
     next[hero_seat] = next[hero_seat].saturating_add(dead_pot);
+    next
+}
+
+fn showdown_stacks(
+    stacks: &[u32],
+    winner_seat: usize,
+    participants: &[usize],
+    commitments: &[(usize, u32)],
+    dead_pot: u32,
+) -> Vec<u32> {
+    let mut next = stacks.to_vec();
+    let mut prize = dead_pot;
+
+    for &(seat, amount) in commitments {
+        if seat == winner_seat {
+            continue;
+        }
+        prize = prize.saturating_add(amount);
+    }
+
+    for &seat in participants {
+        if seat == winner_seat {
+            continue;
+        }
+        if let Some((_, amount)) = commitments
+            .iter()
+            .find(|(committed_seat, _)| *committed_seat == seat)
+        {
+            next[seat] = next[seat].saturating_sub(*amount);
+        }
+    }
+
+    next[winner_seat] = next[winner_seat].saturating_add(prize);
     next
 }
 
