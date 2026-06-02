@@ -315,7 +315,19 @@ fn print_json_response_node(
             .collect::<Vec<_>>()
             .join(",")
     );
-    print_json_range("range", &node.range, false, indent + 2);
+    print_json_range("range", &node.range, true, indent + 2);
+    print_json_response_node(
+        "next_response",
+        node.next_response.as_deref(),
+        true,
+        indent + 2,
+    );
+    print_json_response_node(
+        "fold_response",
+        node.fold_response.as_deref(),
+        false,
+        indent + 2,
+    );
     println!("{pad}}}{}", if trailing_comma { "," } else { "" });
 }
 

@@ -77,6 +77,8 @@ pub struct ResponseNode {
     pub actor_seat: u8,
     pub prior_callers: Vec<u8>,
     pub range: Vec<HandResult>,
+    pub next_response: Option<Box<ResponseNode>>,
+    pub fold_response: Option<Box<ResponseNode>>,
 }
 
 #[derive(Debug, Clone)]
@@ -500,20 +502,48 @@ fn next_response_node(
     opener_seat: usize,
     caller_seat: usize,
 ) -> Option<ResponseNode> {
-    let actor_seat = caller_seat + 1;
-    if actor_seat >= stacks.len() || caller_range.is_empty() || opener_range.is_empty() {
+    if caller_range.is_empty() || opener_range.is_empty() {
         return None;
     }
 
-    let prior_callers = vec![caller_seat];
-    let prior_ranges = vec![sample_range(caller_range, config.range_sample_limit.min(4))];
     let sampled_opener_range = sample_range(
         &sample_range(opener_range, config.range_sample_limit),
         config.range_sample_limit.min(4),
     );
-    let range = response_node_range(
+    response_node_from_prior(
         classes,
         &sampled_opener_range,
+        vec![sample_range(caller_range, config.range_sample_limit.min(4))],
+        config,
+        stacks,
+        dead_pot,
+        opener_seat,
+        caller_seat + 1,
+        vec![caller_seat],
+    )
+}
+
+fn response_node_from_prior(
+    classes: &[HandClass],
+    sampled_opener_range: &[HandClass],
+    prior_ranges: Vec<Vec<HandClass>>,
+    config: &ShortStackConfig,
+    stacks: &[u32],
+    dead_pot: u32,
+    opener_seat: usize,
+    actor_seat: usize,
+    prior_callers: Vec<usize>,
+) -> Option<ResponseNode> {
+    if actor_seat >= stacks.len()
+        || sampled_opener_range.is_empty()
+        || prior_ranges.iter().any(|range| range.is_empty())
+    {
+        return None;
+    }
+
+    let range = response_node_range(
+        classes,
+        sampled_opener_range,
         &prior_ranges,
         config,
         stacks,
@@ -522,11 +552,48 @@ fn next_response_node(
         opener_seat,
         &prior_callers,
     );
+    let next_response = if range.is_empty() {
+        None
+    } else {
+        let mut next_prior_callers = prior_callers.clone();
+        next_prior_callers.push(actor_seat);
+        let mut next_prior_ranges = prior_ranges.clone();
+        next_prior_ranges.push(sample_range(
+            &range.iter().map(|result| result.hand).collect::<Vec<_>>(),
+            config.range_sample_limit.min(4),
+        ));
+        response_node_from_prior(
+            classes,
+            sampled_opener_range,
+            next_prior_ranges,
+            config,
+            stacks,
+            dead_pot,
+            opener_seat,
+            actor_seat + 1,
+            next_prior_callers,
+        )
+        .map(Box::new)
+    };
+    let fold_response = response_node_from_prior(
+        classes,
+        sampled_opener_range,
+        prior_ranges,
+        config,
+        stacks,
+        dead_pot,
+        opener_seat,
+        actor_seat + 1,
+        prior_callers.clone(),
+    )
+    .map(Box::new);
 
     Some(ResponseNode {
         actor_seat: actor_seat as u8,
         prior_callers: prior_callers.into_iter().map(|seat| seat as u8).collect(),
         range,
+        next_response,
+        fold_response,
     })
 }
 

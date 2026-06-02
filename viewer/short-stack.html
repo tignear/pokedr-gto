@@ -92,6 +92,11 @@
       font-size: 13px;
       font-weight: 700;
     }
+    summary .muted {
+      font-weight: 500;
+      opacity: .72;
+      margin-left: 8px;
+    }
     .branch-grid {
       display: grid;
       grid-template-columns: repeat(auto-fit, minmax(310px, 1fr));
@@ -106,6 +111,11 @@
     .branch h4 {
       font-size: 13px;
       margin: 0 0 8px;
+    }
+    .node-body {
+      margin-top: 10px;
+      display: grid;
+      gap: 10px;
     }
     .matrix {
       display: grid;
@@ -218,17 +228,19 @@
     function renderRoot(root, alivePlayers) {
       const opener = root.opener;
       return `
-        <article class="root">
-          <h2>Root: Seat ${opener.seat_index} open AI</h2>
-          <div class="summary">
-            <div class="metric"><b>Posted</b>${opener.posted_amount}</div>
-            <div class="metric"><b>Behind</b>${opener.players_behind}</div>
-            <div class="metric"><b>Open Range</b>${rangeSummary(opener.ranges.first_in_all_in)}</div>
-            <div class="metric"><b>Response Nodes</b>${root.decisions.length}</div>
+        <details class="root">
+          <summary>Root: Seat ${opener.seat_index} open AI <span class="muted">${rangeSummary(opener.ranges.first_in_all_in)} / ${root.decisions.length} response nodes</span></summary>
+          <div class="node-body">
+            <div class="summary">
+              <div class="metric"><b>Posted</b>${opener.posted_amount}</div>
+              <div class="metric"><b>Behind</b>${opener.players_behind}</div>
+              <div class="metric"><b>Open Range</b>${rangeSummary(opener.ranges.first_in_all_in)}</div>
+              <div class="metric"><b>Response Nodes</b>${root.decisions.length}</div>
+            </div>
+            ${renderRangeBlock('open AI range', opener.ranges.first_in_all_in)}
+            ${root.decisions.map(decision => renderDecision(opener, decision, alivePlayers)).join('')}
           </div>
-          ${renderRangeBlock('open AI range', opener.ranges.first_in_all_in)}
-          ${root.decisions.map(decision => renderDecision(opener, decision, alivePlayers)).join('')}
-        </article>
+        </details>
       `;
     }
 
@@ -237,50 +249,66 @@
       const caller = decision.caller;
       const patterns = spot.patterns || [];
       return `
-        <section class="decision">
-          <h3>Node: Seat ${caller.seat_index} responds to Seat ${opener.seat_index} open AI</h3>
-          <div class="summary">
-            <div class="metric"><b>Effective</b>${spot.effective_all_in_cost}</div>
-            <div class="metric"><b>Required</b>${pct(spot.required_equity)}</div>
-            <div class="metric"><b>Call Range</b>${rangeSummary(spot.range)}</div>
-            <div class="metric"><b>Branches</b>${patterns.length}</div>
-          </div>
-          ${renderRangeBlock(`Seat ${caller.seat_index} call range at this node`, spot.range)}
-          ${spot.next_response ? renderResponseNode(opener, caller, spot.next_response, alivePlayers) : ''}
-          <details open>
-            <summary>Outcome branches after Seat ${caller.seat_index} calls</summary>
-            <div class="branch-grid">
-              ${patterns.map(pattern => renderBranch(opener, caller, pattern, alivePlayers)).join('')}
+        <details class="decision">
+          <summary>Seat ${caller.seat_index} responds to Seat ${opener.seat_index} open AI <span class="muted">${rangeSummary(spot.range)}</span></summary>
+          <div class="node-body">
+            <div class="summary">
+              <div class="metric"><b>Effective</b>${spot.effective_all_in_cost}</div>
+              <div class="metric"><b>Required</b>${pct(spot.required_equity)}</div>
+              <div class="metric"><b>Call Range</b>${rangeSummary(spot.range)}</div>
+              <div class="metric"><b>Branches</b>${patterns.length}</div>
             </div>
-          </details>
-        </section>
-      `;
-    }
-
-    function renderResponseNode(opener, caller, node, alivePlayers) {
-      const prior = node.prior_callers.length ? node.prior_callers.map(seat => `Seat ${seat}`).join(', ') : 'none';
-      const path = responsePath(opener.seat_index, caller.seat_index, node.actor_seat);
-      return `
-        <section class="decision">
-          <h3>Next Node: Seat ${node.actor_seat} responds after Seat ${opener.seat_index} and ${prior} are AI</h3>
-          <div class="summary">
-            <div class="metric"><b>Path</b>${escapeHtml(path)}</div>
-            <div class="metric"><b>Prior Callers</b>${escapeHtml(prior)}</div>
-            <div class="metric"><b>Call Range</b>${rangeSummary(node.range)}</div>
+            ${renderRangeBlock(`Seat ${caller.seat_index} call range at this node`, spot.range)}
+            ${spot.next_response ? renderResponseNode(opener, spot.next_response, alivePlayers) : ''}
+            <details>
+              <summary>Outcome branches after Seat ${caller.seat_index} calls</summary>
+              <div class="branch-grid">
+                ${patterns.map(pattern => renderBranch(opener, caller, pattern, alivePlayers)).join('')}
+              </div>
+            </details>
           </div>
-          ${renderRangeBlock(`Seat ${node.actor_seat} overcall range`, node.range)}
-        </section>
+        </details>
       `;
     }
 
-    function responsePath(openerSeat, callerSeat, actorSeat) {
-      const actions = [`Seat ${openerSeat}: AI`];
-      for (let seat = openerSeat + 1; seat < callerSeat; seat++) {
-        actions.push(`Seat ${seat}: fold`);
+    function renderResponseNode(opener, node, alivePlayers) {
+      const prior = node.prior_callers.length ? node.prior_callers.map(seat => `Seat ${seat}`).join(', ') : 'none';
+      const path = responsePath(opener.seat_index, node.prior_callers, node.actor_seat);
+      return `
+        <details class="decision">
+          <summary>Seat ${node.actor_seat} overcall decision <span class="muted">${rangeSummary(node.range)}</span></summary>
+          <div class="node-body">
+            <div class="summary">
+              <div class="metric"><b>Path</b>${escapeHtml(path)}</div>
+              <div class="metric"><b>Prior Callers</b>${escapeHtml(prior)}</div>
+              <div class="metric"><b>Call Range</b>${rangeSummary(node.range)}</div>
+            </div>
+            ${renderRangeBlock(`Seat ${node.actor_seat} overcall range`, node.range)}
+            ${renderChildResponse('After call', opener, node.next_response, alivePlayers)}
+            ${renderChildResponse('After fold', opener, node.fold_response, alivePlayers)}
+          </div>
+        </details>
+      `;
+    }
+
+    function renderChildResponse(label, opener, node, alivePlayers) {
+      if (!node) {
+        return '';
       }
-      actions.push(`Seat ${callerSeat}: call AI`);
-      for (let seat = callerSeat + 1; seat < actorSeat; seat++) {
-        actions.push(`Seat ${seat}: fold`);
+      return `
+        <details>
+          <summary>${label}: Seat ${node.actor_seat} decision <span class="muted">${rangeSummary(node.range)}</span></summary>
+          <div class="node-body">
+            ${renderResponseNode(opener, node, alivePlayers)}
+          </div>
+        </details>
+      `;
+    }
+
+    function responsePath(openerSeat, priorCallers, actorSeat) {
+      const actions = [`Seat ${openerSeat}: AI`];
+      for (let seat = openerSeat + 1; seat < actorSeat; seat++) {
+        actions.push(`Seat ${seat}: ${priorCallers.includes(seat) ? 'call AI' : 'fold'}`);
       }
       actions.push(`Seat ${actorSeat}: decision`);
       return actions.join(' -> ');
