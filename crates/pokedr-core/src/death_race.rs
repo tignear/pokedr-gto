@@ -20,7 +20,7 @@ pub fn death_race_value(state: &DeathRaceState, hero_seat: usize) -> f64 {
     let mut alive = alive_count(&stacks);
 
     if stacks[hero_seat] == 0 {
-        return rank_points(alive.max(1) as u8).unwrap_or(0) as f64;
+        return rank_points(alive.saturating_add(1).max(1) as u8).unwrap_or(0) as f64;
     }
 
     while alive > 1 {
@@ -98,6 +98,21 @@ mod tests {
                 elapsed_in_level_seconds: 0,
             },
             stacks: vec![1, 40_000, 40_000, 40_000, 40_000, 40_000],
+            next_small_blind_seat: 4,
+            hand_duration_seconds: 20,
+        };
+
+        assert_eq!(death_race_value(&state, 0), -35.0);
+    }
+
+    #[test]
+    fn already_dead_hero_gets_rank_after_living_players() {
+        let state = DeathRaceState {
+            clock: BlindClock {
+                current_level: 11,
+                elapsed_in_level_seconds: 0,
+            },
+            stacks: vec![0, 40_000, 40_000, 40_000, 40_000, 40_000],
             next_small_blind_seat: 4,
             hand_duration_seconds: 20,
         };
