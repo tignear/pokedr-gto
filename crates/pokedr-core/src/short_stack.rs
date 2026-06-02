@@ -377,7 +377,7 @@ fn call_required_equity_for(
     let fold_value = state_value(
         clock,
         config.hand_duration_seconds,
-        posted_stacks,
+        &steal_stacks(posted_stacks, opener_seat, dead_pot),
         caller_seat,
     );
     let win_value = state_value(
