@@ -209,24 +209,43 @@ fn cfr_postflop_action(
     let board = pokedr_board(game_state)?;
     let to_call = amount_to_call(game_state, idx);
     let stack = game_state.stacks[idx];
-    let opponent_idx = heads_up_opponent(game_state, idx)?;
+    let (oop_idx, ip_idx) = heads_up_postflop_positions(game_state)?;
+    let root_player = if idx == oop_idx {
+        Player::Oop
+    } else if idx == ip_idx {
+        Player::Ip
+    } else {
+        return None;
+    };
     let hero_mask = pokedr_hand_mask(game_state, idx)?;
 
-    let hero_range = mc_range_prior(game_state, idx, range_classes, Some(hero_class), 0);
-    let opponent_range = mc_range_prior(game_state, opponent_idx, range_classes, None, hero_mask);
-    if hero_range.is_empty() || opponent_range.is_empty() {
+    let oop_range = mc_range_prior(
+        game_state,
+        oop_idx,
+        range_classes,
+        (idx == oop_idx).then_some(hero_class),
+        if idx == oop_idx { 0 } else { hero_mask },
+    );
+    let ip_range = mc_range_prior(
+        game_state,
+        ip_idx,
+        range_classes,
+        (idx == ip_idx).then_some(hero_class),
+        if idx == ip_idx { 0 } else { hero_mask },
+    );
+    if oop_range.is_empty() || ip_range.is_empty() {
         return None;
     }
 
     let pot = PotState {
         pot: game_state.total_pot as f64,
         stacks: [
-            game_state.stacks[idx] as f64,
-            game_state.stacks[opponent_idx] as f64,
+            game_state.stacks[oop_idx] as f64,
+            game_state.stacks[ip_idx] as f64,
         ],
         committed: [
-            game_state.round_data.player_bet[idx] as f64,
-            game_state.round_data.player_bet[opponent_idx] as f64,
+            game_state.round_data.player_bet[oop_idx] as f64,
+            game_state.round_data.player_bet[ip_idx] as f64,
         ],
         current_bet: game_state.round_data.bet as f64,
         min_raise: game_state.round_data.min_raise as f64,
@@ -234,21 +253,23 @@ fn cfr_postflop_action(
     let spec = SubgameSpec::postflop(
         board.clone(),
         pot,
-        RangeState::new(hero_range, opponent_range),
+        RangeState::new(oop_range, ip_range),
         cfr_action_abstraction(game_state),
         ChancePolicy::Sample(runouts.max(1)),
     )
-    .ok()?;
+    .ok()?
+    .with_root_player(root_player);
     let result = spec
         .solve_cfr_with_request(SubgameSolveRequest {
             iterations,
-            focused_oop_combo_mask: Some(hero_mask),
+            focused_oop_combo_mask: (root_player == Player::Oop).then_some(hero_mask),
+            focused_ip_combo_mask: (root_player == Player::Ip).then_some(hero_mask),
             focused_sampling_rate: 0.5,
         })
         .ok()?;
     let root = result.strategies.iter().find(|strategy| {
         strategy.node == result.root
-            && strategy.player == Player::Oop
+            && strategy.player == root_player
             && strategy.combo.mask == hero_mask
     })?;
     let best = root
@@ -399,6 +420,19 @@ fn heads_up_opponent(game_state: &GameState, idx: usize) -> Option<usize> {
     (0..game_state.num_players).find(|&other| {
         other != idx && (game_state.player_active.get(other) || game_state.player_all_in.get(other))
     })
+}
+
+fn heads_up_postflop_positions(game_state: &GameState) -> Option<(usize, usize)> {
+    if game_state.num_players != 2 {
+        return None;
+    }
+    let ip_idx = game_state.dealer_idx;
+    let oop_idx = (0..game_state.num_players).find(|&idx| idx != ip_idx)?;
+    if game_state.player_active.get(ip_idx) || game_state.player_all_in.get(ip_idx) {
+        Some((oop_idx, ip_idx))
+    } else {
+        None
+    }
 }
 
 fn pokedr_hand_mask(game_state: &GameState, idx: usize) -> Option<u64> {

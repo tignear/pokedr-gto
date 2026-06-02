@@ -104,6 +104,7 @@ impl ChancePolicy {
 pub struct SubgameSpec {
     pub board: Vec<Card>,
     pub street: Street,
+    pub root_player: Player,
     pub pot: PotState,
     pub ranges: RangeState,
     pub actions: ActionAbstraction,
@@ -122,6 +123,7 @@ impl SubgameSpec {
         let spec = Self {
             board,
             street,
+            root_player: Player::Oop,
             pot,
             ranges,
             actions,
@@ -171,17 +173,23 @@ impl SubgameSpec {
             spec: self,
             nodes: Vec::new(),
         };
-        let root = builder.build_decision(Player::Oop, self.pot, 0, Vec::new())?;
+        let root = builder.build_decision(self.root_player, self.pot, 0, Vec::new())?;
         Ok(ActionTree {
             root,
             nodes: builder.nodes,
         })
     }
 
+    pub fn with_root_player(mut self, root_player: Player) -> Self {
+        self.root_player = root_player;
+        self
+    }
+
     pub fn solve_cfr(&self, iterations: usize) -> Result<SubgameCfrResult, SubgameBuildError> {
         self.solve_cfr_with_request(SubgameSolveRequest {
             iterations,
             focused_oop_combo_mask: None,
+            focused_ip_combo_mask: None,
             focused_sampling_rate: 0.0,
         })
     }
@@ -203,7 +211,16 @@ impl SubgameSpec {
         }
         let focused_deals = request
             .focused_oop_combo_mask
-            .map(|mask| focused_oop_deals(&oop_range, &deals, mask))
+            .or(request.focused_ip_combo_mask)
+            .map(|_| {
+                focused_deals(
+                    &oop_range,
+                    &ip_range,
+                    &deals,
+                    request.focused_oop_combo_mask,
+                    request.focused_ip_combo_mask,
+                )
+            })
             .unwrap_or_default();
 
         let mut trainer = SubgameCfrTrainer {
@@ -245,6 +262,7 @@ impl SubgameSpec {
 pub struct SubgameSolveRequest {
     pub iterations: usize,
     pub focused_oop_combo_mask: Option<u64>,
+    pub focused_ip_combo_mask: Option<u64>,
     pub focused_sampling_rate: f64,
 }
 
@@ -851,15 +869,24 @@ fn legal_deals(oop_range: &[PostflopCombo], ip_range: &[PostflopCombo]) -> Vec<(
     deals
 }
 
-fn focused_oop_deals(
+fn focused_deals(
     oop_range: &[PostflopCombo],
+    ip_range: &[PostflopCombo],
     deals: &[(usize, usize)],
-    focused_mask: u64,
+    focused_oop_mask: Option<u64>,
+    focused_ip_mask: Option<u64>,
 ) -> Vec<(usize, usize)> {
     deals
         .iter()
         .copied()
-        .filter(|(oop_index, _)| oop_range[*oop_index].mask == focused_mask)
+        .filter(|(oop_index, ip_index)| {
+            focused_oop_mask
+                .map(|mask| oop_range[*oop_index].mask == mask)
+                .unwrap_or(true)
+                && focused_ip_mask
+                    .map(|mask| ip_range[*ip_index].mask == mask)
+                    .unwrap_or(true)
+        })
         .collect()
 }
 
@@ -986,7 +1013,7 @@ fn player_key(player: Player) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::postflop::parse_range;
+    use crate::postflop::{parse_range, postflop_combos};
 
     fn c(rank: u8, suit: u8) -> Card {
         Card::new(rank, suit)
@@ -997,6 +1024,7 @@ mod tests {
         let spec = SubgameSpec {
             board: vec![c(14, 0), c(14, 0), c(2, 1)],
             street: Street::Flop,
+            root_player: Player::Oop,
             pot: PotState::new(100.0, [1_000.0, 1_000.0]),
             ranges: RangeState::new(parse_range("AA").unwrap(), parse_range("KK").unwrap()),
             actions: ActionAbstraction::default(),
@@ -1058,6 +1086,29 @@ mod tests {
     }
 
     #[test]
+    fn action_tree_uses_configured_root_player() {
+        let spec = SubgameSpec::postflop(
+            vec![c(14, 0), c(13, 1), c(2, 2)],
+            PotState::new(100.0, [1_000.0, 1_000.0]),
+            RangeState::new(
+                parse_range("AA,AKs").unwrap(),
+                parse_range("QQ,AQs").unwrap(),
+            ),
+            ActionAbstraction::default(),
+            ChancePolicy::Sample(8),
+        )
+        .unwrap()
+        .with_root_player(Player::Ip);
+
+        let tree = spec.build_action_tree().unwrap();
+        let ActionTreeNode::Decision { player, .. } = &tree.nodes[tree.root.0] else {
+            panic!("root must be a decision");
+        };
+
+        assert_eq!(*player, Player::Ip);
+    }
+
+    #[test]
     fn solves_cfr_on_generated_action_tree() {
         let spec = SubgameSpec::postflop(
             vec![c(14, 0), c(13, 1), c(2, 2)],
@@ -1104,7 +1155,7 @@ mod tests {
             PotState::new(100.0, [1_000.0, 1_000.0]),
             RangeState::new(
                 parse_range("AA,AKs,AKo,AQs").unwrap(),
-                parse_range("QQ,JJ,AQs,KQs").unwrap(),
+                parse_range("QQ,JJ,AQs,KQs,QJs").unwrap(),
             ),
             ActionAbstraction {
                 bet_sizes: vec![BetSize::PotFraction(0.5), BetSize::PotFraction(1.0)],
@@ -1122,6 +1173,7 @@ mod tests {
             .solve_cfr_with_request(SubgameSolveRequest {
                 iterations: 8,
                 focused_oop_combo_mask: Some(focused_mask),
+                focused_ip_combo_mask: None,
                 focused_sampling_rate: 1.0,
             })
             .unwrap();
@@ -1129,6 +1181,37 @@ mod tests {
         assert!(result.strategies.iter().any(|strategy| {
             strategy.node == result.root
                 && strategy.player == Player::Oop
+                && strategy.combo.mask == focused_mask
+        }));
+    }
+
+    #[test]
+    fn focused_sampling_visits_requested_ip_combo() {
+        let board = vec![c(14, 0), c(13, 1), c(2, 2)];
+        let ip_classes = parse_range("QQ,JJ,AQs,KQs,QJs").unwrap();
+        let focused_mask = postflop_combos(&ip_classes, &board)[0].mask;
+        let spec = SubgameSpec::postflop(
+            board,
+            PotState::new(100.0, [1_000.0, 1_000.0]),
+            RangeState::new(parse_range("AA,AKs,AKo,AQs").unwrap(), ip_classes),
+            ActionAbstraction::default(),
+            ChancePolicy::Sample(8),
+        )
+        .unwrap()
+        .with_root_player(Player::Ip);
+
+        let result = spec
+            .solve_cfr_with_request(SubgameSolveRequest {
+                iterations: 8,
+                focused_oop_combo_mask: None,
+                focused_ip_combo_mask: Some(focused_mask),
+                focused_sampling_rate: 1.0,
+            })
+            .unwrap();
+
+        assert!(result.strategies.iter().any(|strategy| {
+            strategy.node == result.root
+                && strategy.player == Player::Ip
                 && strategy.combo.mask == focused_mask
         }));
     }
