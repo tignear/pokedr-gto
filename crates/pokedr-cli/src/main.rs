@@ -186,6 +186,20 @@ fn parse_f64_list(args: &[String], name: &str, default: &[f64]) -> Vec<f64> {
         .unwrap_or_else(|| default.to_vec())
 }
 
+fn parse_string_list(args: &[String], name: &str, default: &[&str]) -> Vec<String> {
+    parse_string_arg(args, name)
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|part| !part.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .filter(|values| !values.is_empty())
+        .unwrap_or_else(|| default.iter().map(|value| value.to_string()).collect())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn print_open2bb_scan(
     args: &[String],
@@ -297,6 +311,54 @@ fn jam_fraction_label(value: Option<f64>) -> String {
         .unwrap_or_else(|| "solver".to_string())
 }
 
+fn defense_profile_stacks(
+    profile: &str,
+    base_stack: u32,
+    big_blind: u32,
+    player_count: usize,
+    opener_seat: usize,
+    defender_seat: usize,
+) -> Vec<u32> {
+    let mut stacks = vec![base_stack; player_count];
+    let critical = (3.0 * big_blind as f64).round() as u32;
+    let medium = (6.0 * big_blind as f64).round() as u32;
+    let defender_short = (8.0 * big_blind as f64).round() as u32;
+    let opener_big = (30.0 * big_blind as f64).round() as u32;
+    let short_seats: Vec<_> = (0..player_count)
+        .filter(|seat| *seat != opener_seat && *seat != defender_seat)
+        .collect();
+
+    match profile {
+        "one-critical-short" => {
+            if let Some(&seat) = short_seats.first() {
+                stacks[seat] = critical.min(base_stack);
+            }
+        }
+        "one-medium-short" => {
+            if let Some(&seat) = short_seats.first() {
+                stacks[seat] = medium.min(base_stack);
+            }
+        }
+        "two-shorts" => {
+            if let Some(&seat) = short_seats.first() {
+                stacks[seat] = critical.min(base_stack);
+            }
+            if let Some(&seat) = short_seats.get(1) {
+                stacks[seat] = medium.min(base_stack);
+            }
+        }
+        "defender-short" => {
+            stacks[defender_seat] = defender_short.min(base_stack);
+        }
+        "opener-big" => {
+            stacks[opener_seat] = opener_big.max(base_stack);
+        }
+        _ => {}
+    }
+
+    stacks
+}
+
 #[allow(clippy::too_many_arguments)]
 fn print_defense2bb_scan(
     args: &[String],
@@ -330,9 +392,10 @@ fn print_defense2bb_scan(
     };
 
     println!(
-        "level,stack,stack_bb,opener_seat,defender_seat,opener_open_fraction,opener_call_fraction,defender_flat_realization,hand,best_action,fold_value,flat_value,jam_value,flat_ev,jam_ev,flat_equity,jam_equity,bb_win_bb_delta,bb_win_opener_delta,bb_win_others_delta,bb_lose_bb_delta,bb_lose_opener_delta,bb_lose_others_delta"
+        "level,stack_profile,stack,stack_bb,opener_seat,defender_seat,opener_open_fraction,opener_call_fraction,defender_flat_realization,hand,best_action,fold_value,flat_value,jam_value,flat_ev,jam_ev,flat_equity,jam_equity,bb_win_bb_delta,bb_win_opener_delta,bb_win_others_delta,bb_lose_bb_delta,bb_lose_opener_delta,bb_lose_others_delta"
     );
     let stack_bbs = parse_f64_list(args, "--scan-defense-bbs", &[]);
+    let stack_profiles = parse_string_list(args, "--stack-profiles", &["equal"]);
     let stack_points: Vec<(u32, f64)> = if stack_bbs.is_empty() {
         let defender_stack = stacks.get(defender_seat).copied().unwrap_or(stack);
         vec![(
@@ -351,62 +414,72 @@ fn print_defense2bb_scan(
             .collect()
     };
 
-    for (scan_stack, stack_bb) in stack_points {
-        let scan_stacks = vec![scan_stack; alive_players as usize];
-        for &opener_open_fraction in &opener_open_fractions {
-            for &opener_call_fraction in &opener_call_fractions {
-                for &defender_flat_realization in &flat_realizations {
-                    let config = ShortStackConfig {
-                        level,
-                        alive_players: scan_stacks.len() as u8,
-                        stack: scan_stack,
-                        stacks: scan_stacks.clone(),
-                        players_behind,
-                        elapsed_in_level_seconds,
-                        hand_duration_seconds,
-                        max_boards_per_combo,
-                        range_sample_limit,
-                        iterations,
-                        spot_iterations,
-                        include_overcall,
-                        postflop_realization,
-                        flat_call_fraction,
-                        defender_jam_fraction_override,
-                    };
-                    for result in analyze_open_2bb_defense(
-                        &config,
-                        opener_seat,
-                        defender_seat,
-                        opener_open_fraction,
-                        opener_call_fraction,
-                        defender_flat_realization,
-                    ) {
-                        println!(
-                            "{},{},{:.3},{},{},{:.3},{:.3},{:.3},{},{},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6}",
-                            level.level,
-                            scan_stack,
-                            stack_bb,
+    for profile in stack_profiles {
+        for (scan_stack, stack_bb) in stack_points.iter().copied() {
+            let scan_stacks = defense_profile_stacks(
+                &profile,
+                scan_stack,
+                level.big_blind,
+                alive_players as usize,
+                opener_seat,
+                defender_seat,
+            );
+            for &opener_open_fraction in &opener_open_fractions {
+                for &opener_call_fraction in &opener_call_fractions {
+                    for &defender_flat_realization in &flat_realizations {
+                        let config = ShortStackConfig {
+                            level,
+                            alive_players: scan_stacks.len() as u8,
+                            stack: scan_stack,
+                            stacks: scan_stacks.clone(),
+                            players_behind,
+                            elapsed_in_level_seconds,
+                            hand_duration_seconds,
+                            max_boards_per_combo,
+                            range_sample_limit,
+                            iterations,
+                            spot_iterations,
+                            include_overcall,
+                            postflop_realization,
+                            flat_call_fraction,
+                            defender_jam_fraction_override,
+                        };
+                        for result in analyze_open_2bb_defense(
+                            &config,
                             opener_seat,
                             defender_seat,
                             opener_open_fraction,
                             opener_call_fraction,
                             defender_flat_realization,
-                            result.hand.label(),
-                            result.best_action.label(),
-                            result.fold_value,
-                            result.flat_value,
-                            result.jam_value,
-                            result.flat_value - result.fold_value,
-                            result.jam_value - result.fold_value,
-                            result.flat_equity,
-                            result.jam_equity,
-                            result.bb_win_bb_delta,
-                            result.bb_win_opener_delta,
-                            result.bb_win_others_delta,
-                            result.bb_lose_bb_delta,
-                            result.bb_lose_opener_delta,
-                            result.bb_lose_others_delta
-                        );
+                        ) {
+                            println!(
+                                "{},{},{},{:.3},{},{},{:.3},{:.3},{:.3},{},{},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6}",
+                                level.level,
+                                profile,
+                                scan_stack,
+                                stack_bb,
+                                opener_seat,
+                                defender_seat,
+                                opener_open_fraction,
+                                opener_call_fraction,
+                                defender_flat_realization,
+                                result.hand.label(),
+                                result.best_action.label(),
+                                result.fold_value,
+                                result.flat_value,
+                                result.jam_value,
+                                result.flat_value - result.fold_value,
+                                result.jam_value - result.fold_value,
+                                result.flat_equity,
+                                result.jam_equity,
+                                result.bb_win_bb_delta,
+                                result.bb_win_opener_delta,
+                                result.bb_win_others_delta,
+                                result.bb_lose_bb_delta,
+                                result.bb_lose_opener_delta,
+                                result.bb_lose_others_delta
+                            );
+                        }
                     }
                 }
             }
