@@ -5,7 +5,7 @@ use crate::hand_class::HandClass;
 use crate::hand_eval::evaluate_seven;
 
 #[cfg(not(test))]
-const MIN_SAMPLED_BOARDS_PER_COMBO: usize = 64;
+const MIN_SAMPLED_BOARDS_PER_COMBO: usize = 32;
 #[cfg(test)]
 const MIN_SAMPLED_BOARDS_PER_COMBO: usize = 1;
 

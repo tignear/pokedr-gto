@@ -3,7 +3,7 @@ use std::env;
 use pokedr_core::blinds::blind_level;
 use pokedr_core::short_stack::{ShortStackConfig, ShortStackReport, analyze_short_stack};
 
-const DEFAULT_MAX_BOARDS_PER_COMBO: usize = 64;
+const DEFAULT_MAX_BOARDS_PER_COMBO: usize = 32;
 const DEFAULT_RANGE_SAMPLE_LIMIT: usize = 8;
 const DEFAULT_MAX_ITERATIONS: usize = 8;
 const DEFAULT_MAX_SPOT_ITERATIONS: usize = 2;
@@ -26,6 +26,7 @@ fn main() {
         .unwrap_or(DEFAULT_MAX_SPOT_ITERATIONS as u32) as usize;
     let elapsed_in_level_seconds = parse_arg(&args, "--elapsed").unwrap_or(0);
     let hand_duration_seconds = parse_arg(&args, "--hand-seconds").unwrap_or(20);
+    let include_overcall = has_flag(&args, "--overcall");
     let format = parse_string_arg(&args, "--format").unwrap_or("text");
 
     let Some(level) = blind_level(level as u8) else {
@@ -45,6 +46,7 @@ fn main() {
         range_sample_limit,
         iterations,
         spot_iterations,
+        include_overcall,
     });
 
     match format {
@@ -67,6 +69,10 @@ fn parse_string_arg<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
     args.windows(2)
         .find(|window| window[0] == name)
         .map(|window| window[1].as_str())
+}
+
+fn has_flag(args: &[String], name: &str) -> bool {
+    args.iter().any(|arg| arg == name)
 }
 
 fn parse_stacks(args: &[String]) -> Option<Vec<u32>> {
@@ -99,6 +105,7 @@ fn print_report(level: u8, stacks: &[u32], players_behind: u8, report: &ShortSta
     );
     println!("max iterations: {}", report.max_iterations);
     println!("max spot iterations: {}", report.max_spot_iterations);
+    println!("overcall analyzed: {}", report.overcall_analyzed);
     println!("dead pot: {}", report.dead_pot);
     println!(
         "orbit cost if everyone folds: {} ({:.1}% of stack)",
@@ -154,7 +161,12 @@ fn print_report(level: u8, stacks: &[u32], players_behind: u8, report: &ShortSta
             );
             print_range("    range", &spot.range, 40);
         }
-        print_range("  overcall range vs jam+call", &seat.overcall_range, 40);
+        if report.overcall_analyzed {
+            print_range("  overcall range vs jam+call", &seat.overcall_range, 40);
+        } else {
+            println!("  overcall range vs jam+call: skipped (pass --overcall to analyze)");
+            println!();
+        }
     }
 }
 
@@ -180,6 +192,7 @@ fn print_json_report(level: u8, stacks: &[u32], players_behind: u8, report: &Sho
     println!("  \"converged\": {},", report.converged);
     println!("  \"max_iterations\": {},", report.max_iterations);
     println!("  \"max_spot_iterations\": {},", report.max_spot_iterations);
+    println!("  \"overcall_analyzed\": {},", report.overcall_analyzed);
     println!("  \"dead_pot\": {},", report.dead_pot);
     println!("  \"orbit_cost\": {},", report.orbit_cost);
     println!(

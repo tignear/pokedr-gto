@@ -19,6 +19,7 @@ pub struct ShortStackConfig {
     pub range_sample_limit: usize,
     pub iterations: usize,
     pub spot_iterations: usize,
+    pub include_overcall: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -29,6 +30,7 @@ pub struct ShortStackReport {
     pub converged: bool,
     pub max_iterations: usize,
     pub max_spot_iterations: usize,
+    pub overcall_analyzed: bool,
     pub single_call_required_equity: f64,
     pub overcall_required_equity: f64,
     pub seats: Vec<SeatRanges>,
@@ -110,6 +112,7 @@ pub fn analyze_short_stack(config: &ShortStackConfig) -> ShortStackReport {
         converged,
         max_iterations: config.iterations,
         max_spot_iterations: config.spot_iterations,
+        overcall_analyzed: config.include_overcall,
         single_call_required_equity,
         overcall_required_equity,
         seats,
@@ -209,6 +212,7 @@ fn analyze_seat(
             .collect::<Vec<_>>(),
         call_required_equity,
         config.max_boards_per_combo,
+        config.range_sample_limit,
         cache,
     );
     let call_spots = analyze_call_spots(
@@ -219,18 +223,22 @@ fn analyze_seat(
         seat_index as usize,
         cache,
     );
-    let overcall_range = profitable_overcall_range(
-        classes,
-        &modeled_shove_range
-            .iter()
-            .map(|result| result.hand)
-            .collect::<Vec<_>>(),
-        &solution.call_range,
-        overcall_required_equity,
-        config.max_boards_per_combo,
-        config.range_sample_limit,
-        cache,
-    );
+    let overcall_range = if config.include_overcall {
+        profitable_overcall_range(
+            classes,
+            &modeled_shove_range
+                .iter()
+                .map(|result| result.hand)
+                .collect::<Vec<_>>(),
+            &solution.call_range,
+            overcall_required_equity,
+            config.max_boards_per_combo,
+            config.range_sample_limit,
+            cache,
+        )
+    } else {
+        Vec::new()
+    };
 
     SeatRanges {
         seat_index,
@@ -316,6 +324,7 @@ fn analyze_call_spots(
                 .collect::<Vec<_>>(),
             required_equity,
             config.max_boards_per_combo,
+            config.range_sample_limit,
             cache,
         );
 
@@ -370,6 +379,7 @@ fn solve_shove_response(
             &shove_range,
             response_required_equity,
             config.max_boards_per_combo,
+            config.range_sample_limit,
             cache,
         )
         .into_iter()
@@ -487,6 +497,18 @@ fn profitable_shove_results(
 
     let mut results = Vec::new();
 
+    if sampled_call_range.is_empty() || called_probability == 0.0 {
+        let ev = steal_value - fold_value;
+        if ev >= 0.0 {
+            results.extend(classes.iter().copied().map(|hand| HandResult {
+                hand,
+                equity: 0.0,
+                ev,
+            }));
+        }
+        return results;
+    }
+
     for &hand in classes {
         let equity = heads_up_equity_vs_range_cached(
             hand,
@@ -518,10 +540,28 @@ fn profitable_call_range(
     shove_range: &[HandClass],
     required_equity: f64,
     max_boards_per_combo: usize,
+    range_sample_limit: usize,
     cache: &mut EquityCache,
 ) -> Vec<HandResult> {
     let mut results = Vec::new();
-    let sampled_shove_range = sample_range(shove_range, 32);
+    let sampled_shove_range = sample_range(shove_range, range_sample_limit);
+
+    if sampled_shove_range.is_empty() {
+        return results;
+    }
+
+    if required_equity <= 0.0 {
+        results.extend(classes.iter().copied().map(|hand| HandResult {
+            hand,
+            equity: 0.0,
+            ev: 0.0,
+        }));
+        return results;
+    }
+
+    if required_equity >= 1.0 {
+        return results;
+    }
 
     for &hand in classes {
         let equity = heads_up_equity_vs_range_cached(
@@ -755,6 +795,7 @@ mod tests {
             range_sample_limit: 1,
             iterations: 0,
             spot_iterations: 0,
+            include_overcall: false,
         });
 
         assert_eq!(report.seats.len(), 3);
