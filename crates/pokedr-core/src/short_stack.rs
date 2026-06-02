@@ -89,6 +89,7 @@ pub struct HandResult {
     pub hand: HandClass,
     pub equity: f64,
     pub ev: f64,
+    pub frequency: f64,
     pub call_value: Option<f64>,
     pub fold_value: Option<f64>,
 }
@@ -446,12 +447,10 @@ fn solve_call_tree(
                 opener_seat,
                 &key.prior_callers,
             );
-            let old_classes = ranges
-                .get(key)
-                .map(|range| hand_classes(range))
-                .unwrap_or_default();
-            let new_classes = hand_classes(&new_range);
-            if old_classes != new_classes {
+            if !ranges_equivalent(
+                ranges.get(key).map(Vec::as_slice).unwrap_or(&[]),
+                &new_range,
+            ) {
                 changed = true;
             }
             next_ranges.insert(key.clone(), new_range);
@@ -604,10 +603,12 @@ fn decision_node_range_from_strategy(
             }
 
             let ev = call_value - fold_value;
-            (ev >= 0.0).then_some(HandResult {
+            let frequency = soft_action_frequency(ev);
+            (frequency > 0.001).then_some(HandResult {
                 hand,
                 equity: hero_share,
                 ev,
+                frequency,
                 call_value: Some(call_value),
                 fold_value: Some(fold_value),
             })
@@ -655,8 +656,9 @@ fn future_patterns_from_strategy(
             prior_callers: prior_callers.clone(),
         };
         let range = strategy_ranges.get(&key).cloned().unwrap_or_default();
-        let range_classes = sample_range(&hand_classes(&range), range_sample_limit);
-        let call_probability = combo_fraction(&range_classes).clamp(0.0, 1.0);
+        let sampled_range = sample_hand_results(&range, range_sample_limit);
+        let range_classes = hand_classes(&sampled_range);
+        let call_probability = weighted_combo_fraction(&sampled_range).clamp(0.0, 1.0);
 
         if call_probability < 1.0 {
             walk(
@@ -779,6 +781,7 @@ fn hand_results_from_classes(classes: Vec<HandClass>) -> Vec<HandResult> {
             hand,
             equity: 0.0,
             ev: 0.0,
+            frequency: 1.0,
             call_value: None,
             fold_value: None,
         })
@@ -787,6 +790,37 @@ fn hand_results_from_classes(classes: Vec<HandClass>) -> Vec<HandResult> {
 
 fn hand_classes(range: &[HandResult]) -> Vec<HandClass> {
     range.iter().map(|result| result.hand).collect()
+}
+
+fn ranges_equivalent(left: &[HandResult], right: &[HandResult]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+
+    left.iter().zip(right).all(|(left, right)| {
+        left.hand == right.hand && (left.frequency - right.frequency).abs() <= 0.01
+    })
+}
+
+fn sample_hand_results(range: &[HandResult], limit: usize) -> Vec<HandResult> {
+    if limit == 0 || range.len() <= limit {
+        return range.to_vec();
+    }
+
+    (0..limit)
+        .map(|index| {
+            let sampled_index = (index * range.len() + range.len() / (limit * 2)) / limit;
+            range[sampled_index.min(range.len() - 1)].clone()
+        })
+        .collect()
+}
+
+fn weighted_combo_fraction(range: &[HandResult]) -> f64 {
+    range
+        .iter()
+        .map(|result| result.hand.combos().len() as f64 * result.frequency.clamp(0.0, 1.0))
+        .sum::<f64>()
+        / 1326.0
 }
 
 struct DownstreamPattern {
@@ -839,6 +873,7 @@ fn pattern_range(
                 hand,
                 equity: outcome.hero_share,
                 ev,
+                frequency: 1.0,
                 call_value: Some(outcome.value),
                 fold_value: Some(fold_value),
             })
@@ -1383,6 +1418,7 @@ fn profitable_shove_results(
                     hand,
                     equity: 0.0,
                     ev,
+                    frequency: 1.0,
                     call_value: None,
                     fold_value: None,
                 })
@@ -1412,6 +1448,7 @@ fn profitable_shove_results(
                     hand,
                     equity,
                     ev,
+                    frequency: 1.0,
                     call_value: None,
                     fold_value: None,
                 })
@@ -1452,6 +1489,7 @@ fn profitable_call_range(
                 hand,
                 equity: 0.0,
                 ev: 0.0,
+                frequency: 1.0,
                 call_value: None,
                 fold_value: None,
             })
@@ -1481,6 +1519,7 @@ fn profitable_call_range(
                     hand,
                     equity,
                     ev,
+                    frequency: 1.0,
                     call_value: None,
                     fold_value: None,
                 })
@@ -1526,6 +1565,7 @@ fn profitable_overcall_range(
                     hand,
                     equity,
                     ev,
+                    frequency: 1.0,
                     call_value: None,
                     fold_value: None,
                 })
@@ -1588,6 +1628,11 @@ fn heuristic_strength(hand: HandClass) -> f64 {
 
 fn combo_fraction(range: &[HandClass]) -> f64 {
     range.iter().map(|hand| hand.combos().len()).sum::<usize>() as f64 / 1326.0
+}
+
+fn soft_action_frequency(ev: f64) -> f64 {
+    let scale = 1.5;
+    1.0 / (1.0 + (-ev / scale).exp())
 }
 
 fn normalized_stacks(config: &ShortStackConfig) -> Vec<u32> {

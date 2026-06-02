@@ -133,7 +133,20 @@
       opacity: .35;
       background: color-mix(in srgb, CanvasText 4%, Canvas);
       cursor: pointer;
+      overflow: hidden;
+      position: relative;
       user-select: none;
+    }
+    .cell::before {
+      content: "";
+      position: absolute;
+      inset: 0 auto 0 0;
+      width: var(--freq, 0%);
+      background: var(--fill, color-mix(in srgb, CanvasText 8%, Canvas));
+    }
+    .cell span {
+      position: relative;
+      z-index: 1;
     }
     .cell:focus-visible {
       outline: 2px solid color-mix(in srgb, CanvasText 70%, Canvas);
@@ -146,15 +159,16 @@
       opacity: 1;
       color: #08111f;
       border-color: transparent;
+      background: color-mix(in srgb, CanvasText 8%, Canvas);
     }
     .cell.pair.in {
-      background: #f4c542;
+      --fill: #f4c542;
     }
     .cell.suited.in {
-      background: #57c7a3;
+      --fill: #57c7a3;
     }
     .cell.offsuit.in {
-      background: #7aa7ff;
+      --fill: #7aa7ff;
     }
     .legend {
       display: flex;
@@ -415,7 +429,8 @@
           const result = byHand.get(hand);
           const kind = hand.length === 2 ? 'pair' : hand.endsWith('s') ? 'suited' : 'offsuit';
           const cellTitle = result ? handDetail(hand, result) : hand;
-          cells.push(`<span class="cell ${kind}${result ? ' in' : ''}" role="button" tabindex="0" title="${escapeHtml(cellTitle)}" data-detail-target="${blockId}-detail" data-detail="${escapeHtml(cellTitle)}">${hand}</span>`);
+          const style = result ? ` style="--freq:${cellFrequency(result).toFixed(1)}%"` : '';
+          cells.push(`<span class="cell ${kind}${result ? ' in' : ''}"${style} role="button" tabindex="0" title="${escapeHtml(cellTitle)}" data-detail-target="${blockId}-detail" data-detail="${escapeHtml(cellTitle)}"><span>${hand}</span></span>`);
         }
       }
 
@@ -438,6 +453,7 @@
       const parts = [
         `${hand} equity ${pct(result.equity)}`,
         `ev ${result.ev.toFixed(4)}`,
+        `freq ${pct(result.frequency ?? 1)}`,
       ];
 
       if (result.call_value != null) {
@@ -448,6 +464,11 @@
       }
 
       return parts.join(', ');
+    }
+
+    function cellFrequency(result) {
+      const frequency = result.frequency ?? 1;
+      return 100 * Math.max(0, Math.min(1, frequency));
     }
 
     function matrixHand(ranks, row, col) {
@@ -465,7 +486,9 @@
     }
 
     function rangeSummary(range) {
-      return `${range.classes} classes, ${range.combos} combos (${pct(range.combo_fraction)})`;
+      const weightedFraction = range.weighted_combo_fraction ?? range.combo_fraction;
+      const weightedCombos = range.weighted_combos ?? range.combos;
+      return `${range.classes} classes, ${weightedCombos.toFixed(1)} w-combos (${pct(weightedFraction)})`;
     }
 
     function title(value) {

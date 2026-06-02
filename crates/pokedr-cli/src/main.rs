@@ -339,6 +339,11 @@ fn print_json_range(
 ) {
     let pad = " ".repeat(indent);
     let combo_count: usize = range.iter().map(|result| result.hand.combos().len()).sum();
+    let weighted_combos: f64 = range
+        .iter()
+        .map(|result| result.hand.combos().len() as f64 * result.frequency)
+        .sum::<f64>()
+        .max(0.0);
     println!("{pad}\"{name}\": {{");
     println!("{pad}  \"classes\": {},", range.len());
     println!("{pad}  \"combos\": {combo_count},");
@@ -346,15 +351,21 @@ fn print_json_range(
         "{pad}  \"combo_fraction\": {:.6},",
         combo_count as f64 / 1326.0
     );
+    println!("{pad}  \"weighted_combos\": {:.3},", weighted_combos);
+    println!(
+        "{pad}  \"weighted_combo_fraction\": {:.6},",
+        weighted_combos / 1326.0
+    );
     println!("{pad}  \"hands\": [");
 
     for (index, result) in range.iter().enumerate() {
         let comma = if index + 1 == range.len() { "" } else { "," };
         println!(
-            "{pad}    {{\"hand\":\"{}\",\"equity\":{:.6},\"ev\":{:.6},\"call_value\":{},\"fold_value\":{}}}{comma}",
+            "{pad}    {{\"hand\":\"{}\",\"equity\":{:.6},\"ev\":{:.6},\"frequency\":{:.6},\"call_value\":{},\"fold_value\":{}}}{comma}",
             result.hand.label(),
             result.equity,
             result.ev,
+            result.frequency,
             json_optional_f64(result.call_value),
             json_optional_f64(result.fold_value)
         );
