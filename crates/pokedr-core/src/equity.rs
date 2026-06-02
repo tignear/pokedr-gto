@@ -376,12 +376,21 @@ pub fn multi_way_range_showdown_payouts(
     pots: &[EquityPot],
     samples: usize,
 ) -> Vec<Vec<f64>> {
+    multi_way_range_showdown_payouts_with_dead_mask(player_ranges, pots, samples, 0)
+}
+
+pub fn multi_way_range_showdown_payouts_with_dead_mask(
+    player_ranges: &[Vec<HandClass>],
+    pots: &[EquityPot],
+    samples: usize,
+    dead_mask: u64,
+) -> Vec<Vec<f64>> {
     let samples = samples.max(MIN_SAMPLED_BOARDS_PER_COMBO);
     let mut payouts = Vec::new();
-    let mut rng = SplitMix64::new(player_ranges.len() as u64 ^ 0x9e37_79b9_7f4a_7c15);
+    let mut rng = SplitMix64::new(player_ranges.len() as u64 ^ dead_mask ^ 0x9e37_79b9_7f4a_7c15);
 
     'sample: for _ in 0..samples {
-        let mut used_mask = 0;
+        let mut used_mask = dead_mask;
         let mut combos = Vec::with_capacity(player_ranges.len());
 
         for range in player_ranges {
