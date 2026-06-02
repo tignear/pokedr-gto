@@ -1,9 +1,9 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::cards::{Card, deck};
 use crate::hand_class::HandClass;
 use crate::hand_eval::evaluate_seven;
-use crate::postflop::{PostflopCombo, postflop_combos};
+use crate::postflop::PostflopCombo;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Street {
@@ -25,14 +25,81 @@ impl Street {
 
 #[derive(Debug, Clone)]
 pub struct RangeState {
-    pub oop: Vec<HandClass>,
-    pub ip: Vec<HandClass>,
+    pub oop: Vec<RangeEntry>,
+    pub ip: Vec<RangeEntry>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct RangeEntry {
+    pub class: HandClass,
+    pub weight: f64,
 }
 
 impl RangeState {
     pub fn new(oop: Vec<HandClass>, ip: Vec<HandClass>) -> Self {
-        Self { oop, ip }
+        Self {
+            oop: uniform_range(oop),
+            ip: uniform_range(ip),
+        }
     }
+
+    pub fn weighted(oop: Vec<(HandClass, f64)>, ip: Vec<(HandClass, f64)>) -> Self {
+        Self {
+            oop: weighted_range(oop),
+            ip: weighted_range(ip),
+        }
+    }
+}
+
+fn uniform_range(classes: Vec<HandClass>) -> Vec<RangeEntry> {
+    classes
+        .into_iter()
+        .map(|class| RangeEntry { class, weight: 1.0 })
+        .collect()
+}
+
+fn weighted_range(entries: Vec<(HandClass, f64)>) -> Vec<RangeEntry> {
+    entries
+        .into_iter()
+        .filter_map(|(class, weight)| {
+            if weight.is_finite() && weight > 0.0 {
+                Some(RangeEntry { class, weight })
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn weighted_postflop_combos(entries: &[RangeEntry], board: &[Card]) -> Vec<WeightedPostflopCombo> {
+    let board_mask = board.iter().fold(0_u64, |mask, card| mask | card.mask());
+    let mut combos = Vec::new();
+    let mut seen = HashSet::new();
+
+    for entry in entries {
+        if !(entry.weight.is_finite() && entry.weight > 0.0) {
+            continue;
+        }
+        for [first, second] in entry.class.combos() {
+            let Some(combo) = crate::river::Combo::new(first, second) else {
+                continue;
+            };
+            let mask = combo.mask();
+            if mask & board_mask != 0 || !seen.insert(mask) {
+                continue;
+            }
+            combos.push(WeightedPostflopCombo {
+                combo: PostflopCombo {
+                    combo,
+                    class: entry.class,
+                    mask,
+                },
+                weight: entry.weight,
+            });
+        }
+    }
+
+    combos
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -199,8 +266,8 @@ impl SubgameSpec {
         request: SubgameSolveRequest,
     ) -> Result<SubgameCfrResult, SubgameBuildError> {
         let tree = self.build_action_tree()?;
-        let oop_range = postflop_combos(&self.ranges.oop, &self.board);
-        let ip_range = postflop_combos(&self.ranges.ip, &self.board);
+        let oop_range = weighted_postflop_combos(&self.ranges.oop, &self.board);
+        let ip_range = weighted_postflop_combos(&self.ranges.ip, &self.board);
         if oop_range.is_empty() || ip_range.is_empty() {
             return Err(SubgameBuildError::NoLegalDeals);
         }
@@ -238,7 +305,7 @@ impl SubgameSpec {
             let focused = !focused_deals.is_empty()
                 && should_sample_focused(iteration, request.focused_sampling_rate);
             let deal_pool = if focused { &focused_deals } else { &deals };
-            let (oop_index, ip_index) = deal_pool[sampled_index(iteration, deal_pool.len())];
+            let (oop_index, ip_index) = sample_weighted_deal(iteration, deal_pool);
             utility_sum += trainer.cfr(tree.root, oop_index, ip_index, [1.0, 1.0]);
         }
 
@@ -628,11 +695,17 @@ fn apply_call(player: Player, mut pot: PotState) -> PotState {
 struct SubgameCfrTrainer<'a> {
     spec: &'a SubgameSpec,
     tree: &'a ActionTree,
-    oop_range: &'a [PostflopCombo],
-    ip_range: &'a [PostflopCombo],
+    oop_range: &'a [WeightedPostflopCombo],
+    ip_range: &'a [WeightedPostflopCombo],
     nodes: HashMap<SubgameInfoKey, SubgameCfrNode>,
     equity_cache: HashMap<(u64, u64, u64), f64>,
     average_weight: f64,
+}
+
+#[derive(Debug, Clone)]
+struct WeightedPostflopCombo {
+    combo: PostflopCombo,
+    weight: f64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -738,8 +811,8 @@ impl SubgameCfrTrainer<'_> {
         ip_index: usize,
     ) -> SubgameInfoKey {
         let combo_mask = match player {
-            Player::Oop => self.oop_range[oop_index].mask,
-            Player::Ip => self.ip_range[ip_index].mask,
+            Player::Oop => self.oop_range[oop_index].combo.mask,
+            Player::Ip => self.ip_range[ip_index].combo.mask,
         };
         SubgameInfoKey {
             node: node_id,
@@ -763,8 +836,8 @@ impl SubgameCfrTrainer<'_> {
         }
 
         let combo = match player {
-            Player::Oop => self.oop_range[oop_index].clone(),
-            Player::Ip => self.ip_range[ip_index].clone(),
+            Player::Oop => self.oop_range[oop_index].combo.clone(),
+            Player::Ip => self.ip_range[ip_index].combo.clone(),
         };
         let oop_equity = self.combo_equity(oop_index, ip_index);
         let equity = match player {
@@ -790,7 +863,7 @@ impl SubgameCfrTrainer<'_> {
     fn combo_equity(&mut self, oop_index: usize, ip_index: usize) -> f64 {
         let oop = &self.oop_range[oop_index];
         let ip = &self.ip_range[ip_index];
-        let key = (board_mask(&self.spec.board), oop.mask, ip.mask);
+        let key = (board_mask(&self.spec.board), oop.combo.mask, ip.combo.mask);
         if let Some(&equity) = self.equity_cache.get(&key) {
             return equity;
         }
@@ -857,37 +930,92 @@ impl SubgameCfrNode {
     }
 }
 
-fn legal_deals(oop_range: &[PostflopCombo], ip_range: &[PostflopCombo]) -> Vec<(usize, usize)> {
+#[derive(Debug, Clone, Copy)]
+struct LegalDeal {
+    oop_index: usize,
+    ip_index: usize,
+    weight: f64,
+    cumulative_weight: f64,
+}
+
+fn legal_deals(
+    oop_range: &[WeightedPostflopCombo],
+    ip_range: &[WeightedPostflopCombo],
+) -> Vec<LegalDeal> {
     let mut deals = Vec::new();
     for oop_index in 0..oop_range.len() {
         for ip_index in 0..ip_range.len() {
-            if oop_range[oop_index].mask & ip_range[ip_index].mask == 0 {
-                deals.push((oop_index, ip_index));
+            if oop_range[oop_index].combo.mask & ip_range[ip_index].combo.mask == 0 {
+                deals.push(LegalDeal {
+                    oop_index,
+                    ip_index,
+                    weight: oop_range[oop_index].weight * ip_range[ip_index].weight,
+                    cumulative_weight: 0.0,
+                });
             }
         }
+    }
+    with_cumulative_weights(deals)
+}
+
+fn focused_deals(
+    oop_range: &[WeightedPostflopCombo],
+    ip_range: &[WeightedPostflopCombo],
+    deals: &[LegalDeal],
+    focused_oop_mask: Option<u64>,
+    focused_ip_mask: Option<u64>,
+) -> Vec<LegalDeal> {
+    let focused = deals
+        .iter()
+        .copied()
+        .filter(|deal| {
+            focused_oop_mask
+                .map(|mask| oop_range[deal.oop_index].combo.mask == mask)
+                .unwrap_or(true)
+                && focused_ip_mask
+                    .map(|mask| ip_range[deal.ip_index].combo.mask == mask)
+                    .unwrap_or(true)
+        })
+        .map(|deal| LegalDeal {
+            cumulative_weight: 0.0,
+            ..deal
+        })
+        .collect();
+    with_cumulative_weights(focused)
+}
+
+fn with_cumulative_weights(mut deals: Vec<LegalDeal>) -> Vec<LegalDeal> {
+    let mut cumulative = 0.0;
+    for deal in &mut deals {
+        cumulative += deal.weight.max(0.0);
+        deal.cumulative_weight = cumulative;
     }
     deals
 }
 
-fn focused_deals(
-    oop_range: &[PostflopCombo],
-    ip_range: &[PostflopCombo],
-    deals: &[(usize, usize)],
-    focused_oop_mask: Option<u64>,
-    focused_ip_mask: Option<u64>,
-) -> Vec<(usize, usize)> {
-    deals
-        .iter()
-        .copied()
-        .filter(|(oop_index, ip_index)| {
-            focused_oop_mask
-                .map(|mask| oop_range[*oop_index].mask == mask)
-                .unwrap_or(true)
-                && focused_ip_mask
-                    .map(|mask| ip_range[*ip_index].mask == mask)
-                    .unwrap_or(true)
-        })
-        .collect()
+fn sample_weighted_deal(iteration: usize, deals: &[LegalDeal]) -> (usize, usize) {
+    let total_weight = deals
+        .last()
+        .map(|deal| deal.cumulative_weight)
+        .unwrap_or(0.0);
+    if total_weight <= 0.0 {
+        let deal = deals[sampled_index(iteration, deals.len())];
+        return (deal.oop_index, deal.ip_index);
+    }
+
+    let threshold = deterministic_unit(iteration) * total_weight;
+    let mut low = 0;
+    let mut high = deals.len();
+    while low < high {
+        let mid = (low + high) / 2;
+        if deals[mid].cumulative_weight < threshold {
+            low = mid + 1;
+        } else {
+            high = mid;
+        }
+    }
+    let deal = deals[low.min(deals.len() - 1)];
+    (deal.oop_index, deal.ip_index)
 }
 
 fn should_sample_focused(iteration: usize, focused_sampling_rate: f64) -> bool {
@@ -903,22 +1031,24 @@ fn should_sample_focused(iteration: usize, focused_sampling_rate: f64) -> bool {
 
 fn combo_equity(
     board: &[Card],
-    oop: &PostflopCombo,
-    ip: &PostflopCombo,
+    oop: &WeightedPostflopCombo,
+    ip: &WeightedPostflopCombo,
     max_runouts: usize,
 ) -> f64 {
-    if oop.mask & ip.mask != 0 {
+    if oop.combo.mask & ip.combo.mask != 0 {
         return 0.0;
     }
     let mut win = 0.0;
     let mut tie = 0.0;
     let mut total = 0.0;
-    for completed_board in
-        sampled_runouts(board, board_mask(board) | oop.mask | ip.mask, max_runouts)
-    {
+    for completed_board in sampled_runouts(
+        board,
+        board_mask(board) | oop.combo.mask | ip.combo.mask,
+        max_runouts,
+    ) {
         let oop_value = evaluate_seven([
-            oop.combo.first,
-            oop.combo.second,
+            oop.combo.combo.first,
+            oop.combo.combo.second,
             completed_board[0],
             completed_board[1],
             completed_board[2],
@@ -926,8 +1056,8 @@ fn combo_equity(
             completed_board[4],
         ]);
         let ip_value = evaluate_seven([
-            ip.combo.first,
-            ip.combo.second,
+            ip.combo.combo.first,
+            ip.combo.combo.second,
             completed_board[0],
             completed_board[1],
             completed_board[2],
@@ -993,10 +1123,18 @@ fn sampled_runouts(board: &[Card], used_mask: u64, max_runouts: usize) -> Vec<[C
 }
 
 fn sampled_index(iteration: usize, len: usize) -> usize {
+    (deterministic_u64(iteration) as usize) % len
+}
+
+fn deterministic_unit(iteration: usize) -> f64 {
+    deterministic_u64(iteration) as f64 / u64::MAX as f64
+}
+
+fn deterministic_u64(iteration: usize) -> u64 {
     let mut value = iteration as u64 + 0x517c_c1b7_2722_0a95;
     value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
     value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-    ((value ^ (value >> 31)) as usize) % len
+    value ^ (value >> 31)
 }
 
 fn board_mask(board: &[Card]) -> u64 {
@@ -1214,5 +1352,35 @@ mod tests {
                 && strategy.player == Player::Ip
                 && strategy.combo.mask == focused_mask
         }));
+    }
+
+    #[test]
+    fn weighted_range_entries_bias_chance_sampling() {
+        let board = vec![c(2, 0), c(7, 1), c(9, 2)];
+        let aa = HandClass::new(14, 14, false);
+        let t3o = HandClass::new(10, 3, false);
+        let oop_range =
+            weighted_postflop_combos(&weighted_range(vec![(aa, 100.0), (t3o, 1.0)]), &board);
+        let ip_range = weighted_postflop_combos(
+            &weighted_range(vec![(HandClass::new(5, 4, true), 1.0)]),
+            &board,
+        );
+        let deals = legal_deals(&oop_range, &ip_range);
+
+        let mut aa_samples = 0;
+        let mut t3o_samples = 0;
+        for iteration in 0..128 {
+            let (oop_index, _) = sample_weighted_deal(iteration, &deals);
+            match oop_range[oop_index].combo.class {
+                class if class == aa => aa_samples += 1,
+                class if class == t3o => t3o_samples += 1,
+                _ => {}
+            }
+        }
+
+        assert!(
+            aa_samples > t3o_samples * 20,
+            "weighted sampling ignored range weights: AA={aa_samples} T3o={t3o_samples}"
+        );
     }
 }

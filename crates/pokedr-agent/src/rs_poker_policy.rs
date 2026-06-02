@@ -253,7 +253,7 @@ fn cfr_postflop_action(
     let spec = SubgameSpec::postflop(
         board.clone(),
         pot,
-        RangeState::new(oop_range, ip_range),
+        RangeState::weighted(oop_range, ip_range),
         cfr_action_abstraction(game_state),
         ChancePolicy::Sample(runouts.max(1)),
     )
@@ -372,7 +372,7 @@ fn mc_range_prior(
     max_classes: usize,
     required: Option<HandClass>,
     extra_dead_mask: u64,
-) -> Vec<HandClass> {
+) -> Vec<(HandClass, f64)> {
     let board_mask = pokedr_board(game_state)
         .map(|board| board.iter().fold(0_u64, |mask, card| mask | card.mask()))
         .unwrap_or(0);
@@ -391,10 +391,25 @@ fn mc_range_prior(
         .collect();
 
     scored.sort_by(|left, right| right.1.total_cmp(&left.1));
-    let mut classes = stratified_classes(&scored, max_classes.max(1));
+    let classes = stratified_classes(&scored, max_classes.max(1));
+    let min_equity = scored.last().map(|(_, equity)| *equity).unwrap_or(0.0);
+    let max_equity = scored.first().map(|(_, equity)| *equity).unwrap_or(1.0);
+    let span = (max_equity - min_equity).max(0.001);
+    let mut classes: Vec<_> = classes
+        .into_iter()
+        .map(|class| {
+            let equity = scored
+                .iter()
+                .find(|(candidate, _)| *candidate == class)
+                .map(|(_, equity)| *equity)
+                .unwrap_or(min_equity);
+            let percentile = ((equity - min_equity) / span).clamp(0.0, 1.0);
+            (class, 0.05 + f64::from(percentile) * 0.95)
+        })
+        .collect();
     if let Some(required) = required {
-        if !classes.contains(&required) {
-            classes.push(required);
+        if !classes.iter().any(|(class, _)| *class == required) {
+            classes.push((required, 1.0));
         }
     }
     classes
