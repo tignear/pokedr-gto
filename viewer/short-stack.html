@@ -457,7 +457,7 @@
       const parts = [
         `${hand} equity ${pct(result.equity)}`,
         `ev ${result.ev.toFixed(4)}`,
-        `freq ${pct(result.frequency ?? 1)}`,
+        `selected ${pct(result.frequency ?? 1)}`,
       ];
 
       if (result.call_value != null) {

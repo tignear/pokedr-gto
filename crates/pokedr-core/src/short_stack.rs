@@ -256,7 +256,7 @@ fn analyze_seat(
             seat_index as usize,
             cache,
         );
-        mix_root_action_ranges(open_values, shove_values)
+        select_root_action_ranges(open_values, shove_values)
     };
     let call_range_results = solution.call_range.clone();
     let call_spots = analyze_call_spots(
@@ -1960,7 +1960,7 @@ fn open_raise_value_results(
     results
 }
 
-fn mix_root_action_ranges(
+fn select_root_action_ranges(
     open_values: Vec<HandResult>,
     shove_values: Vec<HandResult>,
 ) -> (Vec<HandResult>, Vec<HandResult>) {
@@ -1976,20 +1976,26 @@ fn mix_root_action_ranges(
             continue;
         };
         let fold_value = open.fold_value.unwrap_or(0.0);
-        let open_edge = (open.call_value.unwrap_or(fold_value) - fold_value).max(0.0);
-        let shove_edge = (shove.call_value.unwrap_or(fold_value) - fold_value).max(0.0);
-        let edge_sum = open_edge + shove_edge;
+        let open_value = open.call_value.unwrap_or(fold_value);
+        let shove_value = shove.call_value.unwrap_or(fold_value);
+        let best_value = fold_value.max(open_value).max(shove_value);
 
-        if edge_sum <= 0.0 {
+        if best_value <= fold_value {
             continue;
         }
 
-        if open_edge > 0.0 {
-            open.frequency = open_edge / edge_sum;
+        let tolerance = 1.0e-9;
+        let open_is_best = (open_value - best_value).abs() <= tolerance;
+        let shove_is_best = (shove_value - best_value).abs() <= tolerance;
+        let best_action_count = open_is_best as usize + shove_is_best as usize;
+        let selected_frequency = 1.0 / best_action_count as f64;
+
+        if open_is_best {
+            open.frequency = selected_frequency;
             open_range.push(open);
         }
-        if shove_edge > 0.0 {
-            shove.frequency = shove_edge / edge_sum;
+        if shove_is_best {
+            shove.frequency = selected_frequency;
             shove_range.push(shove);
         }
     }
