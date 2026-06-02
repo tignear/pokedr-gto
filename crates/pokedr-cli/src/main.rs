@@ -1,6 +1,8 @@
 use std::env;
+use std::time::Instant;
 
 use pokedr_core::blinds::blind_level;
+use pokedr_core::cfr::{KuhnCfrResult, KuhnCfrSolver};
 use pokedr_core::short_stack::{
     ShortStackConfig, ShortStackReport, analyze_open_2bb_defense, analyze_short_stack,
 };
@@ -16,6 +18,7 @@ const DEFAULT_FLAT_CALL_FRACTION: f64 = 0.25;
 
 fn main() {
     let args: Vec<String> = env::args().collect();
+    let solve_kuhn = has_flag(&args, "--solve-kuhn");
     let scan_open2bb = has_flag(&args, "--scan-open2bb");
     let scan_defense2bb = has_flag(&args, "--scan-defense2bb");
     let level = parse_arg(&args, "--level").unwrap_or(DEFAULT_LEVEL);
@@ -59,6 +62,23 @@ fn main() {
     let defender_jam_fraction_override = parse_f64_arg(&args, "--defender-jam-fraction");
     let include_overcall = has_flag(&args, "--overcall");
     let format = parse_string_arg(&args, "--format").unwrap_or("text");
+
+    if solve_kuhn {
+        let iterations = parse_arg(&args, "--cfr-iterations").unwrap_or(100_000) as usize;
+        let started_at = Instant::now();
+        let mut solver = KuhnCfrSolver::new();
+        let result = solver.train(iterations);
+        let elapsed = started_at.elapsed();
+        match format {
+            "json" => print_kuhn_json(&result, elapsed.as_secs_f64()),
+            "text" => print_kuhn_report(&result, elapsed.as_secs_f64()),
+            _ => {
+                eprintln!("invalid --format; expected text or json");
+                std::process::exit(2);
+            }
+        }
+        return;
+    }
 
     let Some(level) = blind_level(level as u8) else {
         eprintln!("invalid --level; expected 1..=16");
@@ -160,6 +180,59 @@ fn parse_stacks(args: &[String]) -> Option<Vec<u32>> {
         .collect();
 
     (!stacks.is_empty()).then_some(stacks)
+}
+
+fn print_kuhn_report(result: &KuhnCfrResult, elapsed_seconds: f64) {
+    let iterations_per_second = if elapsed_seconds > 0.0 {
+        result.iterations as f64 / elapsed_seconds
+    } else {
+        0.0
+    };
+
+    println!("Kuhn poker CFR");
+    println!("iterations: {}", result.iterations);
+    println!("expected value P0: {:.6}", result.expected_value);
+    println!("known value P0: {:.6}", -1.0 / 18.0);
+    println!("elapsed seconds: {:.6}", elapsed_seconds);
+    println!("iterations/sec: {:.0}", iterations_per_second);
+    println!();
+    println!("infoset,check_or_fold,bet_or_call");
+    for strategy in &result.infosets {
+        println!(
+            "{},{:.6},{:.6}",
+            strategy.key, strategy.check_or_fold, strategy.bet_or_call
+        );
+    }
+}
+
+fn print_kuhn_json(result: &KuhnCfrResult, elapsed_seconds: f64) {
+    let iterations_per_second = if elapsed_seconds > 0.0 {
+        result.iterations as f64 / elapsed_seconds
+    } else {
+        0.0
+    };
+
+    println!("{{");
+    println!("  \"game\": \"kuhn\",");
+    println!("  \"iterations\": {},", result.iterations);
+    println!("  \"expected_value_p0\": {:.9},", result.expected_value);
+    println!("  \"known_value_p0\": {:.9},", -1.0 / 18.0);
+    println!("  \"elapsed_seconds\": {:.9},", elapsed_seconds);
+    println!("  \"iterations_per_second\": {:.3},", iterations_per_second);
+    println!("  \"infosets\": [");
+    for (index, strategy) in result.infosets.iter().enumerate() {
+        let comma = if index + 1 == result.infosets.len() {
+            ""
+        } else {
+            ","
+        };
+        println!(
+            "    {{\"key\":\"{}\",\"check_or_fold\":{:.9},\"bet_or_call\":{:.9}}}{}",
+            strategy.key, strategy.check_or_fold, strategy.bet_or_call, comma
+        );
+    }
+    println!("  ]");
+    println!("}}");
 }
 
 fn parse_u32_list(args: &[String], name: &str, default: &[u32]) -> Vec<u32> {

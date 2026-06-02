@@ -1,5 +1,6 @@
 pub mod blinds;
 pub mod cards;
+pub mod cfr;
 pub mod death_race;
 pub mod equity;
 pub mod hand_class;
