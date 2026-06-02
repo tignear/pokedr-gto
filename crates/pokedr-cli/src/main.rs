@@ -330,56 +330,78 @@ fn print_defense2bb_scan(
     };
 
     println!(
-        "level,stack,opener_seat,defender_seat,opener_open_fraction,opener_call_fraction,defender_flat_realization,hand,best_action,fold_value,flat_value,jam_value,flat_ev,jam_ev,flat_equity,jam_equity"
+        "level,stack,stack_bb,opener_seat,defender_seat,opener_open_fraction,opener_call_fraction,defender_flat_realization,hand,best_action,fold_value,flat_value,jam_value,flat_ev,jam_ev,flat_equity,jam_equity"
     );
+    let stack_bbs = parse_f64_list(args, "--scan-defense-bbs", &[]);
+    let stack_points: Vec<(u32, f64)> = if stack_bbs.is_empty() {
+        let defender_stack = stacks.get(defender_seat).copied().unwrap_or(stack);
+        vec![(
+            defender_stack,
+            defender_stack as f64 / level.big_blind as f64,
+        )]
+    } else {
+        stack_bbs
+            .iter()
+            .map(|stack_bb| {
+                (
+                    (stack_bb * level.big_blind as f64).round().max(1.0) as u32,
+                    *stack_bb,
+                )
+            })
+            .collect()
+    };
 
-    for &opener_open_fraction in &opener_open_fractions {
-        for &opener_call_fraction in &opener_call_fractions {
-            for &defender_flat_realization in &flat_realizations {
-                let config = ShortStackConfig {
-                    level,
-                    alive_players: stacks.len() as u8,
-                    stack,
-                    stacks: stacks.clone(),
-                    players_behind,
-                    elapsed_in_level_seconds,
-                    hand_duration_seconds,
-                    max_boards_per_combo,
-                    range_sample_limit,
-                    iterations,
-                    spot_iterations,
-                    include_overcall,
-                    postflop_realization,
-                    flat_call_fraction,
-                    defender_jam_fraction_override,
-                };
-                for result in analyze_open_2bb_defense(
-                    &config,
-                    opener_seat,
-                    defender_seat,
-                    opener_open_fraction,
-                    opener_call_fraction,
-                    defender_flat_realization,
-                ) {
-                    println!(
-                        "{},{},{},{},{:.3},{:.3},{:.3},{},{},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6}",
-                        level.level,
-                        stacks.get(defender_seat).copied().unwrap_or(stack),
+    for (scan_stack, stack_bb) in stack_points {
+        let scan_stacks = vec![scan_stack; alive_players as usize];
+        for &opener_open_fraction in &opener_open_fractions {
+            for &opener_call_fraction in &opener_call_fractions {
+                for &defender_flat_realization in &flat_realizations {
+                    let config = ShortStackConfig {
+                        level,
+                        alive_players: scan_stacks.len() as u8,
+                        stack: scan_stack,
+                        stacks: scan_stacks.clone(),
+                        players_behind,
+                        elapsed_in_level_seconds,
+                        hand_duration_seconds,
+                        max_boards_per_combo,
+                        range_sample_limit,
+                        iterations,
+                        spot_iterations,
+                        include_overcall,
+                        postflop_realization,
+                        flat_call_fraction,
+                        defender_jam_fraction_override,
+                    };
+                    for result in analyze_open_2bb_defense(
+                        &config,
                         opener_seat,
                         defender_seat,
                         opener_open_fraction,
                         opener_call_fraction,
                         defender_flat_realization,
-                        result.hand.label(),
-                        result.best_action.label(),
-                        result.fold_value,
-                        result.flat_value,
-                        result.jam_value,
-                        result.flat_value - result.fold_value,
-                        result.jam_value - result.fold_value,
-                        result.flat_equity,
-                        result.jam_equity
-                    );
+                    ) {
+                        println!(
+                            "{},{},{:.3},{},{},{:.3},{:.3},{:.3},{},{},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6}",
+                            level.level,
+                            scan_stack,
+                            stack_bb,
+                            opener_seat,
+                            defender_seat,
+                            opener_open_fraction,
+                            opener_call_fraction,
+                            defender_flat_realization,
+                            result.hand.label(),
+                            result.best_action.label(),
+                            result.fold_value,
+                            result.flat_value,
+                            result.jam_value,
+                            result.flat_value - result.fold_value,
+                            result.jam_value - result.fold_value,
+                            result.flat_equity,
+                            result.jam_equity
+                        );
+                    }
                 }
             }
         }

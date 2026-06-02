@@ -236,40 +236,45 @@ pub fn analyze_open_2bb_defense(
         current_level: config.level.level,
         elapsed_in_level_seconds: config.elapsed_in_level_seconds,
     };
-    let fold_value = state_value(
+    let fold_value = state_value_from_next_small_blind(
         clock,
         config.hand_duration_seconds,
         &award_pot_stacks(&opened_stacks, opener_seat, open_pot),
         defender_seat,
+        0,
     );
-    let flat_current_value = state_value(
+    let flat_current_value = state_value_from_next_small_blind(
         clock,
         config.hand_duration_seconds,
         &flat_stacks,
         defender_seat,
+        0,
     );
-    let flat_win_value = showdown_state_value(
+    let flat_win_value = showdown_state_value_from_next_small_blind(
         clock,
         config.hand_duration_seconds,
         &award_pot_stacks(&flat_stacks, defender_seat, flat_pot),
         defender_seat,
         &stacks,
+        0,
     );
-    let flat_lose_value = showdown_state_value(
+    let flat_lose_value = showdown_state_value_from_next_small_blind(
         clock,
         config.hand_duration_seconds,
         &award_pot_stacks(&flat_stacks, opener_seat, flat_pot),
         defender_seat,
         &stacks,
+        0,
     );
-    let jam_fold_value = state_value(
+    let jam_fold_value = state_value_from_next_small_blind(
         clock,
         config.hand_duration_seconds,
         &award_pot_stacks(&opened_stacks, defender_seat, open_pot),
         defender_seat,
+        0,
     );
     let jam_cost = opened_stacks[defender_seat].min(opened_stacks[opener_seat]);
-    let jam_win_value = showdown_state_value(
+    let jam_win_value = showdown_state_value_from_next_small_blind(
         clock,
         config.hand_duration_seconds,
         &call_win_stacks(
@@ -281,8 +286,9 @@ pub fn analyze_open_2bb_defense(
         ),
         defender_seat,
         &stacks,
+        0,
     );
-    let jam_lose_value = showdown_state_value(
+    let jam_lose_value = showdown_state_value_from_next_small_blind(
         clock,
         config.hand_duration_seconds,
         &call_lose_stacks(
@@ -294,6 +300,7 @@ pub fn analyze_open_2bb_defense(
         ),
         defender_seat,
         &stacks,
+        0,
     );
 
     let call_probability = opener_call_fraction.clamp(0.0, 1.0);
@@ -2506,11 +2513,27 @@ fn state_value(
     stacks: &[u32],
     hero_seat: usize,
 ) -> f64 {
+    state_value_from_next_small_blind(
+        clock,
+        hand_duration_seconds,
+        stacks,
+        hero_seat,
+        stacks.len().saturating_sub(2),
+    )
+}
+
+fn state_value_from_next_small_blind(
+    clock: BlindClock,
+    hand_duration_seconds: u32,
+    stacks: &[u32],
+    hero_seat: usize,
+    next_small_blind_seat: usize,
+) -> f64 {
     death_race_value(
         &DeathRaceState {
             clock,
             stacks: stacks.to_vec(),
-            next_small_blind_seat: stacks.len().saturating_sub(2),
+            next_small_blind_seat,
             hand_duration_seconds,
         },
         hero_seat,
@@ -2526,6 +2549,44 @@ fn showdown_state_value(
 ) -> f64 {
     if stacks.get(hero_seat).copied().unwrap_or_default() > 0 {
         return state_value(clock, hand_duration_seconds, stacks, hero_seat);
+    }
+
+    let alive = stacks.iter().filter(|&&stack| stack > 0).count();
+    let mut busted: Vec<_> = stacks
+        .iter()
+        .enumerate()
+        .filter_map(|(seat, &stack)| {
+            (stack == 0).then_some((
+                seat,
+                hand_start_stacks.get(seat).copied().unwrap_or_default(),
+            ))
+        })
+        .collect();
+    busted.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+
+    let Some(position) = busted.iter().position(|&(seat, _)| seat == hero_seat) else {
+        return 0.0;
+    };
+    let rank = alive + position + 1;
+    rank_points(rank as u8).unwrap_or(0) as f64
+}
+
+fn showdown_state_value_from_next_small_blind(
+    clock: BlindClock,
+    hand_duration_seconds: u32,
+    stacks: &[u32],
+    hero_seat: usize,
+    hand_start_stacks: &[u32],
+    next_small_blind_seat: usize,
+) -> f64 {
+    if stacks.get(hero_seat).copied().unwrap_or_default() > 0 {
+        return state_value_from_next_small_blind(
+            clock,
+            hand_duration_seconds,
+            stacks,
+            hero_seat,
+            next_small_blind_seat,
+        );
     }
 
     let alive = stacks.iter().filter(|&&stack| stack > 0).count();
