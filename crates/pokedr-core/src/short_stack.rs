@@ -387,6 +387,12 @@ struct DecisionKey {
     prior_callers: Vec<usize>,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct RegretState {
+    call: f64,
+    fold: f64,
+}
+
 fn solve_call_tree(
     classes: &[HandClass],
     opener_range: &[HandClass],
@@ -426,6 +432,7 @@ fn solve_call_tree(
             (key, range)
         })
         .collect();
+    let mut regrets: HashMap<(DecisionKey, HandClass), RegretState> = HashMap::new();
 
     let iterations = config.spot_iterations.max(1);
     let mut converged = false;
@@ -447,6 +454,7 @@ fn solve_call_tree(
                 opener_seat,
                 &key.prior_callers,
             );
+            let new_range = apply_regret_matching(key, &new_range, &ranges, &mut regrets);
             if !ranges_equivalent(
                 ranges.get(key).map(Vec::as_slice).unwrap_or(&[]),
                 &new_range,
@@ -560,7 +568,7 @@ fn decision_node_range_from_strategy(
     let mut range: Vec<_> = classes
         .par_iter()
         .copied()
-        .filter_map(|hand| {
+        .map(|hand| {
             let mut hero_share = 0.0;
             let mut call_value = 0.0;
             let mut fold_value = 0.0;
@@ -603,15 +611,14 @@ fn decision_node_range_from_strategy(
             }
 
             let ev = call_value - fold_value;
-            let frequency = soft_action_frequency(ev);
-            (frequency > 0.001).then_some(HandResult {
+            HandResult {
                 hand,
                 equity: hero_share,
                 ev,
-                frequency,
+                frequency: 0.0,
                 call_value: Some(call_value),
                 fold_value: Some(fold_value),
-            })
+            }
         })
         .collect();
 
@@ -622,6 +629,59 @@ fn decision_node_range_from_strategy(
             .then_with(|| right.equity.total_cmp(&left.equity))
     });
     range
+}
+
+fn apply_regret_matching(
+    key: &DecisionKey,
+    values: &[HandResult],
+    current_ranges: &HashMap<DecisionKey, Vec<HandResult>>,
+    regrets: &mut HashMap<(DecisionKey, HandClass), RegretState>,
+) -> Vec<HandResult> {
+    let current = current_ranges.get(key).map(Vec::as_slice).unwrap_or(&[]);
+    let mut range: Vec<_> = values
+        .iter()
+        .filter_map(|result| {
+            let call_value = result.call_value?;
+            let fold_value = result.fold_value?;
+            let current_frequency = current_frequency(current, result.hand);
+            let strategy_value =
+                current_frequency * call_value + (1.0 - current_frequency) * fold_value;
+            let state = regrets.entry((key.clone(), result.hand)).or_default();
+            state.call = (state.call * 0.75 + call_value - strategy_value).max(0.0);
+            state.fold = (state.fold * 0.75 + fold_value - strategy_value).max(0.0);
+
+            let call_regret = state.call;
+            let fold_regret = state.fold;
+            let regret_sum = call_regret + fold_regret;
+            let frequency = if regret_sum > 0.0 {
+                call_regret / regret_sum
+            } else {
+                current_frequency
+            };
+
+            (frequency > 0.001).then_some(HandResult {
+                frequency,
+                ..result.clone()
+            })
+        })
+        .collect();
+
+    range.sort_by(|left, right| {
+        right
+            .ev
+            .total_cmp(&left.ev)
+            .then_with(|| right.frequency.total_cmp(&left.frequency))
+            .then_with(|| right.equity.total_cmp(&left.equity))
+    });
+    range
+}
+
+fn current_frequency(range: &[HandResult], hand: HandClass) -> f64 {
+    range
+        .iter()
+        .find(|result| result.hand == hand)
+        .map(|result| result.frequency)
+        .unwrap_or(0.0)
 }
 
 fn future_patterns_from_strategy(
@@ -1628,11 +1688,6 @@ fn heuristic_strength(hand: HandClass) -> f64 {
 
 fn combo_fraction(range: &[HandClass]) -> f64 {
     range.iter().map(|hand| hand.combos().len()).sum::<usize>() as f64 / 1326.0
-}
-
-fn soft_action_frequency(ev: f64) -> f64 {
-    let scale = 1.5;
-    1.0 / (1.0 + (-ev / scale).exp())
 }
 
 fn normalized_stacks(config: &ShortStackConfig) -> Vec<u32> {
