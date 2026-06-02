@@ -114,7 +114,9 @@ fn analyze_seat(
             &call_range,
             &seat_config,
             dead_pot,
+            fold_stack,
             all_in_cost,
+            orbit_cost,
             cache,
         );
         call_range = profitable_call_range(
@@ -134,7 +136,9 @@ fn analyze_seat(
         &call_range,
         &seat_config,
         dead_pot,
+        fold_stack,
         all_in_cost,
+        orbit_cost,
         cache,
     );
     let displayed_shove_range = if players_behind == 0 {
@@ -182,13 +186,24 @@ fn profitable_shove_range(
     call_range: &[HandClass],
     config: &ShortStackConfig,
     dead_pot: u32,
+    fold_stack: u32,
     all_in_cost: u32,
+    orbit_cost: u32,
     cache: &mut EquityCache,
 ) -> Vec<HandClass> {
-    profitable_shove_results(classes, call_range, config, dead_pot, all_in_cost, cache)
-        .into_iter()
-        .map(|result| result.hand)
-        .collect()
+    profitable_shove_results(
+        classes,
+        call_range,
+        config,
+        dead_pot,
+        fold_stack,
+        all_in_cost,
+        orbit_cost,
+        cache,
+    )
+    .into_iter()
+    .map(|result| result.hand)
+    .collect()
 }
 
 fn profitable_shove_results(
@@ -196,15 +211,24 @@ fn profitable_shove_results(
     call_range: &[HandClass],
     config: &ShortStackConfig,
     dead_pot: u32,
+    fold_stack: u32,
     all_in_cost: u32,
+    orbit_cost: u32,
     cache: &mut EquityCache,
 ) -> Vec<HandResult> {
     let call_probability = combo_fraction(call_range);
     let sampled_call_range = sample_range(call_range, config.range_sample_limit);
     let fold_probability = (1.0 - call_probability).powi(config.players_behind as i32);
     let called_probability = 1.0 - fold_probability;
-    let called_pot = (dead_pot + all_in_cost.saturating_mul(2)) as f64;
-    let risk = all_in_cost as f64;
+    let fold_value = stack_survival_value(fold_stack, orbit_cost);
+    let steal_value = stack_survival_value(fold_stack.saturating_add(dead_pot), orbit_cost);
+    let win_value = stack_survival_value(
+        fold_stack
+            .saturating_add(dead_pot)
+            .saturating_add(all_in_cost),
+        orbit_cost,
+    );
+    let lose_value = 0.0;
 
     let mut results = Vec::new();
 
@@ -216,8 +240,9 @@ fn profitable_shove_results(
             cache,
         )
         .share();
-        let ev =
-            fold_probability * dead_pot as f64 + called_probability * (equity * called_pot - risk);
+        let shove_value = fold_probability * steal_value
+            + called_probability * (equity * win_value + (1.0 - equity) * lose_value);
+        let ev = shove_value - fold_value;
 
         if ev >= 0.0 {
             results.push(HandResult { hand, equity, ev });
@@ -427,5 +452,15 @@ mod tests {
         let pot_odds = all_in_cost as f64 / pot_after_call as f64;
 
         assert!(survival_required_equity(fold_stack, pot_after_call, orbit_cost) > pot_odds);
+    }
+
+    #[test]
+    fn stack_survival_value_has_diminishing_returns() {
+        let orbit_cost = 10_000;
+        let first_orbit = stack_survival_value(10_000, orbit_cost);
+        let second_orbit_gain =
+            stack_survival_value(20_000, orbit_cost) - stack_survival_value(10_000, orbit_cost);
+
+        assert!(first_orbit > second_orbit_gain);
     }
 }
