@@ -5,8 +5,9 @@ use pokedr_core::blinds::blind_level;
 use pokedr_core::cards::Card;
 use pokedr_core::cfr::{CfrResult, KuhnCfrSolver, LeducCfrSolver};
 use pokedr_core::postflop::{
-    PostflopCfrConfig, PostflopCfrResult, PostflopEquityReport, PostflopNode, PostflopRole,
-    parse_range, postflop_combos, postflop_equity_reports, solve_postflop_check_bet,
+    PostflopCfrConfig, PostflopCfrResult, PostflopComboFeatures, PostflopEquityReport,
+    PostflopNode, PostflopNodeReport, PostflopRole, parse_range, postflop_combos,
+    postflop_equity_reports, solve_postflop_check_bet,
 };
 use pokedr_core::river::{
     RiverCfrConfig, RiverCfrResult, RiverNode, RiverRole, river_blocker_reports, river_combos,
@@ -147,6 +148,7 @@ fn main() {
             let cfr_iterations = parse_arg(&args, "--cfr-iterations").unwrap_or(100_000) as usize;
             let pot = parse_f64_arg(&args, "--pot").unwrap_or(100.0);
             let bet = parse_f64_arg(&args, "--bet").unwrap_or(pot * 0.75);
+            let raise = parse_f64_arg(&args, "--raise").unwrap_or(bet * 3.0);
             print_postflop_solution(
                 &board,
                 oop_range,
@@ -155,6 +157,7 @@ fn main() {
                 cfr_iterations,
                 pot,
                 bet,
+                raise,
                 limit,
                 format,
             );
@@ -461,6 +464,7 @@ fn print_postflop_solution(
     iterations: usize,
     pot: f64,
     bet: f64,
+    raise: f64,
     limit: usize,
     format: &str,
 ) {
@@ -484,6 +488,7 @@ fn print_postflop_solution(
         ip_range: postflop_combos(&ip_classes, board),
         pot,
         bet,
+        raise,
         iterations,
         max_runouts,
     });
@@ -514,9 +519,31 @@ fn print_postflop_solution_result(result: &PostflopCfrResult, limit: usize, form
             );
             println!("  \"pot\": {:.6},", result.pot);
             println!("  \"bet\": {:.6},", result.bet);
+            println!("  \"raise\": {:.6},", result.raise);
             println!("  \"board_cards\": {},", result.board_cards);
             println!("  \"oop_combo_count\": {},", result.oop_combo_count);
             println!("  \"ip_combo_count\": {},", result.ip_combo_count);
+            println!("  \"limitations\": [");
+            for (index, limitation) in result.limitations.iter().enumerate() {
+                let comma = if index + 1 == result.limitations.len() {
+                    ""
+                } else {
+                    ","
+                };
+                println!("    \"{}\"{}", limitation, comma);
+            }
+            println!("  ],");
+            println!("  \"node_reports\": [");
+            let node_reports = postflop_display_node_reports(result);
+            for (index, report) in node_reports.iter().enumerate() {
+                let comma = if index + 1 == node_reports.len() {
+                    ""
+                } else {
+                    ","
+                };
+                print_postflop_node_report_json(report, limit, "    ", comma);
+            }
+            println!("  ],");
             println!("  \"strategies\": [");
             for (index, strategy) in strategies.iter().take(limit).enumerate() {
                 let comma = if index + 1 == limit.min(strategies.len()) {
@@ -525,13 +552,14 @@ fn print_postflop_solution_result(result: &PostflopCfrResult, limit: usize, form
                     ","
                 };
                 println!(
-                    "    {{\"role\":\"{}\",\"node\":\"{}\",\"board\":\"{}\",\"combo\":\"{}\",\"class\":\"{}\",\"equity\":{:.9},\"actions\":[",
+                    "    {{\"role\":\"{}\",\"node\":\"{}\",\"board\":\"{}\",\"combo\":\"{}\",\"class\":\"{}\",\"equity\":{:.9},\"features\":{},\"actions\":[",
                     postflop_role_label(strategy.role),
                     postflop_node_label(strategy.node),
                     cards_label(&strategy.board),
                     strategy.combo.label(),
                     strategy.combo.class.label(),
-                    strategy.equity
+                    strategy.equity,
+                    postflop_features_json(strategy.features)
                 );
                 for (action_index, action) in strategy.actions.iter().enumerate() {
                     let action_comma = if action_index + 1 == strategy.actions.len() {
@@ -555,10 +583,49 @@ fn print_postflop_solution_result(result: &PostflopCfrResult, limit: usize, form
             println!("expected value OOP: {:.6}", result.expected_value_oop);
             println!("pot: {:.3}", result.pot);
             println!("bet: {:.3}", result.bet);
+            println!("raise: {:.3}", result.raise);
             println!("board cards: {}", result.board_cards);
             println!("OOP combos: {}", result.oop_combo_count);
             println!("IP combos: {}", result.ip_combo_count);
-            println!("role,node,board,combo,class,equity,actions");
+            println!("limitations:");
+            for limitation in &result.limitations {
+                println!("- {}", limitation);
+            }
+            println!("node reports:");
+            for report in postflop_display_node_reports(result) {
+                println!(
+                    "{} {} {} combos={} top_entries",
+                    postflop_role_label(report.role),
+                    postflop_node_label(report.node),
+                    cards_label(&report.board),
+                    report.combo_count
+                );
+                for entry in report.entries.iter().take(limit.min(12)) {
+                    let actions = entry
+                        .actions
+                        .iter()
+                        .map(|action| format!("{}={:.3}", action.action, action.frequency))
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    println!(
+                        "  {:<5} {:<4} weight={:.3} eq={:.3} sc={} gap={} pair_block={} flush_block={} top_block={} {}",
+                        entry.combo.label(),
+                        entry.combo.class.label(),
+                        entry.range_weight,
+                        entry.equity,
+                        entry.features.is_suited_connector,
+                        entry.features.connector_gap,
+                        entry.features.blocks_board_pair,
+                        entry.features.blocks_board_flush_suit,
+                        entry.features.blocks_top_villain,
+                        actions
+                    );
+                }
+            }
+            println!("strategy rows:");
+            println!(
+                "role,node,board,combo,class,equity,suited,connector_gap,suited_connector,blocks_board_pair,blocks_board_flush_suit,blocks_top_villain,actions"
+            );
             for strategy in strategies.iter().take(limit) {
                 let actions = strategy
                     .actions
@@ -567,13 +634,19 @@ fn print_postflop_solution_result(result: &PostflopCfrResult, limit: usize, form
                     .collect::<Vec<_>>()
                     .join(" ");
                 println!(
-                    "{},{},{},{},{},{:.6},{}",
+                    "{},{},{},{},{},{:.6},{},{},{},{},{},{},{}",
                     postflop_role_label(strategy.role),
                     postflop_node_label(strategy.node),
                     cards_label(&strategy.board),
                     strategy.combo.label(),
                     strategy.combo.class.label(),
                     strategy.equity,
+                    strategy.features.suited,
+                    strategy.features.connector_gap,
+                    strategy.features.is_suited_connector,
+                    strategy.features.blocks_board_pair,
+                    strategy.features.blocks_board_flush_suit,
+                    strategy.features.blocks_top_villain,
                     actions
                 );
             }
@@ -583,6 +656,80 @@ fn print_postflop_solution_result(result: &PostflopCfrResult, limit: usize, form
             std::process::exit(2);
         }
     }
+}
+
+fn postflop_display_node_reports(result: &PostflopCfrResult) -> Vec<&PostflopNodeReport> {
+    let reports: Vec<_> = result
+        .node_reports
+        .iter()
+        .filter(|report| report.board.len() == result.board_cards)
+        .collect();
+    if reports.is_empty() {
+        result.node_reports.iter().collect()
+    } else {
+        reports
+    }
+}
+
+fn print_postflop_node_report_json(
+    report: &PostflopNodeReport,
+    limit: usize,
+    indent: &str,
+    trailing_comma: &str,
+) {
+    println!("{indent}{{");
+    println!(
+        "{indent}  \"role\": \"{}\",",
+        postflop_role_label(report.role)
+    );
+    println!(
+        "{indent}  \"node\": \"{}\",",
+        postflop_node_label(report.node)
+    );
+    println!("{indent}  \"board\": \"{}\",", cards_label(&report.board));
+    println!("{indent}  \"combo_count\": {},", report.combo_count);
+    println!("{indent}  \"entries\": [");
+    for (index, entry) in report.entries.iter().take(limit).enumerate() {
+        let comma = if index + 1 == limit.min(report.entries.len()) {
+            ""
+        } else {
+            ","
+        };
+        println!(
+            "{indent}    {{\"combo\":\"{}\",\"class\":\"{}\",\"equity\":{:.9},\"range_weight\":{:.9},\"features\":{},\"actions\":[",
+            entry.combo.label(),
+            entry.combo.class.label(),
+            entry.equity,
+            entry.range_weight,
+            postflop_features_json(entry.features)
+        );
+        for (action_index, action) in entry.actions.iter().enumerate() {
+            let action_comma = if action_index + 1 == entry.actions.len() {
+                ""
+            } else {
+                ","
+            };
+            println!(
+                "{indent}      {{\"action\":\"{}\",\"frequency\":{:.9}}}{}",
+                action.action, action.frequency, action_comma
+            );
+        }
+        println!("{indent}    ]}}{}", comma);
+    }
+    println!("{indent}  ]");
+    println!("{indent}}}{trailing_comma}");
+}
+
+fn postflop_features_json(features: PostflopComboFeatures) -> String {
+    format!(
+        "{{\"suited\":{},\"connector_gap\":{},\"suited_connector\":{},\"blocks_board_pair\":{},\"blocks_board_flush_suit\":{},\"blocks_top_villain\":{}}}",
+        features.suited,
+        features.connector_gap,
+        features.is_suited_connector,
+        features.blocks_board_pair,
+        features.blocks_board_flush_suit,
+        features.blocks_top_villain
+    )
 }
 
 fn cards_label(cards: &[Card]) -> String {
@@ -638,6 +785,8 @@ fn postflop_role_label(role: PostflopRole) -> &'static str {
 fn postflop_node_label(node: PostflopNode) -> &'static str {
     match node {
         PostflopNode::FacingBet => "facing-bet",
+        PostflopNode::FacingRaise => "facing-raise",
+        PostflopNode::FacingReraise => "facing-reraise",
         PostflopNode::AfterCheck => "after-check",
     }
 }

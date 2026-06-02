@@ -28,6 +28,7 @@ pub struct PostflopCfrConfig {
     pub ip_range: Vec<PostflopCombo>,
     pub pot: f64,
     pub bet: f64,
+    pub raise: f64,
     pub iterations: usize,
     pub max_runouts: usize,
 }
@@ -38,10 +39,13 @@ pub struct PostflopCfrResult {
     pub expected_value_oop: f64,
     pub pot: f64,
     pub bet: f64,
+    pub raise: f64,
     pub board_cards: usize,
     pub oop_combo_count: usize,
     pub ip_combo_count: usize,
+    pub limitations: Vec<&'static str>,
     pub strategies: Vec<PostflopComboStrategy>,
+    pub node_reports: Vec<PostflopNodeReport>,
 }
 
 #[derive(Debug, Clone)]
@@ -51,18 +55,49 @@ pub struct PostflopComboStrategy {
     pub role: PostflopRole,
     pub node: PostflopNode,
     pub equity: f64,
+    pub features: PostflopComboFeatures,
     pub actions: Vec<PostflopActionFrequency>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone)]
+pub struct PostflopNodeReport {
+    pub board: Vec<Card>,
+    pub role: PostflopRole,
+    pub node: PostflopNode,
+    pub combo_count: usize,
+    pub entries: Vec<PostflopRangeEntry>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PostflopRangeEntry {
+    pub combo: PostflopCombo,
+    pub equity: f64,
+    pub range_weight: f64,
+    pub features: PostflopComboFeatures,
+    pub actions: Vec<PostflopActionFrequency>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct PostflopComboFeatures {
+    pub suited: bool,
+    pub connector_gap: u8,
+    pub is_suited_connector: bool,
+    pub blocks_board_pair: u8,
+    pub blocks_board_flush_suit: u8,
+    pub blocks_top_villain: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PostflopRole {
     Oop,
     Ip,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PostflopNode {
     FacingBet,
+    FacingRaise,
+    FacingReraise,
     AfterCheck,
 }
 
@@ -206,16 +241,20 @@ pub fn solve_postflop_check_bet(config: PostflopCfrConfig) -> PostflopCfrResult 
             expected_value_oop: 0.0,
             pot: config.pot,
             bet: config.bet,
+            raise: config.raise,
             board_cards: config.board.len(),
             oop_combo_count: config.oop_range.len(),
             ip_combo_count: config.ip_range.len(),
+            limitations: postflop_limitations(),
             strategies: Vec::new(),
+            node_reports: Vec::new(),
         };
     }
     let mut solver = PostflopCfrTrainer {
         oop_range: &config.oop_range,
         ip_range: &config.ip_range,
         bet: config.bet,
+        raise: config.raise,
         max_runouts: config.max_runouts,
         nodes: HashMap::new(),
     };
@@ -233,7 +272,9 @@ pub fn solve_postflop_check_bet(config: PostflopCfrConfig) -> PostflopCfrResult 
         );
     }
 
-    let strategies = solver.combo_strategies();
+    let mut strategies = solver.combo_strategies();
+    annotate_top_blockers(&mut strategies);
+    let node_reports = postflop_node_reports(&strategies);
     PostflopCfrResult {
         iterations: config.iterations,
         expected_value_oop: if config.iterations == 0 {
@@ -243,10 +284,13 @@ pub fn solve_postflop_check_bet(config: PostflopCfrConfig) -> PostflopCfrResult 
         },
         pot: config.pot,
         bet: config.bet,
+        raise: config.raise,
         board_cards: config.board.len(),
         oop_combo_count: config.oop_range.len(),
         ip_combo_count: config.ip_range.len(),
+        limitations: postflop_limitations(),
         strategies,
+        node_reports,
     }
 }
 
@@ -254,12 +298,15 @@ pub fn solve_postflop_check_bet(config: PostflopCfrConfig) -> PostflopCfrResult 
 enum PostflopHistory {
     IpDecision,
     OopFacingBet,
+    IpFacingRaise,
+    OopFacingReraise,
 }
 
 struct PostflopCfrTrainer<'a> {
     oop_range: &'a [PostflopCombo],
     ip_range: &'a [PostflopCombo],
     bet: f64,
+    raise: f64,
     max_runouts: usize,
     nodes: HashMap<String, PostflopCfrNode>,
 }
@@ -271,9 +318,9 @@ struct PostflopCfrNode {
     node: PostflopNode,
     combo: PostflopCombo,
     equity: f64,
-    action_labels: [&'static str; 2],
-    regret_sum: [f64; 2],
-    strategy_sum: [f64; 2],
+    action_labels: Vec<&'static str>,
+    regret_sum: Vec<f64>,
+    strategy_sum: Vec<f64>,
 }
 
 impl PostflopCfrTrainer<'_> {
@@ -289,13 +336,15 @@ impl PostflopCfrTrainer<'_> {
         let player = match history {
             PostflopHistory::IpDecision => 1,
             PostflopHistory::OopFacingBet => 0,
+            PostflopHistory::IpFacingRaise => 1,
+            PostflopHistory::OopFacingReraise => 0,
         };
         let key = self.infoset_key(history, board, oop_index, ip_index);
         let strategy = self.strategy_for(&key, history, board, oop_index, ip_index);
-        let mut action_values = [0.0; 2];
+        let mut action_values = vec![0.0; strategy.len()];
         let mut node_value = 0.0;
 
-        for action in 0..2 {
+        for action in 0..strategy.len() {
             let mut next_reach = reach;
             next_reach[player] *= strategy[action];
             action_values[action] = match history {
@@ -316,10 +365,55 @@ impl PostflopCfrTrainer<'_> {
                 PostflopHistory::OopFacingBet => {
                     if action == 0 {
                         -pot * 0.5
-                    } else {
+                    } else if action == 1 {
                         self.advance_or_showdown(
                             board,
                             pot + self.bet * 2.0,
+                            oop_index,
+                            ip_index,
+                            next_reach,
+                        )
+                    } else {
+                        self.cfr(
+                            PostflopHistory::IpFacingRaise,
+                            board,
+                            pot,
+                            oop_index,
+                            ip_index,
+                            next_reach,
+                        )
+                    }
+                }
+                PostflopHistory::IpFacingRaise => {
+                    if action == 0 {
+                        pot * 0.5 + self.bet
+                    } else if action == 1 {
+                        self.advance_or_showdown(
+                            board,
+                            pot + self.raise * 2.0,
+                            oop_index,
+                            ip_index,
+                            next_reach,
+                        )
+                    } else {
+                        self.cfr(
+                            PostflopHistory::OopFacingReraise,
+                            board,
+                            pot,
+                            oop_index,
+                            ip_index,
+                            next_reach,
+                        )
+                    }
+                }
+                PostflopHistory::OopFacingReraise => {
+                    let reraise = self.raise * 2.0;
+                    if action == 0 {
+                        -(pot * 0.5 + self.raise)
+                    } else {
+                        self.advance_or_showdown(
+                            board,
+                            pot + reraise * 2.0,
                             oop_index,
                             ip_index,
                             next_reach,
@@ -335,7 +429,7 @@ impl PostflopCfrTrainer<'_> {
             .get_mut(&key)
             .expect("postflop CFR node should exist after strategy lookup");
         let opponent_reach = reach[1 - player];
-        for action in 0..2 {
+        for action in 0..strategy.len() {
             let regret = if player == 0 {
                 action_values[action] - node_value
             } else {
@@ -441,6 +535,18 @@ impl PostflopCfrTrainer<'_> {
                     self.oop_range[oop_index].label()
                 )
             }
+            PostflopHistory::IpFacingRaise => {
+                format!(
+                    "IP:{board}:{}:facing-raise",
+                    self.ip_range[ip_index].label()
+                )
+            }
+            PostflopHistory::OopFacingReraise => {
+                format!(
+                    "OOP:{board}:{}:facing-reraise",
+                    self.oop_range[oop_index].label()
+                )
+            }
         }
     }
 
@@ -451,7 +557,7 @@ impl PostflopCfrTrainer<'_> {
         board: &[Card],
         oop_index: usize,
         ip_index: usize,
-    ) -> [f64; 2] {
+    ) -> Vec<f64> {
         if let Some(node) = self.nodes.get(key) {
             return node.strategy();
         }
@@ -469,9 +575,9 @@ impl PostflopCfrTrainer<'_> {
                 node: PostflopNode::AfterCheck,
                 combo: self.ip_range[ip_index].clone(),
                 equity: 1.0 - oop_equity,
-                action_labels: ["check", "bet"],
-                regret_sum: [0.0, 0.0],
-                strategy_sum: [0.0, 0.0],
+                action_labels: vec!["check", "bet"],
+                regret_sum: vec![0.0, 0.0],
+                strategy_sum: vec![0.0, 0.0],
             },
             PostflopHistory::OopFacingBet => PostflopCfrNode {
                 board: board.to_vec(),
@@ -479,9 +585,29 @@ impl PostflopCfrTrainer<'_> {
                 node: PostflopNode::FacingBet,
                 combo: self.oop_range[oop_index].clone(),
                 equity: oop_equity,
-                action_labels: ["fold", "call"],
-                regret_sum: [0.0, 0.0],
-                strategy_sum: [0.0, 0.0],
+                action_labels: vec!["fold", "call", "raise"],
+                regret_sum: vec![0.0, 0.0, 0.0],
+                strategy_sum: vec![0.0, 0.0, 0.0],
+            },
+            PostflopHistory::IpFacingRaise => PostflopCfrNode {
+                board: board.to_vec(),
+                role: PostflopRole::Ip,
+                node: PostflopNode::FacingRaise,
+                combo: self.ip_range[ip_index].clone(),
+                equity: 1.0 - oop_equity,
+                action_labels: vec!["fold", "call", "reraise"],
+                regret_sum: vec![0.0, 0.0, 0.0],
+                strategy_sum: vec![0.0, 0.0, 0.0],
+            },
+            PostflopHistory::OopFacingReraise => PostflopCfrNode {
+                board: board.to_vec(),
+                role: PostflopRole::Oop,
+                node: PostflopNode::FacingReraise,
+                combo: self.oop_range[oop_index].clone(),
+                equity: oop_equity,
+                action_labels: vec!["fold", "call"],
+                regret_sum: vec![0.0, 0.0],
+                strategy_sum: vec![0.0, 0.0],
             },
         };
         let strategy = node.strategy();
@@ -498,7 +624,8 @@ impl PostflopCfrTrainer<'_> {
                 combo: node.combo.clone(),
                 role: node.role,
                 node: node.node,
-                equity: node.equity,
+                equity: self.range_equity(node),
+                features: combo_features(&node.board, &node.combo),
                 actions: node.average_strategy(),
             })
             .collect();
@@ -511,35 +638,294 @@ impl PostflopCfrTrainer<'_> {
         });
         strategies
     }
+
+    fn range_equity(&self, node: &PostflopCfrNode) -> f64 {
+        let (hero, villains) = match node.role {
+            PostflopRole::Oop => (&node.combo, self.ip_range),
+            PostflopRole::Ip => (&node.combo, self.oop_range),
+        };
+        let mut total = 0.0;
+        let mut count = 0.0;
+        for villain in villains {
+            if hero.mask & villain.mask != 0 {
+                continue;
+            }
+            let equity = combo_equity(&node.board, hero, villain, self.max_runouts);
+            total += match node.role {
+                PostflopRole::Oop => equity,
+                PostflopRole::Ip => 1.0 - equity,
+            };
+            count += 1.0;
+        }
+        if count == 0.0 {
+            node.equity
+        } else {
+            total / count
+        }
+    }
+}
+
+fn postflop_node_reports(strategies: &[PostflopComboStrategy]) -> Vec<PostflopNodeReport> {
+    let mut grouped: HashMap<(String, PostflopRole, PostflopNode), Vec<PostflopComboStrategy>> =
+        HashMap::new();
+
+    for strategy in strategies {
+        grouped
+            .entry((board_label(&strategy.board), strategy.role, strategy.node))
+            .or_default()
+            .push(strategy.clone());
+    }
+
+    let mut reports: Vec<_> = grouped
+        .into_values()
+        .map(|mut node_strategies| {
+            node_strategies.sort_by(|left, right| {
+                right
+                    .equity
+                    .total_cmp(&left.equity)
+                    .then_with(|| {
+                        right
+                            .features
+                            .blocks_top_villain
+                            .cmp(&left.features.blocks_top_villain)
+                    })
+                    .then_with(|| left.combo.label().cmp(&right.combo.label()))
+            });
+            let combo_count = node_strategies.len();
+            let board = node_strategies
+                .first()
+                .map(|strategy| strategy.board.clone())
+                .unwrap_or_default();
+            let role = node_strategies
+                .first()
+                .map(|strategy| strategy.role)
+                .unwrap_or(PostflopRole::Ip);
+            let node = node_strategies
+                .first()
+                .map(|strategy| strategy.node)
+                .unwrap_or(PostflopNode::AfterCheck);
+            let entries = action_weighted_entries(&node_strategies, None);
+
+            PostflopNodeReport {
+                board,
+                role,
+                node,
+                combo_count,
+                entries,
+            }
+        })
+        .collect();
+
+    reports.sort_by(|left, right| {
+        left.board
+            .len()
+            .cmp(&right.board.len())
+            .then_with(|| board_label(&left.board).cmp(&board_label(&right.board)))
+            .then_with(|| postflop_role_key(left.role).cmp(&postflop_role_key(right.role)))
+            .then_with(|| postflop_node_key(left.node).cmp(&postflop_node_key(right.node)))
+    });
+    reports
+}
+
+fn annotate_top_blockers(strategies: &mut [PostflopComboStrategy]) {
+    let snapshot = strategies.to_vec();
+    for strategy in strategies {
+        let opposing: Vec<_> = snapshot
+            .iter()
+            .filter(|other| other.board == strategy.board && other.role != strategy.role)
+            .cloned()
+            .collect();
+        if opposing.is_empty() {
+            continue;
+        }
+        let mut top = opposing;
+        top.sort_by(|left, right| {
+            right
+                .equity
+                .total_cmp(&left.equity)
+                .then_with(|| left.combo.label().cmp(&right.combo.label()))
+        });
+        let top_count = ((top.len() as f64) * 0.2).ceil().max(1.0) as usize;
+        strategy.features.blocks_top_villain = top
+            .iter()
+            .take(top_count)
+            .filter(|villain| villain.combo.mask & strategy.combo.mask != 0)
+            .count();
+    }
+}
+
+pub fn postflop_action_range_report(
+    result: &PostflopCfrResult,
+    board: &[Card],
+    role: PostflopRole,
+    node: PostflopNode,
+    action: &str,
+) -> Option<PostflopNodeReport> {
+    let mut strategies: Vec<_> = result
+        .strategies
+        .iter()
+        .filter(|strategy| {
+            strategy.board == board && strategy.role == role && strategy.node == node
+        })
+        .cloned()
+        .collect();
+    if strategies.is_empty() {
+        return None;
+    }
+    strategies.sort_by(|left, right| {
+        action_frequency(right, action)
+            .total_cmp(&action_frequency(left, action))
+            .then_with(|| {
+                right
+                    .features
+                    .blocks_top_villain
+                    .cmp(&left.features.blocks_top_villain)
+            })
+            .then_with(|| right.equity.total_cmp(&left.equity))
+            .then_with(|| left.combo.label().cmp(&right.combo.label()))
+    });
+
+    Some(PostflopNodeReport {
+        board: board.to_vec(),
+        role,
+        node,
+        combo_count: strategies.len(),
+        entries: action_weighted_entries(&strategies, Some(action)),
+    })
+}
+
+fn action_weighted_entries(
+    strategies: &[PostflopComboStrategy],
+    action: Option<&str>,
+) -> Vec<PostflopRangeEntry> {
+    let weights: Vec<_> = strategies
+        .iter()
+        .map(|strategy| {
+            action
+                .map(|action| action_frequency(strategy, action))
+                .unwrap_or(1.0)
+        })
+        .collect();
+    let total_weight: f64 = weights.iter().sum();
+
+    strategies
+        .iter()
+        .zip(weights)
+        .filter(|(_, weight)| *weight > 0.0)
+        .map(|(strategy, weight)| PostflopRangeEntry {
+            combo: strategy.combo.clone(),
+            equity: strategy.equity,
+            range_weight: if total_weight > 0.0 {
+                weight / total_weight
+            } else {
+                0.0
+            },
+            features: strategy.features,
+            actions: strategy.actions.clone(),
+        })
+        .collect()
+}
+
+fn action_frequency(strategy: &PostflopComboStrategy, action: &str) -> f64 {
+    strategy
+        .actions
+        .iter()
+        .find(|frequency| frequency.action == action)
+        .map(|frequency| frequency.frequency)
+        .unwrap_or(0.0)
+}
+
+fn combo_features(board: &[Card], combo: &PostflopCombo) -> PostflopComboFeatures {
+    let suited = combo.combo.first.suit() == combo.combo.second.suit();
+    let high = combo.combo.first.rank().max(combo.combo.second.rank());
+    let low = combo.combo.first.rank().min(combo.combo.second.rank());
+    let connector_gap = high.saturating_sub(low).saturating_sub(1);
+    let is_suited_connector = suited && connector_gap <= 1 && high != low;
+    let blocks_board_pair = [combo.combo.first, combo.combo.second]
+        .iter()
+        .filter(|card| {
+            board
+                .iter()
+                .any(|board_card| board_card.rank() == card.rank())
+        })
+        .count() as u8;
+    let flush_suit = dominant_board_suit(board);
+    let blocks_board_flush_suit = flush_suit
+        .map(|suit| {
+            [combo.combo.first, combo.combo.second]
+                .iter()
+                .filter(|card| card.suit() == suit)
+                .count() as u8
+        })
+        .unwrap_or(0);
+
+    PostflopComboFeatures {
+        suited,
+        connector_gap,
+        is_suited_connector,
+        blocks_board_pair,
+        blocks_board_flush_suit,
+        blocks_top_villain: 0,
+    }
+}
+
+fn dominant_board_suit(board: &[Card]) -> Option<u8> {
+    let mut counts = [0_u8; 4];
+    for card in board {
+        counts[card.suit() as usize] += 1;
+    }
+    counts
+        .iter()
+        .enumerate()
+        .filter(|(_, count)| **count >= 2)
+        .max_by_key(|(_, count)| **count)
+        .map(|(suit, _)| suit as u8)
+}
+
+fn postflop_limitations() -> Vec<&'static str> {
+    vec![
+        "chipEV only; no ICM or tournament utility",
+        "single bet size only",
+        "one raise and one reraise are available after IP bets; no deeper raise chain yet",
+        "no OOP donk bets, probes, overbets, or all-in sizing",
+        "heads-up only",
+        "chance nodes are sampled by --runouts, not fully enumerated when capped",
+        "range reports use average CFR strategy, not exploitability-certified convergence",
+        "blocker features are heuristic and do not yet compute action-specific blocker EV",
+        "preflop range generation is not solved yet; ranges are user supplied",
+    ]
 }
 
 impl PostflopCfrNode {
-    fn strategy(&self) -> [f64; 2] {
-        let positive = [self.regret_sum[0].max(0.0), self.regret_sum[1].max(0.0)];
-        let normalizer = positive[0] + positive[1];
+    fn strategy(&self) -> Vec<f64> {
+        let positive: Vec<_> = self
+            .regret_sum
+            .iter()
+            .map(|regret| regret.max(0.0))
+            .collect();
+        let normalizer: f64 = positive.iter().sum();
 
         if normalizer > 0.0 {
-            [positive[0] / normalizer, positive[1] / normalizer]
+            positive.iter().map(|value| value / normalizer).collect()
         } else {
-            [0.5, 0.5]
+            vec![1.0 / self.regret_sum.len() as f64; self.regret_sum.len()]
         }
     }
 
     fn average_strategy(&self) -> Vec<PostflopActionFrequency> {
-        let normalizer = self.strategy_sum[0] + self.strategy_sum[1];
-        let probabilities = if normalizer > 0.0 {
-            [
-                self.strategy_sum[0] / normalizer,
-                self.strategy_sum[1] / normalizer,
-            ]
-        } else {
-            [0.5, 0.5]
-        };
+        let normalizer: f64 = self.strategy_sum.iter().sum();
 
         self.action_labels
             .iter()
-            .zip(probabilities)
-            .map(|(&action, frequency)| PostflopActionFrequency { action, frequency })
+            .enumerate()
+            .map(|(index, &action)| {
+                let frequency = if normalizer > 0.0 {
+                    self.strategy_sum[index] / normalizer
+                } else {
+                    1.0 / self.strategy_sum.len() as f64
+                };
+                PostflopActionFrequency { action, frequency }
+            })
             .collect()
     }
 }
@@ -616,6 +1002,8 @@ fn postflop_node_key(node: PostflopNode) -> u8 {
     match node {
         PostflopNode::AfterCheck => 0,
         PostflopNode::FacingBet => 1,
+        PostflopNode::FacingRaise => 2,
+        PostflopNode::FacingReraise => 3,
     }
 }
 
@@ -847,6 +1235,7 @@ mod tests {
             ip_range: ip,
             pot: 100.0,
             bet: 75.0,
+            raise: 225.0,
             iterations: 1_000,
             max_runouts: 8,
         });
