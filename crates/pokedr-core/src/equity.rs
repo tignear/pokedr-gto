@@ -158,6 +158,143 @@ pub fn three_way_equity_vs_ranges_cached(
     equity
 }
 
+pub fn multi_way_equity_vs_ranges(
+    hero: HandClass,
+    opponent_ranges: &[Vec<HandClass>],
+    samples: usize,
+) -> Equity {
+    let samples = samples.max(MIN_SAMPLED_BOARDS_PER_COMBO);
+    let hero_combos = hero.combos();
+    let mut equity = Equity {
+        win: 0.0,
+        tie: 0.0,
+        total: 0.0,
+    };
+
+    for hero_combo in hero_combos {
+        let hero_mask = combo_mask(hero_combo);
+        let mut rng = SplitMix64::new(hero_mask ^ opponent_ranges.len() as u64);
+
+        'sample: for _ in 0..samples {
+            let mut used_mask = hero_mask;
+            let mut opponent_combos = Vec::with_capacity(opponent_ranges.len());
+
+            for range in opponent_ranges {
+                let Some(combo) = sample_non_overlapping_combo(range, used_mask, &mut rng) else {
+                    continue 'sample;
+                };
+                used_mask |= combo_mask(combo);
+                opponent_combos.push(combo);
+            }
+
+            let available = available_cards(used_mask);
+            let board = sample_board(&available, &mut rng);
+            let hero_value = evaluate_seven([
+                hero_combo[0],
+                hero_combo[1],
+                board[0],
+                board[1],
+                board[2],
+                board[3],
+                board[4],
+            ]);
+            let mut best = hero_value;
+            let mut winner_count = 1;
+
+            for combo in &opponent_combos {
+                let value = evaluate_seven([
+                    combo[0], combo[1], board[0], board[1], board[2], board[3], board[4],
+                ]);
+                if value > best {
+                    best = value;
+                    winner_count = 1;
+                } else if value == best {
+                    winner_count += 1;
+                }
+            }
+
+            if hero_value == best {
+                if winner_count == 1 {
+                    equity.win += 1.0;
+                } else {
+                    equity.tie += 1.0 / winner_count as f64;
+                }
+            }
+            equity.total += 1.0;
+        }
+    }
+
+    equity
+}
+
+pub fn multi_way_showdown_shares(
+    hero: HandClass,
+    opponent_ranges: &[Vec<HandClass>],
+    samples: usize,
+) -> Vec<f64> {
+    let samples = samples.max(MIN_SAMPLED_BOARDS_PER_COMBO);
+    let hero_combos = hero.combos();
+    let mut shares = vec![0.0; opponent_ranges.len() + 1];
+    let mut total = 0.0;
+
+    for hero_combo in hero_combos {
+        let hero_mask = combo_mask(hero_combo);
+        let mut rng = SplitMix64::new(hero_mask ^ ((opponent_ranges.len() as u64) << 32));
+
+        'sample: for _ in 0..samples {
+            let mut used_mask = hero_mask;
+            let mut opponent_combos = Vec::with_capacity(opponent_ranges.len());
+
+            for range in opponent_ranges {
+                let Some(combo) = sample_non_overlapping_combo(range, used_mask, &mut rng) else {
+                    continue 'sample;
+                };
+                used_mask |= combo_mask(combo);
+                opponent_combos.push(combo);
+            }
+
+            let available = available_cards(used_mask);
+            let board = sample_board(&available, &mut rng);
+            let mut values = Vec::with_capacity(opponent_combos.len() + 1);
+            values.push(evaluate_seven([
+                hero_combo[0],
+                hero_combo[1],
+                board[0],
+                board[1],
+                board[2],
+                board[3],
+                board[4],
+            ]));
+            values.extend(opponent_combos.iter().map(|combo| {
+                evaluate_seven([
+                    combo[0], combo[1], board[0], board[1], board[2], board[3], board[4],
+                ])
+            }));
+
+            let best = values
+                .iter()
+                .copied()
+                .max()
+                .expect("showdown has at least the hero hand");
+            let winner_count = values.iter().filter(|&&value| value == best).count() as f64;
+            for (index, value) in values.into_iter().enumerate() {
+                if value == best {
+                    shares[index] += 1.0 / winner_count;
+                }
+            }
+            total += 1.0;
+        }
+    }
+
+    if total > 0.0 {
+        for share in &mut shares {
+            *share /= total;
+        }
+    }
+
+    shares
+}
+
 fn heads_up_combo_equity_cached(
     hero: [Card; 2],
     villain: [Card; 2],
@@ -370,6 +507,31 @@ fn available_cards(dead_mask: u64) -> Vec<Card> {
         .into_iter()
         .filter(|card| dead_mask & card.mask() == 0)
         .collect()
+}
+
+fn sample_non_overlapping_combo(
+    range: &[HandClass],
+    used_mask: u64,
+    rng: &mut SplitMix64,
+) -> Option<[Card; 2]> {
+    if range.is_empty() {
+        return None;
+    }
+
+    for _ in 0..32 {
+        let hand = range[rng.next_usize(range.len())];
+        let combos = hand.combos();
+        let combo = combos[rng.next_usize(combos.len())];
+        if combo_mask(combo) & used_mask == 0 {
+            return Some(combo);
+        }
+    }
+
+    range.iter().find_map(|hand| {
+        hand.combos()
+            .into_iter()
+            .find(|&combo| combo_mask(combo) & used_mask == 0)
+    })
 }
 
 fn sample_board(available: &[Card], rng: &mut SplitMix64) -> [Card; 5] {

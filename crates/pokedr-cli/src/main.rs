@@ -160,6 +160,7 @@ fn print_report(level: u8, stacks: &[u32], players_behind: u8, report: &ShortSta
                 }
             );
             print_range("    range", &spot.range, 40);
+            println!("    patterns: {}", spot.patterns.len());
         }
         if report.overcall_analyzed {
             print_range("  overcall range vs jam+call", &seat.overcall_range, 40);
@@ -243,7 +244,30 @@ fn print_json_report(level: u8, stacks: &[u32], players_behind: u8, report: &Sho
                 "          \"required_equity\": {:.6},",
                 spot.required_equity
             );
-            print_json_range("range", &spot.range, false, 10);
+            print_json_range("range", &spot.range, true, 10);
+            println!("          \"patterns\": [");
+            for (pattern_index, pattern) in spot.patterns.iter().enumerate() {
+                let pattern_comma = if pattern_index + 1 == spot.patterns.len() {
+                    ""
+                } else {
+                    ","
+                };
+                println!("            {{");
+                println!(
+                    "              \"callers\": [{}],",
+                    pattern
+                        .callers
+                        .iter()
+                        .map(|seat| seat.to_string())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                );
+                println!("              \"way\": {},", pattern.callers.len() + 2);
+                println!("              \"probability\": {:.6},", pattern.probability);
+                print_json_range("range", &pattern.range, false, 14);
+                println!("            }}{pattern_comma}");
+            }
+            println!("          ]");
             println!("        }}{spot_comma}");
         }
         println!("      ],");

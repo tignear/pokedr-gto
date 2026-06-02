@@ -71,6 +71,42 @@
       font-size: 15px;
       margin: 0 0 8px;
     }
+    .spot {
+      border-top: 1px solid color-mix(in srgb, CanvasText 14%, Canvas);
+      margin-top: 14px;
+      padding-top: 12px;
+    }
+    .spot h3,
+    .spot h4 {
+      font-size: 14px;
+      margin: 0 0 8px;
+    }
+    details {
+      border: 1px solid color-mix(in srgb, CanvasText 14%, Canvas);
+      border-radius: 6px;
+      margin: 8px 0;
+      padding: 8px;
+    }
+    summary {
+      cursor: pointer;
+      font-size: 13px;
+      font-weight: 700;
+    }
+    .tree-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(310px, 1fr));
+      gap: 10px;
+      margin-top: 10px;
+    }
+    .tree {
+      border: 1px solid color-mix(in srgb, CanvasText 12%, Canvas);
+      border-radius: 6px;
+      padding: 10px;
+    }
+    .tree h4 {
+      font-size: 13px;
+      margin: 0 0 8px;
+    }
     .matrix {
       display: grid;
       grid-template-columns: repeat(13, minmax(22px, 1fr));
@@ -183,15 +219,39 @@
     }
 
     function renderCallSpot(spot) {
+      const patterns = spot.patterns || [];
       return `
-        <section>
-          <h2>call vs seat ${spot.opener_seat} AI: ${spot.range.classes} classes, ${spot.range.combos} combos (${pct(spot.range.combo_fraction)})</h2>
+        <section class="spot">
+          <h3>Call vs Seat ${spot.opener_seat} AI</h3>
           <div class="summary">
             <div class="metric"><b>Effective</b>${spot.effective_all_in_cost}</div>
             <div class="metric"><b>Required</b>${pct(spot.required_equity)}</div>
+            <div class="metric"><b>Aggregate</b>${rangeSummary(spot.range)}</div>
+            <div class="metric"><b>Trees</b>${patterns.length}</div>
           </div>
+          ${renderRangeBlock('aggregate call range', spot.range)}
+          <details open>
+            <summary>Tree ranges</summary>
+            <div class="tree-grid">
+              ${patterns.map(pattern => renderPattern(spot, pattern)).join('')}
+            </div>
+          </details>
+        </section>
+      `;
+    }
+
+    function renderPattern(spot, pattern) {
+      const callers = pattern.callers.length ? pattern.callers.map(seat => `Seat ${seat}`).join(', ') : 'none';
+      return `
+        <section class="tree">
+          <h4>${pattern.way}-way: opener Seat ${spot.opener_seat}, caller hero, later callers ${callers}</h4>
+          <div class="summary">
+            <div class="metric"><b>Probability</b>${pct(pattern.probability)}</div>
+            <div class="metric"><b>Range</b>${rangeSummary(pattern.range)}</div>
+          </div>
+          ${renderLegend()}
           <div class="matrix">
-            ${renderMatrix(spot.range)}
+            ${renderMatrix(pattern.range)}
           </div>
         </section>
       `;
@@ -201,15 +261,33 @@
       return `
         <section>
           <h2>${title(name)}: ${range.classes} classes, ${range.combos} combos (${pct(range.combo_fraction)})</h2>
-          <div class="legend">
-            <span class="pair">pair</span>
-            <span class="suited">suited</span>
-            <span class="offsuit">offsuit</span>
-          </div>
+          ${renderLegend()}
           <div class="matrix">
             ${renderMatrix(range)}
           </div>
         </section>
+      `;
+    }
+
+    function renderRangeBlock(name, range) {
+      return `
+        <section>
+          <h4>${title(name)}: ${rangeSummary(range)}</h4>
+          ${renderLegend()}
+          <div class="matrix">
+            ${renderMatrix(range)}
+          </div>
+        </section>
+      `;
+    }
+
+    function renderLegend() {
+      return `
+        <div class="legend">
+          <span class="pair">pair</span>
+          <span class="suited">suited</span>
+          <span class="offsuit">offsuit</span>
+        </div>
       `;
     }
 
@@ -245,6 +323,10 @@
 
     function pct(value) {
       return `${(value * 100).toFixed(1)}%`;
+    }
+
+    function rangeSummary(range) {
+      return `${range.classes} classes, ${range.combos} combos (${pct(range.combo_fraction)})`;
     }
 
     function title(value) {
