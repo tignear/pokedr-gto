@@ -18,6 +18,7 @@ pub struct ShortStackConfig {
     pub max_boards_per_combo: usize,
     pub range_sample_limit: usize,
     pub iterations: usize,
+    pub spot_iterations: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -25,6 +26,9 @@ pub struct ShortStackReport {
     pub dead_pot: u32,
     pub stack_in_big_blinds: f64,
     pub orbit_cost: u32,
+    pub converged: bool,
+    pub max_iterations: usize,
+    pub max_spot_iterations: usize,
     pub single_call_required_equity: f64,
     pub overcall_required_equity: f64,
     pub seats: Vec<SeatRanges>,
@@ -35,6 +39,8 @@ pub struct SeatRanges {
     pub seat_index: u8,
     pub players_behind: u8,
     pub posted_amount: u32,
+    pub iterations_run: usize,
+    pub converged: bool,
     pub call_required_equity: f64,
     pub overcall_required_equity: f64,
     pub shove_range: Vec<HandResult>,
@@ -47,6 +53,8 @@ pub struct SeatRanges {
 pub struct CallSpot {
     pub opener_seat: u8,
     pub effective_all_in_cost: u32,
+    pub iterations_run: usize,
+    pub converged: bool,
     pub required_equity: f64,
     pub range: Vec<HandResult>,
 }
@@ -74,7 +82,7 @@ pub fn analyze_short_stack(config: &ShortStackConfig) -> ShortStackReport {
 
     let classes = all_hand_classes();
     let mut cache = EquityCache::new();
-    let seats = (0..config.alive_players)
+    let seats: Vec<_> = (0..config.alive_players)
         .map(|seat_index| {
             let players_behind = config
                 .alive_players
@@ -91,11 +99,17 @@ pub fn analyze_short_stack(config: &ShortStackConfig) -> ShortStackReport {
             )
         })
         .collect();
+    let converged = seats
+        .iter()
+        .all(|seat| seat.converged && seat.call_spots.iter().all(|spot| spot.converged));
 
     ShortStackReport {
         dead_pot,
         stack_in_big_blinds: report_stack as f64 / config.level.big_blind as f64,
         orbit_cost: orbit_cost(config.level, config.alive_players),
+        converged,
+        max_iterations: config.iterations,
+        max_spot_iterations: config.spot_iterations,
         single_call_required_equity,
         overcall_required_equity,
         seats,
@@ -170,41 +184,18 @@ fn analyze_seat(
     let call_required_equity = state_required_equity(fold_value, call_win_value, call_lose_value);
     let overcall_required_equity =
         state_required_equity(fold_value, overcall_win_value, overcall_lose_value);
-    let mut call_range = top_fraction_by_heuristic(classes, 0.25);
-
-    for _ in 0..config.iterations {
-        let shove_range = profitable_shove_range(
-            classes,
-            &call_range,
-            &seat_config,
-            stacks,
-            dead_pot,
-            all_in_cost,
-            seat_index as usize,
-            cache,
-        );
-        call_range = profitable_call_range(
-            classes,
-            &shove_range,
-            call_required_equity,
-            config.max_boards_per_combo,
-            cache,
-        )
-        .into_iter()
-        .map(|result| result.hand)
-        .collect();
-    }
-
-    let modeled_shove_range = profitable_shove_results(
+    let solution = solve_shove_response(
         classes,
-        &call_range,
+        call_required_equity,
         &seat_config,
         stacks,
         dead_pot,
         all_in_cost,
         seat_index as usize,
+        config.iterations,
         cache,
     );
+    let modeled_shove_range = solution.shove_range;
     let displayed_shove_range = if players_behind == 0 {
         Vec::new()
     } else {
@@ -234,7 +225,7 @@ fn analyze_seat(
             .iter()
             .map(|result| result.hand)
             .collect::<Vec<_>>(),
-        &call_range,
+        &solution.call_range,
         overcall_required_equity,
         config.max_boards_per_combo,
         config.range_sample_limit,
@@ -245,6 +236,8 @@ fn analyze_seat(
         seat_index,
         players_behind,
         posted_amount,
+        iterations_run: solution.iterations_run,
+        converged: solution.converged,
         call_required_equity,
         overcall_required_equity,
         shove_range: displayed_shove_range,
@@ -289,18 +282,6 @@ fn analyze_call_spots(
             players_behind: stacks.len().saturating_sub(opener_seat).saturating_sub(1) as u8,
             ..config.clone()
         };
-        let baseline_call_range = top_fraction_by_heuristic(classes, 0.25);
-        let opener_range = profitable_shove_range(
-            classes,
-            &baseline_call_range,
-            &opener_config,
-            stacks,
-            dead_pot,
-            opener_cost,
-            opener_seat,
-            cache,
-        );
-
         let fold_value = state_value(clock, config.hand_duration_seconds, &posted, caller_seat);
         let win_value = state_value(
             clock,
@@ -315,9 +296,24 @@ fn analyze_call_spots(
             caller_seat,
         );
         let required_equity = state_required_equity(fold_value, win_value, lose_value);
+        let solution = solve_shove_response(
+            classes,
+            required_equity,
+            &opener_config,
+            stacks,
+            dead_pot,
+            opener_cost,
+            opener_seat,
+            config.spot_iterations,
+            cache,
+        );
         let range = profitable_call_range(
             classes,
-            &opener_range,
+            &solution
+                .shove_range
+                .iter()
+                .map(|result| result.hand)
+                .collect::<Vec<_>>(),
             required_equity,
             config.max_boards_per_combo,
             cache,
@@ -326,12 +322,86 @@ fn analyze_call_spots(
         spots.push(CallSpot {
             opener_seat: opener_seat as u8,
             effective_all_in_cost: effective_cost,
+            iterations_run: solution.iterations_run,
+            converged: solution.converged,
             required_equity,
             range,
         });
     }
 
     spots
+}
+
+struct ShoveResponseSolution {
+    shove_range: Vec<HandResult>,
+    call_range: Vec<HandClass>,
+    iterations_run: usize,
+    converged: bool,
+}
+
+fn solve_shove_response(
+    classes: &[HandClass],
+    response_required_equity: f64,
+    config: &ShortStackConfig,
+    stacks: &[u32],
+    dead_pot: u32,
+    all_in_cost: u32,
+    hero_seat: usize,
+    max_iterations: usize,
+    cache: &mut EquityCache,
+) -> ShoveResponseSolution {
+    let mut call_range = top_fraction_by_heuristic(classes, 0.25);
+    let mut iterations_run = 0;
+    let mut converged = false;
+
+    for _ in 0..max_iterations {
+        let shove_range = profitable_shove_range(
+            classes,
+            &call_range,
+            config,
+            stacks,
+            dead_pot,
+            all_in_cost,
+            hero_seat,
+            cache,
+        );
+        let next_call_range = profitable_call_range(
+            classes,
+            &shove_range,
+            response_required_equity,
+            config.max_boards_per_combo,
+            cache,
+        )
+        .into_iter()
+        .map(|result| result.hand)
+        .collect();
+
+        iterations_run += 1;
+        if next_call_range == call_range {
+            call_range = next_call_range;
+            converged = true;
+            break;
+        }
+        call_range = next_call_range;
+    }
+
+    let shove_range = profitable_shove_results(
+        classes,
+        &call_range,
+        config,
+        stacks,
+        dead_pot,
+        all_in_cost,
+        hero_seat,
+        cache,
+    );
+
+    ShoveResponseSolution {
+        shove_range,
+        call_range,
+        iterations_run,
+        converged,
+    }
 }
 
 fn profitable_shove_range(
@@ -684,6 +754,7 @@ mod tests {
             max_boards_per_combo: 1,
             range_sample_limit: 1,
             iterations: 0,
+            spot_iterations: 0,
         });
 
         assert_eq!(report.seats.len(), 3);

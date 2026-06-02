@@ -3,6 +3,11 @@ use std::env;
 use pokedr_core::blinds::blind_level;
 use pokedr_core::short_stack::{ShortStackConfig, ShortStackReport, analyze_short_stack};
 
+const DEFAULT_MAX_BOARDS_PER_COMBO: usize = 64;
+const DEFAULT_RANGE_SAMPLE_LIMIT: usize = 8;
+const DEFAULT_MAX_ITERATIONS: usize = 8;
+const DEFAULT_MAX_SPOT_ITERATIONS: usize = 2;
+
 fn main() {
     let args: Vec<String> = env::args().collect();
     let level = parse_arg(&args, "--level").unwrap_or(11);
@@ -11,9 +16,14 @@ fn main() {
     let stacks = parse_stacks(&args).unwrap_or_else(|| vec![stack; alive_players as usize]);
     let players_behind =
         parse_arg(&args, "--behind").unwrap_or(alive_players.saturating_sub(1) as u32) as u8;
-    let max_boards_per_combo = parse_arg(&args, "--boards").unwrap_or(4) as usize;
-    let range_sample_limit = parse_arg(&args, "--range-sample").unwrap_or(18) as usize;
-    let iterations = parse_arg(&args, "--iterations").unwrap_or(2) as usize;
+    let max_boards_per_combo =
+        parse_arg(&args, "--boards").unwrap_or(DEFAULT_MAX_BOARDS_PER_COMBO as u32) as usize;
+    let range_sample_limit =
+        parse_arg(&args, "--range-sample").unwrap_or(DEFAULT_RANGE_SAMPLE_LIMIT as u32) as usize;
+    let iterations =
+        parse_arg(&args, "--iterations").unwrap_or(DEFAULT_MAX_ITERATIONS as u32) as usize;
+    let spot_iterations = parse_arg(&args, "--spot-iterations")
+        .unwrap_or(DEFAULT_MAX_SPOT_ITERATIONS as u32) as usize;
     let elapsed_in_level_seconds = parse_arg(&args, "--elapsed").unwrap_or(0);
     let hand_duration_seconds = parse_arg(&args, "--hand-seconds").unwrap_or(20);
     let format = parse_string_arg(&args, "--format").unwrap_or("text");
@@ -34,6 +44,7 @@ fn main() {
         max_boards_per_combo,
         range_sample_limit,
         iterations,
+        spot_iterations,
     });
 
     match format {
@@ -78,6 +89,16 @@ fn print_report(level: u8, stacks: &[u32], players_behind: u8, report: &ShortSta
     );
     println!("alive players: {}", stacks.len());
     println!("players behind for first-in shove: {players_behind}");
+    println!(
+        "overall convergence: {}",
+        if report.converged {
+            "converged"
+        } else {
+            "not converged"
+        }
+    );
+    println!("max iterations: {}", report.max_iterations);
+    println!("max spot iterations: {}", report.max_spot_iterations);
     println!("dead pot: {}", report.dead_pot);
     println!(
         "orbit cost if everyone folds: {} ({:.1}% of stack)",
@@ -96,6 +117,16 @@ fn print_report(level: u8, stacks: &[u32], players_behind: u8, report: &ShortSta
             seat.seat_index, seat.players_behind, seat.posted_amount
         );
         println!(
+            "  response solve: {} / {} iterations, {}",
+            seat.iterations_run,
+            report.max_iterations,
+            if seat.converged {
+                "converged"
+            } else {
+                "not converged"
+            }
+        );
+        println!(
             "  death-race required equity: call {:.1}%, overcall {:.1}%",
             seat.call_required_equity * 100.0,
             seat.overcall_required_equity * 100.0
@@ -109,10 +140,17 @@ fn print_report(level: u8, stacks: &[u32], players_behind: u8, report: &ShortSta
         print_range("  call vs one all-in range", &seat.call_range, 40);
         for spot in &seat.call_spots {
             println!(
-                "  call vs seat {} AI: effective {}, required {:.1}%",
+                "  call vs seat {} AI: effective {}, required {:.1}%, {} / {} iterations, {}",
                 spot.opener_seat,
                 spot.effective_all_in_cost,
-                spot.required_equity * 100.0
+                spot.required_equity * 100.0,
+                spot.iterations_run,
+                report.max_spot_iterations,
+                if spot.converged {
+                    "converged"
+                } else {
+                    "not converged"
+                }
             );
             print_range("    range", &spot.range, 40);
         }
@@ -139,6 +177,9 @@ fn print_json_report(level: u8, stacks: &[u32], players_behind: u8, report: &Sho
     );
     println!("  \"alive_players\": {},", stacks.len());
     println!("  \"players_behind\": {players_behind},");
+    println!("  \"converged\": {},", report.converged);
+    println!("  \"max_iterations\": {},", report.max_iterations);
+    println!("  \"max_spot_iterations\": {},", report.max_spot_iterations);
     println!("  \"dead_pot\": {},", report.dead_pot);
     println!("  \"orbit_cost\": {},", report.orbit_cost);
     println!(
@@ -160,6 +201,8 @@ fn print_json_report(level: u8, stacks: &[u32], players_behind: u8, report: &Sho
         println!("      \"seat_index\": {},", seat.seat_index);
         println!("      \"players_behind\": {},", seat.players_behind);
         println!("      \"posted_amount\": {},", seat.posted_amount);
+        println!("      \"iterations_run\": {},", seat.iterations_run);
+        println!("      \"converged\": {},", seat.converged);
         println!(
             "      \"call_required_equity\": {:.6},",
             seat.call_required_equity
@@ -181,6 +224,8 @@ fn print_json_report(level: u8, stacks: &[u32], players_behind: u8, report: &Sho
                 "          \"effective_all_in_cost\": {},",
                 spot.effective_all_in_cost
             );
+            println!("          \"iterations_run\": {},", spot.iterations_run);
+            println!("          \"converged\": {},", spot.converged);
             println!(
                 "          \"required_equity\": {:.6},",
                 spot.required_equity
