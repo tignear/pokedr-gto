@@ -46,6 +46,7 @@ pub struct PostflopCfrResult {
 
 #[derive(Debug, Clone)]
 pub struct PostflopComboStrategy {
+    pub board: Vec<Card>,
     pub combo: PostflopCombo,
     pub role: PostflopRole,
     pub node: PostflopNode,
@@ -212,20 +213,24 @@ pub fn solve_postflop_check_bet(config: PostflopCfrConfig) -> PostflopCfrResult 
         };
     }
     let mut solver = PostflopCfrTrainer {
-        board: &config.board,
         oop_range: &config.oop_range,
         ip_range: &config.ip_range,
-        pot: config.pot,
         bet: config.bet,
         max_runouts: config.max_runouts,
-        equity_cache: HashMap::new(),
         nodes: HashMap::new(),
     };
     let mut utility_sum = 0.0;
 
     for iteration in 0..config.iterations {
         let (oop_index, ip_index) = deals[sampled_index(iteration, deals.len())];
-        utility_sum += solver.cfr(PostflopHistory::IpDecision, oop_index, ip_index, [1.0, 1.0]);
+        utility_sum += solver.cfr(
+            PostflopHistory::IpDecision,
+            &config.board,
+            config.pot,
+            oop_index,
+            ip_index,
+            [1.0, 1.0],
+        );
     }
 
     let strategies = solver.combo_strategies();
@@ -252,18 +257,16 @@ enum PostflopHistory {
 }
 
 struct PostflopCfrTrainer<'a> {
-    board: &'a [Card],
     oop_range: &'a [PostflopCombo],
     ip_range: &'a [PostflopCombo],
-    pot: f64,
     bet: f64,
     max_runouts: usize,
-    equity_cache: HashMap<(u64, u64), f64>,
     nodes: HashMap<String, PostflopCfrNode>,
 }
 
 #[derive(Debug, Clone)]
 struct PostflopCfrNode {
+    board: Vec<Card>,
     role: PostflopRole,
     node: PostflopNode,
     combo: PostflopCombo,
@@ -277,6 +280,8 @@ impl PostflopCfrTrainer<'_> {
     fn cfr(
         &mut self,
         history: PostflopHistory,
+        board: &[Card],
+        pot: f64,
         oop_index: usize,
         ip_index: usize,
         reach: [f64; 2],
@@ -285,8 +290,8 @@ impl PostflopCfrTrainer<'_> {
             PostflopHistory::IpDecision => 1,
             PostflopHistory::OopFacingBet => 0,
         };
-        let key = self.infoset_key(history, oop_index, ip_index);
-        let strategy = self.strategy_for(&key, history, oop_index, ip_index);
+        let key = self.infoset_key(history, board, oop_index, ip_index);
+        let strategy = self.strategy_for(&key, history, board, oop_index, ip_index);
         let mut action_values = [0.0; 2];
         let mut node_value = 0.0;
 
@@ -296,10 +301,12 @@ impl PostflopCfrTrainer<'_> {
             action_values[action] = match history {
                 PostflopHistory::IpDecision => {
                     if action == 0 {
-                        self.showdown_utility(oop_index, ip_index, self.pot * 0.5)
+                        self.advance_or_showdown(board, pot, oop_index, ip_index, next_reach)
                     } else {
                         self.cfr(
                             PostflopHistory::OopFacingBet,
+                            board,
+                            pot,
                             oop_index,
                             ip_index,
                             next_reach,
@@ -308,9 +315,15 @@ impl PostflopCfrTrainer<'_> {
                 }
                 PostflopHistory::OopFacingBet => {
                     if action == 0 {
-                        -self.pot * 0.5
+                        -pot * 0.5
                     } else {
-                        self.showdown_utility(oop_index, ip_index, self.pot * 0.5 + self.bet)
+                        self.advance_or_showdown(
+                            board,
+                            pot + self.bet * 2.0,
+                            oop_index,
+                            ip_index,
+                            next_reach,
+                        )
                     }
                 }
             };
@@ -335,30 +348,98 @@ impl PostflopCfrTrainer<'_> {
         node_value
     }
 
-    fn showdown_utility(&mut self, oop_index: usize, ip_index: usize, win_amount: f64) -> f64 {
-        let equity = self.oop_equity(oop_index, ip_index);
-        (2.0 * equity - 1.0) * win_amount
+    fn advance_or_showdown(
+        &mut self,
+        board: &[Card],
+        pot: f64,
+        oop_index: usize,
+        ip_index: usize,
+        reach: [f64; 2],
+    ) -> f64 {
+        if board.len() == 5 {
+            return self.showdown_utility(board, oop_index, ip_index, pot * 0.5);
+        }
+
+        let cards = sampled_next_cards(
+            board,
+            self.oop_range[oop_index].mask | self.ip_range[ip_index].mask,
+            self.max_runouts,
+        );
+        if cards.is_empty() {
+            return 0.0;
+        }
+
+        let probability = 1.0 / cards.len() as f64;
+        cards
+            .into_iter()
+            .map(|card| {
+                let mut next_board = board.to_vec();
+                next_board.push(card);
+                probability
+                    * self.cfr(
+                        PostflopHistory::IpDecision,
+                        &next_board,
+                        pot,
+                        oop_index,
+                        ip_index,
+                        reach,
+                    )
+            })
+            .sum()
     }
 
-    fn oop_equity(&mut self, oop_index: usize, ip_index: usize) -> f64 {
+    fn showdown_utility(
+        &self,
+        board: &[Card],
+        oop_index: usize,
+        ip_index: usize,
+        win_amount: f64,
+    ) -> f64 {
         let oop = &self.oop_range[oop_index];
         let ip = &self.ip_range[ip_index];
-        let key = (oop.mask, ip.mask);
-        if let Some(&equity) = self.equity_cache.get(&key) {
-            return equity;
+        debug_assert_eq!(board.len(), 5);
+        let oop_value = evaluate_seven([
+            oop.combo.first,
+            oop.combo.second,
+            board[0],
+            board[1],
+            board[2],
+            board[3],
+            board[4],
+        ]);
+        let ip_value = evaluate_seven([
+            ip.combo.first,
+            ip.combo.second,
+            board[0],
+            board[1],
+            board[2],
+            board[3],
+            board[4],
+        ]);
+        match oop_value.cmp(&ip_value) {
+            std::cmp::Ordering::Greater => win_amount,
+            std::cmp::Ordering::Less => -win_amount,
+            std::cmp::Ordering::Equal => 0.0,
         }
-        let equity = combo_equity(self.board, oop, ip, self.max_runouts);
-        self.equity_cache.insert(key, equity);
-        equity
     }
 
-    fn infoset_key(&self, history: PostflopHistory, oop_index: usize, ip_index: usize) -> String {
+    fn infoset_key(
+        &self,
+        history: PostflopHistory,
+        board: &[Card],
+        oop_index: usize,
+        ip_index: usize,
+    ) -> String {
+        let board = board_label(board);
         match history {
             PostflopHistory::IpDecision => {
-                format!("IP:{}:after-check", self.ip_range[ip_index].label())
+                format!("IP:{board}:{}:after-check", self.ip_range[ip_index].label())
             }
             PostflopHistory::OopFacingBet => {
-                format!("OOP:{}:facing-bet", self.oop_range[oop_index].label())
+                format!(
+                    "OOP:{board}:{}:facing-bet",
+                    self.oop_range[oop_index].label()
+                )
             }
         }
     }
@@ -367,6 +448,7 @@ impl PostflopCfrTrainer<'_> {
         &mut self,
         key: &str,
         history: PostflopHistory,
+        board: &[Card],
         oop_index: usize,
         ip_index: usize,
     ) -> [f64; 2] {
@@ -374,9 +456,15 @@ impl PostflopCfrTrainer<'_> {
             return node.strategy();
         }
 
-        let oop_equity = self.oop_equity(oop_index, ip_index);
+        let oop_equity = combo_equity(
+            board,
+            &self.oop_range[oop_index],
+            &self.ip_range[ip_index],
+            self.max_runouts,
+        );
         let node = match history {
             PostflopHistory::IpDecision => PostflopCfrNode {
+                board: board.to_vec(),
                 role: PostflopRole::Ip,
                 node: PostflopNode::AfterCheck,
                 combo: self.ip_range[ip_index].clone(),
@@ -386,6 +474,7 @@ impl PostflopCfrTrainer<'_> {
                 strategy_sum: [0.0, 0.0],
             },
             PostflopHistory::OopFacingBet => PostflopCfrNode {
+                board: board.to_vec(),
                 role: PostflopRole::Oop,
                 node: PostflopNode::FacingBet,
                 combo: self.oop_range[oop_index].clone(),
@@ -405,6 +494,7 @@ impl PostflopCfrTrainer<'_> {
             .nodes
             .values()
             .map(|node| PostflopComboStrategy {
+                board: node.board.clone(),
                 combo: node.combo.clone(),
                 role: node.role,
                 node: node.node,
@@ -527,6 +617,61 @@ fn postflop_node_key(node: PostflopNode) -> u8 {
         PostflopNode::AfterCheck => 0,
         PostflopNode::FacingBet => 1,
     }
+}
+
+fn sampled_next_cards(board: &[Card], hand_mask: u64, max_cards: usize) -> Vec<Card> {
+    let board_mask = board.iter().fold(0_u64, |mask, card| mask | card.mask());
+    let available: Vec<_> = deck()
+        .into_iter()
+        .filter(|card| (board_mask | hand_mask) & card.mask() == 0)
+        .collect();
+
+    if max_cards == 0 || available.len() <= max_cards {
+        return available;
+    }
+
+    let mut sampled = Vec::with_capacity(max_cards);
+    let mut seen = HashSet::new();
+    let mut iteration = 0;
+    while sampled.len() < max_cards {
+        let index = sampled_index(iteration, available.len());
+        if seen.insert(index) {
+            sampled.push(available[index]);
+        }
+        iteration += 1;
+    }
+    sampled
+}
+
+fn board_label(board: &[Card]) -> String {
+    board.iter().map(|&card| card_label(card)).collect()
+}
+
+fn card_label(card: Card) -> String {
+    let rank = match card.rank() {
+        14 => 'A',
+        13 => 'K',
+        12 => 'Q',
+        11 => 'J',
+        10 => 'T',
+        9 => '9',
+        8 => '8',
+        7 => '7',
+        6 => '6',
+        5 => '5',
+        4 => '4',
+        3 => '3',
+        2 => '2',
+        _ => '?',
+    };
+    let suit = match card.suit() {
+        0 => 'c',
+        1 => 'd',
+        2 => 'h',
+        3 => 's',
+        _ => '?',
+    };
+    format!("{rank}{suit}")
 }
 
 fn parse_range_token(token: &str) -> Result<Vec<HandClass>, RangeParseError> {

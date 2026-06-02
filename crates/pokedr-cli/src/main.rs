@@ -525,9 +525,10 @@ fn print_postflop_solution_result(result: &PostflopCfrResult, limit: usize, form
                     ","
                 };
                 println!(
-                    "    {{\"role\":\"{}\",\"node\":\"{}\",\"combo\":\"{}\",\"class\":\"{}\",\"equity\":{:.9},\"actions\":[",
+                    "    {{\"role\":\"{}\",\"node\":\"{}\",\"board\":\"{}\",\"combo\":\"{}\",\"class\":\"{}\",\"equity\":{:.9},\"actions\":[",
                     postflop_role_label(strategy.role),
                     postflop_node_label(strategy.node),
+                    cards_label(&strategy.board),
                     strategy.combo.label(),
                     strategy.combo.class.label(),
                     strategy.equity
@@ -557,7 +558,7 @@ fn print_postflop_solution_result(result: &PostflopCfrResult, limit: usize, form
             println!("board cards: {}", result.board_cards);
             println!("OOP combos: {}", result.oop_combo_count);
             println!("IP combos: {}", result.ip_combo_count);
-            println!("role,node,combo,class,equity,actions");
+            println!("role,node,board,combo,class,equity,actions");
             for strategy in strategies.iter().take(limit) {
                 let actions = strategy
                     .actions
@@ -566,9 +567,10 @@ fn print_postflop_solution_result(result: &PostflopCfrResult, limit: usize, form
                     .collect::<Vec<_>>()
                     .join(" ");
                 println!(
-                    "{},{},{},{},{:.6},{}",
+                    "{},{},{},{},{},{:.6},{}",
                     postflop_role_label(strategy.role),
                     postflop_node_label(strategy.node),
+                    cards_label(&strategy.board),
                     strategy.combo.label(),
                     strategy.combo.class.label(),
                     strategy.equity,
@@ -581,6 +583,37 @@ fn print_postflop_solution_result(result: &PostflopCfrResult, limit: usize, form
             std::process::exit(2);
         }
     }
+}
+
+fn cards_label(cards: &[Card]) -> String {
+    cards.iter().map(|&card| card_label(card)).collect()
+}
+
+fn card_label(card: Card) -> String {
+    let rank = match card.rank() {
+        14 => 'A',
+        13 => 'K',
+        12 => 'Q',
+        11 => 'J',
+        10 => 'T',
+        9 => '9',
+        8 => '8',
+        7 => '7',
+        6 => '6',
+        5 => '5',
+        4 => '4',
+        3 => '3',
+        2 => '2',
+        _ => '?',
+    };
+    let suit = match card.suit() {
+        0 => 'c',
+        1 => 'd',
+        2 => 'h',
+        3 => 's',
+        _ => '?',
+    };
+    format!("{rank}{suit}")
 }
 
 fn postflop_action_frequency(
