@@ -14,20 +14,39 @@ const DEFAULT_FLAT_CALL_FRACTION: f64 = 0.25;
 
 fn main() {
     let args: Vec<String> = env::args().collect();
+    let scan_open2bb = has_flag(&args, "--scan-open2bb");
     let level = parse_arg(&args, "--level").unwrap_or(DEFAULT_LEVEL);
     let stack = parse_arg(&args, "--stack").unwrap_or(STARTING_STACK);
     let alive_players = parse_arg(&args, "--alive").unwrap_or(6) as u8;
     let stacks = parse_stacks(&args).unwrap_or_else(|| vec![stack; alive_players as usize]);
     let players_behind =
         parse_arg(&args, "--behind").unwrap_or(alive_players.saturating_sub(1) as u32) as u8;
-    let max_boards_per_combo =
-        parse_arg(&args, "--boards").unwrap_or(DEFAULT_MAX_BOARDS_PER_COMBO as u32) as usize;
+    let default_boards = if scan_open2bb {
+        1
+    } else {
+        DEFAULT_MAX_BOARDS_PER_COMBO as u32
+    };
+    let default_range_sample = if scan_open2bb {
+        1
+    } else {
+        DEFAULT_RANGE_SAMPLE_LIMIT as u32
+    };
+    let default_iterations = if scan_open2bb {
+        0
+    } else {
+        DEFAULT_MAX_ITERATIONS as u32
+    };
+    let default_spot_iterations = if scan_open2bb {
+        0
+    } else {
+        DEFAULT_MAX_SPOT_ITERATIONS as u32
+    };
+    let max_boards_per_combo = parse_arg(&args, "--boards").unwrap_or(default_boards) as usize;
     let range_sample_limit =
-        parse_arg(&args, "--range-sample").unwrap_or(DEFAULT_RANGE_SAMPLE_LIMIT as u32) as usize;
-    let iterations =
-        parse_arg(&args, "--iterations").unwrap_or(DEFAULT_MAX_ITERATIONS as u32) as usize;
-    let spot_iterations = parse_arg(&args, "--spot-iterations")
-        .unwrap_or(DEFAULT_MAX_SPOT_ITERATIONS as u32) as usize;
+        parse_arg(&args, "--range-sample").unwrap_or(default_range_sample) as usize;
+    let iterations = parse_arg(&args, "--iterations").unwrap_or(default_iterations) as usize;
+    let spot_iterations =
+        parse_arg(&args, "--spot-iterations").unwrap_or(default_spot_iterations) as usize;
     let elapsed_in_level_seconds = parse_arg(&args, "--elapsed").unwrap_or(0);
     let hand_duration_seconds = parse_arg(&args, "--hand-seconds").unwrap_or(20);
     let postflop_realization =
@@ -41,6 +60,21 @@ fn main() {
         eprintln!("invalid --level; expected 1..=16");
         std::process::exit(2);
     };
+
+    if scan_open2bb {
+        print_open2bb_scan(
+            &args,
+            alive_players,
+            max_boards_per_combo,
+            range_sample_limit,
+            iterations,
+            spot_iterations,
+            elapsed_in_level_seconds,
+            hand_duration_seconds,
+            include_overcall,
+        );
+        return;
+    }
 
     let report = analyze_short_stack(&ShortStackConfig {
         level,
@@ -99,6 +133,131 @@ fn parse_stacks(args: &[String]) -> Option<Vec<u32>> {
         .collect();
 
     (!stacks.is_empty()).then_some(stacks)
+}
+
+fn parse_u32_list(args: &[String], name: &str, default: &[u32]) -> Vec<u32> {
+    parse_string_arg(args, name)
+        .map(|value| {
+            value
+                .split(',')
+                .filter_map(|part| part.trim().parse().ok())
+                .collect::<Vec<_>>()
+        })
+        .filter(|values| !values.is_empty())
+        .unwrap_or_else(|| default.to_vec())
+}
+
+fn parse_f64_list(args: &[String], name: &str, default: &[f64]) -> Vec<f64> {
+    parse_string_arg(args, name)
+        .map(|value| {
+            value
+                .split(',')
+                .filter_map(|part| part.trim().parse().ok())
+                .collect::<Vec<_>>()
+        })
+        .filter(|values| !values.is_empty())
+        .unwrap_or_else(|| default.to_vec())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn print_open2bb_scan(
+    args: &[String],
+    alive_players: u8,
+    max_boards_per_combo: usize,
+    range_sample_limit: usize,
+    iterations: usize,
+    spot_iterations: usize,
+    elapsed_in_level_seconds: u32,
+    hand_duration_seconds: u32,
+    include_overcall: bool,
+) {
+    let levels = parse_u32_list(args, "--scan-levels", &[8, 9, 10]);
+    let stack_bbs = parse_f64_list(args, "--scan-bbs", &[3.0, 4.0, 5.0, 6.0, 8.0, 10.0]);
+    let realizations = parse_f64_list(args, "--scan-realizations", &[0.4]);
+    let flat_fractions = parse_f64_list(args, "--scan-flat-fractions", &[0.0, 0.25]);
+
+    println!(
+        "level,stack,stack_bb,postflop_realization,flat_call_fraction,seat,posted,open2bb_wfrac,ai_wfrac,fold_wfrac,open2bb_classes,ai_classes,top_open2bb,top_ai"
+    );
+
+    for level_number in levels {
+        let Some(level) = blind_level(level_number as u8) else {
+            continue;
+        };
+        for stack_bb in &stack_bbs {
+            let stack = (stack_bb * level.big_blind as f64).round().max(1.0) as u32;
+            let stacks = vec![stack; alive_players as usize];
+            for &postflop_realization in &realizations {
+                for &flat_call_fraction in &flat_fractions {
+                    let report = analyze_short_stack(&ShortStackConfig {
+                        level,
+                        alive_players,
+                        stack,
+                        stacks: stacks.clone(),
+                        players_behind: alive_players.saturating_sub(1),
+                        elapsed_in_level_seconds,
+                        hand_duration_seconds,
+                        max_boards_per_combo,
+                        range_sample_limit,
+                        iterations,
+                        spot_iterations,
+                        include_overcall,
+                        postflop_realization,
+                        flat_call_fraction,
+                    });
+
+                    for seat in report.seats.iter().filter(|seat| seat.players_behind > 0) {
+                        let open_wfrac =
+                            clean_fraction(weighted_combo_fraction(&seat.open_2bb_range));
+                        let ai_wfrac = clean_fraction(weighted_combo_fraction(&seat.shove_range));
+                        let fold_wfrac = clean_fraction(1.0 - open_wfrac - ai_wfrac);
+                        println!(
+                            "{},{},{:.3},{:.3},{:.3},{},{},{:.6},{:.6},{:.6},{},{},{},{}",
+                            level.level,
+                            stack,
+                            *stack_bb,
+                            postflop_realization,
+                            flat_call_fraction,
+                            seat.seat_index,
+                            seat.posted_amount,
+                            open_wfrac,
+                            ai_wfrac,
+                            fold_wfrac,
+                            seat.open_2bb_range.len(),
+                            seat.shove_range.len(),
+                            top_hands(&seat.open_2bb_range, 5),
+                            top_hands(&seat.shove_range, 5)
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn weighted_combo_fraction(range: &[pokedr_core::short_stack::HandResult]) -> f64 {
+    range
+        .iter()
+        .map(|result| result.hand.combos().len() as f64 * result.frequency)
+        .sum::<f64>()
+        / 1326.0
+}
+
+fn clean_fraction(value: f64) -> f64 {
+    if value.abs() < 1.0e-9 {
+        0.0
+    } else {
+        value.clamp(0.0, 1.0)
+    }
+}
+
+fn top_hands(range: &[pokedr_core::short_stack::HandResult], limit: usize) -> String {
+    range
+        .iter()
+        .take(limit)
+        .map(|result| result.hand.label())
+        .collect::<Vec<_>>()
+        .join("|")
 }
 
 fn print_report(level: u8, stacks: &[u32], players_behind: u8, report: &ShortStackReport) {
