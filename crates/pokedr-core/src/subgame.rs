@@ -1,6 +1,9 @@
-use crate::cards::Card;
+use std::collections::HashMap;
+
+use crate::cards::{Card, deck};
 use crate::hand_class::HandClass;
-use crate::postflop::{PostflopCfrConfig, postflop_combos};
+use crate::hand_eval::evaluate_seven;
+use crate::postflop::{PostflopCombo, postflop_combos};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Street {
@@ -162,38 +165,6 @@ impl SubgameSpec {
         Ok(())
     }
 
-    pub fn to_postflop_config(
-        &self,
-        iterations: usize,
-    ) -> Result<PostflopCfrConfig, SubgameBuildError> {
-        self.validate()?;
-        let oop_range = postflop_combos(&self.ranges.oop, &self.board);
-        let ip_range = postflop_combos(&self.ranges.ip, &self.board);
-        if oop_range.is_empty() || ip_range.is_empty() {
-            return Err(SubgameBuildError::EmptyComboRange);
-        }
-
-        let bet = resolve_first(
-            &self.actions.bet_sizes,
-            &self.pot,
-            self.pot.current_bet.max(self.pot.min_raise),
-        )?;
-        let raise = resolve_first(&self.actions.raise_sizes, &self.pot, bet)?;
-        let reraise = resolve_first(&self.actions.reraise_sizes, &self.pot, raise)?;
-
-        Ok(PostflopCfrConfig {
-            board: self.board.clone(),
-            oop_range,
-            ip_range,
-            pot: self.pot.pot,
-            bet,
-            raise,
-            reraise,
-            iterations,
-            max_runouts: self.chance.max_runouts(),
-        })
-    }
-
     pub fn build_action_tree(&self) -> Result<ActionTree, SubgameBuildError> {
         self.validate()?;
         let mut builder = ActionTreeBuilder {
@@ -206,6 +177,78 @@ impl SubgameSpec {
             nodes: builder.nodes,
         })
     }
+
+    pub fn solve_cfr(&self, iterations: usize) -> Result<SubgameCfrResult, SubgameBuildError> {
+        let tree = self.build_action_tree()?;
+        let oop_range = postflop_combos(&self.ranges.oop, &self.board);
+        let ip_range = postflop_combos(&self.ranges.ip, &self.board);
+        if oop_range.is_empty() || ip_range.is_empty() {
+            return Err(SubgameBuildError::NoLegalDeals);
+        }
+
+        let deals = legal_deals(&oop_range, &ip_range);
+        if deals.is_empty() {
+            return Err(SubgameBuildError::NoLegalDeals);
+        }
+
+        let mut trainer = SubgameCfrTrainer {
+            spec: self,
+            tree: &tree,
+            oop_range: &oop_range,
+            ip_range: &ip_range,
+            nodes: HashMap::new(),
+            equity_cache: HashMap::new(),
+            average_weight: 1.0,
+        };
+        let mut utility_sum = 0.0;
+        for iteration in 0..iterations {
+            trainer.average_weight = iteration as f64 + 1.0;
+            let (oop_index, ip_index) = deals[sampled_index(iteration, deals.len())];
+            utility_sum += trainer.cfr(tree.root, oop_index, ip_index, [1.0, 1.0]);
+        }
+
+        Ok(SubgameCfrResult {
+            iterations,
+            expected_value_oop: if iterations == 0 {
+                0.0
+            } else {
+                utility_sum / iterations as f64
+            },
+            root: tree.root,
+            node_count: tree.nodes.len(),
+            oop_combo_count: oop_range.len(),
+            ip_combo_count: ip_range.len(),
+            strategies: trainer.combo_strategies(),
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SubgameCfrResult {
+    pub iterations: usize,
+    pub expected_value_oop: f64,
+    pub root: NodeId,
+    pub node_count: usize,
+    pub oop_combo_count: usize,
+    pub ip_combo_count: usize,
+    pub strategies: Vec<SubgameComboStrategy>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SubgameComboStrategy {
+    pub node: NodeId,
+    pub player: Player,
+    pub board: Vec<Card>,
+    pub history: Vec<ActionKind>,
+    pub combo: PostflopCombo,
+    pub equity: f64,
+    pub actions: Vec<SubgameActionFrequency>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SubgameActionFrequency {
+    pub action: ActionKind,
+    pub frequency: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -294,8 +337,7 @@ pub enum SubgameValidationError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SubgameBuildError {
     Validation(SubgameValidationError),
-    EmptyComboRange,
-    UnsupportedAllInSize,
+    NoLegalDeals,
 }
 
 impl From<SubgameValidationError> for SubgameBuildError {
@@ -330,29 +372,12 @@ fn validate_bet_size(size: BetSize) -> Result<(), SubgameValidationError> {
     }
 }
 
-fn resolve_first(
-    sizes: &[BetSize],
-    pot: &PotState,
-    current_bet: f64,
-) -> Result<f64, SubgameBuildError> {
-    let Some(size) = sizes.first() else {
-        return Err(SubgameBuildError::Validation(
-            SubgameValidationError::InvalidBetSize,
-        ));
-    };
-    resolve_bet_size(*size, pot, current_bet)
-}
-
-fn resolve_bet_size(
-    size: BetSize,
-    pot: &PotState,
-    current_bet: f64,
-) -> Result<f64, SubgameBuildError> {
+fn resolve_bet_size(size: BetSize, pot: &PotState, current_bet: f64) -> f64 {
     match size {
-        BetSize::PotFraction(fraction) => Ok(pot.pot * fraction),
-        BetSize::CurrentBetMultiple(multiplier) => Ok(current_bet.max(1.0) * multiplier),
-        BetSize::Chips(chips) => Ok(chips),
-        BetSize::AllIn => Err(SubgameBuildError::UnsupportedAllInSize),
+        BetSize::PotFraction(fraction) => pot.pot * fraction,
+        BetSize::CurrentBetMultiple(multiplier) => current_bet.max(1.0) * multiplier,
+        BetSize::Chips(chips) => chips,
+        BetSize::AllIn => unreachable!("all-in is resolved by actor stack"),
     }
 }
 
@@ -454,7 +479,7 @@ impl ActionTreeBuilder<'_> {
                 let amount = capped_commitment(
                     player,
                     pot,
-                    resolve_tree_bet_size(*size, player, &pot, pot.pot)?,
+                    resolve_tree_bet_size(*size, player, &pot, pot.pot),
                 );
                 if amount > pot.committed[player.index()] {
                     actions.push(sized_aggressive_action(*size, amount, false));
@@ -480,7 +505,7 @@ impl ActionTreeBuilder<'_> {
                 let amount = capped_commitment(
                     player,
                     pot,
-                    resolve_tree_bet_size(*size, player, &pot, pot.current_bet)?,
+                    resolve_tree_bet_size(*size, player, &pot, pot.current_bet),
                 );
                 if amount > pot.current_bet {
                     actions.push(sized_aggressive_action(*size, amount, true));
@@ -519,14 +544,9 @@ fn sized_aggressive_action(size: BetSize, amount: f64, facing_bet: bool) -> Acti
     }
 }
 
-fn resolve_tree_bet_size(
-    size: BetSize,
-    player: Player,
-    pot: &PotState,
-    current_bet: f64,
-) -> Result<f64, SubgameBuildError> {
+fn resolve_tree_bet_size(size: BetSize, player: Player, pot: &PotState, current_bet: f64) -> f64 {
     match size {
-        BetSize::AllIn => Ok(all_in_commitment(player, *pot)),
+        BetSize::AllIn => all_in_commitment(player, *pot),
         _ => resolve_bet_size(size, pot, current_bet),
     }
 }
@@ -562,6 +582,370 @@ fn apply_call(player: Player, mut pot: PotState) -> PotState {
     pot
 }
 
+struct SubgameCfrTrainer<'a> {
+    spec: &'a SubgameSpec,
+    tree: &'a ActionTree,
+    oop_range: &'a [PostflopCombo],
+    ip_range: &'a [PostflopCombo],
+    nodes: HashMap<String, SubgameCfrNode>,
+    equity_cache: HashMap<(u64, u64, u64), f64>,
+    average_weight: f64,
+}
+
+#[derive(Debug, Clone)]
+struct SubgameCfrNode {
+    node: NodeId,
+    player: Player,
+    board: Vec<Card>,
+    history: Vec<ActionKind>,
+    combo: PostflopCombo,
+    equity: f64,
+    actions: Vec<ActionKind>,
+    regret_sum: Vec<f64>,
+    strategy_sum: Vec<f64>,
+}
+
+impl SubgameCfrTrainer<'_> {
+    fn cfr(&mut self, node_id: NodeId, oop_index: usize, ip_index: usize, reach: [f64; 2]) -> f64 {
+        match &self.tree.nodes[node_id.0] {
+            ActionTreeNode::Terminal { terminal, pot, .. } => {
+                self.terminal_utility(*terminal, *pot, oop_index, ip_index)
+            }
+            ActionTreeNode::Decision {
+                player,
+                history,
+                actions,
+                ..
+            } => {
+                let player_index = player.index();
+                let key = self.infoset_key(node_id, *player, history, oop_index, ip_index);
+                let strategy = self.strategy_for(
+                    &key, node_id, *player, history, actions, oop_index, ip_index,
+                );
+                let mut action_values = vec![0.0; strategy.len()];
+                let mut node_value = 0.0;
+
+                for (index, edge) in actions.iter().enumerate() {
+                    let mut next_reach = reach;
+                    next_reach[player_index] *= strategy[index];
+                    action_values[index] = self.cfr(edge.to, oop_index, ip_index, next_reach);
+                    node_value += strategy[index] * action_values[index];
+                }
+
+                let node = self
+                    .nodes
+                    .get_mut(&key)
+                    .expect("subgame CFR node should exist after strategy lookup");
+                let opponent_reach = reach[player.other().index()];
+                for action in 0..strategy.len() {
+                    let regret = if *player == Player::Oop {
+                        action_values[action] - node_value
+                    } else {
+                        node_value - action_values[action]
+                    };
+                    node.regret_sum[action] =
+                        (node.regret_sum[action] + opponent_reach * regret).max(0.0);
+                    node.strategy_sum[action] +=
+                        self.average_weight * reach[player_index] * strategy[action];
+                }
+
+                node_value
+            }
+        }
+    }
+
+    fn terminal_utility(
+        &mut self,
+        terminal: TerminalKind,
+        pot: PotState,
+        oop_index: usize,
+        ip_index: usize,
+    ) -> f64 {
+        match terminal {
+            TerminalKind::Fold { winner } => {
+                if winner == Player::Oop {
+                    pot.pot - pot.committed[Player::Oop.index()]
+                } else {
+                    -pot.committed[Player::Oop.index()]
+                }
+            }
+            TerminalKind::Showdown => {
+                let equity = self.combo_equity(oop_index, ip_index);
+                equity * pot.pot - pot.committed[Player::Oop.index()]
+            }
+        }
+    }
+
+    fn infoset_key(
+        &self,
+        node_id: NodeId,
+        player: Player,
+        history: &[ActionKind],
+        oop_index: usize,
+        ip_index: usize,
+    ) -> String {
+        let combo = match player {
+            Player::Oop => self.oop_range[oop_index].label(),
+            Player::Ip => self.ip_range[ip_index].label(),
+        };
+        format!(
+            "{:?}:{}:{}:{combo}:{}",
+            player,
+            node_id.0,
+            board_label(&self.spec.board),
+            history_label(history)
+        )
+    }
+
+    fn strategy_for(
+        &mut self,
+        key: &str,
+        node_id: NodeId,
+        player: Player,
+        history: &[ActionKind],
+        actions: &[ActionEdge],
+        oop_index: usize,
+        ip_index: usize,
+    ) -> Vec<f64> {
+        if let Some(node) = self.nodes.get(key) {
+            return node.strategy();
+        }
+
+        let combo = match player {
+            Player::Oop => self.oop_range[oop_index].clone(),
+            Player::Ip => self.ip_range[ip_index].clone(),
+        };
+        let oop_equity = self.combo_equity(oop_index, ip_index);
+        let equity = match player {
+            Player::Oop => oop_equity,
+            Player::Ip => 1.0 - oop_equity,
+        };
+        let node = SubgameCfrNode {
+            node: node_id,
+            player,
+            board: self.spec.board.clone(),
+            history: history.to_vec(),
+            combo,
+            equity,
+            actions: actions.iter().map(|edge| edge.action).collect(),
+            regret_sum: vec![0.0; actions.len()],
+            strategy_sum: vec![0.0; actions.len()],
+        };
+        let strategy = node.strategy();
+        self.nodes.insert(key.to_string(), node);
+        strategy
+    }
+
+    fn combo_equity(&mut self, oop_index: usize, ip_index: usize) -> f64 {
+        let oop = &self.oop_range[oop_index];
+        let ip = &self.ip_range[ip_index];
+        let key = (board_mask(&self.spec.board), oop.mask, ip.mask);
+        if let Some(&equity) = self.equity_cache.get(&key) {
+            return equity;
+        }
+        let equity = combo_equity(&self.spec.board, oop, ip, self.spec.chance.max_runouts());
+        self.equity_cache.insert(key, equity);
+        equity
+    }
+
+    fn combo_strategies(&mut self) -> Vec<SubgameComboStrategy> {
+        let mut strategies: Vec<_> = self
+            .nodes
+            .values()
+            .map(|node| SubgameComboStrategy {
+                node: node.node,
+                player: node.player,
+                board: node.board.clone(),
+                history: node.history.clone(),
+                combo: node.combo.clone(),
+                equity: node.equity,
+                actions: node.average_strategy(),
+            })
+            .collect();
+        strategies.sort_by(|left, right| {
+            left.node
+                .0
+                .cmp(&right.node.0)
+                .then_with(|| player_key(left.player).cmp(&player_key(right.player)))
+                .then_with(|| right.equity.total_cmp(&left.equity))
+                .then_with(|| left.combo.label().cmp(&right.combo.label()))
+        });
+        strategies
+    }
+}
+
+impl SubgameCfrNode {
+    fn strategy(&self) -> Vec<f64> {
+        let positive: Vec<_> = self
+            .regret_sum
+            .iter()
+            .map(|regret| regret.max(0.0))
+            .collect();
+        let normalizer: f64 = positive.iter().sum();
+        if normalizer > 0.0 {
+            positive.iter().map(|value| value / normalizer).collect()
+        } else {
+            vec![1.0 / self.regret_sum.len() as f64; self.regret_sum.len()]
+        }
+    }
+
+    fn average_strategy(&self) -> Vec<SubgameActionFrequency> {
+        let normalizer: f64 = self.strategy_sum.iter().sum();
+        self.actions
+            .iter()
+            .enumerate()
+            .map(|(index, &action)| {
+                let frequency = if normalizer > 0.0 {
+                    self.strategy_sum[index] / normalizer
+                } else {
+                    1.0 / self.strategy_sum.len() as f64
+                };
+                SubgameActionFrequency { action, frequency }
+            })
+            .collect()
+    }
+}
+
+fn legal_deals(oop_range: &[PostflopCombo], ip_range: &[PostflopCombo]) -> Vec<(usize, usize)> {
+    let mut deals = Vec::new();
+    for oop_index in 0..oop_range.len() {
+        for ip_index in 0..ip_range.len() {
+            if oop_range[oop_index].mask & ip_range[ip_index].mask == 0 {
+                deals.push((oop_index, ip_index));
+            }
+        }
+    }
+    deals
+}
+
+fn combo_equity(
+    board: &[Card],
+    oop: &PostflopCombo,
+    ip: &PostflopCombo,
+    max_runouts: usize,
+) -> f64 {
+    if oop.mask & ip.mask != 0 {
+        return 0.0;
+    }
+    let mut win = 0.0;
+    let mut tie = 0.0;
+    let mut total = 0.0;
+    for completed_board in
+        sampled_runouts(board, board_mask(board) | oop.mask | ip.mask, max_runouts)
+    {
+        let oop_value = evaluate_seven([
+            oop.combo.first,
+            oop.combo.second,
+            completed_board[0],
+            completed_board[1],
+            completed_board[2],
+            completed_board[3],
+            completed_board[4],
+        ]);
+        let ip_value = evaluate_seven([
+            ip.combo.first,
+            ip.combo.second,
+            completed_board[0],
+            completed_board[1],
+            completed_board[2],
+            completed_board[3],
+            completed_board[4],
+        ]);
+        match oop_value.cmp(&ip_value) {
+            std::cmp::Ordering::Greater => win += 1.0,
+            std::cmp::Ordering::Equal => tie += 1.0,
+            std::cmp::Ordering::Less => {}
+        }
+        total += 1.0;
+    }
+    if total == 0.0 {
+        0.0
+    } else {
+        (win + tie * 0.5) / total
+    }
+}
+
+fn sampled_runouts(board: &[Card], used_mask: u64, max_runouts: usize) -> Vec<[Card; 5]> {
+    debug_assert!((3..=5).contains(&board.len()));
+    if board.len() == 5 {
+        return vec![[board[0], board[1], board[2], board[3], board[4]]];
+    }
+
+    let available: Vec<_> = deck()
+        .into_iter()
+        .filter(|card| used_mask & card.mask() == 0)
+        .collect();
+    let needed = 5 - board.len();
+    let mut runouts = Vec::new();
+
+    match needed {
+        1 => {
+            for &river in &available {
+                let mut completed = [Card(0); 5];
+                completed[..board.len()].copy_from_slice(board);
+                completed[board.len()] = river;
+                runouts.push(completed);
+            }
+        }
+        2 => {
+            for first_index in 0..available.len() {
+                for second_index in (first_index + 1)..available.len() {
+                    let mut completed = [Card(0); 5];
+                    completed[..board.len()].copy_from_slice(board);
+                    completed[board.len()] = available[first_index];
+                    completed[board.len() + 1] = available[second_index];
+                    runouts.push(completed);
+                }
+            }
+        }
+        _ => unreachable!("postflop board should have 3 to 5 cards"),
+    }
+
+    if max_runouts == 0 || runouts.len() <= max_runouts {
+        return runouts;
+    }
+    (0..max_runouts)
+        .map(|iteration| runouts[sampled_index(iteration, runouts.len())])
+        .collect()
+}
+
+fn sampled_index(iteration: usize, len: usize) -> usize {
+    let mut value = iteration as u64 + 0x517c_c1b7_2722_0a95;
+    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    ((value ^ (value >> 31)) as usize) % len
+}
+
+fn board_mask(board: &[Card]) -> u64 {
+    board.iter().fold(0_u64, |mask, card| mask | card.mask())
+}
+
+fn board_label(board: &[Card]) -> String {
+    board.iter().map(|card| format!("{:02}", card.0)).collect()
+}
+
+fn history_label(history: &[ActionKind]) -> String {
+    history
+        .iter()
+        .map(|action| match action {
+            ActionKind::Check => "x".to_string(),
+            ActionKind::Fold => "f".to_string(),
+            ActionKind::Call => "c".to_string(),
+            ActionKind::Bet(amount) => format!("b{amount:.2}"),
+            ActionKind::Raise(amount) => format!("r{amount:.2}"),
+            ActionKind::AllIn(amount) => format!("a{amount:.2}"),
+        })
+        .collect::<Vec<_>>()
+        .join("-")
+}
+
+fn player_key(player: Player) -> u8 {
+    match player {
+        Player::Oop => 0,
+        Player::Ip => 1,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -586,54 +970,6 @@ mod tests {
             spec.validate(),
             Err(SubgameValidationError::DuplicateBoardCard)
         );
-    }
-
-    #[test]
-    fn builds_compatible_postflop_config() {
-        let board = vec![c(14, 0), c(13, 1), c(2, 2)];
-        let spec = SubgameSpec::postflop(
-            board.clone(),
-            PotState::new(100.0, [1_000.0, 1_000.0]),
-            RangeState::new(
-                parse_range("AA,AKs,AKo").unwrap(),
-                parse_range("QQ,JJ,AQs").unwrap(),
-            ),
-            ActionAbstraction::default(),
-            ChancePolicy::Sample(8),
-        )
-        .unwrap();
-
-        let config = spec.to_postflop_config(500).unwrap();
-
-        assert_eq!(config.board, board);
-        assert_eq!(config.iterations, 500);
-        assert_eq!(config.max_runouts, 8);
-        assert_eq!(config.pot, 100.0);
-        assert_eq!(config.bet, 75.0);
-        assert_eq!(config.raise, 225.0);
-        assert_eq!(config.reraise, 562.5);
-        assert!(!config.oop_range.is_empty());
-        assert!(!config.ip_range.is_empty());
-    }
-
-    #[test]
-    fn adapter_rejects_all_in_sizes_until_tree_supports_stacks() {
-        let spec = SubgameSpec::postflop(
-            vec![c(14, 0), c(13, 1), c(2, 2)],
-            PotState::new(100.0, [1_000.0, 1_000.0]),
-            RangeState::new(parse_range("AA").unwrap(), parse_range("KK").unwrap()),
-            ActionAbstraction {
-                bet_sizes: vec![BetSize::AllIn],
-                ..ActionAbstraction::default()
-            },
-            ChancePolicy::Sample(8),
-        )
-        .unwrap();
-
-        assert!(matches!(
-            spec.to_postflop_config(500),
-            Err(SubgameBuildError::UnsupportedAllInSize)
-        ));
     }
 
     #[test]
@@ -682,5 +1018,44 @@ mod tests {
                 if actions.iter().any(|edge| edge.action == ActionKind::Raise(250.0))
         )));
         assert!(tree.nodes.len() > actions.len());
+    }
+
+    #[test]
+    fn solves_cfr_on_generated_action_tree() {
+        let spec = SubgameSpec::postflop(
+            vec![c(14, 0), c(13, 1), c(2, 2)],
+            PotState::new(100.0, [1_000.0, 1_000.0]),
+            RangeState::new(
+                parse_range("AA,AKs,AKo").unwrap(),
+                parse_range("QQ,JJ,AQs").unwrap(),
+            ),
+            ActionAbstraction {
+                bet_sizes: vec![BetSize::PotFraction(0.5), BetSize::PotFraction(1.0)],
+                raise_sizes: vec![BetSize::CurrentBetMultiple(2.5)],
+                reraise_sizes: vec![BetSize::CurrentBetMultiple(2.0)],
+                allow_all_in: false,
+                max_raises: 2,
+            },
+            ChancePolicy::Sample(8),
+        )
+        .unwrap();
+
+        let result = spec.solve_cfr(500).unwrap();
+
+        assert_eq!(result.iterations, 500);
+        assert!(result.node_count > 4);
+        assert!(!result.strategies.is_empty());
+        assert!(result.strategies.iter().any(|strategy| {
+            strategy
+                .actions
+                .iter()
+                .any(|action| action.action == ActionKind::Bet(50.0))
+        }));
+        assert!(result.strategies.iter().any(|strategy| {
+            strategy
+                .actions
+                .iter()
+                .any(|action| action.action == ActionKind::Raise(250.0))
+        }));
     }
 }
