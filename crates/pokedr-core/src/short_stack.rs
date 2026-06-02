@@ -2119,8 +2119,8 @@ mod tests {
         let report = analyze_short_stack(&ShortStackConfig {
             level: crate::blinds::blind_level(11).expect("level 11 exists"),
             alive_players: 3,
-            stack: 40_000,
-            stacks: vec![40_000; 3],
+            stack: crate::structure::STARTING_STACK,
+            stacks: vec![crate::structure::STARTING_STACK; 3],
             players_behind: 2,
             elapsed_in_level_seconds: 0,
             hand_duration_seconds: 20,
@@ -2224,11 +2224,11 @@ mod tests {
 
         assert_eq!(
             showdown_state_value(clock, 20, &stacks_after_showdown, 0, &hand_start_stacks),
-            -21.0
+            -18.0
         );
         assert_eq!(
             showdown_state_value(clock, 20, &stacks_after_showdown, 1, &hand_start_stacks),
-            -35.0
+            -40.0
         );
     }
 

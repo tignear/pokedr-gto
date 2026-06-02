@@ -1,6 +1,6 @@
 use crate::blinds::BlindLevel;
 
-pub const STARTING_STACK: u32 = 40_000;
+pub const STARTING_STACK: u32 = 20_000;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BlindPressure {
@@ -48,24 +48,35 @@ mod tests {
     }
 
     #[test]
+    fn level_eight_pressure_is_the_new_transition_point() {
+        let pressure = blind_pressure(blind_level(8).expect("level 8 exists"), 6, STARTING_STACK);
+
+        assert!((pressure.stack_in_big_blinds - 8.0).abs() < 0.001);
+        assert_eq!(pressure.orbit_cost, 7_530);
+        assert!((pressure.orbit_cost_as_stack_fraction - 0.3765).abs() < 0.001);
+        assert_eq!(pressure.stack_after_one_folded_orbit, 12_470);
+        assert!((pressure.stack_after_one_folded_orbit_in_big_blinds - 4.988).abs() < 0.001);
+    }
+
+    #[test]
     fn level_nine_pressure_is_already_short_from_starting_stack() {
         let pressure = blind_pressure(blind_level(9).expect("level 9 exists"), 6, STARTING_STACK);
 
-        assert!((pressure.stack_in_big_blinds - 10.526).abs() < 0.001);
+        assert!((pressure.stack_in_big_blinds - 5.263).abs() < 0.001);
         assert_eq!(pressure.orbit_cost, 11_400);
-        assert!((pressure.orbit_cost_as_stack_fraction - 0.285).abs() < 0.001);
-        assert_eq!(pressure.stack_after_one_folded_orbit, 28_600);
-        assert!((pressure.stack_after_one_folded_orbit_in_big_blinds - 7.526).abs() < 0.001);
+        assert!((pressure.orbit_cost_as_stack_fraction - 0.57).abs() < 0.001);
+        assert_eq!(pressure.stack_after_one_folded_orbit, 8_600);
+        assert!((pressure.stack_after_one_folded_orbit_in_big_blinds - 2.263).abs() < 0.001);
     }
 
     #[test]
     fn level_ten_pressure_is_push_fold_like_from_starting_stack() {
         let pressure = blind_pressure(blind_level(10).expect("level 10 exists"), 6, STARTING_STACK);
 
-        assert!((pressure.stack_in_big_blinds - 7.018).abs() < 0.001);
+        assert!((pressure.stack_in_big_blinds - 3.509).abs() < 0.001);
         assert_eq!(pressure.orbit_cost, 16_950);
-        assert!((pressure.orbit_cost_as_stack_fraction - 0.42375).abs() < 0.001);
-        assert_eq!(pressure.stack_after_one_folded_orbit, 23_050);
-        assert!((pressure.stack_after_one_folded_orbit_in_big_blinds - 4.043).abs() < 0.001);
+        assert!((pressure.orbit_cost_as_stack_fraction - 0.8475).abs() < 0.001);
+        assert_eq!(pressure.stack_after_one_folded_orbit, 3_050);
+        assert!((pressure.stack_after_one_folded_orbit_in_big_blinds - 0.535).abs() < 0.001);
     }
 }

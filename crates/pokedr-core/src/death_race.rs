@@ -102,7 +102,7 @@ mod tests {
             hand_duration_seconds: 20,
         };
 
-        assert_eq!(death_race_value(&state, 0), -35.0);
+        assert_eq!(death_race_value(&state, 0), -40.0);
     }
 
     #[test]
@@ -117,7 +117,7 @@ mod tests {
             hand_duration_seconds: 20,
         };
 
-        assert_eq!(death_race_value(&state, 0), -35.0);
+        assert_eq!(death_race_value(&state, 0), -40.0);
     }
 
     #[test]
@@ -132,7 +132,7 @@ mod tests {
             hand_duration_seconds: 20,
         };
 
-        assert_eq!(death_race_value(&state, 5), 35.0);
+        assert_eq!(death_race_value(&state, 5), 40.0);
     }
 
     #[test]
@@ -140,7 +140,7 @@ mod tests {
         let state = DeathRaceState {
             clock: BlindClock {
                 current_level: 10,
-                elapsed_in_level_seconds: 179,
+                elapsed_in_level_seconds: 239,
             },
             stacks: vec![100_000, 100_000],
             next_small_blind_seat: 0,
@@ -148,6 +148,6 @@ mod tests {
         };
         let value = death_race_value(&state, 0);
 
-        assert!((-35.0..=35.0).contains(&value));
+        assert!((-40.0..=40.0).contains(&value));
     }
 }

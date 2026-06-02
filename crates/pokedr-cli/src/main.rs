@@ -2,16 +2,18 @@ use std::env;
 
 use pokedr_core::blinds::blind_level;
 use pokedr_core::short_stack::{ShortStackConfig, ShortStackReport, analyze_short_stack};
+use pokedr_core::structure::STARTING_STACK;
 
 const DEFAULT_MAX_BOARDS_PER_COMBO: usize = 32;
 const DEFAULT_RANGE_SAMPLE_LIMIT: usize = 8;
 const DEFAULT_MAX_ITERATIONS: usize = 8;
 const DEFAULT_MAX_SPOT_ITERATIONS: usize = 2;
+const DEFAULT_LEVEL: u32 = 9;
 
 fn main() {
     let args: Vec<String> = env::args().collect();
-    let level = parse_arg(&args, "--level").unwrap_or(11);
-    let stack = parse_arg(&args, "--stack").unwrap_or(40_000);
+    let level = parse_arg(&args, "--level").unwrap_or(DEFAULT_LEVEL);
+    let stack = parse_arg(&args, "--stack").unwrap_or(STARTING_STACK);
     let alive_players = parse_arg(&args, "--alive").unwrap_or(6) as u8;
     let stacks = parse_stacks(&args).unwrap_or_else(|| vec![stack; alive_players as usize]);
     let players_behind =

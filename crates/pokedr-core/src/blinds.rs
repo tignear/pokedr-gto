@@ -12,7 +12,7 @@ pub struct BlindClock {
     pub elapsed_in_level_seconds: u32,
 }
 
-pub const LEVEL_DURATION_SECONDS: u32 = 180;
+pub const LEVEL_DURATION_SECONDS: u32 = 240;
 
 pub const BLIND_LEVELS: [BlindLevel; 16] = [
     BlindLevel {
@@ -215,26 +215,26 @@ mod tests {
         let clock = BlindClock::new();
         assert_eq!(clock.level().level, 1);
 
-        let clock = clock.next_hand_after(179);
+        let clock = clock.next_hand_after(239);
         assert_eq!(clock.level().level, 1);
-        assert_eq!(clock.elapsed_in_level_seconds, 179);
+        assert_eq!(clock.elapsed_in_level_seconds, 239);
 
         let clock = clock.next_hand_after(1);
         assert_eq!(clock.level().level, 2);
         assert_eq!(clock.elapsed_in_level_seconds, 0);
 
-        let clock = clock.next_hand_after(179);
+        let clock = clock.next_hand_after(239);
         assert_eq!(clock.level().level, 2);
-        assert_eq!(clock.elapsed_in_level_seconds, 179);
+        assert_eq!(clock.elapsed_in_level_seconds, 239);
     }
 
     #[test]
-    fn new_level_gets_a_fresh_three_minute_clock() {
-        let clock = BlindClock::new().next_hand_after(180);
+    fn new_level_gets_a_fresh_four_minute_clock() {
+        let clock = BlindClock::new().next_hand_after(240);
         assert_eq!(clock.level().level, 2);
         assert_eq!(clock.seconds_until_level_up(), LEVEL_DURATION_SECONDS);
 
-        let clock = clock.next_hand_after(120);
+        let clock = clock.next_hand_after(180);
         assert_eq!(clock.level().level, 2);
         assert_eq!(clock.seconds_until_level_up(), 60);
     }
@@ -251,7 +251,7 @@ mod tests {
     fn blind_clock_stays_at_last_level() {
         let mut clock = BlindClock {
             current_level: 16,
-            elapsed_in_level_seconds: 179,
+            elapsed_in_level_seconds: 239,
         };
 
         clock = clock.next_hand_after(1);
