@@ -110,3 +110,16 @@ cargo run --release -p pokedr-cli -- gpu-info
 The expected result is an adapter name containing the target GPU, such as
 `RX 9070 XT`. If it prints `no GPU adapter visible to wgpu`, the container still
 does not expose a backend that `wgpu` can use.
+
+Codex/sandbox note: GPU checks in this workspace must be run with escalated
+permissions. Non-escalated commands can hide `/dev/dxg` or DXCore/Vulkan access
+and incorrectly make `wgpu` report that no adapter is visible. When validating
+the GPU smoke path, run the workspace test with the pinned toolchain and
+escalation:
+
+```bash
+cargo +1.95.0 test --workspace
+```
+
+Do not treat a non-escalated GPU failure as evidence that the devcontainer GPU
+setup is broken.
