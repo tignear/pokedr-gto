@@ -16,11 +16,12 @@ fn main() {
         Some("gpu-smoke") => run_gpu_smoke(),
         Some("postflop-smoke") => run_postflop_smoke(),
         Some("solve-flop") => run_solve_flop(args.next().as_deref()),
+        Some("solve-flop-metrics") => run_solve_flop_metrics(args.next().as_deref()),
         Some("rs-poker-smoke") => run_rs_poker_smoke(),
         Some("rs-poker-trace") => run_rs_poker_trace(),
         _ => {
             eprintln!(
-                "usage: {program} <gpu-info|gpu-smoke|postflop-smoke|solve-flop|rs-poker-smoke|rs-poker-trace>"
+                "usage: {program} <gpu-info|gpu-smoke|postflop-smoke|solve-flop|solve-flop-metrics|rs-poker-smoke|rs-poker-trace>"
             );
             std::process::exit(2);
         }
@@ -240,11 +241,63 @@ fn run_solve_flop(flop_arg: Option<&str>) {
     println!("elapsed: {:.2}s", summary.elapsed_secs);
 }
 
+fn run_solve_flop_metrics(flop_arg: Option<&str>) {
+    let flop = parse_flop(flop_arg.unwrap_or("As7h2c")).unwrap_or_else(|error| {
+        eprintln!("{error}");
+        std::process::exit(2);
+    });
+    let config = match_config();
+    let iterations = metric_iterations();
+    println!(
+        "solving fixed flop metrics depth={} runouts={} iterations={:?}",
+        config.max_depth, config.max_showdown_runouts, iterations
+    );
+    for row in pokedr_agent::solve_fixed_flop_metrics(flop, config, &iterations) {
+        let delta = row
+            .root_strategy_l1_delta
+            .map(|value| format!("{value:.6}"))
+            .unwrap_or_else(|| "n/a".to_string());
+        let root_actions = row
+            .root_action_probabilities
+            .iter()
+            .map(|value| format!("{value:.4}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        println!(
+            "board={} iterations={} elapsed={:.2}s root_l1_delta={} root_actions=[{}] regret_mass={:.3} illegal_mass={:.6} current_norm_err={:.6} avg_norm_err={:.6} finite={}",
+            row.board,
+            row.iterations,
+            row.elapsed_secs,
+            delta,
+            root_actions,
+            row.positive_regret_mass,
+            row.illegal_strategy_mass,
+            row.current_strategy_norm_error,
+            row.average_strategy_norm_error,
+            row.finite
+        );
+    }
+}
+
 fn smoke_hands() -> usize {
     std::env::var("POKEDR_HANDS")
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(16)
+}
+
+fn metric_iterations() -> Vec<usize> {
+    std::env::var("POKEDR_METRIC_ITERATIONS")
+        .ok()
+        .map(|value| {
+            value
+                .split(',')
+                .filter_map(|part| part.trim().parse::<usize>().ok())
+                .filter(|value| *value > 0)
+                .collect::<Vec<_>>()
+        })
+        .filter(|values| !values.is_empty())
+        .unwrap_or_else(|| vec![1, 2, 4, 8, 16, 32])
 }
 
 fn fixed_flop_config() -> pokedr_agent::PokedrAgentConfig {

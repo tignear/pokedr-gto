@@ -105,6 +105,20 @@ pub struct FixedFlopSolveSummary {
     pub elapsed_secs: f32,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct FixedFlopMetricRow {
+    pub board: String,
+    pub iterations: usize,
+    pub elapsed_secs: f32,
+    pub root_strategy_l1_delta: Option<f32>,
+    pub root_action_probabilities: Vec<f32>,
+    pub positive_regret_mass: f32,
+    pub illegal_strategy_mass: f32,
+    pub current_strategy_norm_error: f32,
+    pub average_strategy_norm_error: f32,
+    pub finite: bool,
+}
+
 impl Default for PokedrAgent {
     fn default() -> Self {
         Self::new(PokedrAgentConfig::default())
@@ -398,6 +412,164 @@ pub fn solve_fixed_flop_once(
         max_actions: layout.max_actions(),
         elapsed_secs: started.elapsed().as_secs_f32(),
     }
+}
+
+pub fn solve_fixed_flop_metrics(
+    flop: [PokedrCard; 3],
+    base_config: PokedrAgentConfig,
+    iteration_counts: &[usize],
+) -> Vec<FixedFlopMetricRow> {
+    let public_state = PublicState {
+        street: Street::Flop,
+        board: Board::new(flop.to_vec()),
+        pot: 4,
+        hero_invested: 2,
+        villain_invested: 2,
+        effective_stack: 100,
+        to_call: 0,
+        min_aggressive_amount: 2,
+        acting_player: Player::Hero,
+        raises_this_street: 0,
+        checks_this_street: 0,
+    };
+    let tree = SubgameTree::build(
+        public_state,
+        SubgameTreeConfig {
+            action_set: base_config.action_set.clone(),
+            max_raises_per_street: base_config.max_raises_per_street,
+            max_depth: base_config.max_depth,
+        },
+    );
+    let layout = PostflopDenseLayout::from_tree(&tree);
+    let villain_weights = vec![1.0; COMBO_COUNT];
+    let indexer = ComboIndexer::new();
+    let root_dead = root_board(&tree).deck_mask();
+    let mut previous_root_strategy: Option<Vec<f32>> = None;
+    let mut rows = Vec::with_capacity(iteration_counts.len());
+    for iterations in iteration_counts.iter().copied() {
+        let started = Instant::now();
+        let mut config = base_config.clone();
+        config.cfr_iterations = iterations.max(1);
+        let state = solve_public_tree_cfr(&tree, &layout, &config, &villain_weights);
+        let elapsed_secs = started.elapsed().as_secs_f32();
+        let root_strategy = root_average_strategy(&layout, &state, &indexer, root_dead);
+        let root_strategy_l1_delta = previous_root_strategy
+            .as_ref()
+            .map(|previous| mean_l1_delta(previous, &root_strategy));
+        let root_action_probabilities = root_action_probabilities(&layout, &root_strategy);
+        let diagnostics = cfr_state_diagnostics(&state);
+        rows.push(FixedFlopMetricRow {
+            board: format_pokedr_cards(&flop),
+            iterations: config.cfr_iterations,
+            elapsed_secs,
+            root_strategy_l1_delta,
+            root_action_probabilities,
+            positive_regret_mass: diagnostics.positive_regret_mass,
+            illegal_strategy_mass: diagnostics.illegal_strategy_mass,
+            current_strategy_norm_error: diagnostics.current_strategy_norm_error,
+            average_strategy_norm_error: diagnostics.average_strategy_norm_error,
+            finite: diagnostics.finite,
+        });
+        previous_root_strategy = Some(root_strategy);
+    }
+    rows
+}
+
+struct CfrDiagnostics {
+    positive_regret_mass: f32,
+    illegal_strategy_mass: f32,
+    current_strategy_norm_error: f32,
+    average_strategy_norm_error: f32,
+    finite: bool,
+}
+
+fn cfr_state_diagnostics(state: &DenseCfrState) -> CfrDiagnostics {
+    let positive_regret_mass = state
+        .regrets()
+        .iter()
+        .copied()
+        .map(|value| value.max(0.0))
+        .sum();
+    let illegal_strategy_mass = state
+        .strategy_sum()
+        .iter()
+        .zip(state.legal_actions())
+        .filter(|(_, legal)| !**legal)
+        .map(|(value, _)| value.abs())
+        .sum();
+    let finite = state.regrets().iter().all(|value| value.is_finite())
+        && state.strategy_sum().iter().all(|value| value.is_finite());
+    let mut current = vec![0.0; state.actions()];
+    let mut average = vec![0.0; state.actions()];
+    let mut current_strategy_norm_error = 0.0f32;
+    let mut average_strategy_norm_error = 0.0f32;
+    for infoset in 0..state.infosets() {
+        state.strategy_for(infoset, &mut current);
+        state.average_strategy_for(infoset, &mut average);
+        current_strategy_norm_error =
+            current_strategy_norm_error.max((current.iter().sum::<f32>() - 1.0).abs());
+        average_strategy_norm_error =
+            average_strategy_norm_error.max((average.iter().sum::<f32>() - 1.0).abs());
+    }
+    CfrDiagnostics {
+        positive_regret_mass,
+        illegal_strategy_mass,
+        current_strategy_norm_error,
+        average_strategy_norm_error,
+        finite,
+    }
+}
+
+fn root_average_strategy(
+    layout: &PostflopDenseLayout,
+    state: &DenseCfrState,
+    indexer: &ComboIndexer,
+    root_dead: u64,
+) -> Vec<f32> {
+    let mut result = Vec::with_capacity(COMBO_COUNT * layout.max_actions());
+    let mut strategy = vec![0.0; layout.max_actions()];
+    for (combo_index, combo) in indexer.combos().iter().enumerate() {
+        if combo.collides_with(root_dead) {
+            result.extend(std::iter::repeat_n(0.0, layout.max_actions()));
+            continue;
+        }
+        state.average_strategy_for(private_infoset(0, Player::Hero, combo_index), &mut strategy);
+        result.extend_from_slice(&strategy);
+    }
+    result
+}
+
+fn root_action_probabilities(layout: &PostflopDenseLayout, root_strategy: &[f32]) -> Vec<f32> {
+    let mut probabilities = vec![0.0; layout.max_actions()];
+    let mut legal_combo_count = 0usize;
+    for strategy in root_strategy.chunks(layout.max_actions()) {
+        let mass: f32 = strategy.iter().sum();
+        if mass <= 0.0 {
+            continue;
+        }
+        legal_combo_count += 1;
+        for (target, value) in probabilities.iter_mut().zip(strategy) {
+            *target += *value;
+        }
+    }
+    if legal_combo_count > 0 {
+        for probability in &mut probabilities {
+            *probability /= legal_combo_count as f32;
+        }
+    }
+    probabilities
+}
+
+fn mean_l1_delta(left: &[f32], right: &[f32]) -> f32 {
+    assert_eq!(left.len(), right.len());
+    if left.is_empty() {
+        return 0.0;
+    }
+    left.iter()
+        .zip(right)
+        .map(|(left, right)| (left - right).abs())
+        .sum::<f32>()
+        / left.len() as f32
 }
 
 struct PostflopEvaluationContext<'a> {
