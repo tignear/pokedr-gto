@@ -1,4 +1,4 @@
-use std::sync::mpsc;
+use std::{sync::mpsc, time::Instant};
 
 use wgpu::util::DeviceExt;
 
@@ -1570,6 +1570,43 @@ struct GpuPublicTreeEdge {
 unsafe impl bytemuck::Zeroable for GpuPublicTreeEdge {}
 unsafe impl bytemuck::Pod for GpuPublicTreeEdge {}
 
+struct GpuPublicTreeIterationContext {
+    nodes_len: usize,
+    combos_len: usize,
+    infosets: usize,
+    actions: usize,
+    action_len: usize,
+    output_len: usize,
+    node_combo_len: usize,
+    public_infoset_count: usize,
+    node_buffer: wgpu::Buffer,
+    child_buffer: wgpu::Buffer,
+    reach_edge_buffer: wgpu::Buffer,
+    reach_layer_ranges: Vec<(usize, usize)>,
+    backup_nodes_buffer: wgpu::Buffer,
+    backup_layer_ranges: Vec<(usize, usize)>,
+    board_buffer: wgpu::Buffer,
+    combo_buffer: wgpu::Buffer,
+    root_weights_buffer: wgpu::Buffer,
+    hero_reaches_buffer: wgpu::Buffer,
+    villain_reaches_buffer: wgpu::Buffer,
+    hero_values_buffer: wgpu::Buffer,
+    villain_values_buffer: wgpu::Buffer,
+    output_buffer: wgpu::Buffer,
+    fold_terminal_nodes: Vec<u32>,
+    showdown_terminal_nodes: Vec<u32>,
+    decision_nodes_buffer: wgpu::Buffer,
+    terminal_tile_count: usize,
+    terminal_tile_size: usize,
+    terminal_board_tile_count: usize,
+    terminal_board_tile_size: usize,
+    terminal_chunk_size: usize,
+    hero_terminal_partials_buffer: wgpu::Buffer,
+    villain_terminal_partials_buffer: wgpu::Buffer,
+    hero_decision_aggregates_buffer: wgpu::Buffer,
+    villain_decision_aggregates_buffer: wgpu::Buffer,
+}
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 struct GpuPublicTreeParams {
@@ -2166,6 +2203,61 @@ impl GpuDenseCfrBackend {
         &self.adapter_info
     }
 
+    fn gpu_profile_enabled() -> bool {
+        std::env::var_os("POKEDR_GPU_PROFILE").is_some()
+    }
+
+    fn profile_poll(&self) -> Result<(), GpuCfrError> {
+        self.device
+            .poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: None,
+            })
+            .map(|_| ())
+            .map_err(|error| GpuCfrError::MapFailed(error.to_string()))
+    }
+
+    fn finish_profile_phase(
+        &self,
+        encoder: wgpu::CommandEncoder,
+        phase: &str,
+        start: Option<Instant>,
+    ) -> Result<wgpu::CommandEncoder, GpuCfrError> {
+        let Some(start) = start else {
+            return Ok(encoder);
+        };
+        self.queue.submit(Some(encoder.finish()));
+        self.profile_poll()?;
+        eprintln!(
+            "pokedr: gpu profile phase={} elapsed_ms={:.3}",
+            phase,
+            start.elapsed().as_secs_f64() * 1000.0
+        );
+        Ok(self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("public tree profiled iteration encoder"),
+            }))
+    }
+
+    fn submit_final_profile_phase(
+        &self,
+        encoder: wgpu::CommandEncoder,
+        phase: &str,
+        start: Option<Instant>,
+    ) -> Result<(), GpuCfrError> {
+        self.queue.submit(Some(encoder.finish()));
+        if let Some(start) = start {
+            self.profile_poll()?;
+            eprintln!(
+                "pokedr: gpu profile phase={} elapsed_ms={:.3}",
+                phase,
+                start.elapsed().as_secs_f64() * 1000.0
+            );
+        }
+        Ok(())
+    }
+
     pub fn update_all_infosets(
         &self,
         state: &mut DenseCfrState,
@@ -2396,11 +2488,8 @@ impl GpuDenseCfrBackend {
         let output_count = combos.len() * final_boards.len();
         let combo_buffer = readonly_buffer(&self.device, "strength combos", combos);
         let board_buffer = readonly_buffer(&self.device, "strength boards", final_boards);
-        let output_buffer = storage_buffer(
-            &self.device,
-            "final board strengths",
-            &vec![0.0f32; output_count],
-        );
+        let output_buffer =
+            uninit_storage_buffer(&self.device, "final board strengths", output_count, false);
         let params = readonly_buffer(
             &self.device,
             "strength params",
@@ -2464,15 +2553,17 @@ impl GpuDenseCfrBackend {
             fold_terminal_nodes,
         );
         let aggregate_len = fold_terminal_nodes.len() * FOLD_AGGREGATE_SLOTS;
-        let hero_aggregates_buffer = storage_buffer(
+        let hero_aggregates_buffer = uninit_storage_buffer(
             &self.device,
             "public tree hero fold aggregates",
-            &vec![0.0f32; aggregate_len],
+            aggregate_len,
+            false,
         );
-        let villain_aggregates_buffer = storage_buffer(
+        let villain_aggregates_buffer = uninit_storage_buffer(
             &self.device,
             "public tree villain fold aggregates",
-            &vec![0.0f32; aggregate_len],
+            aggregate_len,
+            false,
         );
 
         let (aggregate_x_groups, aggregate_y_groups, aggregate_x_invocations) =
@@ -2740,7 +2831,7 @@ impl GpuDenseCfrBackend {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn public_tree_iteration_output(
+    fn public_tree_iteration_context(
         &self,
         nodes: &[GpuPublicTreeNode],
         children: &[u32],
@@ -2749,11 +2840,9 @@ impl GpuDenseCfrBackend {
         combo_legal: &[u32],
         villain_weights: &[f32],
         showdown_boards: &[GpuFinalBoard],
-        strength_buffer: &wgpu::Buffer,
-        regrets_buffer: &wgpu::Buffer,
         infosets: usize,
         actions: usize,
-    ) -> Result<(wgpu::Buffer, usize, usize), GpuCfrError> {
+    ) -> GpuPublicTreeIterationContext {
         assert!(!nodes.is_empty());
         assert_eq!(combo_legal.len(), combos.len());
         assert_eq!(villain_weights.len(), combos.len());
@@ -2785,30 +2874,542 @@ impl GpuDenseCfrBackend {
             .collect();
         let root_weights_buffer =
             readonly_buffer(&self.device, "public tree root weights", &root_weights);
-        let hero_reaches_buffer = storage_buffer(
+        let hero_reaches_buffer = uninit_storage_buffer(
             &self.device,
             "public tree hero reaches",
-            &vec![0.0f32; node_combo_len],
+            node_combo_len,
+            false,
         );
-        let villain_reaches_buffer = storage_buffer(
+        let villain_reaches_buffer = uninit_storage_buffer(
             &self.device,
             "public tree villain reaches",
-            &vec![0.0f32; node_combo_len],
+            node_combo_len,
+            false,
         );
-        let hero_values_buffer = storage_buffer(
+        let hero_values_buffer = uninit_storage_buffer(
             &self.device,
             "public tree hero private values",
-            &vec![0.0f32; node_combo_len],
+            node_combo_len,
+            false,
         );
-        let villain_values_buffer = storage_buffer(
+        let villain_values_buffer = uninit_storage_buffer(
             &self.device,
             "public tree villain private values",
-            &vec![0.0f32; node_combo_len],
+            node_combo_len,
+            false,
         );
-        let output_buffer = storage_buffer(
+        let output_buffer = uninit_storage_buffer(
             &self.device,
             "public tree iteration output",
-            &vec![0.0f32; output_len],
+            output_len,
+            true,
+        );
+        let fold_terminal_nodes: Vec<_> = nodes
+            .iter()
+            .enumerate()
+            .filter_map(|(index, node)| {
+                (node.kind != 0 && node.kind != 1 && node.terminal_kind != 2)
+                    .then_some(index as u32)
+            })
+            .collect();
+        let showdown_terminal_nodes: Vec<_> = nodes
+            .iter()
+            .enumerate()
+            .filter_map(|(index, node)| {
+                (node.kind != 0 && node.kind != 1 && node.terminal_kind == 2)
+                    .then_some(index as u32)
+            })
+            .collect();
+        let public_infoset_count = nodes_public_infoset_count(nodes);
+        let mut decision_nodes = vec![u32::MAX; public_infoset_count];
+        for (index, node) in nodes.iter().enumerate() {
+            if node.kind == 0 {
+                decision_nodes[node.public_infoset as usize] = index as u32;
+            }
+        }
+        let decision_nodes_buffer =
+            readonly_buffer(&self.device, "public tree decision nodes", &decision_nodes);
+        let terminal_tile_count = std::env::var("POKEDR_GPU_TERMINAL_TILES")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(1)
+            .max(1)
+            .min(combos.len().max(1));
+        let terminal_tile_size = combos.len().div_ceil(terminal_tile_count);
+        let max_showdown_boards = showdown_terminal_nodes
+            .iter()
+            .map(|node_index| nodes[*node_index as usize]._pad0 as usize)
+            .max()
+            .unwrap_or(1)
+            .max(1);
+        let terminal_board_tile_count = std::env::var("POKEDR_GPU_BOARD_TILES")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(1)
+            .max(1)
+            .min(max_showdown_boards);
+        let terminal_board_tile_size = max_showdown_boards.div_ceil(terminal_board_tile_count);
+        let terminal_parallel_factor = terminal_tile_count * terminal_board_tile_count;
+        let default_max_terminal_partial_values = if terminal_parallel_factor > 1 {
+            16_000_000usize
+        } else {
+            32_000_000usize
+        };
+        let max_terminal_partial_values = std::env::var("POKEDR_GPU_MAX_TERMINAL_PARTIAL_VALUES")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(default_max_terminal_partial_values)
+            .max(combos.len() * terminal_parallel_factor);
+        let terminal_chunk_size = (max_terminal_partial_values
+            / (combos.len() * terminal_tile_count * terminal_board_tile_count))
+            .max(1);
+        let terminal_partial_len = terminal_chunk_size
+            .min(showdown_terminal_nodes.len())
+            .max(1)
+            * combos.len()
+            * terminal_tile_count
+            * terminal_board_tile_count;
+        let hero_terminal_partials_buffer = uninit_storage_buffer(
+            &self.device,
+            "public tree hero terminal partial values",
+            terminal_partial_len,
+            false,
+        );
+        let villain_terminal_partials_buffer = uninit_storage_buffer(
+            &self.device,
+            "public tree villain terminal partial values",
+            terminal_partial_len,
+            false,
+        );
+        const DECISION_AGGREGATE_SLOTS: usize = 53;
+        let decision_aggregate_len = public_infoset_count * DECISION_AGGREGATE_SLOTS;
+        let hero_decision_aggregates_buffer = uninit_storage_buffer(
+            &self.device,
+            "public tree hero decision aggregates",
+            decision_aggregate_len,
+            false,
+        );
+        let villain_decision_aggregates_buffer = uninit_storage_buffer(
+            &self.device,
+            "public tree villain decision aggregates",
+            decision_aggregate_len,
+            false,
+        );
+
+        GpuPublicTreeIterationContext {
+            nodes_len: nodes.len(),
+            combos_len: combos.len(),
+            infosets,
+            actions,
+            action_len,
+            output_len,
+            node_combo_len,
+            public_infoset_count,
+            node_buffer,
+            child_buffer,
+            reach_edge_buffer,
+            reach_layer_ranges,
+            backup_nodes_buffer,
+            backup_layer_ranges,
+            board_buffer,
+            combo_buffer,
+            root_weights_buffer,
+            hero_reaches_buffer,
+            villain_reaches_buffer,
+            hero_values_buffer,
+            villain_values_buffer,
+            output_buffer,
+            fold_terminal_nodes,
+            showdown_terminal_nodes,
+            decision_nodes_buffer,
+            terminal_tile_count,
+            terminal_tile_size,
+            terminal_board_tile_count,
+            terminal_board_tile_size,
+            terminal_chunk_size,
+            hero_terminal_partials_buffer,
+            villain_terminal_partials_buffer,
+            hero_decision_aggregates_buffer,
+            villain_decision_aggregates_buffer,
+        }
+    }
+
+    fn public_tree_iteration_output_with_context(
+        &self,
+        ctx: &GpuPublicTreeIterationContext,
+        strength_buffer: &wgpu::Buffer,
+        regrets_buffer: &wgpu::Buffer,
+    ) -> Result<(wgpu::Buffer, usize, usize), GpuCfrError> {
+        if std::env::var_os("POKEDR_SOLVER_PROGRESS_OFF").is_none() {
+            eprintln!(
+                "pokedr: gpu public tree cfv nodes={} combos={} node_combo_values={} folds={} showdowns={} terminal_tiles={} board_tiles={} terminal_chunk={}",
+                ctx.nodes_len,
+                ctx.combos_len,
+                ctx.node_combo_len,
+                ctx.fold_terminal_nodes.len(),
+                ctx.showdown_terminal_nodes.len(),
+                ctx.terminal_tile_count,
+                ctx.terminal_board_tile_count,
+                ctx.terminal_chunk_size
+            );
+        }
+
+        let profile = Self::gpu_profile_enabled();
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("public tree iteration encoder"),
+            });
+        let mut phase_start = profile.then(Instant::now);
+        let (init_x_groups, init_y_groups, init_x_invocations) = dispatch_grid(ctx.node_combo_len);
+        let reach_init_params = uniform_buffer(
+            &self.device,
+            "public tree reach init params",
+            &[GpuPublicTreeParams {
+                combo_count: ctx.combos_len as u32,
+                node_count: ctx.nodes_len as u32,
+                max_actions: ctx.actions as u32,
+                output_len: init_x_invocations,
+                pair_start: 0,
+                chunk_pairs: 0,
+                _pad0: 0,
+                _pad1: 0,
+            }],
+        );
+        let reach_init_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("public tree reach init bind group"),
+            layout: &self.public_tree_reach_bind_group_layout,
+            entries: &[
+                bind_entry(0, &ctx.node_buffer),
+                bind_entry(1, &ctx.reach_edge_buffer),
+                bind_entry(2, &ctx.combo_buffer),
+                bind_entry(3, &ctx.root_weights_buffer),
+                bind_entry(4, regrets_buffer),
+                bind_entry(5, &ctx.hero_reaches_buffer),
+                bind_entry(6, &ctx.villain_reaches_buffer),
+                bind_entry(7, &reach_init_params),
+            ],
+        });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("public tree reach init pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.public_tree_reach_init_pipeline);
+            pass.set_bind_group(0, &reach_init_bind_group, &[]);
+            pass.dispatch_workgroups(init_x_groups, init_y_groups, 1);
+        }
+
+        for &(layer_start, layer_end) in &ctx.reach_layer_ranges {
+            let layer_edge_count = layer_end - layer_start;
+            if layer_edge_count == 0 {
+                continue;
+            }
+            let invocation_count = layer_edge_count * ctx.combos_len;
+            let (x_groups, y_groups, x_invocations) = dispatch_grid(invocation_count);
+            let reach_edge_params = uniform_buffer(
+                &self.device,
+                "public tree reach edge params",
+                &[GpuPublicTreeParams {
+                    combo_count: ctx.combos_len as u32,
+                    node_count: ctx.nodes_len as u32,
+                    max_actions: ctx.actions as u32,
+                    output_len: x_invocations,
+                    pair_start: 0,
+                    chunk_pairs: layer_start as u32,
+                    _pad0: layer_edge_count as u32,
+                    _pad1: 0,
+                }],
+            );
+            let reach_edge_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("public tree reach edge bind group"),
+                layout: &self.public_tree_reach_bind_group_layout,
+                entries: &[
+                    bind_entry(0, &ctx.node_buffer),
+                    bind_entry(1, &ctx.reach_edge_buffer),
+                    bind_entry(2, &ctx.combo_buffer),
+                    bind_entry(3, &ctx.root_weights_buffer),
+                    bind_entry(4, regrets_buffer),
+                    bind_entry(5, &ctx.hero_reaches_buffer),
+                    bind_entry(6, &ctx.villain_reaches_buffer),
+                    bind_entry(7, &reach_edge_params),
+                ],
+            });
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("public tree reach edge pass"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.public_tree_reach_edge_pipeline);
+                pass.set_bind_group(0, &reach_edge_bind_group, &[]);
+                pass.dispatch_workgroups(x_groups, y_groups, 1);
+            }
+        }
+        encoder = self.finish_profile_phase(encoder, "cfv_reach", phase_start)?;
+        phase_start = profile.then(Instant::now);
+
+        self.fill_fold_values(
+            &mut encoder,
+            &ctx.node_buffer,
+            &ctx.fold_terminal_nodes,
+            &ctx.combo_buffer,
+            &ctx.hero_reaches_buffer,
+            &ctx.villain_reaches_buffer,
+            &ctx.hero_values_buffer,
+            &ctx.villain_values_buffer,
+            ctx.combos_len,
+        )?;
+        self.fill_terminal_values(
+            &mut encoder,
+            &ctx.node_buffer,
+            &ctx.showdown_terminal_nodes,
+            &ctx.board_buffer,
+            &ctx.combo_buffer,
+            strength_buffer,
+            &ctx.hero_reaches_buffer,
+            &ctx.villain_reaches_buffer,
+            &ctx.hero_values_buffer,
+            &ctx.villain_values_buffer,
+            &ctx.hero_terminal_partials_buffer,
+            &ctx.villain_terminal_partials_buffer,
+            ctx.combos_len,
+            ctx.terminal_tile_count,
+            ctx.terminal_tile_size,
+            ctx.terminal_board_tile_count,
+            ctx.terminal_board_tile_size,
+            ctx.terminal_chunk_size,
+        )?;
+        encoder = self.finish_profile_phase(encoder, "cfv_terminal", phase_start)?;
+        phase_start = profile.then(Instant::now);
+
+        self.backup_nonterminal_values(
+            &mut encoder,
+            &ctx.node_buffer,
+            &ctx.child_buffer,
+            &ctx.backup_nodes_buffer,
+            &ctx.hero_reaches_buffer,
+            &ctx.villain_reaches_buffer,
+            &ctx.hero_values_buffer,
+            &ctx.villain_values_buffer,
+            &ctx.backup_layer_ranges,
+            ctx.combos_len,
+            ctx.nodes_len,
+            ctx.actions,
+        )?;
+        encoder = self.finish_profile_phase(encoder, "cfv_backup", phase_start)?;
+        phase_start = profile.then(Instant::now);
+
+        const DECISION_AGGREGATE_SLOTS: usize = 53;
+        let (
+            decision_aggregate_x_groups,
+            decision_aggregate_y_groups,
+            decision_aggregate_x_invocations,
+        ) = dispatch_grid(ctx.public_infoset_count * DECISION_AGGREGATE_SLOTS);
+        let decision_aggregate_params = uniform_buffer(
+            &self.device,
+            "public tree decision aggregate params",
+            &[GpuPublicTreeParams {
+                combo_count: ctx.combos_len as u32,
+                node_count: ctx.public_infoset_count as u32,
+                max_actions: DECISION_AGGREGATE_SLOTS as u32,
+                output_len: decision_aggregate_x_invocations,
+                pair_start: 0,
+                chunk_pairs: 0,
+                _pad0: 0,
+                _pad1: 0,
+            }],
+        );
+        let decision_aggregate_bind_group =
+            self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("public tree decision aggregate bind group"),
+                layout: &self.public_tree_decision_aggregate_bind_group_layout,
+                entries: &[
+                    bind_entry(0, &ctx.decision_nodes_buffer),
+                    bind_entry(1, &ctx.combo_buffer),
+                    bind_entry(2, &ctx.hero_reaches_buffer),
+                    bind_entry(3, &ctx.villain_reaches_buffer),
+                    bind_entry(4, &ctx.hero_decision_aggregates_buffer),
+                    bind_entry(5, &ctx.villain_decision_aggregates_buffer),
+                    bind_entry(6, &decision_aggregate_params),
+                ],
+            });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("public tree decision aggregate pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.public_tree_decision_aggregate_pipeline);
+            pass.set_bind_group(0, &decision_aggregate_bind_group, &[]);
+            pass.dispatch_workgroups(decision_aggregate_x_groups, decision_aggregate_y_groups, 1);
+        }
+        for (label, value_player) in [("hero", 0u32), ("villain", 1u32)] {
+            let denominator_params = uniform_buffer(
+                &self.device,
+                &format!("public tree {label} denominator params"),
+                &[GpuPublicTreeParams {
+                    combo_count: ctx.combos_len as u32,
+                    node_count: ctx.nodes_len as u32,
+                    max_actions: ctx.actions as u32,
+                    output_len: ctx.infosets as u32,
+                    pair_start: value_player,
+                    chunk_pairs: 0,
+                    _pad0: 0,
+                    _pad1: 0,
+                }],
+            );
+            let denominator_bind_group =
+                self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("public tree denominator bind group"),
+                    layout: &self.public_tree_denominator_bind_group_layout,
+                    entries: &[
+                        bind_entry(0, &ctx.node_buffer),
+                        bind_entry(1, &ctx.combo_buffer),
+                        bind_entry(2, &ctx.decision_nodes_buffer),
+                        bind_entry(3, &ctx.hero_reaches_buffer),
+                        bind_entry(4, &ctx.villain_reaches_buffer),
+                        bind_entry(5, &ctx.hero_decision_aggregates_buffer),
+                        bind_entry(6, &ctx.villain_decision_aggregates_buffer),
+                        bind_entry(7, &ctx.output_buffer),
+                        bind_entry(8, &denominator_params),
+                    ],
+                });
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("public tree denominator pass"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.public_tree_denominator_pipeline);
+                pass.set_bind_group(0, &denominator_bind_group, &[]);
+                pass.dispatch_workgroups((ctx.infosets as u32).div_ceil(WORKGROUP_SIZE), 1, 1);
+            }
+        }
+        encoder = self.finish_profile_phase(encoder, "cfv_decision_denominator", phase_start)?;
+        phase_start = profile.then(Instant::now);
+
+        for (label, value_player, value_buffer) in [
+            ("hero", 0u32, &ctx.hero_values_buffer),
+            ("villain", 1u32, &ctx.villain_values_buffer),
+        ] {
+            let aggregate_params = uniform_buffer(
+                &self.device,
+                &format!("public tree {label} aggregate params"),
+                &[GpuPublicTreeParams {
+                    combo_count: ctx.combos_len as u32,
+                    node_count: ctx.nodes_len as u32,
+                    max_actions: ctx.actions as u32,
+                    output_len: ctx.action_len as u32,
+                    pair_start: value_player,
+                    chunk_pairs: 0,
+                    _pad0: 0,
+                    _pad1: 0,
+                }],
+            );
+            let aggregate_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("public tree aggregate bind group"),
+                layout: &self.public_tree_aggregate_bind_group_layout,
+                entries: &[
+                    bind_entry(0, &ctx.node_buffer),
+                    bind_entry(1, &ctx.child_buffer),
+                    bind_entry(2, &ctx.combo_buffer),
+                    bind_entry(3, &ctx.decision_nodes_buffer),
+                    bind_entry(4, &ctx.hero_reaches_buffer),
+                    bind_entry(5, &ctx.villain_reaches_buffer),
+                    bind_entry(6, value_buffer),
+                    bind_entry(7, &ctx.output_buffer),
+                    bind_entry(8, &aggregate_params),
+                ],
+            });
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("public tree aggregate pass"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.public_tree_aggregate_pipeline);
+                pass.set_bind_group(0, &aggregate_bind_group, &[]);
+                pass.dispatch_workgroups((ctx.action_len as u32).div_ceil(WORKGROUP_SIZE), 1, 1);
+            }
+        }
+        self.submit_final_profile_phase(encoder, "cfv_action_aggregate", phase_start)?;
+        Ok((ctx.output_buffer.clone(), ctx.output_len, ctx.action_len))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn public_tree_iteration_output(
+        &self,
+        nodes: &[GpuPublicTreeNode],
+        children: &[u32],
+        child_cards: &[u32],
+        combos: &[GpuPrivateCombo],
+        combo_legal: &[u32],
+        villain_weights: &[f32],
+        showdown_boards: &[GpuFinalBoard],
+        strength_buffer: &wgpu::Buffer,
+        regrets_buffer: &wgpu::Buffer,
+        infosets: usize,
+        actions: usize,
+    ) -> Result<(wgpu::Buffer, usize, usize), GpuCfrError> {
+        assert!(!nodes.is_empty());
+        assert_eq!(combo_legal.len(), combos.len());
+        assert_eq!(villain_weights.len(), combos.len());
+        assert_eq!(
+            infosets,
+            nodes_public_infoset_count(nodes) * combos.len() * 2
+        );
+
+        let action_len = infosets * actions;
+        let output_len = action_len * 2 + infosets * 2;
+        let node_combo_len = nodes.len() * combos.len();
+        let profile = Self::gpu_profile_enabled();
+        let setup_start = profile.then(Instant::now);
+        let (reach_edges, reach_layer_ranges) =
+            public_tree_reach_layers(nodes, children, child_cards);
+        let (backup_nodes, backup_layer_ranges) = public_tree_backup_layers(nodes, children);
+
+        let node_buffer = readonly_buffer(&self.device, "public tree nodes", nodes);
+        let child_buffer = readonly_buffer(&self.device, "public tree children", children);
+        let reach_edge_buffer =
+            readonly_buffer(&self.device, "public tree reach edges", &reach_edges);
+        let backup_nodes_buffer =
+            readonly_buffer(&self.device, "public tree backup nodes", &backup_nodes);
+        let board_buffer =
+            readonly_buffer(&self.device, "public tree showdown boards", showdown_boards);
+        let combo_buffer = readonly_buffer(&self.device, "public tree combos", combos);
+        let root_weights: Vec<_> = combo_legal
+            .iter()
+            .zip(villain_weights)
+            .map(|(is_legal, weight)| if *is_legal != 0 { *weight } else { -1.0 })
+            .collect();
+        let root_weights_buffer =
+            readonly_buffer(&self.device, "public tree root weights", &root_weights);
+        let hero_reaches_buffer = uninit_storage_buffer(
+            &self.device,
+            "public tree hero reaches",
+            node_combo_len,
+            false,
+        );
+        let villain_reaches_buffer = uninit_storage_buffer(
+            &self.device,
+            "public tree villain reaches",
+            node_combo_len,
+            false,
+        );
+        let hero_values_buffer = uninit_storage_buffer(
+            &self.device,
+            "public tree hero private values",
+            node_combo_len,
+            false,
+        );
+        let villain_values_buffer = uninit_storage_buffer(
+            &self.device,
+            "public tree villain private values",
+            node_combo_len,
+            false,
+        );
+        let output_buffer = uninit_storage_buffer(
+            &self.device,
+            "public tree iteration output",
+            output_len,
+            true,
         );
         let fold_terminal_nodes: Vec<_> = nodes
             .iter()
@@ -2888,21 +3489,30 @@ impl GpuDenseCfrBackend {
                 terminal_chunk_size
             );
         }
-        let hero_terminal_partials_buffer = storage_buffer(
+        let hero_terminal_partials_buffer = uninit_storage_buffer(
             &self.device,
             "public tree hero terminal partial values",
-            &vec![0.0f32; terminal_partial_len],
+            terminal_partial_len,
+            false,
         );
-        let villain_terminal_partials_buffer = storage_buffer(
+        let villain_terminal_partials_buffer = uninit_storage_buffer(
             &self.device,
             "public tree villain terminal partial values",
-            &vec![0.0f32; terminal_partial_len],
+            terminal_partial_len,
+            false,
         );
+        if let Some(start) = setup_start {
+            eprintln!(
+                "pokedr: gpu profile phase=cfv_setup elapsed_ms={:.3}",
+                start.elapsed().as_secs_f64() * 1000.0
+            );
+        }
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("public tree iteration encoder"),
             });
+        let mut phase_start = profile.then(Instant::now);
         let (init_x_groups, init_y_groups, init_x_invocations) = dispatch_grid(node_combo_len);
         let reach_init_params = uniform_buffer(
             &self.device,
@@ -2987,6 +3597,8 @@ impl GpuDenseCfrBackend {
                 pass.dispatch_workgroups(x_groups, y_groups, 1);
             }
         }
+        encoder = self.finish_profile_phase(encoder, "cfv_reach", phase_start)?;
+        phase_start = profile.then(Instant::now);
 
         self.fill_fold_values(
             &mut encoder,
@@ -3020,6 +3632,8 @@ impl GpuDenseCfrBackend {
             terminal_board_tile_size,
             terminal_chunk_size,
         )?;
+        encoder = self.finish_profile_phase(encoder, "cfv_terminal", phase_start)?;
+        phase_start = profile.then(Instant::now);
 
         self.backup_nonterminal_values(
             &mut encoder,
@@ -3035,17 +3649,21 @@ impl GpuDenseCfrBackend {
             nodes.len(),
             actions,
         )?;
+        encoder = self.finish_profile_phase(encoder, "cfv_backup", phase_start)?;
+        phase_start = profile.then(Instant::now);
         const DECISION_AGGREGATE_SLOTS: usize = 53;
         let decision_aggregate_len = public_infoset_count * DECISION_AGGREGATE_SLOTS;
-        let hero_decision_aggregates_buffer = storage_buffer(
+        let hero_decision_aggregates_buffer = uninit_storage_buffer(
             &self.device,
             "public tree hero decision aggregates",
-            &vec![0.0f32; decision_aggregate_len],
+            decision_aggregate_len,
+            false,
         );
-        let villain_decision_aggregates_buffer = storage_buffer(
+        let villain_decision_aggregates_buffer = uninit_storage_buffer(
             &self.device,
             "public tree villain decision aggregates",
-            &vec![0.0f32; decision_aggregate_len],
+            decision_aggregate_len,
+            false,
         );
         let (
             decision_aggregate_x_groups,
@@ -3130,6 +3748,8 @@ impl GpuDenseCfrBackend {
                 pass.dispatch_workgroups((infosets as u32).div_ceil(WORKGROUP_SIZE), 1, 1);
             }
         }
+        encoder = self.finish_profile_phase(encoder, "cfv_decision_denominator", phase_start)?;
+        phase_start = profile.then(Instant::now);
         let hero_aggregate_params = uniform_buffer(
             &self.device,
             "public tree hero aggregate params",
@@ -3208,7 +3828,7 @@ impl GpuDenseCfrBackend {
             pass.set_bind_group(0, &villain_aggregate_bind_group, &[]);
             pass.dispatch_workgroups((action_len as u32).div_ceil(WORKGROUP_SIZE), 1, 1);
         }
-        self.queue.submit(Some(encoder.finish()));
+        self.submit_final_profile_phase(encoder, "cfv_action_aggregate", phase_start)?;
         Ok((output_buffer, output_len, action_len))
     }
 
@@ -3314,6 +3934,8 @@ impl GpuDenseCfrBackend {
         state: &mut GpuDenseCfrState,
         iteration: usize,
     ) -> Result<(), GpuCfrError> {
+        let profile = Self::gpu_profile_enabled();
+        let cfv_start = profile.then(Instant::now);
         let (output_buffer, _output_len, action_len) = self.public_tree_iteration_output(
             nodes,
             children,
@@ -3327,6 +3949,14 @@ impl GpuDenseCfrBackend {
             state.infosets,
             state.actions,
         )?;
+        if let Some(start) = cfv_start {
+            self.profile_poll()?;
+            eprintln!(
+                "pokedr: gpu profile iteration={} phase=cfv elapsed_ms={:.3}",
+                iteration,
+                start.elapsed().as_secs_f64() * 1000.0
+            );
+        }
         let reach_start = action_len * 2;
         let strategy_start = reach_start + state.infosets;
         let params = readonly_buffer(
@@ -3353,6 +3983,7 @@ impl GpuDenseCfrBackend {
                 bind_entry(4, &state.legal_actions_buffer),
             ],
         });
+        let update_start = profile.then(Instant::now);
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -3369,6 +4000,87 @@ impl GpuDenseCfrBackend {
             pass.dispatch_workgroups(groups, 1, 1);
         }
         self.queue.submit(Some(encoder.finish()));
+        if let Some(start) = update_start {
+            self.profile_poll()?;
+            eprintln!(
+                "pokedr: gpu profile iteration={} phase=cfr_update elapsed_ms={:.3}",
+                iteration,
+                start.elapsed().as_secs_f64() * 1000.0
+            );
+        }
+        Ok(())
+    }
+
+    fn public_tree_update_state_with_context(
+        &self,
+        context: &GpuPublicTreeIterationContext,
+        strength_buffer: &wgpu::Buffer,
+        state: &mut GpuDenseCfrState,
+        iteration: usize,
+    ) -> Result<(), GpuCfrError> {
+        let profile = Self::gpu_profile_enabled();
+        let cfv_start = profile.then(Instant::now);
+        let (output_buffer, _output_len, action_len) = self
+            .public_tree_iteration_output_with_context(context, strength_buffer, &state.regrets)?;
+        if let Some(start) = cfv_start {
+            self.profile_poll()?;
+            eprintln!(
+                "pokedr: gpu profile iteration={} phase=cfv elapsed_ms={:.3}",
+                iteration,
+                start.elapsed().as_secs_f64() * 1000.0
+            );
+        }
+        let reach_start = action_len * 2;
+        let strategy_start = reach_start + state.infosets;
+        let params = readonly_buffer(
+            &self.device,
+            "public tree CFR update params",
+            &[
+                state.infosets as u32,
+                state.actions as u32,
+                variant_code(state.variant),
+                iteration as u32,
+                action_len as u32,
+                reach_start as u32,
+                strategy_start as u32,
+            ],
+        );
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("public tree CFR update bind group"),
+            layout: &self.public_tree_cfr_update_bind_group_layout,
+            entries: &[
+                bind_entry(0, &state.regrets),
+                bind_entry(1, &state.strategy_sum),
+                bind_entry(2, &output_buffer),
+                bind_entry(3, &params),
+                bind_entry(4, &state.legal_actions_buffer),
+            ],
+        });
+        let update_start = profile.then(Instant::now);
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("public tree CFR update encoder"),
+            });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("public tree CFR update pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.public_tree_cfr_update_pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            let groups = (state.infosets as u32).div_ceil(WORKGROUP_SIZE);
+            pass.dispatch_workgroups(groups, 1, 1);
+        }
+        self.queue.submit(Some(encoder.finish()));
+        if let Some(start) = update_start {
+            self.profile_poll()?;
+            eprintln!(
+                "pokedr: gpu profile iteration={} phase=cfr_update elapsed_ms={:.3}",
+                iteration,
+                start.elapsed().as_secs_f64() * 1000.0
+            );
+        }
         Ok(())
     }
 
@@ -3385,32 +4097,61 @@ impl GpuDenseCfrBackend {
         state: &mut GpuDenseCfrState,
         iterations: usize,
     ) -> Result<(), GpuCfrError> {
+        let profile = Self::gpu_profile_enabled();
+        let strength_start = profile.then(Instant::now);
         let strength_buffer = self.final_board_strength_buffer(combos, showdown_boards)?;
+        if let Some(start) = strength_start {
+            self.profile_poll()?;
+            eprintln!(
+                "pokedr: gpu profile phase=strength_precompute elapsed_ms={:.3}",
+                start.elapsed().as_secs_f64() * 1000.0
+            );
+        }
+        let setup_start = profile.then(Instant::now);
+        let context = self.public_tree_iteration_context(
+            nodes,
+            children,
+            child_cards,
+            combos,
+            combo_legal,
+            villain_weights,
+            showdown_boards,
+            state.infosets,
+            state.actions,
+        );
+        if let Some(start) = setup_start {
+            eprintln!(
+                "pokedr: gpu profile phase=cfv_setup elapsed_ms={:.3}",
+                start.elapsed().as_secs_f64() * 1000.0
+            );
+        }
         let flush_interval = std::env::var("POKEDR_GPU_ITERATION_FLUSH")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
             .unwrap_or(4)
             .max(1);
         for iteration in 1..=iterations.max(1) {
-            self.public_tree_update_state_with_strengths(
-                nodes,
-                children,
-                child_cards,
-                combos,
-                combo_legal,
-                villain_weights,
-                showdown_boards,
+            self.public_tree_update_state_with_context(
+                &context,
                 &strength_buffer,
                 state,
                 iteration,
             )?;
             if iteration % flush_interval == 0 {
+                let flush_start = profile.then(Instant::now);
                 self.device
                     .poll(wgpu::PollType::Wait {
                         submission_index: None,
                         timeout: None,
                     })
                     .map_err(|error| GpuCfrError::MapFailed(error.to_string()))?;
+                if let Some(start) = flush_start {
+                    eprintln!(
+                        "pokedr: gpu profile iteration={} phase=flush elapsed_ms={:.3}",
+                        iteration,
+                        start.elapsed().as_secs_f64() * 1000.0
+                    );
+                }
             }
         }
         Ok(())
@@ -3656,6 +4397,24 @@ fn storage_buffer(device: &wgpu::Device, label: &str, data: &[f32]) -> wgpu::Buf
         label: Some(label),
         contents: bytemuck::cast_slice(data),
         usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+    })
+}
+
+fn uninit_storage_buffer(
+    device: &wgpu::Device,
+    label: &str,
+    len: usize,
+    copy_src: bool,
+) -> wgpu::Buffer {
+    let mut usage = wgpu::BufferUsages::STORAGE;
+    if copy_src {
+        usage |= wgpu::BufferUsages::COPY_SRC;
+    }
+    device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some(label),
+        size: byte_len::<f32>(len),
+        usage,
+        mapped_at_creation: false,
     })
 }
 
