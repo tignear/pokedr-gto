@@ -223,6 +223,124 @@ The chunk boundary may split combo pairs, but it must not change math. The
 chunk outputs are additive numerators and denominators; division happens only
 after all chunks are reduced.
 
+## Board-Major Terminal CFV With Local Blocker Correction
+
+The current showdown terminal kernel is terminal-major:
+
+```text
+for terminal z:
+  for private combo h:
+    for opponent combo v:
+      for runout board B:
+        compare strength[B,h] and strength[B,v]
+```
+
+For a flop or turn terminal this mixes the runout average with the
+hero-villain pair loop. That prevents the GPU from using the natural final-board
+parallelism and repeatedly performs the same board-local strength comparisons.
+
+For a public board `P`, let:
+
+- `D = Deck \ P`.
+- `R_m(P)` be the full unordered set of missing runout cards, with
+  `m = 5 - |P|`.
+- `B = P union r` be a final board for `r in R_m(P)`.
+- `C` be the private combo set.
+- `r_v(v)` be villain reach at the terminal.
+- `s_B(c)` be the sortable hand strength of combo `c` on final board `B`.
+- `N(h) = { v in C : v intersects h }` be the blocker neighborhood of hero
+  combo `h`.
+
+For legal private pairs `h intersect v = empty`, and when `R_m(P)` is the full
+runout set, the pair-specific valid-board denominator is constant:
+
+```text
+K(h,v)
+ = |{ r in R_m(P) : r intersects h = empty and r intersects v = empty }|
+ = choose(|D| - 4, m)
+ = K
+```
+
+This constant-denominator identity is false for truncated or sampled runout
+lists. Board-major terminal CFV therefore requires full runouts, or a different
+sampling semantics.
+
+With full runouts, hero terminal CFV can be reordered as:
+
+```text
+V_H(h)
+ = (1/K) * sum_{r in R_m(P), r intersects h = empty}
+     [ pot * W_B(h) - invested_H * T_B(h) ]
+```
+
+where `B = P union r`, and board-local nonblocked win/tie/total masses are:
+
+```text
+W_B(h) = Win_B(h) + 0.5 * Tie_B(h)
+T_B(h) = Total_B(h)
+```
+
+For a fixed final board `B`, first compute raw board-legal villain masses,
+ignoring hero blockers:
+
+```text
+C_B = { v in C : v intersects B = empty }
+
+WinRaw_B(h)
+  = sum_{v in C_B, s_B(v) < s_B(h)} r_v(v)
+
+TieRaw_B(h)
+  = sum_{v in C_B, s_B(v) = s_B(h)} r_v(v)
+
+TotalRaw_B
+  = sum_{v in C_B} r_v(v)
+```
+
+These raw masses can be obtained from a board-local strength grouping and a
+prefix sum over group mass. Hero blockers are then subtracted by a small
+neighborhood loop:
+
+```text
+BlockWin_B(h)
+  = sum_{v in C_B intersect N(h), s_B(v) < s_B(h)} r_v(v)
+
+BlockTie_B(h)
+  = sum_{v in C_B intersect N(h), s_B(v) = s_B(h)} r_v(v)
+
+BlockTotal_B(h)
+  = sum_{v in C_B intersect N(h)} r_v(v)
+```
+
+Therefore:
+
+```text
+Win_B(h)   = WinRaw_B(h)   - BlockWin_B(h)
+Tie_B(h)   = TieRaw_B(h)   - BlockTie_B(h)
+Total_B(h) = TotalRaw_B    - BlockTotal_B(h)
+```
+
+No `+ r_v(h)` correction appears in this formulation. The neighborhood
+`N(h)` is a set, not the inclusion-exclusion expression
+`has_card[a] + has_card[b]`, so the combo `h = {a,b}` is subtracted exactly
+once.
+
+This transforms the board-local work from:
+
+```text
+O(|C|^2)
+```
+
+to roughly:
+
+```text
+O(|C| + G_B + |C| * |N(h)|)
+```
+
+where `G_B` is the number of distinct hand-strength groups on board `B`, and
+`|N(h)|` is about 90 board-legal combos on a river board. The design avoids a
+global `prefix_card[52][G_B]` table; blocker correction is computed locally
+from the small neighborhood instead of being materialized as 52 prefix lanes.
+
 ## Non-Goals And Known Bad Paths
 
 - Do not CPU-traverse `(hero_combo, villain_combo, public_tree)` for production

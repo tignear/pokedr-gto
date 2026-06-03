@@ -4649,6 +4649,229 @@ mod tests {
     }
 
     #[test]
+    fn board_major_blocker_correction_matches_bruteforce_on_turn_runouts() {
+        let public = [12, 18, 27, 35];
+        let combos = [
+            GpuPrivateCombo { cards: [0, 1] },
+            GpuPrivateCombo { cards: [2, 3] },
+            GpuPrivateCombo { cards: [4, 5] },
+            GpuPrivateCombo { cards: [6, 7] },
+            GpuPrivateCombo { cards: [8, 9] },
+            GpuPrivateCombo { cards: [10, 11] },
+            GpuPrivateCombo { cards: [13, 14] },
+            GpuPrivateCombo { cards: [15, 16] },
+        ];
+        let reaches = [0.17, 0.03, 0.21, 0.11, 0.07, 0.19, 0.13, 0.09];
+        let boards = full_final_boards(&public);
+
+        let brute = brute_force_terminal_cfv(&combos, &boards, &reaches, 17.5, 6.0);
+        let board_major = board_major_terminal_cfv(&combos, &public, &boards, &reaches, 17.5, 6.0);
+        assert_close_vec("turn board-major cfv", &brute, &board_major, 1.0e-4);
+    }
+
+    #[test]
+    fn board_major_blocker_correction_matches_bruteforce_on_flop_runouts() {
+        let public = [12, 18, 27];
+        let combos = [
+            GpuPrivateCombo { cards: [0, 1] },
+            GpuPrivateCombo { cards: [2, 3] },
+            GpuPrivateCombo { cards: [4, 5] },
+            GpuPrivateCombo { cards: [6, 7] },
+            GpuPrivateCombo { cards: [8, 9] },
+            GpuPrivateCombo { cards: [10, 11] },
+            GpuPrivateCombo { cards: [13, 14] },
+        ];
+        let reaches = [0.23, 0.05, 0.17, 0.31, 0.02, 0.13, 0.09];
+        let boards = full_final_boards(&public);
+
+        let brute = brute_force_terminal_cfv(&combos, &boards, &reaches, 22.0, 8.5);
+        let board_major = board_major_terminal_cfv(&combos, &public, &boards, &reaches, 22.0, 8.5);
+        assert_close_vec("flop board-major cfv", &brute, &board_major, 1.0e-4);
+    }
+
+    fn full_final_boards(public: &[u32]) -> Vec<GpuFinalBoard> {
+        assert!(public.len() <= 5);
+        let public_mask = public.iter().fold(0u64, |mask, card| mask | (1u64 << card));
+        let missing = 5 - public.len();
+        let deck: Vec<_> = (0..Card::COUNT as u32)
+            .filter(|card| public_mask & (1u64 << card) == 0)
+            .collect();
+        let mut boards = Vec::new();
+        match missing {
+            0 => {
+                boards.push(final_board_from_public_runout(public, &[]));
+            }
+            1 => {
+                for &card in &deck {
+                    boards.push(final_board_from_public_runout(public, &[card]));
+                }
+            }
+            2 => {
+                for first in 0..deck.len() {
+                    for second in first + 1..deck.len() {
+                        boards.push(final_board_from_public_runout(
+                            public,
+                            &[deck[first], deck[second]],
+                        ));
+                    }
+                }
+            }
+            _ => panic!("tests only cover flop or later boards"),
+        }
+        boards
+    }
+
+    fn final_board_from_public_runout(public: &[u32], runout: &[u32]) -> GpuFinalBoard {
+        let mut cards = [u32::MAX; 5];
+        for (slot, card) in public.iter().chain(runout).enumerate() {
+            cards[slot] = *card;
+        }
+        GpuFinalBoard { cards }
+    }
+
+    fn brute_force_terminal_cfv(
+        combos: &[GpuPrivateCombo],
+        boards: &[GpuFinalBoard],
+        reaches: &[f32],
+        pot: f32,
+        invested: f32,
+    ) -> Vec<f32> {
+        let mut values = vec![0.0; combos.len()];
+        for (hero_index, &hero) in combos.iter().enumerate() {
+            for (villain_index, &villain) in combos.iter().enumerate() {
+                if combos_collide(hero, villain) {
+                    continue;
+                }
+                let mut equity_sum = 0.0;
+                let mut valid_boards = 0usize;
+                for &board in boards {
+                    if combo_hits_final_board(hero, board) || combo_hits_final_board(villain, board)
+                    {
+                        continue;
+                    }
+                    valid_boards += 1;
+                    let hero_strength = evaluate_combo_final_board(hero, board);
+                    let villain_strength = evaluate_combo_final_board(villain, board);
+                    if hero_strength > villain_strength {
+                        equity_sum += 1.0;
+                    } else if hero_strength == villain_strength {
+                        equity_sum += 0.5;
+                    }
+                }
+                if valid_boards == 0 {
+                    continue;
+                }
+                values[hero_index] +=
+                    reaches[villain_index] * (pot * equity_sum / valid_boards as f32 - invested);
+            }
+        }
+        values
+    }
+
+    fn board_major_terminal_cfv(
+        combos: &[GpuPrivateCombo],
+        public: &[u32],
+        boards: &[GpuFinalBoard],
+        reaches: &[f32],
+        pot: f32,
+        invested: f32,
+    ) -> Vec<f32> {
+        let denominator = full_runout_pair_denominator(public.len()) as f32;
+        let mut values = vec![0.0; combos.len()];
+        for &board in boards {
+            let mut ordered: Vec<_> = combos
+                .iter()
+                .enumerate()
+                .filter_map(|(combo_index, &combo)| {
+                    (!combo_hits_final_board(combo, board)).then(|| {
+                        (
+                            evaluate_combo_final_board(combo, board),
+                            combo_index,
+                            reaches[combo_index],
+                        )
+                    })
+                })
+                .collect();
+            ordered.sort_unstable_by_key(|(strength, combo_index, _)| (*strength, *combo_index));
+
+            let mut prefix = Vec::with_capacity(ordered.len() + 1);
+            prefix.push(0.0f32);
+            for &(_, _, reach) in &ordered {
+                prefix.push(prefix.last().copied().unwrap() + reach);
+            }
+
+            for (hero_index, &hero) in combos.iter().enumerate() {
+                if combo_hits_final_board(hero, board) {
+                    continue;
+                }
+                let hero_strength = evaluate_combo_final_board(hero, board);
+                let group_start =
+                    ordered.partition_point(|(strength, _, _)| *strength < hero_strength);
+                let group_end =
+                    ordered.partition_point(|(strength, _, _)| *strength <= hero_strength);
+
+                let win_raw = prefix[group_start];
+                let tie_raw = prefix[group_end] - prefix[group_start];
+                let total_raw = prefix.last().copied().unwrap_or(0.0);
+                let mut block_win = 0.0;
+                let mut block_tie = 0.0;
+                let mut block_total = 0.0;
+                for (villain_index, &villain) in combos.iter().enumerate() {
+                    if !combos_collide(hero, villain) || combo_hits_final_board(villain, board) {
+                        continue;
+                    }
+                    let villain_reach = reaches[villain_index];
+                    let villain_strength = evaluate_combo_final_board(villain, board);
+                    block_total += villain_reach;
+                    if villain_strength < hero_strength {
+                        block_win += villain_reach;
+                    } else if villain_strength == hero_strength {
+                        block_tie += villain_reach;
+                    }
+                }
+
+                let win = win_raw - block_win;
+                let tie = tie_raw - block_tie;
+                let total = total_raw - block_total;
+                values[hero_index] += (pot * (win + 0.5 * tie) - invested * total) / denominator;
+            }
+        }
+        values
+    }
+
+    fn full_runout_pair_denominator(public_len: usize) -> usize {
+        let missing = 5 - public_len;
+        let remaining_after_public_and_pair = Card::COUNT - public_len - 4;
+        match missing {
+            0 => 1,
+            1 => remaining_after_public_and_pair,
+            2 => remaining_after_public_and_pair * (remaining_after_public_and_pair - 1) / 2,
+            _ => panic!("tests only cover flop or later boards"),
+        }
+    }
+
+    fn combos_collide(left: GpuPrivateCombo, right: GpuPrivateCombo) -> bool {
+        left.cards[0] == right.cards[0]
+            || left.cards[0] == right.cards[1]
+            || left.cards[1] == right.cards[0]
+            || left.cards[1] == right.cards[1]
+    }
+
+    fn combo_hits_final_board(combo: GpuPrivateCombo, board: GpuFinalBoard) -> bool {
+        board.cards.contains(&combo.cards[0]) || board.cards.contains(&combo.cards[1])
+    }
+
+    fn assert_close_vec(label: &str, left: &[f32], right: &[f32], tolerance: f32) {
+        assert_eq!(left.len(), right.len());
+        for (index, (&left, &right)) in left.iter().zip(right).enumerate() {
+            assert!(
+                (left - right).abs() <= tolerance,
+                "{label} mismatch at {index}: left={left} right={right}"
+            );
+        }
+    }
+
+    #[test]
     #[ignore = "GPU tests must run on the main thread; use `cargo test -p pokedr-core --test gpu_smoke`"]
     fn gpu_update_matches_cpu_reference_when_adapter_exists() {
         let backend = match GpuDenseCfrBackend::new() {
