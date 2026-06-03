@@ -1262,6 +1262,88 @@ fn tree_aggregate(@builtin(global_invocation_id) id: vec3<u32>) {
     }
 
     let child = children[node.first_child + action];
+    let node_base = node_index * params.combo_count;
+    let value_weight = output[action_len * 2u + private_infoset];
+    let value_offset = child * params.combo_count + acting_combo;
+    let action_value = values[value_offset];
+    var strategy_weight = node._pad1 * hero_reaches[node_base + acting_combo];
+    if node.acting_player == 1u {
+        strategy_weight = node._pad1 * villain_reaches[node_base + acting_combo];
+    }
+    output[index] = action_value;
+    output[action_len + index] = value_weight;
+    if action == 0u {
+        let infoset_count = action_len / params.max_actions;
+        output[action_len * 2u + private_infoset] = value_weight;
+        output[action_len * 2u + infoset_count + private_infoset] = strategy_weight;
+    }
+}
+"#;
+
+const PUBLIC_TREE_DENOMINATOR_SHADER: &str = r#"
+struct Combo { cards: array<u32, 2>, };
+struct TreeNode {
+    kind: u32,
+    acting_player: u32,
+    public_infoset: u32,
+    first_child: u32,
+    child_count: u32,
+    terminal_kind: u32,
+    showdown_offset: u32,
+    _pad0: u32,
+    pot: f32,
+    hero_invested: f32,
+    _pad1: f32,
+    _pad2: f32,
+};
+struct Params {
+    combo_count: u32,
+    node_count: u32,
+    max_actions: u32,
+    output_len: u32,
+    value_player: u32,
+    _pad1: u32,
+    _pad2: u32,
+    _pad3: u32,
+};
+
+@group(0) @binding(0) var<storage, read> nodes: array<TreeNode>;
+@group(0) @binding(1) var<storage, read> combos: array<Combo>;
+@group(0) @binding(2) var<storage, read> decision_nodes: array<u32>;
+@group(0) @binding(3) var<storage, read> hero_reaches: array<f32>;
+@group(0) @binding(4) var<storage, read> villain_reaches: array<f32>;
+@group(0) @binding(5) var<storage, read_write> output: array<f32>;
+@group(0) @binding(6) var<uniform> params: Params;
+
+fn collide(left: Combo, right: Combo) -> bool {
+    return left.cards[0] == right.cards[0] || left.cards[0] == right.cards[1]
+        || left.cards[1] == right.cards[0] || left.cards[1] == right.cards[1];
+}
+
+@compute @workgroup_size(64)
+fn denominator_mass(@builtin(global_invocation_id) id: vec3<u32>) {
+    let private_infoset = id.x;
+    if private_infoset >= params.output_len {
+        return;
+    }
+    let public_infoset = private_infoset / (params.combo_count * 2u);
+    let player_slot = (private_infoset / params.combo_count) % 2u;
+    let acting_combo = private_infoset % params.combo_count;
+    if player_slot != params.value_player {
+        return;
+    }
+
+    let node_index = decision_nodes[public_infoset];
+    if node_index == 0xffffffffu {
+        output[params.output_len * params.max_actions * 2u + private_infoset] = 0.0;
+        return;
+    }
+    let node = nodes[node_index];
+    if node.kind != 0u || node.acting_player != player_slot {
+        output[params.output_len * params.max_actions * 2u + private_infoset] = 0.0;
+        return;
+    }
+
     var value_weight = 0.0;
     let node_base = node_index * params.combo_count;
     for (var opponent = 0u; opponent < params.combo_count; opponent = opponent + 1u) {
@@ -1274,19 +1356,7 @@ fn tree_aggregate(@builtin(global_invocation_id) id: vec3<u32>) {
             value_weight = value_weight + hero_reaches[node_base + opponent];
         }
     }
-    let value_offset = child * params.combo_count + acting_combo;
-    let action_value = values[value_offset];
-    var strategy_weight = node._pad1 * hero_reaches[node_base + acting_combo];
-    if node.acting_player == 1u {
-        strategy_weight = node._pad1 * villain_reaches[node_base + acting_combo];
-    }
-    output[index] = action_value;
-    output[action_len + index] = node._pad1 * value_weight;
-    if action == 0u {
-        let infoset_count = action_len / params.max_actions;
-        output[action_len * 2u + private_infoset] = node._pad1 * value_weight;
-        output[action_len * 2u + infoset_count + private_infoset] = strategy_weight;
-    }
+    output[params.output_len * params.max_actions * 2u + private_infoset] = node._pad1 * value_weight;
 }
 "#;
 
@@ -1323,6 +1393,8 @@ pub struct GpuDenseCfrBackend {
     public_tree_fold_value_bind_group_layout: wgpu::BindGroupLayout,
     public_tree_backup_pipeline: wgpu::ComputePipeline,
     public_tree_backup_bind_group_layout: wgpu::BindGroupLayout,
+    public_tree_denominator_pipeline: wgpu::ComputePipeline,
+    public_tree_denominator_bind_group_layout: wgpu::BindGroupLayout,
     public_tree_aggregate_pipeline: wgpu::ComputePipeline,
     public_tree_aggregate_bind_group_layout: wgpu::BindGroupLayout,
 }
@@ -1794,6 +1866,39 @@ impl GpuDenseCfrBackend {
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
                 cache: None,
             });
+        let public_tree_denominator_shader =
+            device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("public tree denominator shader"),
+                source: wgpu::ShaderSource::Wgsl(PUBLIC_TREE_DENOMINATOR_SHADER.into()),
+            });
+        let public_tree_denominator_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("public tree denominator bind group layout"),
+                entries: &[
+                    storage_entry(0, true),
+                    storage_entry(1, true),
+                    storage_entry(2, true),
+                    storage_entry(3, true),
+                    storage_entry(4, true),
+                    storage_entry(5, false),
+                    uniform_entry(6),
+                ],
+            });
+        let public_tree_denominator_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("public tree denominator pipeline layout"),
+                bind_group_layouts: &[Some(&public_tree_denominator_bind_group_layout)],
+                immediate_size: 0,
+            });
+        let public_tree_denominator_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("public tree denominator pipeline"),
+                layout: Some(&public_tree_denominator_pipeline_layout),
+                module: &public_tree_denominator_shader,
+                entry_point: Some("denominator_mass"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                cache: None,
+            });
         let public_tree_aggregate_shader =
             device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("public tree aggregate shader"),
@@ -1855,6 +1960,8 @@ impl GpuDenseCfrBackend {
             public_tree_fold_value_bind_group_layout,
             public_tree_backup_pipeline,
             public_tree_backup_bind_group_layout,
+            public_tree_denominator_pipeline,
+            public_tree_denominator_bind_group_layout,
             public_tree_aggregate_pipeline,
             public_tree_aggregate_bind_group_layout,
         })
@@ -2702,6 +2809,45 @@ impl GpuDenseCfrBackend {
             nodes.len(),
             actions,
         )?;
+        for (label, value_player) in [("hero", 0u32), ("villain", 1u32)] {
+            let denominator_params = uniform_buffer(
+                &self.device,
+                &format!("public tree {label} denominator params"),
+                &[GpuPublicTreeParams {
+                    combo_count: combos.len() as u32,
+                    node_count: nodes.len() as u32,
+                    max_actions: actions as u32,
+                    output_len: infosets as u32,
+                    pair_start: value_player,
+                    chunk_pairs: 0,
+                    _pad0: 0,
+                    _pad1: 0,
+                }],
+            );
+            let denominator_bind_group =
+                self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("public tree denominator bind group"),
+                    layout: &self.public_tree_denominator_bind_group_layout,
+                    entries: &[
+                        bind_entry(0, &node_buffer),
+                        bind_entry(1, &combo_buffer),
+                        bind_entry(2, &decision_nodes_buffer),
+                        bind_entry(3, &hero_reaches_buffer),
+                        bind_entry(4, &villain_reaches_buffer),
+                        bind_entry(5, &output_buffer),
+                        bind_entry(6, &denominator_params),
+                    ],
+                });
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("public tree denominator pass"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.public_tree_denominator_pipeline);
+                pass.set_bind_group(0, &denominator_bind_group, &[]);
+                pass.dispatch_workgroups((infosets as u32).div_ceil(WORKGROUP_SIZE), 1, 1);
+            }
+        }
         let hero_aggregate_params = uniform_buffer(
             &self.device,
             "public tree hero aggregate params",
