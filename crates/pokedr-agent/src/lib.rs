@@ -645,7 +645,7 @@ fn solve_public_tree_cfr(
     let indexer = ComboIndexer::new();
     let gpu_backend = cfr_gpu_backend();
     let matrix_cache = RefCell::new(ShowdownMatrixCache::new(showdown_matrix_cache_capacity()));
-    if let Some(backend) = &gpu_backend
+    if let Some(backend) = gpu_backend.as_deref()
         && let Some(gpu_state) = try_solve_gpu_public_tree_resident(
             tree,
             layout,
@@ -673,7 +673,7 @@ fn solve_public_tree_cfr(
             tree,
             layout,
             &indexer,
-            gpu_backend.as_ref(),
+            gpu_backend.as_deref(),
             &state,
             config,
             villain_weights,
@@ -685,7 +685,7 @@ fn solve_public_tree_cfr(
             *weight *= average_weight;
         }
         batch.validate(&dense_config);
-        if let Some(backend) = &gpu_backend {
+        if let Some(backend) = gpu_backend.as_deref() {
             backend
                 .update_all_infosets(
                     &mut state,
@@ -728,12 +728,19 @@ fn should_report_iteration(iteration: usize, total: usize) -> bool {
     iteration == 1 || iteration == total || iteration % (total / 4).max(1) == 0
 }
 
-fn cfr_gpu_backend() -> Option<GpuDenseCfrBackend> {
+fn cfr_gpu_backend() -> Option<Rc<GpuDenseCfrBackend>> {
     if cfg!(test) || std::env::var_os("POKEDR_DISABLE_GPU_CFR").is_some() {
-        None
-    } else {
-        GpuDenseCfrBackend::new().ok()
+        return None;
     }
+    thread_local! {
+        static SHARED_GPU_BACKEND: RefCell<Option<Rc<GpuDenseCfrBackend>>> = const { RefCell::new(None) };
+    }
+    SHARED_GPU_BACKEND.with(|backend| {
+        if backend.borrow().is_none() {
+            *backend.borrow_mut() = GpuDenseCfrBackend::new().ok().map(Rc::new);
+        }
+        backend.borrow().clone()
+    })
 }
 
 fn showdown_matrix_cache_capacity() -> usize {

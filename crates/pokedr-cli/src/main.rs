@@ -190,14 +190,16 @@ fn run_postflop_smoke() {
 }
 
 fn run_rs_poker_smoke() {
-    let summary = pokedr_agent::run_heads_up_match(smoke_hands(), 7);
+    let summary = pokedr_agent::run_heads_up_match_with_config(smoke_hands(), 7, match_config());
     println!("hands: {}", summary.hands);
     println!("hero_net: {:.2}", summary.hero_net);
     println!("villain_net: {:.2}", summary.villain_net);
 }
 
 fn run_rs_poker_trace() {
-    for trace in pokedr_agent::run_traced_heads_up_match(smoke_hands(), 7) {
+    for trace in
+        pokedr_agent::run_traced_heads_up_match_with_config(smoke_hands(), 7, match_config())
+    {
         println!(
             "hand {} hero [{}] villain [{}] board [{}] hero_net {:.2} villain_net {:.2}",
             trace.hand_index,
@@ -246,8 +248,14 @@ fn smoke_hands() -> usize {
 }
 
 fn fixed_flop_config() -> pokedr_agent::PokedrAgentConfig {
-    let mut config = pokedr_agent::PokedrAgentConfig::default();
+    let mut config = match_config();
     config.cfr_iterations = env_usize("POKEDR_CFR_ITERATIONS").unwrap_or(1);
+    config
+}
+
+fn match_config() -> pokedr_agent::PokedrAgentConfig {
+    let mut config = pokedr_agent::PokedrAgentConfig::default();
+    config.cfr_iterations = env_usize("POKEDR_CFR_ITERATIONS").unwrap_or(config.cfr_iterations);
     config.max_depth = env_usize("POKEDR_MAX_DEPTH").unwrap_or(config.max_depth);
     config.max_showdown_runouts =
         env_usize("POKEDR_MAX_SHOWDOWN_RUNOUTS").unwrap_or(config.max_showdown_runouts);

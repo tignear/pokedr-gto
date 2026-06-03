@@ -2958,6 +2958,11 @@ impl GpuDenseCfrBackend {
         iterations: usize,
     ) -> Result<(), GpuCfrError> {
         let strength_buffer = self.final_board_strength_buffer(combos, showdown_boards)?;
+        let flush_interval = std::env::var("POKEDR_GPU_ITERATION_FLUSH")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(4)
+            .max(1);
         for iteration in 1..=iterations.max(1) {
             self.public_tree_update_state_with_strengths(
                 nodes,
@@ -2971,6 +2976,14 @@ impl GpuDenseCfrBackend {
                 state,
                 iteration,
             )?;
+            if iteration % flush_interval == 0 {
+                self.device
+                    .poll(wgpu::PollType::Wait {
+                        submission_index: None,
+                        timeout: None,
+                    })
+                    .map_err(|error| GpuCfrError::MapFailed(error.to_string()))?;
+            }
         }
         Ok(())
     }
