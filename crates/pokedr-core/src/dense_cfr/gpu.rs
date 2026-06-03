@@ -1,4 +1,4 @@
-use std::{sync::mpsc, time::Instant};
+use std::{collections::BTreeMap, sync::mpsc, time::Instant};
 
 use wgpu::util::DeviceExt;
 
@@ -811,7 +811,7 @@ struct Params {
     prefix_stride: u32,
     order_stride: u32,
     x_invocations: u32,
-    _pad2: u32,
+    board_base: u32,
     _pad3: u32,
 };
 
@@ -886,7 +886,7 @@ struct Params {
     prefix_stride: u32,
     blocker_stride: u32,
     x_invocations: u32,
-    denominator: u32,
+    board_base: u32,
     _pad3: u32,
 };
 
@@ -918,11 +918,12 @@ fn terminal_reduce(@builtin(global_invocation_id) id: vec3<u32>) {
     var villain_value = 0.0;
     for (var board = 0u; board < node.board_count; board = board + 1u) {
         let board_index = node.showdown_offset + board;
-        let bounds = combo_bounds[board_index * params.combo_count + combo];
+        let local_board = board_index - params.board_base;
+        let bounds = combo_bounds[local_board * params.combo_count + combo];
         if bounds.legal == 0u {
             continue;
         }
-        let prefix_base = (terminal_slot * params.board_count + board_index) * params.prefix_stride;
+        let prefix_base = (terminal_slot * params.board_count + local_board) * params.prefix_stride;
         let total_pair = prefix_pairs[prefix_base + params.combo_count];
         let win_pair = prefix_pairs[prefix_base + bounds.group_start];
         let tie_pair = prefix_pairs[prefix_base + bounds.group_end];
@@ -939,7 +940,7 @@ fn terminal_reduce(@builtin(global_invocation_id) id: vec3<u32>) {
             if opponent == 0xffffffffu {
                 continue;
             }
-            let opponent_bounds = combo_bounds[board_index * params.combo_count + opponent];
+            let opponent_bounds = combo_bounds[local_board * params.combo_count + opponent];
             if opponent_bounds.legal == 0u {
                 continue;
             }
@@ -1576,6 +1577,9 @@ unsafe impl bytemuck::Zeroable for GpuPublicTreeEdge {}
 unsafe impl bytemuck::Pod for GpuPublicTreeEdge {}
 
 struct GpuPublicTreeIterationContext {
+    nodes: Vec<GpuPublicTreeNode>,
+    combos: Vec<GpuPrivateCombo>,
+    showdown_boards: Vec<GpuFinalBoard>,
     nodes_len: usize,
     combos_len: usize,
     infosets: usize,
@@ -1584,7 +1588,6 @@ struct GpuPublicTreeIterationContext {
     output_len: usize,
     node_combo_len: usize,
     public_infoset_count: usize,
-    showdown_board_count: usize,
     node_buffer: wgpu::Buffer,
     child_buffer: wgpu::Buffer,
     reach_edge_buffer: wgpu::Buffer,
@@ -1604,11 +1607,9 @@ struct GpuPublicTreeIterationContext {
     terminal_tile_count: usize,
     terminal_board_tile_count: usize,
     terminal_chunk_size: usize,
-    terminal_combo_order_buffer: wgpu::Buffer,
-    terminal_combo_bounds_buffer: wgpu::Buffer,
     terminal_blocker_neighbors_buffer: wgpu::Buffer,
     terminal_blocker_neighbor_stride: usize,
-    terminal_prefix_pairs_buffer: wgpu::Buffer,
+    terminal_prefix_pair_budget: usize,
     hero_decision_aggregates_buffer: wgpu::Buffer,
     villain_decision_aggregates_buffer: wgpu::Buffer,
 }
@@ -1633,6 +1634,21 @@ pub fn showdown_strength_order(
     combos: &[GpuPrivateCombo],
     final_boards: &[GpuFinalBoard],
 ) -> GpuShowdownStrengthOrder {
+    let (combo_order, combo_bounds) = showdown_strength_order_data(combos, final_boards);
+    let (blocker_neighbors, blocker_neighbor_stride) = showdown_blocker_neighbors(combos);
+
+    GpuShowdownStrengthOrder {
+        combo_order,
+        combo_bounds,
+        blocker_neighbors,
+        blocker_neighbor_stride,
+    }
+}
+
+fn showdown_strength_order_data(
+    combos: &[GpuPrivateCombo],
+    final_boards: &[GpuFinalBoard],
+) -> (Vec<u32>, Vec<GpuShowdownComboBounds>) {
     let combo_count = combos.len();
     let mut combo_order = Vec::with_capacity(final_boards.len() * combo_count);
     let mut combo_bounds =
@@ -1675,6 +1691,11 @@ pub fn showdown_strength_order(
             group_start = group_end;
         }
     }
+    (combo_order, combo_bounds)
+}
+
+fn showdown_blocker_neighbors(combos: &[GpuPrivateCombo]) -> (Vec<u32>, usize) {
+    let combo_count = combos.len();
     let blocker_neighbor_stride = combos
         .iter()
         .map(|&combo| {
@@ -1696,13 +1717,7 @@ pub fn showdown_strength_order(
             }
         }
     }
-
-    GpuShowdownStrengthOrder {
-        combo_order,
-        combo_bounds,
-        blocker_neighbors,
-        blocker_neighbor_stride,
-    }
+    (blocker_neighbors, blocker_neighbor_stride)
 }
 
 fn combos_collide_for_order(left: GpuPrivateCombo, right: GpuPrivateCombo) -> bool {
@@ -1714,15 +1729,6 @@ fn combos_collide_for_order(left: GpuPrivateCombo, right: GpuPrivateCombo) -> bo
 
 fn combo_hits_final_board_for_order(combo: GpuPrivateCombo, board: GpuFinalBoard) -> bool {
     board.cards.contains(&combo.cards[0]) || board.cards.contains(&combo.cards[1])
-}
-
-fn terminal_denominator_from_board_count(board_count: usize) -> usize {
-    match board_count {
-        1 => 1,
-        48 => 44,
-        1176 => 990,
-        _ => board_count.max(1),
-    }
 }
 
 fn evaluate_combo_final_board(combo: GpuPrivateCombo, board: GpuFinalBoard) -> u32 {
@@ -2717,116 +2723,171 @@ impl GpuDenseCfrBackend {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn fill_terminal_values(
+    fn fill_terminal_values_streaming(
         &self,
-        encoder: &mut wgpu::CommandEncoder,
+        nodes: &[GpuPublicTreeNode],
         node_buffer: &wgpu::Buffer,
         terminal_nodes: &[u32],
-        combo_order_buffer: &wgpu::Buffer,
-        combo_bounds_buffer: &wgpu::Buffer,
+        combos: &[GpuPrivateCombo],
+        showdown_boards: &[GpuFinalBoard],
         blocker_neighbors_buffer: &wgpu::Buffer,
         hero_reaches_buffer: &wgpu::Buffer,
         villain_reaches_buffer: &wgpu::Buffer,
         hero_values_buffer: &wgpu::Buffer,
         villain_values_buffer: &wgpu::Buffer,
-        terminal_prefix_pairs_buffer: &wgpu::Buffer,
         combo_count: usize,
-        board_count: usize,
         blocker_neighbor_stride: usize,
-        terminal_chunk_size: usize,
+        max_terminal_prefix_pairs: usize,
     ) -> Result<(), GpuCfrError> {
-        if terminal_nodes.is_empty() || combo_count == 0 || board_count == 0 {
+        if terminal_nodes.is_empty() || combo_count == 0 || showdown_boards.is_empty() {
             return Ok(());
         }
-        for terminal_chunk in terminal_nodes.chunks(terminal_chunk_size.max(1)) {
-            let terminal_count = terminal_chunk.len();
-            let terminal_nodes_buffer =
-                readonly_buffer(&self.device, "public tree terminal nodes", terminal_chunk);
-            let partial_invocations = terminal_count * board_count;
-            let (partial_x_groups, partial_y_groups, partial_x_invocations) =
-                dispatch_grid(partial_invocations);
-            let partial_params = uniform_buffer(
-                &self.device,
-                "public tree terminal partial params",
-                &[GpuPublicTreeParams {
-                    combo_count: combo_count as u32,
-                    node_count: terminal_count as u32,
-                    max_actions: board_count as u32,
-                    output_len: (combo_count + 1) as u32,
-                    pair_start: combo_count as u32,
-                    chunk_pairs: partial_x_invocations,
-                    _pad0: 0,
-                    _pad1: 0,
-                }],
-            );
-            let partial_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("public tree terminal partial bind group"),
-                layout: &self.public_tree_terminal_partial_bind_group_layout,
-                entries: &[
-                    bind_entry(0, node_buffer),
-                    bind_entry(1, &terminal_nodes_buffer),
-                    bind_entry(2, combo_order_buffer),
-                    bind_entry(3, combo_bounds_buffer),
-                    bind_entry(4, hero_reaches_buffer),
-                    bind_entry(5, villain_reaches_buffer),
-                    bind_entry(6, terminal_prefix_pairs_buffer),
-                    bind_entry(7, &partial_params),
-                ],
-            });
-
-            let reduce_invocations = terminal_count * combo_count;
-            let (reduce_x_groups, reduce_y_groups, reduce_x_invocations) =
-                dispatch_grid(reduce_invocations);
-            let reduce_params = uniform_buffer(
-                &self.device,
-                "public tree terminal reduce params",
-                &[GpuPublicTreeParams {
-                    combo_count: combo_count as u32,
-                    node_count: terminal_count as u32,
-                    max_actions: board_count as u32,
-                    output_len: (combo_count + 1) as u32,
-                    pair_start: blocker_neighbor_stride as u32,
-                    chunk_pairs: reduce_x_invocations,
-                    _pad0: terminal_denominator_from_board_count(board_count) as u32,
-                    _pad1: 0,
-                }],
-            );
-            let reduce_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("public tree terminal reduce bind group"),
-                layout: &self.public_tree_terminal_reduce_bind_group_layout,
-                entries: &[
-                    bind_entry(0, node_buffer),
-                    bind_entry(1, &terminal_nodes_buffer),
-                    bind_entry(2, combo_bounds_buffer),
-                    bind_entry(3, blocker_neighbors_buffer),
-                    bind_entry(4, hero_reaches_buffer),
-                    bind_entry(5, villain_reaches_buffer),
-                    bind_entry(6, terminal_prefix_pairs_buffer),
-                    bind_entry(7, hero_values_buffer),
-                    bind_entry(8, villain_values_buffer),
-                    bind_entry(9, &reduce_params),
-                ],
-            });
-            {
-                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("public tree terminal partial pass"),
-                    timestamp_writes: None,
-                });
-                pass.set_pipeline(&self.public_tree_terminal_partial_pipeline);
-                pass.set_bind_group(0, &partial_bind_group, &[]);
-                pass.dispatch_workgroups(partial_x_groups, partial_y_groups, 1);
+        let mut groups: BTreeMap<(usize, usize), Vec<u32>> = BTreeMap::new();
+        for &node_index in terminal_nodes {
+            let node = nodes[node_index as usize];
+            groups
+                .entry((node.showdown_offset as usize, node._pad0 as usize))
+                .or_default()
+                .push(node_index);
+        }
+        let poll_interval = std::env::var("POKEDR_GPU_TERMINAL_STREAM_POLL")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(16)
+            .max(1);
+        let mut submitted_chunks = 0usize;
+        for ((board_base, board_count), group_nodes) in groups {
+            if board_count == 0 {
+                continue;
             }
+            let boards = &showdown_boards[board_base..board_base + board_count];
+            let (combo_order, combo_bounds) = showdown_strength_order_data(combos, boards);
+            let combo_order_buffer = readonly_buffer(
+                &self.device,
+                "public tree streamed terminal combo strength order",
+                &combo_order,
+            );
+            let combo_bounds_buffer = readonly_buffer(
+                &self.device,
+                "public tree streamed terminal combo strength bounds",
+                &combo_bounds,
+            );
+            let prefix_pairs_per_terminal = board_count * (combo_count + 1);
+            let terminal_chunk_size = (max_terminal_prefix_pairs / prefix_pairs_per_terminal)
+                .max(1)
+                .min(group_nodes.len().max(1));
+            for terminal_chunk in group_nodes.chunks(terminal_chunk_size) {
+                let terminal_count = terminal_chunk.len();
+                let terminal_nodes_buffer = readonly_buffer(
+                    &self.device,
+                    "public tree streamed terminal nodes",
+                    terminal_chunk,
+                );
+                let terminal_prefix_pair_len = terminal_count * board_count * (combo_count + 1);
+                let terminal_prefix_pairs_buffer = uninit_storage_buffer(
+                    &self.device,
+                    "public tree streamed terminal prefix pairs",
+                    terminal_prefix_pair_len * 2,
+                    false,
+                );
+                let partial_invocations = terminal_count * board_count;
+                let (partial_x_groups, partial_y_groups, partial_x_invocations) =
+                    dispatch_grid(partial_invocations);
+                let partial_params = uniform_buffer(
+                    &self.device,
+                    "public tree streamed terminal partial params",
+                    &[GpuPublicTreeParams {
+                        combo_count: combo_count as u32,
+                        node_count: terminal_count as u32,
+                        max_actions: board_count as u32,
+                        output_len: (combo_count + 1) as u32,
+                        pair_start: combo_count as u32,
+                        chunk_pairs: partial_x_invocations,
+                        _pad0: board_base as u32,
+                        _pad1: 0,
+                    }],
+                );
+                let partial_bind_group =
+                    self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("public tree streamed terminal partial bind group"),
+                        layout: &self.public_tree_terminal_partial_bind_group_layout,
+                        entries: &[
+                            bind_entry(0, node_buffer),
+                            bind_entry(1, &terminal_nodes_buffer),
+                            bind_entry(2, &combo_order_buffer),
+                            bind_entry(3, &combo_bounds_buffer),
+                            bind_entry(4, hero_reaches_buffer),
+                            bind_entry(5, villain_reaches_buffer),
+                            bind_entry(6, &terminal_prefix_pairs_buffer),
+                            bind_entry(7, &partial_params),
+                        ],
+                    });
 
-            {
-                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("public tree terminal reduce pass"),
-                    timestamp_writes: None,
+                let reduce_invocations = terminal_count * combo_count;
+                let (reduce_x_groups, reduce_y_groups, reduce_x_invocations) =
+                    dispatch_grid(reduce_invocations);
+                let reduce_params = uniform_buffer(
+                    &self.device,
+                    "public tree streamed terminal reduce params",
+                    &[GpuPublicTreeParams {
+                        combo_count: combo_count as u32,
+                        node_count: terminal_count as u32,
+                        max_actions: board_count as u32,
+                        output_len: (combo_count + 1) as u32,
+                        pair_start: blocker_neighbor_stride as u32,
+                        chunk_pairs: reduce_x_invocations,
+                        _pad0: board_base as u32,
+                        _pad1: 0,
+                    }],
+                );
+                let reduce_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("public tree streamed terminal reduce bind group"),
+                    layout: &self.public_tree_terminal_reduce_bind_group_layout,
+                    entries: &[
+                        bind_entry(0, node_buffer),
+                        bind_entry(1, &terminal_nodes_buffer),
+                        bind_entry(2, &combo_bounds_buffer),
+                        bind_entry(3, blocker_neighbors_buffer),
+                        bind_entry(4, hero_reaches_buffer),
+                        bind_entry(5, villain_reaches_buffer),
+                        bind_entry(6, &terminal_prefix_pairs_buffer),
+                        bind_entry(7, hero_values_buffer),
+                        bind_entry(8, villain_values_buffer),
+                        bind_entry(9, &reduce_params),
+                    ],
                 });
-                pass.set_pipeline(&self.public_tree_terminal_reduce_pipeline);
-                pass.set_bind_group(0, &reduce_bind_group, &[]);
-                pass.dispatch_workgroups(reduce_x_groups, reduce_y_groups, 1);
+                let mut encoder =
+                    self.device
+                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                            label: Some("public tree streamed terminal encoder"),
+                        });
+                {
+                    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("public tree streamed terminal partial pass"),
+                        timestamp_writes: None,
+                    });
+                    pass.set_pipeline(&self.public_tree_terminal_partial_pipeline);
+                    pass.set_bind_group(0, &partial_bind_group, &[]);
+                    pass.dispatch_workgroups(partial_x_groups, partial_y_groups, 1);
+                }
+
+                {
+                    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("public tree streamed terminal reduce pass"),
+                        timestamp_writes: None,
+                    });
+                    pass.set_pipeline(&self.public_tree_terminal_reduce_pipeline);
+                    pass.set_bind_group(0, &reduce_bind_group, &[]);
+                    pass.dispatch_workgroups(reduce_x_groups, reduce_y_groups, 1);
+                }
+                self.queue.submit(Some(encoder.finish()));
+                submitted_chunks += 1;
+                if submitted_chunks % poll_interval == 0 {
+                    self.profile_poll()?;
+                }
             }
         }
+        self.profile_poll()?;
         Ok(())
     }
 
@@ -3001,42 +3062,20 @@ impl GpuDenseCfrBackend {
             .max(1);
         let terminal_board_tile_count = 1;
         let _terminal_board_tile_size = max_showdown_boards;
-        let strength_order = showdown_strength_order(combos, showdown_boards);
-        let terminal_combo_order_buffer = readonly_buffer(
-            &self.device,
-            "public tree terminal combo strength order",
-            &strength_order.combo_order,
-        );
-        let terminal_combo_bounds_buffer = readonly_buffer(
-            &self.device,
-            "public tree terminal combo strength bounds",
-            &strength_order.combo_bounds,
-        );
+        let (blocker_neighbors, blocker_neighbor_stride) = showdown_blocker_neighbors(combos);
         let terminal_blocker_neighbors_buffer = readonly_buffer(
             &self.device,
             "public tree terminal blocker neighbors",
-            &strength_order.blocker_neighbors,
+            &blocker_neighbors,
         );
         let default_max_terminal_prefix_pairs = 8_000_000usize;
         let max_terminal_prefix_pairs = std::env::var("POKEDR_GPU_MAX_TERMINAL_PREFIX_PAIRS")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
             .unwrap_or(default_max_terminal_prefix_pairs)
-            .max(showdown_boards.len().max(1) * (combos.len() + 1));
-        let terminal_chunk_size = (max_terminal_prefix_pairs
-            / (showdown_boards.len().max(1) * (combos.len() + 1)))
-            .max(1);
-        let terminal_prefix_pair_len = terminal_chunk_size
-            .min(showdown_terminal_nodes.len())
-            .max(1)
-            * showdown_boards.len().max(1)
-            * (combos.len() + 1);
-        let terminal_prefix_pairs_buffer = uninit_storage_buffer(
-            &self.device,
-            "public tree terminal prefix pairs",
-            terminal_prefix_pair_len * 2,
-            false,
-        );
+            .max(max_showdown_boards * (combos.len() + 1));
+        let terminal_chunk_size =
+            (max_terminal_prefix_pairs / (max_showdown_boards * (combos.len() + 1))).max(1);
         const DECISION_AGGREGATE_SLOTS: usize = 53;
         let decision_aggregate_len = public_infoset_count * DECISION_AGGREGATE_SLOTS;
         let hero_decision_aggregates_buffer = uninit_storage_buffer(
@@ -3053,6 +3092,9 @@ impl GpuDenseCfrBackend {
         );
 
         GpuPublicTreeIterationContext {
+            nodes: nodes.to_vec(),
+            combos: combos.to_vec(),
+            showdown_boards: showdown_boards.to_vec(),
             nodes_len: nodes.len(),
             combos_len: combos.len(),
             infosets,
@@ -3061,7 +3103,6 @@ impl GpuDenseCfrBackend {
             output_len,
             node_combo_len,
             public_infoset_count,
-            showdown_board_count: showdown_boards.len(),
             node_buffer,
             child_buffer,
             reach_edge_buffer,
@@ -3081,11 +3122,9 @@ impl GpuDenseCfrBackend {
             terminal_tile_count,
             terminal_board_tile_count,
             terminal_chunk_size,
-            terminal_combo_order_buffer,
-            terminal_combo_bounds_buffer,
             terminal_blocker_neighbors_buffer,
-            terminal_blocker_neighbor_stride: strength_order.blocker_neighbor_stride,
-            terminal_prefix_pairs_buffer,
+            terminal_blocker_neighbor_stride: blocker_neighbor_stride,
+            terminal_prefix_pair_budget: max_terminal_prefix_pairs,
             hero_decision_aggregates_buffer,
             villain_decision_aggregates_buffer,
         }
@@ -3215,24 +3254,33 @@ impl GpuDenseCfrBackend {
             &ctx.villain_values_buffer,
             ctx.combos_len,
         )?;
-        self.fill_terminal_values(
-            &mut encoder,
+        self.queue.submit(Some(encoder.finish()));
+        self.fill_terminal_values_streaming(
+            &ctx.nodes,
             &ctx.node_buffer,
             &ctx.showdown_terminal_nodes,
-            &ctx.terminal_combo_order_buffer,
-            &ctx.terminal_combo_bounds_buffer,
+            &ctx.combos,
+            &ctx.showdown_boards,
             &ctx.terminal_blocker_neighbors_buffer,
             &ctx.hero_reaches_buffer,
             &ctx.villain_reaches_buffer,
             &ctx.hero_values_buffer,
             &ctx.villain_values_buffer,
-            &ctx.terminal_prefix_pairs_buffer,
             ctx.combos_len,
-            ctx.showdown_board_count,
             ctx.terminal_blocker_neighbor_stride,
-            ctx.terminal_chunk_size,
+            ctx.terminal_prefix_pair_budget,
         )?;
-        encoder = self.finish_profile_phase(encoder, "cfv_terminal", phase_start)?;
+        if let Some(start) = phase_start {
+            eprintln!(
+                "pokedr: gpu profile phase=cfv_terminal elapsed_ms={:.3}",
+                start.elapsed().as_secs_f64() * 1000.0
+            );
+        }
+        encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("public tree post-terminal iteration encoder"),
+            });
         phase_start = profile.then(Instant::now);
 
         self.backup_nonterminal_values(
@@ -3499,36 +3547,20 @@ impl GpuDenseCfrBackend {
             .max(1);
         let terminal_board_tile_count = 1;
         let _terminal_board_tile_size = max_showdown_boards;
-        let strength_order = showdown_strength_order(combos, showdown_boards);
-        let terminal_combo_order_buffer = readonly_buffer(
-            &self.device,
-            "public tree terminal combo strength order",
-            &strength_order.combo_order,
-        );
-        let terminal_combo_bounds_buffer = readonly_buffer(
-            &self.device,
-            "public tree terminal combo strength bounds",
-            &strength_order.combo_bounds,
-        );
+        let (blocker_neighbors, blocker_neighbor_stride) = showdown_blocker_neighbors(combos);
         let terminal_blocker_neighbors_buffer = readonly_buffer(
             &self.device,
             "public tree terminal blocker neighbors",
-            &strength_order.blocker_neighbors,
+            &blocker_neighbors,
         );
         let default_max_terminal_prefix_pairs = 8_000_000usize;
         let max_terminal_prefix_pairs = std::env::var("POKEDR_GPU_MAX_TERMINAL_PREFIX_PAIRS")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
             .unwrap_or(default_max_terminal_prefix_pairs)
-            .max(showdown_boards.len().max(1) * (combos.len() + 1));
-        let terminal_chunk_size = (max_terminal_prefix_pairs
-            / (showdown_boards.len().max(1) * (combos.len() + 1)))
-            .max(1);
-        let terminal_prefix_pair_len = terminal_chunk_size
-            .min(showdown_terminal_nodes.len())
-            .max(1)
-            * showdown_boards.len().max(1)
-            * (combos.len() + 1);
+            .max(max_showdown_boards * (combos.len() + 1));
+        let terminal_chunk_size =
+            (max_terminal_prefix_pairs / (max_showdown_boards * (combos.len() + 1))).max(1);
         if std::env::var_os("POKEDR_SOLVER_PROGRESS_OFF").is_none() {
             eprintln!(
                 "pokedr: gpu public tree cfv nodes={} combos={} node_combo_values={} folds={} showdowns={} terminal_tiles={} board_tiles={} terminal_chunk={}",
@@ -3542,12 +3574,6 @@ impl GpuDenseCfrBackend {
                 terminal_chunk_size
             );
         }
-        let terminal_prefix_pairs_buffer = uninit_storage_buffer(
-            &self.device,
-            "public tree terminal prefix pairs",
-            terminal_prefix_pair_len * 2,
-            false,
-        );
         if let Some(start) = setup_start {
             eprintln!(
                 "pokedr: gpu profile phase=cfv_setup elapsed_ms={:.3}",
@@ -3659,24 +3685,33 @@ impl GpuDenseCfrBackend {
             combos.len(),
         )?;
 
-        self.fill_terminal_values(
-            &mut encoder,
+        self.queue.submit(Some(encoder.finish()));
+        self.fill_terminal_values_streaming(
+            nodes,
             &node_buffer,
             &showdown_terminal_nodes,
-            &terminal_combo_order_buffer,
-            &terminal_combo_bounds_buffer,
+            combos,
+            showdown_boards,
             &terminal_blocker_neighbors_buffer,
             &hero_reaches_buffer,
             &villain_reaches_buffer,
             &hero_values_buffer,
             &villain_values_buffer,
-            &terminal_prefix_pairs_buffer,
             combos.len(),
-            showdown_boards.len(),
-            strength_order.blocker_neighbor_stride,
-            terminal_chunk_size,
+            blocker_neighbor_stride,
+            max_terminal_prefix_pairs,
         )?;
-        encoder = self.finish_profile_phase(encoder, "cfv_terminal", phase_start)?;
+        if let Some(start) = phase_start {
+            eprintln!(
+                "pokedr: gpu profile phase=cfv_terminal elapsed_ms={:.3}",
+                start.elapsed().as_secs_f64() * 1000.0
+            );
+        }
+        encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("public tree post-terminal iteration encoder"),
+            });
         phase_start = profile.then(Instant::now);
 
         self.backup_nonterminal_values(
