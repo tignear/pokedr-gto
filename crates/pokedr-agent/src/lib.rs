@@ -1,10 +1,10 @@
 pub use pokedr_core::{dense_cfr, postflop, postflop_dense, range};
 
-use std::collections::HashMap;
+use std::{cell::RefCell, collections::HashMap, rc::Rc, time::Instant};
 
 use pokedr_core::{
     cards::{Board, Card as PokedrCard, Rank as PokedrRank, Suit as PokedrSuit, evaluate},
-    dense_cfr::gpu::{GpuCfrError, GpuDenseCfrBackend},
+    dense_cfr::gpu::{GpuCfrError, GpuDenseCfrBackend, GpuShowdownTask},
     dense_cfr::{CfrVariant, DenseCfrIteration, DenseCfrState},
     postflop::{
         ActionSetConfig, Player, PlayerAction, PublicNodeKind, PublicState, Street, SubgameTree,
@@ -15,18 +15,20 @@ use pokedr_core::{
 };
 use rs_poker::{
     arena::{
-        Agent,
+        Agent, Historian,
         action::Action,
         action::AgentAction,
         game_state::{GameState, Round},
-        historian::{HistoryRecord, VecHistorian},
+        historian::{HistorianError, HistoryRecord, VecHistorian},
     },
     core::{Card as RsCard, Suit as RsSuit, Value as RsValue},
 };
 
-#[derive(Debug, Clone)]
 pub struct PokedrAgent {
     config: PokedrAgentConfig,
+    history: SharedHistory,
+    shared_plan: SharedPostflopPlan,
+    postflop_plan: Option<PostflopPlan>,
 }
 
 #[derive(Debug, Clone)]
@@ -88,14 +90,28 @@ impl Default for PokedrAgent {
     }
 }
 
+impl Clone for PokedrAgent {
+    fn clone(&self) -> Self {
+        Self::new(self.config.clone())
+    }
+}
+
 impl PokedrAgent {
     pub fn new(config: PokedrAgentConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            history: SharedHistory::default(),
+            shared_plan: SharedPostflopPlan::default(),
+            postflop_plan: None,
+        }
     }
 
-    fn choose_action(&self, game_state: &GameState) -> AgentAction {
+    fn choose_action(&mut self, game_state: &GameState) -> AgentAction {
         match game_state.round {
-            Round::Preflop => self.preflop_action(game_state),
+            Round::Preflop => {
+                self.postflop_plan = None;
+                self.preflop_action(game_state)
+            }
             Round::Flop | Round::Turn | Round::River => self.postflop_action(game_state),
             _ => AgentAction::Call,
         }
@@ -110,6 +126,16 @@ impl PokedrAgent {
             .unwrap_or(PreflopClass::Trash);
         let current_bet = game_state.current_round_bet();
         let big_blind = game_state.big_blind.max(1.0);
+        let unopened_blind_spot = current_bet <= big_blind && to_call <= big_blind;
+        if unopened_blind_spot {
+            if class.three_bets() && can_raise(game_state) {
+                return self.preflop_raise_to(game_state, big_blind * 3.0);
+            }
+            if class.calls_open() || to_call <= 0.0 {
+                return AgentAction::Call;
+            }
+            return AgentAction::Fold;
+        }
         if to_call <= 0.0 {
             if class.open_raises() {
                 return self.preflop_raise_to(game_state, big_blind * 2.5);
@@ -141,28 +167,49 @@ impl PokedrAgent {
         }
     }
 
-    fn postflop_action(&self, game_state: &GameState) -> AgentAction {
+    fn postflop_action(&mut self, game_state: &GameState) -> AgentAction {
         let Some(public_state) = public_state_from_game(game_state) else {
             return AgentAction::Call;
         };
-        let tree = SubgameTree::build(
-            public_state,
-            SubgameTreeConfig {
-                action_set: self.config.action_set.clone(),
-                max_raises_per_street: self.config.max_raises_per_street,
-                max_depth: self.config.max_depth,
-            },
-        );
-        let layout = PostflopDenseLayout::from_tree(&tree);
         let Some(hero_cards) = hero_cards_from_game(game_state) else {
             return AgentAction::Call;
         };
         let indexer = ComboIndexer::new();
         let hero_combo = hero_combo_index(&indexer, hero_cards);
-        let state = solve_public_tree_cfr(&tree, &layout, &self.config);
-        let action_index = best_average_strategy_action(&layout, &state, Player::Hero, hero_combo);
-        let action = layout
-            .action(&tree, 0, action_index)
+
+        if self
+            .postflop_plan
+            .as_ref()
+            .is_none_or(|plan| !plan.contains_state(&public_state))
+        {
+            self.postflop_plan = self.shared_plan.take_matching(&public_state).or_else(|| {
+                Some(build_postflop_plan(
+                    public_state.clone(),
+                    game_state,
+                    &self.config,
+                    &self.history.records(),
+                ))
+            });
+        }
+
+        let plan = self
+            .postflop_plan
+            .as_ref()
+            .expect("postflop plan should be available");
+        let node_index = plan.node_for_state(&public_state).unwrap_or(0);
+        let Some(public_infoset) = plan.layout.node_infoset(node_index) else {
+            return AgentAction::Call;
+        };
+        let action_index = best_average_strategy_action(
+            &plan.layout,
+            &plan.state,
+            public_infoset,
+            Player::Hero,
+            hero_combo,
+        );
+        let action = plan
+            .layout
+            .action(&plan.tree, public_infoset, action_index)
             .map(|candidate| candidate.action)
             .unwrap_or(PlayerAction::Check);
         to_rs_action(game_state, action)
@@ -185,9 +232,25 @@ impl Agent for PokedrAgent {
     fn act(&mut self, _id: u128, game_state: &GameState) -> AgentAction {
         self.choose_action(game_state)
     }
+
+    fn historian(&self) -> Option<Box<dyn Historian>> {
+        Some(Box::new(PokedrAgentHistorian {
+            history: self.history.clone(),
+            shared_plan: self.shared_plan.clone(),
+            config: self.config.clone(),
+        }))
+    }
 }
 
 pub fn run_heads_up_match(hands: usize, seed: u64) -> MatchSummary {
+    run_heads_up_match_with_config(hands, seed, PokedrAgentConfig::default())
+}
+
+pub fn run_heads_up_match_with_config(
+    hands: usize,
+    seed: u64,
+    config: PokedrAgentConfig,
+) -> MatchSummary {
     use rand::{SeedableRng, rngs::StdRng};
     use rs_poker::arena::{HoldemSimulationBuilder, agent::RandomPotControlAgent};
 
@@ -199,7 +262,7 @@ pub fn run_heads_up_match(hands: usize, seed: u64) -> MatchSummary {
         let mut sim = HoldemSimulationBuilder::default()
             .game_state(game_state)
             .agents(vec![
-                Box::new(PokedrAgent::default()),
+                Box::new(PokedrAgent::new(config.clone())),
                 Box::new(RandomPotControlAgent::new(vec![0.65, 0.55, 0.45])),
             ])
             .build()
@@ -216,6 +279,14 @@ pub fn run_heads_up_match(hands: usize, seed: u64) -> MatchSummary {
 }
 
 pub fn run_traced_heads_up_match(hands: usize, seed: u64) -> Vec<HandTrace> {
+    run_traced_heads_up_match_with_config(hands, seed, PokedrAgentConfig::default())
+}
+
+pub fn run_traced_heads_up_match_with_config(
+    hands: usize,
+    seed: u64,
+    config: PokedrAgentConfig,
+) -> Vec<HandTrace> {
     use rand::{SeedableRng, rngs::StdRng};
     use rs_poker::arena::{HoldemSimulationBuilder, agent::RandomPotControlAgent};
 
@@ -228,7 +299,7 @@ pub fn run_traced_heads_up_match(hands: usize, seed: u64) -> Vec<HandTrace> {
         let mut sim = HoldemSimulationBuilder::default()
             .game_state(game_state)
             .agents(vec![
-                Box::new(PokedrAgent::default()),
+                Box::new(PokedrAgent::new(config.clone())),
                 Box::new(RandomPotControlAgent::new(vec![0.65, 0.55, 0.45])),
             ])
             .historians(vec![Box::new(historian)])
@@ -266,17 +337,200 @@ pub fn gpu_backend_mode() -> BackendMode {
     }
 }
 
-struct PostflopEvaluationContext {
+struct PostflopEvaluationContext<'a> {
     hero_cards: [PokedrCard; 2],
     villain_cards: [PokedrCard; 2],
+    gpu_backend: Option<&'a GpuDenseCfrBackend>,
     max_showdown_runouts: usize,
     equity_cache: HashMap<u64, f32>,
+}
+
+struct PostflopPlan {
+    tree: SubgameTree,
+    layout: PostflopDenseLayout,
+    state: DenseCfrState,
+    node_by_state: HashMap<PublicStateKey, usize>,
+}
+
+#[derive(Clone, Default)]
+struct SharedPostflopPlan(Rc<RefCell<Option<PostflopPlan>>>);
+
+impl SharedPostflopPlan {
+    fn set(&self, plan: PostflopPlan) {
+        *self.0.borrow_mut() = Some(plan);
+    }
+
+    fn take_matching(&self, state: &PublicState) -> Option<PostflopPlan> {
+        if self
+            .0
+            .borrow()
+            .as_ref()
+            .is_some_and(|plan| plan.contains_state(state))
+        {
+            self.0.borrow_mut().take()
+        } else {
+            None
+        }
+    }
+}
+
+impl PostflopPlan {
+    fn new(tree: SubgameTree, layout: PostflopDenseLayout, state: DenseCfrState) -> Self {
+        let mut node_by_state = HashMap::new();
+        for (node_index, node) in tree.nodes().iter().enumerate() {
+            if let PublicNodeKind::Decision { state, .. } = &node.kind {
+                node_by_state.insert(PublicStateKey::from(state), node_index);
+            }
+        }
+        Self {
+            tree,
+            layout,
+            state,
+            node_by_state,
+        }
+    }
+
+    fn contains_state(&self, state: &PublicState) -> bool {
+        self.node_by_state
+            .contains_key(&PublicStateKey::from(state))
+    }
+
+    fn node_for_state(&self, state: &PublicState) -> Option<usize> {
+        self.node_by_state
+            .get(&PublicStateKey::from(state))
+            .copied()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct PublicStateKey {
+    street: u8,
+    board_mask: u64,
+    pot: u32,
+    to_call: u32,
+    acting_player: u8,
+    raises_this_street: u8,
+}
+
+impl From<&PublicState> for PublicStateKey {
+    fn from(state: &PublicState) -> Self {
+        Self {
+            street: match state.street {
+                Street::Flop => 0,
+                Street::Turn => 1,
+                Street::River => 2,
+            },
+            board_mask: state.board.deck_mask(),
+            pot: state.pot,
+            to_call: state.to_call,
+            acting_player: match state.acting_player {
+                Player::Hero => 0,
+                Player::Villain => 1,
+            },
+            raises_this_street: state.raises_this_street,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct SharedHistory(Rc<RefCell<Vec<HistoryRecord>>>);
+
+impl SharedHistory {
+    fn records(&self) -> Vec<HistoryRecord> {
+        self.0.borrow().clone()
+    }
+}
+
+#[derive(Clone)]
+struct PokedrAgentHistorian {
+    history: SharedHistory,
+    shared_plan: SharedPostflopPlan,
+    config: PokedrAgentConfig,
+}
+
+impl Historian for PokedrAgentHistorian {
+    fn record_action(
+        &mut self,
+        _id: u128,
+        game_state: &GameState,
+        action: Action,
+    ) -> Result<(), HistorianError> {
+        let build_on_flop_start = matches!(&action, Action::RoundAdvance(Round::Flop));
+        self.history.0.borrow_mut().push(HistoryRecord {
+            before_game_state: None,
+            action,
+            after_game_state: game_state.clone(),
+        });
+        if build_on_flop_start && game_state.board.len() == 3 {
+            if let Some(public_state) = public_state_from_game(game_state) {
+                if self
+                    .shared_plan
+                    .0
+                    .borrow()
+                    .as_ref()
+                    .is_none_or(|plan| !plan.contains_state(&public_state))
+                {
+                    let records = self.history.records();
+                    self.shared_plan.set(build_postflop_plan(
+                        public_state,
+                        game_state,
+                        &self.config,
+                        &records,
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn build_postflop_plan(
+    public_state: PublicState,
+    game_state: &GameState,
+    config: &PokedrAgentConfig,
+    records: &[HistoryRecord],
+) -> PostflopPlan {
+    let started = Instant::now();
+    if solver_progress_enabled() {
+        eprintln!(
+            "pokedr: build postflop plan street={:?} board_cards={} pot={} to_call={} iterations={} depth={}",
+            public_state.street,
+            public_state.board.cards().len(),
+            public_state.pot,
+            public_state.to_call,
+            config.cfr_iterations,
+            config.max_depth
+        );
+    }
+    let tree = SubgameTree::build(
+        public_state,
+        SubgameTreeConfig {
+            action_set: config.action_set.clone(),
+            max_raises_per_street: config.max_raises_per_street,
+            max_depth: config.max_depth,
+        },
+    );
+    let layout = PostflopDenseLayout::from_tree(&tree);
+    let indexer = ComboIndexer::new();
+    let villain_weights = observed_villain_range_weights(records, game_state, &indexer);
+    let state = solve_public_tree_cfr(&tree, &layout, config, &villain_weights);
+    if solver_progress_enabled() {
+        eprintln!(
+            "pokedr: plan ready decisions={} chance={} terminals={} elapsed={:.2}s",
+            tree.decision_count(),
+            tree.chance_count(),
+            tree.terminal_count(),
+            started.elapsed().as_secs_f32()
+        );
+    }
+    PostflopPlan::new(tree, layout, state)
 }
 
 fn solve_public_tree_cfr(
     tree: &SubgameTree,
     layout: &PostflopDenseLayout,
     config: &PokedrAgentConfig,
+    villain_weights: &[f32],
 ) -> DenseCfrState {
     let mut dense_config = layout.dense_config(CfrVariant::CfrPlus);
     dense_config.infosets *= PRIVATE_INFOS_PER_PUBLIC;
@@ -287,7 +541,21 @@ fn solve_public_tree_cfr(
     let gpu_backend = cfr_gpu_backend();
 
     for iteration in 1..=config.cfr_iterations.max(1) {
-        fill_public_tree_iteration(tree, layout, &indexer, &state, config, &mut batch);
+        let iteration_started = Instant::now();
+        fill_public_tree_iteration(
+            tree,
+            layout,
+            &indexer,
+            gpu_backend.as_ref(),
+            &state,
+            config,
+            villain_weights,
+            &mut batch,
+        );
+        let average_weight = iteration as f32;
+        for weight in &mut batch.strategy_weights {
+            *weight *= average_weight;
+        }
         batch.validate(&dense_config);
         if let Some(backend) = &gpu_backend {
             if backend
@@ -309,8 +577,25 @@ fn solve_public_tree_cfr(
             &batch.strategy_weights,
             iteration,
         );
+        if solver_progress_enabled() && should_report_iteration(iteration, config.cfr_iterations) {
+            eprintln!(
+                "pokedr: cfr iteration {}/{} elapsed={:.2}s",
+                iteration,
+                config.cfr_iterations.max(1),
+                iteration_started.elapsed().as_secs_f32()
+            );
+        }
     }
     state
+}
+
+fn solver_progress_enabled() -> bool {
+    !cfg!(test) && std::env::var_os("POKEDR_SOLVER_PROGRESS_OFF").is_none()
+}
+
+fn should_report_iteration(iteration: usize, total: usize) -> bool {
+    let total = total.max(1);
+    iteration == 1 || iteration == total || iteration % (total / 4).max(1) == 0
 }
 
 fn cfr_gpu_backend() -> Option<GpuDenseCfrBackend> {
@@ -325,8 +610,10 @@ fn fill_public_tree_iteration(
     tree: &SubgameTree,
     layout: &PostflopDenseLayout,
     indexer: &ComboIndexer,
+    gpu_backend: Option<&GpuDenseCfrBackend>,
     cfr_state: &DenseCfrState,
     config: &PokedrAgentConfig,
+    villain_weights: &[f32],
     batch: &mut DenseCfrIteration,
 ) {
     batch.action_values.fill(0.0);
@@ -342,6 +629,7 @@ fn fill_public_tree_iteration(
             let mut ctx = PostflopEvaluationContext {
                 hero_cards,
                 villain_cards,
+                gpu_backend,
                 max_showdown_runouts: config.max_showdown_runouts.max(1),
                 equity_cache: HashMap::new(),
             };
@@ -354,6 +642,7 @@ fn fill_public_tree_iteration(
                 hero_combo,
                 villain_combo,
                 1.0,
+                villain_weights[villain_combo],
                 1.0,
                 cfr_state,
                 &mut ctx,
@@ -381,6 +670,7 @@ fn traverse_cfr_node(
     villain_combo: usize,
     hero_reach: f32,
     villain_reach: f32,
+    public_reach: f32,
     cfr_state: &DenseCfrState,
     ctx: &mut PostflopEvaluationContext,
     batch: &mut DenseCfrIteration,
@@ -421,6 +711,7 @@ fn traverse_cfr_node(
                     villain_combo,
                     next_hero_reach,
                     next_villain_reach,
+                    public_reach,
                     cfr_state,
                     ctx,
                     batch,
@@ -429,12 +720,12 @@ fn traverse_cfr_node(
             }
 
             let opponent_reach = match state.acting_player {
-                Player::Hero => villain_reach,
-                Player::Villain => hero_reach,
+                Player::Hero => public_reach * villain_reach,
+                Player::Villain => public_reach * hero_reach,
             };
             let own_reach = match state.acting_player {
-                Player::Hero => hero_reach,
-                Player::Villain => villain_reach,
+                Player::Hero => public_reach * hero_reach,
+                Player::Villain => public_reach * villain_reach,
             };
             if opponent_reach > 0.0 || own_reach > 0.0 {
                 for (action_index, hero_value) in action_values.iter().copied().enumerate() {
@@ -456,8 +747,15 @@ fn traverse_cfr_node(
                 .sum()
         }
         PublicNodeKind::Chance { cards, .. } => {
+            let valid_count = cards
+                .iter()
+                .filter(|card| card.deck_mask() & private_dead_mask(ctx) == 0)
+                .count();
+            if valid_count == 0 {
+                return 0.0;
+            }
+            let child_public_reach = public_reach / valid_count as f32;
             let mut sum = 0.0;
-            let mut count = 0;
             for (card, child) in cards.iter().zip(&tree.nodes()[node_index].children) {
                 if card.deck_mask() & private_dead_mask(ctx) != 0 {
                     continue;
@@ -472,14 +770,14 @@ fn traverse_cfr_node(
                     villain_combo,
                     hero_reach,
                     villain_reach,
+                    child_public_reach,
                     cfr_state,
                     ctx,
                     batch,
                     value_weights,
                 );
-                count += 1;
             }
-            if count == 0 { 0.0 } else { sum / count as f32 }
+            sum / valid_count as f32
         }
         PublicNodeKind::Terminal {
             kind,
@@ -502,18 +800,22 @@ fn traverse_cfr_node(
 fn best_average_strategy_action(
     layout: &PostflopDenseLayout,
     state: &DenseCfrState,
+    public_infoset: usize,
     player: Player,
     hero_combo: usize,
 ) -> usize {
     let mut strategy = vec![0.0; layout.max_actions()];
-    state.average_strategy_for(private_infoset(0, player, hero_combo), &mut strategy);
+    state.average_strategy_for(
+        private_infoset(public_infoset, player, hero_combo),
+        &mut strategy,
+    );
     let mut best = 0;
     let mut best_probability = f32::NEG_INFINITY;
     for (action, probability) in strategy
         .iter()
         .copied()
         .enumerate()
-        .take(layout.action_count(0))
+        .take(layout.action_count(public_infoset))
     {
         if probability > best_probability {
             best = action;
@@ -521,6 +823,27 @@ fn best_average_strategy_action(
         }
     }
     best
+}
+
+fn observed_villain_range_weights(
+    _records: &[HistoryRecord],
+    game_state: &GameState,
+    indexer: &ComboIndexer,
+) -> Vec<f32> {
+    let hero_mask = hero_cards_from_game(game_state)
+        .map(hero_mask)
+        .unwrap_or_default();
+    indexer
+        .combos()
+        .iter()
+        .map(|combo| {
+            if combo.collides_with(hero_mask | board_mask_from_game(game_state)) {
+                0.0
+            } else {
+                1.0
+            }
+        })
+        .collect()
 }
 
 fn private_infoset(public_infoset: usize, player: Player, private_combo: usize) -> usize {
@@ -584,6 +907,10 @@ fn showdown_equity(board: &Board, ctx: &mut PostflopEvaluationContext) -> f32 {
 
     let dead = board.deck_mask() | private_dead_mask(ctx);
     let runouts = completion_runouts(board, dead, ctx.max_showdown_runouts);
+    if let Some(equity) = gpu_showdown_equity(board, &runouts, ctx) {
+        ctx.equity_cache.insert(key, equity);
+        return equity;
+    }
     let mut equity_sum = 0.0;
     let mut matchup_count = 0.0;
 
@@ -616,6 +943,52 @@ fn showdown_equity(board: &Board, ctx: &mut PostflopEvaluationContext) -> f32 {
     };
     ctx.equity_cache.insert(key, equity);
     equity
+}
+
+fn gpu_showdown_equity(
+    board: &Board,
+    runouts: &[Vec<PokedrCard>],
+    ctx: &PostflopEvaluationContext<'_>,
+) -> Option<f32> {
+    let backend = ctx.gpu_backend?;
+    if runouts.len() < 8 {
+        return None;
+    }
+    let mut tasks = Vec::with_capacity(runouts.len());
+    for runout in runouts {
+        let mut final_board = board.cards().to_vec();
+        final_board.extend(runout.iter().copied());
+        if final_board.len() != 5 {
+            return None;
+        }
+        if ctx.villain_cards.iter().any(|card| {
+            card.deck_mask()
+                & final_board
+                    .iter()
+                    .fold(0u64, |mask, card| mask | card.deck_mask())
+                != 0
+        }) {
+            continue;
+        }
+        tasks.push(GpuShowdownTask {
+            cards: [
+                ctx.hero_cards[0].index() as u32,
+                ctx.hero_cards[1].index() as u32,
+                ctx.villain_cards[0].index() as u32,
+                ctx.villain_cards[1].index() as u32,
+                final_board[0].index() as u32,
+                final_board[1].index() as u32,
+                final_board[2].index() as u32,
+                final_board[3].index() as u32,
+                final_board[4].index() as u32,
+            ],
+        });
+    }
+    if tasks.is_empty() {
+        return Some(0.5);
+    }
+    let equities = backend.showdown_equities(&tasks).ok()?;
+    Some(equities.iter().sum::<f32>() / equities.len() as f32)
 }
 
 fn completion_runouts(board: &Board, dead: u64, limit: usize) -> Vec<Vec<PokedrCard>> {
@@ -822,6 +1195,15 @@ fn amount_to_call(game_state: &GameState) -> f32 {
     (game_state.current_round_bet() - game_state.current_round_current_player_bet()).max(0.0)
 }
 
+fn board_mask_from_game(game_state: &GameState) -> u64 {
+    game_state
+        .board
+        .iter()
+        .copied()
+        .map(to_pokedr_card)
+        .fold(0u64, |mask, card| mask | card.deck_mask())
+}
+
 fn can_raise(game_state: &GameState) -> bool {
     game_state.current_player_stack()
         > amount_to_call(game_state) + game_state.current_round_min_raise()
@@ -862,7 +1244,7 @@ impl PreflopClass {
     }
 
     fn calls_three_bet(self) -> bool {
-        self >= Self::Strong
+        self >= Self::Playable
     }
 
     fn four_bets(self) -> bool {
@@ -870,7 +1252,7 @@ impl PreflopClass {
     }
 
     fn calls_large_preflop_bet(self) -> bool {
-        self >= Self::Premium
+        self >= Self::Strong
     }
 }
 
@@ -904,12 +1286,32 @@ fn classify_preflop_values(first_value: u8, second_value: u8, suited: bool) -> P
     if high == 14 && low >= 13 {
         return PreflopClass::Strong;
     }
+    if high == 14 && suited {
+        return if low >= 8 {
+            PreflopClass::Playable
+        } else {
+            PreflopClass::Speculative
+        };
+    }
     if high == 14 && low >= 10 {
         return if suited {
             PreflopClass::Strong
         } else {
             PreflopClass::Playable
         };
+    }
+    if high == 14 {
+        return PreflopClass::Speculative;
+    }
+    if high == 13 && suited {
+        return if low >= 8 {
+            PreflopClass::Playable
+        } else {
+            PreflopClass::Speculative
+        };
+    }
+    if high == 13 && low >= 10 {
+        return PreflopClass::Playable;
     }
     if high >= 13 && low >= 11 {
         return if suited {
@@ -920,6 +1322,9 @@ fn classify_preflop_values(first_value: u8, second_value: u8, suited: bool) -> P
     }
     if suited && high >= 11 && low >= 9 {
         return PreflopClass::Playable;
+    }
+    if high >= 12 && low >= 10 {
+        return PreflopClass::Speculative;
     }
     if suited && gap <= 1 && high >= 8 {
         return PreflopClass::Speculative;
@@ -985,8 +1390,17 @@ mod tests {
 
     #[test]
     fn heads_up_match_runs_to_completion() {
-        let summary = run_heads_up_match(4, 7);
-        assert_eq!(summary.hands, 4);
+        let summary = run_heads_up_match_with_config(
+            2,
+            7,
+            PokedrAgentConfig {
+                cfr_iterations: 1,
+                max_depth: 1,
+                max_showdown_runouts: 1,
+                ..PokedrAgentConfig::default()
+            },
+        );
+        assert_eq!(summary.hands, 2);
         assert!((summary.hero_net + summary.villain_net).abs() < 1e-3);
     }
 
@@ -1008,6 +1422,7 @@ mod tests {
                 PokedrCard::new(PokedrRank::Queen, PokedrSuit::Clubs),
                 PokedrCard::new(PokedrRank::Queen, PokedrSuit::Diamonds),
             ],
+            gpu_backend: None,
             max_showdown_runouts: 1,
             equity_cache: HashMap::new(),
         };
@@ -1020,6 +1435,7 @@ mod tests {
                 PokedrCard::new(PokedrRank::Queen, PokedrSuit::Clubs),
                 PokedrCard::new(PokedrRank::Queen, PokedrSuit::Diamonds),
             ],
+            gpu_backend: None,
             max_showdown_runouts: 1,
             equity_cache: HashMap::new(),
         };
@@ -1061,6 +1477,7 @@ mod tests {
             },
         );
         let layout = PostflopDenseLayout::from_tree(&tree);
+        let villain_weights = vec![1.0; COMBO_COUNT];
         let state = solve_public_tree_cfr(
             &tree,
             &layout,
@@ -1069,6 +1486,7 @@ mod tests {
                 max_showdown_runouts: 1,
                 ..PokedrAgentConfig::default()
             },
+            &villain_weights,
         );
         let hero_combo = hero_combo_index(
             &ComboIndexer::new(),
@@ -1151,6 +1569,7 @@ mod tests {
                 PokedrCard::new(PokedrRank::Queen, PokedrSuit::Clubs),
                 PokedrCard::new(PokedrRank::Queen, PokedrSuit::Diamonds),
             ],
+            gpu_backend: None,
             max_showdown_runouts: 1,
             equity_cache: HashMap::new(),
         };
@@ -1164,6 +1583,7 @@ mod tests {
             None,
             hero_combo,
             villain_combo,
+            1.0,
             1.0,
             1.0,
             &cfr_state,
@@ -1189,11 +1609,30 @@ mod tests {
             RsCard::new(RsValue::Ace, RsSuit::Club),
             RsCard::new(RsValue::King, RsSuit::Diamond),
         ]);
+        let ace_eight = rs_poker::core::Hand::new_with_cards(vec![
+            RsCard::new(RsValue::Ace, RsSuit::Heart),
+            RsCard::new(RsValue::Eight, RsSuit::Club),
+        ]);
+        let king_ten = rs_poker::core::Hand::new_with_cards(vec![
+            RsCard::new(RsValue::King, RsSuit::Spade),
+            RsCard::new(RsValue::Ten, RsSuit::Club),
+        ]);
+        let king_two_suited = rs_poker::core::Hand::new_with_cards(vec![
+            RsCard::new(RsValue::King, RsSuit::Spade),
+            RsCard::new(RsValue::Two, RsSuit::Spade),
+        ]);
 
         assert_eq!(classify_preflop_hand(&nines), PreflopClass::Playable);
         assert!(!classify_preflop_hand(&nines).four_bets());
+        assert!(classify_preflop_hand(&nines).calls_three_bet());
         assert_eq!(classify_preflop_hand(&queens), PreflopClass::Premium);
         assert_eq!(classify_preflop_hand(&ace_king), PreflopClass::Strong);
         assert!(!classify_preflop_hand(&ace_king).four_bets());
+        assert_eq!(classify_preflop_hand(&ace_eight), PreflopClass::Speculative);
+        assert_eq!(classify_preflop_hand(&king_ten), PreflopClass::Playable);
+        assert_eq!(
+            classify_preflop_hand(&king_two_suited),
+            PreflopClass::Speculative
+        );
     }
 }

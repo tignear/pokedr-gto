@@ -1,6 +1,7 @@
+use pokedr_core::cards::{Card, Rank, Suit, evaluate};
 use pokedr_core::dense_cfr::{
     CfrVariant, DenseCfrConfig, DenseCfrSolver, DenseCfrState,
-    gpu::{GpuCfrError, GpuDenseCfrBackend},
+    gpu::{GpuCfrError, GpuDenseCfrBackend, GpuShowdownTask},
 };
 
 fn main() {
@@ -22,6 +23,7 @@ fn main() {
     run_one_shot_update(&backend);
     run_masked_one_shot_update(&backend);
     run_resident_updates(&backend);
+    run_showdown_equities(&backend);
     println!("GPU smoke passed");
 }
 
@@ -136,6 +138,119 @@ fn fill_fixture_iteration_with_state(
     batch: &mut pokedr_core::dense_cfr::DenseCfrIteration,
 ) {
     fill_fixture_iteration(iteration, batch);
+}
+
+fn run_showdown_equities(backend: &GpuDenseCfrBackend) {
+    let fixtures = vec![
+        (
+            [
+                Card::new(Rank::Ace, Suit::Spades),
+                Card::new(Rank::King, Suit::Spades),
+                Card::new(Rank::Queen, Suit::Spades),
+                Card::new(Rank::Two, Suit::Clubs),
+                Card::new(Rank::Three, Suit::Diamonds),
+            ],
+            [
+                Card::new(Rank::Jack, Suit::Spades),
+                Card::new(Rank::Ten, Suit::Spades),
+            ],
+            [
+                Card::new(Rank::Ace, Suit::Clubs),
+                Card::new(Rank::Ace, Suit::Diamonds),
+            ],
+        ),
+        (
+            [
+                Card::new(Rank::Nine, Suit::Clubs),
+                Card::new(Rank::Nine, Suit::Diamonds),
+                Card::new(Rank::Four, Suit::Spades),
+                Card::new(Rank::Four, Suit::Hearts),
+                Card::new(Rank::Two, Suit::Clubs),
+            ],
+            [
+                Card::new(Rank::Nine, Suit::Hearts),
+                Card::new(Rank::Nine, Suit::Spades),
+            ],
+            [
+                Card::new(Rank::Four, Suit::Clubs),
+                Card::new(Rank::Ace, Suit::Diamonds),
+            ],
+        ),
+        (
+            [
+                Card::new(Rank::Two, Suit::Spades),
+                Card::new(Rank::Three, Suit::Spades),
+                Card::new(Rank::Four, Suit::Spades),
+                Card::new(Rank::Five, Suit::Spades),
+                Card::new(Rank::King, Suit::Clubs),
+            ],
+            [
+                Card::new(Rank::Six, Suit::Spades),
+                Card::new(Rank::Seven, Suit::Clubs),
+            ],
+            [
+                Card::new(Rank::Ace, Suit::Hearts),
+                Card::new(Rank::Ace, Suit::Diamonds),
+            ],
+        ),
+        (
+            [
+                Card::new(Rank::Ace, Suit::Clubs),
+                Card::new(Rank::King, Suit::Diamonds),
+                Card::new(Rank::Queen, Suit::Hearts),
+                Card::new(Rank::Jack, Suit::Spades),
+                Card::new(Rank::Ten, Suit::Clubs),
+            ],
+            [
+                Card::new(Rank::Two, Suit::Clubs),
+                Card::new(Rank::Three, Suit::Diamonds),
+            ],
+            [
+                Card::new(Rank::Four, Suit::Hearts),
+                Card::new(Rank::Five, Suit::Spades),
+            ],
+        ),
+    ];
+    let tasks: Vec<_> = fixtures
+        .iter()
+        .map(|(board, hero, villain)| showdown_task(*board, *hero, *villain))
+        .collect();
+    let gpu = backend
+        .showdown_equities(&tasks)
+        .unwrap_or_else(|error| fail(&format!("GPU showdown failed: {error:?}")));
+    let expected: Vec<_> = fixtures
+        .iter()
+        .map(|(board, hero, villain)| cpu_showdown(*board, *hero, *villain))
+        .collect();
+    assert_close("showdown equity", &expected, &gpu);
+}
+
+fn showdown_task(board: [Card; 5], hero: [Card; 2], villain: [Card; 2]) -> GpuShowdownTask {
+    GpuShowdownTask {
+        cards: [
+            hero[0].index() as u32,
+            hero[1].index() as u32,
+            villain[0].index() as u32,
+            villain[1].index() as u32,
+            board[0].index() as u32,
+            board[1].index() as u32,
+            board[2].index() as u32,
+            board[3].index() as u32,
+            board[4].index() as u32,
+        ],
+    }
+}
+
+fn cpu_showdown(board: [Card; 5], hero: [Card; 2], villain: [Card; 2]) -> f32 {
+    let mut hero_cards = hero.to_vec();
+    hero_cards.extend(board);
+    let mut villain_cards = villain.to_vec();
+    villain_cards.extend(board);
+    match evaluate(&hero_cards).cmp(&evaluate(&villain_cards)) {
+        std::cmp::Ordering::Greater => 1.0,
+        std::cmp::Ordering::Equal => 0.5,
+        std::cmp::Ordering::Less => 0.0,
+    }
 }
 
 fn assert_close(label: &str, expected: &[f32], actual: &[f32]) {

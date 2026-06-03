@@ -189,14 +189,32 @@ fn run_postflop_smoke() {
 }
 
 fn run_rs_poker_smoke() {
-    let summary = pokedr_agent::run_heads_up_match(16, 7);
+    let summary = pokedr_agent::run_heads_up_match_with_config(
+        16,
+        7,
+        pokedr_agent::PokedrAgentConfig {
+            cfr_iterations: 1,
+            max_depth: 1,
+            max_showdown_runouts: 1,
+            ..pokedr_agent::PokedrAgentConfig::default()
+        },
+    );
     println!("hands: {}", summary.hands);
     println!("hero_net: {:.2}", summary.hero_net);
     println!("villain_net: {:.2}", summary.villain_net);
 }
 
 fn run_rs_poker_trace() {
-    for trace in pokedr_agent::run_traced_heads_up_match(8, 7) {
+    for trace in pokedr_agent::run_traced_heads_up_match_with_config(
+        16,
+        7,
+        pokedr_agent::PokedrAgentConfig {
+            cfr_iterations: 1,
+            max_depth: 1,
+            max_showdown_runouts: 1,
+            ..pokedr_agent::PokedrAgentConfig::default()
+        },
+    ) {
         println!(
             "hand {} hero [{}] villain [{}] board [{}] hero_net {:.2} villain_net {:.2}",
             trace.hand_index,
