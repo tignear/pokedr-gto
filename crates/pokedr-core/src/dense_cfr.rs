@@ -99,6 +99,24 @@ impl DenseCfrState {
         &self.legal_actions
     }
 
+    pub fn average_strategy_profile_state(&self) -> Self {
+        let mut profile = Self::new_with_legal_actions(
+            DenseCfrConfig {
+                infosets: self.infosets,
+                actions: self.actions,
+                variant: CfrVariant::CfrPlus,
+            },
+            self.legal_actions.clone(),
+        );
+        let mut strategy = vec![0.0; self.actions];
+        for infoset in 0..self.infosets {
+            self.average_strategy_for(infoset, &mut strategy);
+            let offset = infoset * self.actions;
+            profile.regrets[offset..offset + self.actions].copy_from_slice(&strategy);
+        }
+        profile
+    }
+
     pub fn strategy_for(&self, infoset: usize, out: &mut [f32]) {
         assert!(infoset < self.infosets);
         assert!(out.len() >= self.actions);

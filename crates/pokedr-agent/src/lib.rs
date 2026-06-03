@@ -11,7 +11,7 @@ use pokedr_core::{
     cards::{Board, Card as PokedrCard, Rank as PokedrRank, Suit as PokedrSuit, evaluate},
     dense_cfr::gpu::{
         GpuCfrError, GpuDenseCfrBackend, GpuFinalBoard, GpuPrivateCombo, GpuPublicTreeNode,
-        GpuShowdownTask,
+        GpuRootTerminalValues, GpuShowdownTask,
     },
     dense_cfr::{CfrVariant, DenseCfrIteration, DenseCfrState},
     postflop::{
@@ -114,6 +114,8 @@ pub struct FixedFlopMetricRow {
     pub elapsed_secs: f32,
     pub root_strategy_l1_delta: Option<f32>,
     pub root_action_probabilities: Vec<f32>,
+    pub root_br_gap: Option<f32>,
+    pub local_br_gap: Option<f32>,
     pub positive_regret_mass: f32,
     pub illegal_strategy_mass: f32,
     pub current_strategy_norm_error: f32,
@@ -478,6 +480,8 @@ pub fn solve_fixed_flop_metrics(
             elapsed_secs,
             root_strategy_l1_delta,
             root_action_probabilities,
+            root_br_gap: None,
+            local_br_gap: None,
             positive_regret_mass: diagnostics.positive_regret_mass,
             illegal_strategy_mass: diagnostics.illegal_strategy_mass,
             current_strategy_norm_error: diagnostics.current_strategy_norm_error,
@@ -543,6 +547,15 @@ fn try_solve_fixed_flop_metrics_gpu(
             .as_ref()
             .map(|previous| mean_l1_delta(previous, &root_strategy));
         let root_action_probabilities = root_action_probabilities(layout, &root_strategy);
+        let br_gap = br_gap_metrics_gpu(
+            &backend,
+            &linearized,
+            &combos,
+            &combo_legal,
+            villain_weights,
+            layout,
+            &state,
+        );
         let diagnostics = cfr_state_diagnostics(&state);
         rows.push(FixedFlopMetricRow {
             board: format_pokedr_cards(flop),
@@ -550,6 +563,8 @@ fn try_solve_fixed_flop_metrics_gpu(
             elapsed_secs,
             root_strategy_l1_delta,
             root_action_probabilities,
+            root_br_gap: br_gap.as_ref().map(|metrics| metrics.root_br_gap),
+            local_br_gap: br_gap.as_ref().map(|metrics| metrics.local_br_gap),
             positive_regret_mass: diagnostics.positive_regret_mass,
             illegal_strategy_mass: diagnostics.illegal_strategy_mass,
             current_strategy_norm_error: diagnostics.current_strategy_norm_error,
@@ -603,6 +618,95 @@ fn cfr_state_diagnostics(state: &DenseCfrState) -> CfrDiagnostics {
         current_strategy_norm_error,
         average_strategy_norm_error,
         finite,
+    }
+}
+
+struct BrGapMetrics {
+    root_br_gap: f32,
+    local_br_gap: f32,
+}
+
+fn br_gap_metrics_gpu(
+    backend: &GpuDenseCfrBackend,
+    linearized: &GpuLinearizedPublicTree,
+    combos: &[GpuPrivateCombo],
+    combo_legal: &[u32],
+    villain_weights: &[f32],
+    layout: &PostflopDenseLayout,
+    state: &DenseCfrState,
+) -> Option<BrGapMetrics> {
+    let profile = state.average_strategy_profile_state();
+    let values = backend
+        .public_tree_iteration_values(
+            &linearized.nodes,
+            &linearized.children,
+            &linearized.child_cards,
+            combos,
+            combo_legal,
+            villain_weights,
+            &linearized.showdown_boards,
+            &profile,
+        )
+        .ok()?;
+    Some(br_gap_metrics_from_values(layout, &profile, &values))
+}
+
+fn br_gap_metrics_from_values(
+    layout: &PostflopDenseLayout,
+    profile: &DenseCfrState,
+    values: &GpuRootTerminalValues,
+) -> BrGapMetrics {
+    let mut strategy = vec![0.0; layout.max_actions()];
+    let mut root_gap_sum = 0.0;
+    let mut root_weight_sum = 0.0;
+    let mut local_gap_sum = 0.0;
+    let mut local_weight_sum = 0.0;
+
+    for public_infoset in 0..layout.infoset_count() {
+        let action_count = layout.action_count(public_infoset);
+        for player in [Player::Hero, Player::Villain] {
+            for combo_index in 0..COMBO_COUNT {
+                let infoset = private_infoset(public_infoset, player, combo_index);
+                let offset = infoset * layout.max_actions();
+                let action_values = &values.action_values[offset..offset + action_count];
+                let best = action_values
+                    .iter()
+                    .copied()
+                    .fold(f32::NEG_INFINITY, f32::max);
+                if !best.is_finite() {
+                    continue;
+                }
+                profile.average_strategy_for(infoset, &mut strategy);
+                let policy_value = action_values
+                    .iter()
+                    .zip(&strategy)
+                    .map(|(value, probability)| value * probability)
+                    .sum::<f32>();
+                let gap = (best - policy_value).max(0.0);
+                let reach_weight = values.reach_weights.get(infoset).copied().unwrap_or(0.0);
+                if public_infoset == 0 && player == Player::Hero {
+                    root_gap_sum += gap;
+                    root_weight_sum += 1.0;
+                }
+                if reach_weight > 0.0 {
+                    local_gap_sum += gap * reach_weight;
+                    local_weight_sum += reach_weight;
+                }
+            }
+        }
+    }
+
+    BrGapMetrics {
+        root_br_gap: if root_weight_sum > 0.0 {
+            root_gap_sum / root_weight_sum
+        } else {
+            0.0
+        },
+        local_br_gap: if local_weight_sum > 0.0 {
+            local_gap_sum / local_weight_sum
+        } else {
+            0.0
+        },
     }
 }
 
