@@ -372,7 +372,7 @@ impl SubgameTree {
             );
         }
 
-        let actions = builder.build(&ActionSetRequest {
+        let mut actions = builder.build(&ActionSetRequest {
             street: state.street,
             pot: state.pot,
             stack: state.effective_stack,
@@ -380,6 +380,9 @@ impl SubgameTree {
             min_aggressive_amount: state.min_aggressive_amount,
             observed_aggressive_amounts: Vec::new(),
         });
+        if state.raises_this_street >= config.max_raises_per_street {
+            actions.retain(|candidate| !is_aggressive_action(candidate.action));
+        }
         let node = self.push_node(
             parent,
             PublicNodeKind::Decision {
@@ -425,9 +428,6 @@ impl SubgameTree {
             PlayerAction::Bet { amount }
             | PlayerAction::Raise { amount }
             | PlayerAction::AllIn { amount } => {
-                if state.raises_this_street >= config.max_raises_per_street {
-                    return;
-                }
                 let next_state = state_after_aggressive_action(state, amount);
                 self.expand_state(Some(parent), next_state, depth, config, builder);
             }
@@ -531,6 +531,13 @@ fn should_advance_street(state: &PublicState, action: PlayerAction) -> bool {
         PlayerAction::Check => state.to_call == 0 && state.checks_this_street + 1 >= 2,
         _ => false,
     }
+}
+
+fn is_aggressive_action(action: PlayerAction) -> bool {
+    matches!(
+        action,
+        PlayerAction::Bet { .. } | PlayerAction::Raise { .. } | PlayerAction::AllIn { .. }
+    )
 }
 
 fn state_after_passive_action(state: &PublicState, action: PlayerAction) -> PublicState {

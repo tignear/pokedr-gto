@@ -18,6 +18,8 @@ pub struct DenseCfrState {
     infosets: usize,
     actions: usize,
     variant: CfrVariant,
+    legal_actions: Vec<bool>,
+    legal_action_counts: Vec<usize>,
     regrets: Vec<f32>,
     strategy_sum: Vec<f32>,
 }
@@ -31,6 +33,30 @@ impl DenseCfrState {
             infosets: config.infosets,
             actions: config.actions,
             variant: config.variant,
+            legal_actions: vec![true; len],
+            legal_action_counts: vec![config.actions; config.infosets],
+            regrets: vec![0.0; len],
+            strategy_sum: vec![0.0; len],
+        }
+    }
+
+    pub fn new_with_legal_actions(config: DenseCfrConfig, legal_actions: Vec<bool>) -> Self {
+        assert!(config.infosets > 0, "infosets must be non-empty");
+        assert!(config.actions > 0, "actions must be non-empty");
+        assert_eq!(legal_actions.len(), config.infosets * config.actions);
+        let legal_action_counts =
+            legal_action_counts(config.infosets, config.actions, &legal_actions);
+        assert!(
+            legal_action_counts.iter().all(|count| *count > 0),
+            "each infoset must have at least one legal action"
+        );
+        let len = config.infosets * config.actions;
+        Self {
+            infosets: config.infosets,
+            actions: config.actions,
+            variant: config.variant,
+            legal_actions,
+            legal_action_counts,
             regrets: vec![0.0; len],
             strategy_sum: vec![0.0; len],
         }
@@ -52,20 +78,34 @@ impl DenseCfrState {
         &self.strategy_sum
     }
 
+    pub fn legal_actions(&self) -> &[bool] {
+        &self.legal_actions
+    }
+
     pub fn strategy_for(&self, infoset: usize, out: &mut [f32]) {
         assert!(infoset < self.infosets);
         assert!(out.len() >= self.actions);
         let offset = self.offset(infoset);
         let regrets = &self.regrets[offset..offset + self.actions];
-        let normalizer: f32 = regrets.iter().map(|value| value.max(0.0)).sum();
+        let legal = &self.legal_actions[offset..offset + self.actions];
+        let normalizer: f32 = regrets
+            .iter()
+            .zip(legal)
+            .filter(|(_, is_legal)| **is_legal)
+            .map(|(value, _)| value.max(0.0))
+            .sum();
         if normalizer > 0.0 {
             for action in 0..self.actions {
-                out[action] = regrets[action].max(0.0) / normalizer;
+                out[action] = if legal[action] {
+                    regrets[action].max(0.0) / normalizer
+                } else {
+                    0.0
+                };
             }
         } else {
-            let uniform = 1.0 / self.actions as f32;
-            for value in out.iter_mut().take(self.actions) {
-                *value = uniform;
+            let uniform = 1.0 / self.legal_action_counts[infoset] as f32;
+            for action in 0..self.actions {
+                out[action] = if legal[action] { uniform } else { 0.0 };
             }
         }
     }
@@ -75,15 +115,25 @@ impl DenseCfrState {
         assert!(out.len() >= self.actions);
         let offset = self.offset(infoset);
         let sum = &self.strategy_sum[offset..offset + self.actions];
-        let normalizer: f32 = sum.iter().sum();
+        let legal = &self.legal_actions[offset..offset + self.actions];
+        let normalizer: f32 = sum
+            .iter()
+            .zip(legal)
+            .filter(|(_, is_legal)| **is_legal)
+            .map(|(value, _)| *value)
+            .sum();
         if normalizer > 0.0 {
             for action in 0..self.actions {
-                out[action] = sum[action] / normalizer;
+                out[action] = if legal[action] {
+                    sum[action] / normalizer
+                } else {
+                    0.0
+                };
             }
         } else {
-            let uniform = 1.0 / self.actions as f32;
-            for value in out.iter_mut().take(self.actions) {
-                *value = uniform;
+            let uniform = 1.0 / self.legal_action_counts[infoset] as f32;
+            for action in 0..self.actions {
+                out[action] = if legal[action] { uniform } else { 0.0 };
             }
         }
     }
@@ -112,6 +162,11 @@ impl DenseCfrState {
 
         let discount = regret_discount(self.variant, iteration);
         for action in 0..self.actions {
+            if !self.legal_actions[offset + action] {
+                self.regrets[offset + action] = 0.0;
+                self.strategy_sum[offset + action] = 0.0;
+                continue;
+            }
             let regret = (action_values[action] - node_value) * reach_weight;
             let slot = &mut self.regrets[offset + action];
             *slot *= discount;
@@ -248,6 +303,18 @@ fn regret_discount(variant: CfrVariant, iteration: usize) -> f32 {
     }
 }
 
+fn legal_action_counts(infosets: usize, actions: usize, legal_actions: &[bool]) -> Vec<usize> {
+    (0..infosets)
+        .map(|infoset| {
+            let offset = infoset * actions;
+            legal_actions[offset..offset + actions]
+                .iter()
+                .filter(|is_legal| **is_legal)
+                .count()
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -293,6 +360,29 @@ mod tests {
         let mut strategy = [0.0; 2];
         state.strategy_for(0, &mut strategy);
         assert_eq!(strategy, [1.0, 0.0]);
+    }
+
+    #[test]
+    fn legal_action_mask_excludes_padding_actions() {
+        let mut state = DenseCfrState::new_with_legal_actions(
+            DenseCfrConfig {
+                infosets: 1,
+                actions: 4,
+                variant: CfrVariant::CfrPlus,
+            },
+            vec![true, false, true, false],
+        );
+
+        let mut strategy = [0.0; 4];
+        state.strategy_for(0, &mut strategy);
+        assert_eq!(strategy, [0.5, 0.0, 0.5, 0.0]);
+
+        state.update_infoset(0, &[1.0, 100.0, -1.0, 100.0], 1.0, 1.0, 1);
+        state.strategy_for(0, &mut strategy);
+        assert_eq!(strategy[1], 0.0);
+        assert_eq!(strategy[3], 0.0);
+        assert_eq!(state.regrets()[1], 0.0);
+        assert_eq!(state.regrets()[3], 0.0);
     }
 
     #[test]

@@ -13,12 +13,16 @@ const CFR_UPDATE_SHADER: &str = r#"
 @group(0) @binding(3) var<storage, read> reach_weights: array<f32>;
 @group(0) @binding(4) var<storage, read> strategy_weights: array<f32>;
 @group(0) @binding(5) var<storage, read> params: array<u32>;
+@group(0) @binding(6) var<storage, read> legal_actions: array<u32>;
 
 fn positive(value: f32) -> f32 {
     return max(value, 0.0);
 }
 
 fn strategy_at(offset: u32, action: u32, actions: u32, normalizer: f32) -> f32 {
+    if legal_actions[offset + action] == 0u {
+        return 0.0;
+    }
     if normalizer > 0.0 {
         return positive(regrets[offset + action]) / normalizer;
     }
@@ -38,13 +42,24 @@ fn update(@builtin(global_invocation_id) id: vec3<u32>) {
 
     let offset = infoset * actions;
     var normalizer = 0.0;
+    var legal_count = 0u;
     for (var action = 0u; action < actions; action = action + 1u) {
-        normalizer = normalizer + positive(regrets[offset + action]);
+        if legal_actions[offset + action] != 0u {
+            legal_count = legal_count + 1u;
+            normalizer = normalizer + positive(regrets[offset + action]);
+        }
     }
 
     var node_value = 0.0;
     for (var action = 0u; action < actions; action = action + 1u) {
-        let strategy = strategy_at(offset, action, actions, normalizer);
+        let strategy = select(
+            1.0 / f32(max(legal_count, 1u)),
+            strategy_at(offset, action, actions, normalizer),
+            normalizer > 0.0
+        );
+        if legal_actions[offset + action] == 0u {
+            continue;
+        }
         node_value = node_value + strategy * action_values[offset + action];
     }
 
@@ -55,7 +70,16 @@ fn update(@builtin(global_invocation_id) id: vec3<u32>) {
     }
 
     for (var action = 0u; action < actions; action = action + 1u) {
-        let strategy = strategy_at(offset, action, actions, normalizer);
+        if legal_actions[offset + action] == 0u {
+            regrets[offset + action] = 0.0;
+            strategy_sum[offset + action] = 0.0;
+            continue;
+        }
+        let strategy = select(
+            1.0 / f32(max(legal_count, 1u)),
+            strategy_at(offset, action, actions, normalizer),
+            normalizer > 0.0
+        );
         let regret = (action_values[offset + action] - node_value) * reach_weights[infoset];
         var updated = regrets[offset + action] * discount + regret;
         if variant == 0u {
@@ -86,6 +110,8 @@ pub struct GpuDenseCfrState {
     infosets: usize,
     actions: usize,
     variant: super::CfrVariant,
+    legal_actions: Vec<u32>,
+    legal_actions_buffer: wgpu::Buffer,
     regrets: wgpu::Buffer,
     strategy_sum: wgpu::Buffer,
 }
@@ -141,6 +167,7 @@ impl GpuDenseCfrBackend {
                 storage_entry(3, true),
                 storage_entry(4, true),
                 storage_entry(5, true),
+                storage_entry(6, true),
             ],
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -193,6 +220,11 @@ impl GpuDenseCfrBackend {
         let reach_weights = readonly_buffer(&self.device, "reach weights", reach_weights);
         let strategy_weights = readonly_buffer(&self.device, "strategy weights", strategy_weights);
         let params = readonly_buffer(&self.device, "params", &params);
+        let legal_actions = readonly_buffer(
+            &self.device,
+            "legal actions",
+            &legal_actions_u32(&state.legal_actions),
+        );
 
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("dense CFR bind group"),
@@ -204,6 +236,7 @@ impl GpuDenseCfrBackend {
                 bind_entry(3, &reach_weights),
                 bind_entry(4, &strategy_weights),
                 bind_entry(5, &params),
+                bind_entry(6, &legal_actions),
             ],
         });
 
@@ -256,10 +289,17 @@ impl GpuDenseCfrBackend {
     }
 
     pub fn upload_state(&self, state: &DenseCfrState) -> GpuDenseCfrState {
+        let legal_actions = legal_actions_u32(&state.legal_actions);
         GpuDenseCfrState {
             infosets: state.infosets,
             actions: state.actions,
             variant: state.variant,
+            legal_actions_buffer: readonly_buffer(
+                &self.device,
+                "resident legal actions",
+                &legal_actions,
+            ),
+            legal_actions,
             regrets: storage_buffer(&self.device, "resident regrets", &state.regrets),
             strategy_sum: storage_buffer(
                 &self.device,
@@ -274,9 +314,30 @@ impl GpuDenseCfrBackend {
         self.upload_state(&state)
     }
 
+    pub fn zeroed_state_with_legal_actions(
+        &self,
+        config: super::DenseCfrConfig,
+        legal_actions: Vec<bool>,
+    ) -> GpuDenseCfrState {
+        let state = DenseCfrState::new_with_legal_actions(config, legal_actions);
+        self.upload_state(&state)
+    }
+
     pub fn resident_solver(&self, config: DenseCfrConfig) -> GpuResidentDenseCfrSolver {
         GpuResidentDenseCfrSolver {
             state: self.zeroed_state(config.clone()),
+            config,
+            iterations: 0,
+        }
+    }
+
+    pub fn resident_solver_with_legal_actions(
+        &self,
+        config: DenseCfrConfig,
+        legal_actions: Vec<bool>,
+    ) -> GpuResidentDenseCfrSolver {
+        GpuResidentDenseCfrSolver {
+            state: self.zeroed_state_with_legal_actions(config.clone(), legal_actions),
             config,
             iterations: 0,
         }
@@ -320,7 +381,6 @@ impl GpuDenseCfrState {
             strategy_weights,
         );
         let params = readonly_buffer(&backend.device, "resident params", &params);
-
         let bind_group = backend
             .device
             .create_bind_group(&wgpu::BindGroupDescriptor {
@@ -333,6 +393,7 @@ impl GpuDenseCfrState {
                     bind_entry(3, &reach_weights),
                     bind_entry(4, &strategy_weights),
                     bind_entry(5, &params),
+                    bind_entry(6, &self.legal_actions_buffer),
                 ],
             });
 
@@ -381,10 +442,15 @@ impl GpuDenseCfrState {
                 timeout: None,
             })
             .map_err(|error| GpuCfrError::MapFailed(error.to_string()))?;
+        let legal_actions: Vec<_> = self.legal_actions.iter().map(|value| *value != 0).collect();
+        let legal_action_counts =
+            super::legal_action_counts(self.infosets, self.actions, &legal_actions);
         Ok(DenseCfrState {
             infosets: self.infosets,
             actions: self.actions,
             variant: self.variant,
+            legal_actions,
+            legal_action_counts,
             regrets: read_f32_buffer(&backend.device, &regret_readback, len)?,
             strategy_sum: read_f32_buffer(&backend.device, &strategy_readback, len)?,
         })
@@ -515,6 +581,13 @@ fn variant_code(variant: super::CfrVariant) -> u32 {
         super::CfrVariant::CfrPlus => 0,
         super::CfrVariant::Discounted => 1,
     }
+}
+
+fn legal_actions_u32(legal_actions: &[bool]) -> Vec<u32> {
+    legal_actions
+        .iter()
+        .map(|is_legal| u32::from(*is_legal))
+        .collect()
 }
 
 #[cfg(test)]

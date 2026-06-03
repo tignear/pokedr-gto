@@ -20,6 +20,7 @@ fn main() {
     println!("adapter: {} ({:?})", info.name, info.backend);
 
     run_one_shot_update(&backend);
+    run_masked_one_shot_update(&backend);
     run_resident_updates(&backend);
     println!("GPU smoke passed");
 }
@@ -52,6 +53,42 @@ fn run_one_shot_update(backend: &GpuDenseCfrBackend) {
     assert_close("one-shot regret", cpu.regrets(), gpu.regrets());
     assert_close(
         "one-shot strategy_sum",
+        cpu.strategy_sum(),
+        gpu.strategy_sum(),
+    );
+}
+
+fn run_masked_one_shot_update(backend: &GpuDenseCfrBackend) {
+    let config = DenseCfrConfig {
+        infosets: 3,
+        actions: 4,
+        variant: CfrVariant::CfrPlus,
+    };
+    let legal_actions = vec![
+        true, true, false, false, true, false, true, false, false, true, true, true,
+    ];
+    let mut cpu = DenseCfrState::new_with_legal_actions(config.clone(), legal_actions.clone());
+    let mut gpu = DenseCfrState::new_with_legal_actions(config, legal_actions);
+    let action_values = [
+        1.0, -0.5, 100.0, 100.0, -1.0, 100.0, 2.0, 100.0, 100.0, 0.25, 0.75, -0.25,
+    ];
+    let reach_weights = [1.0, 0.5, 2.0];
+    let strategy_weights = [1.0, 0.75, 0.25];
+
+    cpu.update_all_infosets(&action_values, &reach_weights, &strategy_weights, 1);
+    backend
+        .update_all_infosets(
+            &mut gpu,
+            &action_values,
+            &reach_weights,
+            &strategy_weights,
+            1,
+        )
+        .unwrap_or_else(|error| fail(&format!("GPU masked update failed: {error:?}")));
+
+    assert_close("masked regret", cpu.regrets(), gpu.regrets());
+    assert_close(
+        "masked strategy_sum",
         cpu.strategy_sum(),
         gpu.strategy_sum(),
     );
