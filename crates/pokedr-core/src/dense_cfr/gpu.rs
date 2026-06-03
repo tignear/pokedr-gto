@@ -2,6 +2,8 @@ use std::sync::mpsc;
 
 use wgpu::util::DeviceExt;
 
+use crate::cards::{Card, evaluate};
+
 use super::{DenseCfrConfig, DenseCfrIteration, DenseCfrRunStats, DenseCfrState};
 
 const WORKGROUP_SIZE: u32 = 64;
@@ -1552,6 +1554,13 @@ pub struct GpuPublicTreeNode {
 unsafe impl bytemuck::Zeroable for GpuPublicTreeNode {}
 unsafe impl bytemuck::Pod for GpuPublicTreeNode {}
 
+#[derive(Debug, Clone)]
+pub struct GpuShowdownStrengthOrder {
+    pub combo_order: Vec<u32>,
+    pub combo_group_start: Vec<u32>,
+    pub combo_group_end: Vec<u32>,
+}
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 struct GpuPublicTreeEdge {
@@ -1579,6 +1588,68 @@ struct GpuPublicTreeParams {
 
 unsafe impl bytemuck::Zeroable for GpuPublicTreeParams {}
 unsafe impl bytemuck::Pod for GpuPublicTreeParams {}
+
+pub fn showdown_strength_order(
+    combos: &[GpuPrivateCombo],
+    final_boards: &[GpuFinalBoard],
+) -> GpuShowdownStrengthOrder {
+    let combo_count = combos.len();
+    let mut combo_order = Vec::with_capacity(final_boards.len() * combo_count);
+    let mut combo_group_start = vec![0u32; final_boards.len() * combo_count];
+    let mut combo_group_end = vec![0u32; final_boards.len() * combo_count];
+
+    for (board_index, board) in final_boards.iter().enumerate() {
+        let mut ranked: Vec<_> = combos
+            .iter()
+            .enumerate()
+            .map(|(combo_index, combo)| {
+                (
+                    evaluate_combo_final_board(*combo, *board),
+                    combo_index as u32,
+                )
+            })
+            .collect();
+        ranked.sort_unstable_by_key(|(strength, combo_index)| (*strength, *combo_index));
+
+        let board_order_offset = combo_order.len();
+        combo_order.extend(ranked.iter().map(|(_, combo_index)| *combo_index));
+
+        let board_combo_offset = board_index * combo_count;
+        let mut group_start = 0usize;
+        while group_start < ranked.len() {
+            let strength = ranked[group_start].0;
+            let mut group_end = group_start + 1;
+            while group_end < ranked.len() && ranked[group_end].0 == strength {
+                group_end += 1;
+            }
+            for &(_, combo_index) in &ranked[group_start..group_end] {
+                let slot = board_combo_offset + combo_index as usize;
+                combo_group_start[slot] = (board_order_offset + group_start) as u32;
+                combo_group_end[slot] = (board_order_offset + group_end) as u32;
+            }
+            group_start = group_end;
+        }
+    }
+
+    GpuShowdownStrengthOrder {
+        combo_order,
+        combo_group_start,
+        combo_group_end,
+    }
+}
+
+fn evaluate_combo_final_board(combo: GpuPrivateCombo, board: GpuFinalBoard) -> u32 {
+    let cards = [
+        Card::from_index(combo.cards[0] as u8),
+        Card::from_index(combo.cards[1] as u8),
+        Card::from_index(board.cards[0] as u8),
+        Card::from_index(board.cards[1] as u8),
+        Card::from_index(board.cards[2] as u8),
+        Card::from_index(board.cards[3] as u8),
+        Card::from_index(board.cards[4] as u8),
+    ];
+    evaluate(&cards).raw()
+}
 
 pub struct GpuRootTerminalValues {
     pub action_values: Vec<f32>,
@@ -3779,6 +3850,47 @@ fn public_tree_backup_layers(
 mod tests {
     use super::*;
     use crate::dense_cfr::{CfrVariant, DenseCfrConfig};
+
+    #[test]
+    fn showdown_strength_order_is_sorted_and_marks_equal_groups() {
+        let combos = [
+            GpuPrivateCombo { cards: [12, 25] },
+            GpuPrivateCombo { cards: [11, 24] },
+            GpuPrivateCombo { cards: [0, 1] },
+            GpuPrivateCombo { cards: [2, 3] },
+        ];
+        let boards = [GpuFinalBoard {
+            cards: [4, 5, 6, 7, 8],
+        }];
+
+        let order = showdown_strength_order(&combos, &boards);
+        assert_eq!(order.combo_order.len(), combos.len());
+        assert_eq!(order.combo_group_start.len(), combos.len());
+        assert_eq!(order.combo_group_end.len(), combos.len());
+
+        let strengths: Vec<_> = order
+            .combo_order
+            .iter()
+            .map(|combo_index| evaluate_combo_final_board(combos[*combo_index as usize], boards[0]))
+            .collect();
+        assert!(strengths.windows(2).all(|pair| pair[0] <= pair[1]));
+
+        for combo_index in 0..combos.len() {
+            let start = order.combo_group_start[combo_index] as usize;
+            let end = order.combo_group_end[combo_index] as usize;
+            assert!(start < end);
+            assert!(end <= order.combo_order.len());
+            let strength = evaluate_combo_final_board(combos[combo_index], boards[0]);
+            assert!(
+                order.combo_order[start..end]
+                    .iter()
+                    .all(
+                        |peer| evaluate_combo_final_board(combos[*peer as usize], boards[0])
+                            == strength
+                    )
+            );
+        }
+    }
 
     #[test]
     #[ignore = "GPU tests must run on the main thread; use `cargo test -p pokedr-core --test gpu_smoke`"]

@@ -524,6 +524,27 @@ Then each terminal CFV row becomes a small number of prefix lookups per final
 board instead of scanning every opponent combo. This is the next fundamental
 speed target for terminal CFV.
 
+The sort itself is not iteration-dependent:
+
+```text
+order[b,*] = argsort_c(S[b,c])
+group_start[b,c], group_end[b,c]
+```
+
+This can be built once when the subgame is created. A GPU radix sort is a good
+fit here, but it belongs to subgame setup, not the CFR loop. Inside each CFR
+iteration the dynamic input is only reach:
+
+```text
+sorted_reach[pos] = r_opp[z, order[b,pos]]
+prefix_reach      = scan(sorted_reach)
+```
+
+The high-value kernel work is therefore parallel scan / segmented scan over
+`(terminal, board)` rows, followed by O(1) prefix lookups for each private combo.
+Replacing CPU precomputed `order` with GPU sort should not change this operator
+interface.
+
 ## Next Mathematical Cut
 
 The current implementation is still too close to "run a public tree program on
