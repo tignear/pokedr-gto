@@ -2,23 +2,57 @@
 // README at: https://github.com/devcontainers/templates/tree/main/src/rust
 {
 	"name": "Rust",
-	// Or use a Dockerfile or Docker Compose file. More info: https://containers.dev/guide/dockerfile
-	"image": "mcr.microsoft.com/devcontainers/rust:2-1-trixie",
+	"build": {
+		"dockerfile": "Dockerfile"
+	},
 	"features": {
 		"ghcr.io/devcontainers/features/node:2": {}
 	},
+
+	"runArgs": [
+		"--device=/dev/dxg"
+	],
 
 	"mounts": [
 		{
 			"source": "devcontainer-codex-home-${devcontainerId}",
 			"target": "/home/vscode/.codex",
 			"type": "volume"
+		},
+		{
+			"source": "/usr/lib/wsl/lib/libdxcore.so",
+			"target": "/usr/lib/libdxcore.so",
+			"type": "bind"
+		},
+		{
+			"source": "/usr/lib/wsl/lib",
+			"target": "/usr/lib/wsl/lib",
+			"type": "bind"
+		},
+		{
+			"source": "\\\\wsl.localhost\\Ubuntu-24.04\\usr\\lib\\wsl\\drivers",
+			"target": "/usr/lib/wsl/drivers",
+			"type": "bind"
+		},
+		{
+			"source": "\\\\wsl.localhost\\Ubuntu-24.04\\usr\\lib\\x86_64-linux-gnu\\libvulkan_dzn.so",
+			"target": "/usr/lib/x86_64-linux-gnu/libvulkan_dzn.so",
+			"type": "bind"
+		},
+		{
+			"source": "\\\\wsl.localhost\\Ubuntu-24.04\\usr\\lib\\x86_64-linux-gnu\\libspirv_to_dxil.so",
+			"target": "/usr/lib/x86_64-linux-gnu/libspirv_to_dxil.so",
+			"type": "bind"
 		}
 	],
 
 	"remoteEnv": {
 		"CODEX_HOME": "/home/vscode/.codex",
-		"PATH": "${containerEnv:PATH}:/home/vscode/.local/bin"
+		"PATH": "${containerEnv:PATH}:/home/vscode/.local/bin",
+		"LD_LIBRARY_PATH": "/usr/lib/wsl/lib:/usr/lib/x86_64-linux-gnu:${containerEnv:LD_LIBRARY_PATH}",
+		"VK_ICD_FILENAMES": "/usr/share/vulkan/icd.d/dzn_icd.x86_64.json",
+		"WGPU_BACKEND": "vulkan",
+		"WGPU_ALLOW_UNDERLYING_NONCOMPLIANT_ADAPTER": "1"
 	},
 
 	"postCreateCommand": "bash .devcontainer/install-codex.sh"

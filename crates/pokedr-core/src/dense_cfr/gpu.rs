@@ -2,7 +2,7 @@ use std::sync::mpsc;
 
 use wgpu::util::DeviceExt;
 
-use super::DenseCfrState;
+use super::{DenseCfrConfig, DenseCfrIteration, DenseCfrRunStats, DenseCfrState};
 
 const WORKGROUP_SIZE: u32 = 64;
 
@@ -77,8 +77,23 @@ pub enum GpuCfrError {
 pub struct GpuDenseCfrBackend {
     device: wgpu::Device,
     queue: wgpu::Queue,
+    adapter_info: wgpu::AdapterInfo,
     pipeline: wgpu::ComputePipeline,
     bind_group_layout: wgpu::BindGroupLayout,
+}
+
+pub struct GpuDenseCfrState {
+    infosets: usize,
+    actions: usize,
+    variant: super::CfrVariant,
+    regrets: wgpu::Buffer,
+    strategy_sum: wgpu::Buffer,
+}
+
+pub struct GpuResidentDenseCfrSolver {
+    config: DenseCfrConfig,
+    state: GpuDenseCfrState,
+    iterations: usize,
 }
 
 impl GpuDenseCfrBackend {
@@ -87,7 +102,8 @@ impl GpuDenseCfrBackend {
     }
 
     pub async fn new_async() -> Result<Self, GpuCfrError> {
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let instance =
+            wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::HighPerformance,
@@ -96,6 +112,7 @@ impl GpuDenseCfrBackend {
             })
             .await
             .map_err(|_| GpuCfrError::NoAdapter)?;
+        let adapter_info = adapter.get_info();
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("pokedr dense CFR device"),
@@ -138,9 +155,14 @@ impl GpuDenseCfrBackend {
         Ok(Self {
             device,
             queue,
+            adapter_info,
             pipeline,
             bind_group_layout,
         })
+    }
+
+    pub fn adapter_info(&self) -> &wgpu::AdapterInfo {
+        &self.adapter_info
     }
 
     pub fn update_all_infosets(
@@ -227,6 +249,174 @@ impl GpuDenseCfrBackend {
         state.regrets.copy_from_slice(&updated_regrets);
         state.strategy_sum.copy_from_slice(&updated_strategy_sum);
         Ok(())
+    }
+
+    pub fn upload_state(&self, state: &DenseCfrState) -> GpuDenseCfrState {
+        GpuDenseCfrState {
+            infosets: state.infosets,
+            actions: state.actions,
+            variant: state.variant,
+            regrets: storage_buffer(&self.device, "resident regrets", &state.regrets),
+            strategy_sum: storage_buffer(
+                &self.device,
+                "resident strategy sum",
+                &state.strategy_sum,
+            ),
+        }
+    }
+
+    pub fn zeroed_state(&self, config: super::DenseCfrConfig) -> GpuDenseCfrState {
+        let state = DenseCfrState::new(config);
+        self.upload_state(&state)
+    }
+
+    pub fn resident_solver(&self, config: DenseCfrConfig) -> GpuResidentDenseCfrSolver {
+        GpuResidentDenseCfrSolver {
+            state: self.zeroed_state(config.clone()),
+            config,
+            iterations: 0,
+        }
+    }
+}
+
+impl GpuDenseCfrState {
+    pub fn infosets(&self) -> usize {
+        self.infosets
+    }
+
+    pub fn actions(&self) -> usize {
+        self.actions
+    }
+
+    pub fn update_all_infosets(
+        &mut self,
+        backend: &GpuDenseCfrBackend,
+        action_values: &[f32],
+        reach_weights: &[f32],
+        strategy_weights: &[f32],
+        iteration: usize,
+    ) -> Result<(), GpuCfrError> {
+        assert_eq!(action_values.len(), self.infosets * self.actions);
+        assert_eq!(reach_weights.len(), self.infosets);
+        assert_eq!(strategy_weights.len(), self.infosets);
+
+        let params = [
+            self.infosets as u32,
+            self.actions as u32,
+            variant_code(self.variant),
+            iteration as u32,
+        ];
+        let action_values =
+            readonly_buffer(&backend.device, "resident action values", action_values);
+        let reach_weights =
+            readonly_buffer(&backend.device, "resident reach weights", reach_weights);
+        let strategy_weights = readonly_buffer(
+            &backend.device,
+            "resident strategy weights",
+            strategy_weights,
+        );
+        let params = readonly_buffer(&backend.device, "resident params", &params);
+
+        let bind_group = backend
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("resident dense CFR bind group"),
+                layout: &backend.bind_group_layout,
+                entries: &[
+                    bind_entry(0, &self.regrets),
+                    bind_entry(1, &self.strategy_sum),
+                    bind_entry(2, &action_values),
+                    bind_entry(3, &reach_weights),
+                    bind_entry(4, &strategy_weights),
+                    bind_entry(5, &params),
+                ],
+            });
+
+        let mut encoder = backend
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("resident dense CFR update encoder"),
+            });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("resident dense CFR update pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&backend.pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            let groups = (self.infosets as u32).div_ceil(WORKGROUP_SIZE);
+            pass.dispatch_workgroups(groups, 1, 1);
+        }
+        let submission = backend.queue.submit(Some(encoder.finish()));
+        backend
+            .device
+            .poll(wgpu::PollType::Wait {
+                submission_index: Some(submission),
+                timeout: None,
+            })
+            .map_err(|error| GpuCfrError::MapFailed(error.to_string()))?;
+        Ok(())
+    }
+
+    pub fn download(&self, backend: &GpuDenseCfrBackend) -> Result<DenseCfrState, GpuCfrError> {
+        let len = self.infosets * self.actions;
+        let regret_readback = readback_buffer(&backend.device, len);
+        let strategy_readback = readback_buffer(&backend.device, len);
+        let mut encoder = backend
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("resident dense CFR download encoder"),
+            });
+        copy_buffer(&mut encoder, &self.regrets, &regret_readback, len);
+        copy_buffer(&mut encoder, &self.strategy_sum, &strategy_readback, len);
+        let submission = backend.queue.submit(Some(encoder.finish()));
+        backend
+            .device
+            .poll(wgpu::PollType::Wait {
+                submission_index: Some(submission),
+                timeout: None,
+            })
+            .map_err(|error| GpuCfrError::MapFailed(error.to_string()))?;
+        Ok(DenseCfrState {
+            infosets: self.infosets,
+            actions: self.actions,
+            variant: self.variant,
+            regrets: read_f32_buffer(&backend.device, &regret_readback, len)?,
+            strategy_sum: read_f32_buffer(&backend.device, &strategy_readback, len)?,
+        })
+    }
+}
+
+impl GpuResidentDenseCfrSolver {
+    pub fn iterations(&self) -> usize {
+        self.iterations
+    }
+
+    pub fn run_iterations(
+        &mut self,
+        backend: &GpuDenseCfrBackend,
+        count: usize,
+        mut fill_iteration: impl FnMut(usize, &mut DenseCfrIteration),
+    ) -> Result<DenseCfrRunStats, GpuCfrError> {
+        let mut batch = DenseCfrIteration::new(&self.config);
+        for _ in 0..count {
+            let iteration = self.iterations + 1;
+            fill_iteration(iteration, &mut batch);
+            batch.validate(&self.config);
+            self.state.update_all_infosets(
+                backend,
+                &batch.action_values,
+                &batch.reach_weights,
+                &batch.strategy_weights,
+                iteration,
+            )?;
+            self.iterations = iteration;
+        }
+        Ok(DenseCfrRunStats { iterations: count })
+    }
+
+    pub fn download(&self, backend: &GpuDenseCfrBackend) -> Result<DenseCfrState, GpuCfrError> {
+        self.state.download(backend)
     }
 }
 
@@ -329,6 +519,7 @@ mod tests {
     use crate::dense_cfr::{CfrVariant, DenseCfrConfig};
 
     #[test]
+    #[ignore = "GPU tests must run on the main thread; use `cargo test -p pokedr-core --test gpu_smoke`"]
     fn gpu_update_matches_cpu_reference_when_adapter_exists() {
         let backend = match GpuDenseCfrBackend::new() {
             Ok(backend) => backend,
@@ -363,6 +554,48 @@ mod tests {
             assert!((left - right).abs() < 1e-5, "{left} != {right}");
         }
         for (left, right) in cpu.strategy_sum().iter().zip(gpu.strategy_sum()) {
+            assert!((left - right).abs() < 1e-5, "{left} != {right}");
+        }
+    }
+
+    #[test]
+    #[ignore = "GPU tests must run on the main thread; use `cargo test -p pokedr-core --test gpu_smoke`"]
+    fn resident_gpu_state_matches_cpu_after_multiple_updates() {
+        let backend = match GpuDenseCfrBackend::new() {
+            Ok(backend) => backend,
+            Err(GpuCfrError::NoAdapter) => return,
+            Err(error) => panic!("unexpected GPU init error: {error:?}"),
+        };
+        let config = DenseCfrConfig {
+            infosets: 8,
+            actions: 4,
+            variant: CfrVariant::Discounted,
+        };
+        let mut cpu = DenseCfrState::new(config.clone());
+        let mut gpu = backend.zeroed_state(config);
+        let reach_weights = vec![1.0; 8];
+        let strategy_weights = vec![0.75; 8];
+
+        for iteration in 1..=5 {
+            let action_values: Vec<_> = (0..32)
+                .map(|index| ((index as f32 + iteration as f32) * 0.25).sin())
+                .collect();
+            cpu.update_all_infosets(&action_values, &reach_weights, &strategy_weights, iteration);
+            gpu.update_all_infosets(
+                &backend,
+                &action_values,
+                &reach_weights,
+                &strategy_weights,
+                iteration,
+            )
+            .unwrap();
+        }
+
+        let downloaded = gpu.download(&backend).unwrap();
+        for (left, right) in cpu.regrets().iter().zip(downloaded.regrets()) {
+            assert!((left - right).abs() < 1e-5, "{left} != {right}");
+        }
+        for (left, right) in cpu.strategy_sum().iter().zip(downloaded.strategy_sum()) {
             assert!((left - right).abs() < 1e-5, "{left} != {right}");
         }
     }

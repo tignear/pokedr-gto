@@ -1,26 +1,13 @@
 use pokedr_core::dense_cfr::{
-    CfrVariant, DenseCfrConfig, DenseCfrIteration, DenseCfrSolver, DenseCfrState,
+    CfrVariant, DenseCfrConfig, DenseCfrSolver, DenseCfrState,
     gpu::{GpuCfrError, GpuDenseCfrBackend},
 };
 
 fn main() {
-    let mut args = std::env::args();
-    let program = args.next().unwrap_or_else(|| "pokedr".to_string());
-    match args.next().as_deref() {
-        Some("gpu-info") => print_gpu_info(),
-        Some("gpu-smoke") => run_gpu_smoke(),
-        _ => {
-            eprintln!("usage: {program} <gpu-info|gpu-smoke>");
-            std::process::exit(2);
-        }
-    }
-}
-
-fn print_gpu_info() {
     let backend = match GpuDenseCfrBackend::new() {
         Ok(backend) => backend,
         Err(GpuCfrError::NoAdapter) => {
-            println!("no GPU adapter visible to wgpu");
+            println!("skipping GPU smoke: no GPU adapter visible to wgpu");
             return;
         }
         Err(error) => {
@@ -28,35 +15,11 @@ fn print_gpu_info() {
             std::process::exit(1);
         }
     };
-    let info = backend.adapter_info();
-    println!("name: {}", info.name);
-    println!("backend: {:?}", info.backend);
-    println!("device_type: {:?}", info.device_type);
-    println!("vendor: 0x{:x}", info.vendor);
-    println!("device: 0x{:x}", info.device);
-}
 
-fn run_gpu_smoke() {
-    println!("initializing GPU backend");
-    let backend = match GpuDenseCfrBackend::new() {
-        Ok(backend) => backend,
-        Err(GpuCfrError::NoAdapter) => {
-            eprintln!("no GPU adapter visible to wgpu");
-            std::process::exit(1);
-        }
-        Err(error) => {
-            eprintln!("failed to initialize GPU backend: {error:?}");
-            std::process::exit(1);
-        }
-    };
     let info = backend.adapter_info();
     println!("adapter: {} ({:?})", info.name, info.backend);
 
-    println!("running one-shot update");
     run_one_shot_update(&backend);
-    println!("one-shot update passed");
-
-    println!("running resident updates");
     run_resident_updates(&backend);
     println!("GPU smoke passed");
 }
@@ -84,10 +47,8 @@ fn run_one_shot_update(backend: &GpuDenseCfrBackend) {
             &strategy_weights,
             1,
         )
-        .unwrap_or_else(|error| {
-            eprintln!("GPU one-shot update failed: {error:?}");
-            std::process::exit(1);
-        });
+        .unwrap_or_else(|error| fail(&format!("GPU one-shot update failed: {error:?}")));
+
     assert_close("one-shot regret", cpu.regrets(), gpu.regrets());
     assert_close(
         "one-shot strategy_sum",
@@ -106,29 +67,25 @@ fn run_resident_updates(backend: &GpuDenseCfrBackend) {
     let mut gpu = backend.resident_solver(config);
 
     cpu.run_iterations(5, fill_fixture_iteration_with_state);
-    gpu.run_iterations(&backend, 5, |iteration, batch| {
-        println!("dispatch iteration {iteration}");
-        fill_fixture_iteration(iteration, batch);
-    })
-    .unwrap_or_else(|error| {
-        eprintln!("GPU update failed: {error:?}");
-        std::process::exit(1);
-    });
+    gpu.run_iterations(backend, 5, fill_fixture_iteration)
+        .unwrap_or_else(|error| fail(&format!("GPU resident update failed: {error:?}")));
 
-    println!("downloading result");
-    let downloaded = gpu.download(&backend).unwrap_or_else(|error| {
-        eprintln!("GPU download failed: {error:?}");
-        std::process::exit(1);
-    });
-    assert_close("regret", cpu.state().regrets(), downloaded.regrets());
+    let downloaded = gpu
+        .download(backend)
+        .unwrap_or_else(|error| fail(&format!("GPU download failed: {error:?}")));
     assert_close(
-        "strategy_sum",
+        "resident regret",
+        cpu.state().regrets(),
+        downloaded.regrets(),
+    );
+    assert_close(
+        "resident strategy_sum",
         cpu.state().strategy_sum(),
         downloaded.strategy_sum(),
     );
 }
 
-fn fill_fixture_iteration(iteration: usize, batch: &mut DenseCfrIteration) {
+fn fill_fixture_iteration(iteration: usize, batch: &mut pokedr_core::dense_cfr::DenseCfrIteration) {
     for (index, value) in batch.action_values.iter_mut().enumerate() {
         *value = ((index as f32 + iteration as f32) * 0.25).sin();
     }
@@ -138,8 +95,8 @@ fn fill_fixture_iteration(iteration: usize, batch: &mut DenseCfrIteration) {
 
 fn fill_fixture_iteration_with_state(
     iteration: usize,
-    _state: &DenseCfrState,
-    batch: &mut DenseCfrIteration,
+    _state: &pokedr_core::dense_cfr::DenseCfrState,
+    batch: &mut pokedr_core::dense_cfr::DenseCfrIteration,
 ) {
     fill_fixture_iteration(iteration, batch);
 }
@@ -147,8 +104,14 @@ fn fill_fixture_iteration_with_state(
 fn assert_close(label: &str, expected: &[f32], actual: &[f32]) {
     for (index, (expected, actual)) in expected.iter().zip(actual).enumerate() {
         if (expected - actual).abs() >= 1e-5 {
-            eprintln!("{label}[{index}] mismatch: expected {expected}, actual {actual}");
-            std::process::exit(1);
+            fail(&format!(
+                "{label}[{index}] mismatch: expected {expected}, actual {actual}"
+            ));
         }
     }
+}
+
+fn fail(message: &str) -> ! {
+    eprintln!("{message}");
+    std::process::exit(1);
 }

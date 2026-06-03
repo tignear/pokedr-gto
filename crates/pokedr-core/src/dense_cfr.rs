@@ -150,6 +150,94 @@ impl DenseCfrState {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct DenseCfrIteration {
+    pub action_values: Vec<f32>,
+    pub reach_weights: Vec<f32>,
+    pub strategy_weights: Vec<f32>,
+}
+
+impl DenseCfrIteration {
+    pub fn new(config: &DenseCfrConfig) -> Self {
+        Self {
+            action_values: vec![0.0; config.infosets * config.actions],
+            reach_weights: vec![0.0; config.infosets],
+            strategy_weights: vec![0.0; config.infosets],
+        }
+    }
+
+    pub fn validate(&self, config: &DenseCfrConfig) {
+        assert_eq!(self.action_values.len(), config.infosets * config.actions);
+        assert_eq!(self.reach_weights.len(), config.infosets);
+        assert_eq!(self.strategy_weights.len(), config.infosets);
+        assert!(self.action_values.iter().all(|value| value.is_finite()));
+        assert!(
+            self.reach_weights
+                .iter()
+                .all(|value| value.is_finite() && *value >= 0.0)
+        );
+        assert!(
+            self.strategy_weights
+                .iter()
+                .all(|value| value.is_finite() && *value >= 0.0)
+        );
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DenseCfrRunStats {
+    pub iterations: usize,
+}
+
+pub struct DenseCfrSolver {
+    config: DenseCfrConfig,
+    state: DenseCfrState,
+    iterations: usize,
+}
+
+impl DenseCfrSolver {
+    pub fn new(config: DenseCfrConfig) -> Self {
+        Self {
+            state: DenseCfrState::new(config.clone()),
+            config,
+            iterations: 0,
+        }
+    }
+
+    pub fn state(&self) -> &DenseCfrState {
+        &self.state
+    }
+
+    pub fn iterations(&self) -> usize {
+        self.iterations
+    }
+
+    pub fn run_iterations(
+        &mut self,
+        count: usize,
+        mut fill_iteration: impl FnMut(usize, &DenseCfrState, &mut DenseCfrIteration),
+    ) -> DenseCfrRunStats {
+        let mut batch = DenseCfrIteration::new(&self.config);
+        for _ in 0..count {
+            let iteration = self.iterations + 1;
+            fill_iteration(iteration, &self.state, &mut batch);
+            batch.validate(&self.config);
+            self.state.update_all_infosets(
+                &batch.action_values,
+                &batch.reach_weights,
+                &batch.strategy_weights,
+                iteration,
+            );
+            self.iterations = iteration;
+        }
+        DenseCfrRunStats { iterations: count }
+    }
+
+    pub fn into_state(self) -> DenseCfrState {
+        self.state
+    }
+}
+
 fn regret_discount(variant: CfrVariant, iteration: usize) -> f32 {
     match variant {
         CfrVariant::CfrPlus => 1.0,
@@ -205,5 +293,39 @@ mod tests {
         let mut strategy = [0.0; 2];
         state.strategy_for(0, &mut strategy);
         assert_eq!(strategy, [1.0, 0.0]);
+    }
+
+    #[test]
+    fn solver_reuses_iteration_batch_and_tracks_iterations() {
+        let config = DenseCfrConfig {
+            infosets: 3,
+            actions: 2,
+            variant: CfrVariant::Discounted,
+        };
+        let mut solver = DenseCfrSolver::new(config);
+        let stats = solver.run_iterations(4, |iteration, _state, batch| {
+            for (index, value) in batch.action_values.iter_mut().enumerate() {
+                *value = ((index + iteration) as f32 * 0.5).sin();
+            }
+            batch.reach_weights.fill(1.0);
+            batch.strategy_weights.fill(0.25);
+        });
+
+        assert_eq!(stats.iterations, 4);
+        assert_eq!(solver.iterations(), 4);
+        assert!(
+            solver
+                .state()
+                .regrets()
+                .iter()
+                .all(|value| value.is_finite())
+        );
+        assert!(
+            solver
+                .state()
+                .strategy_sum()
+                .iter()
+                .all(|value| value.is_finite())
+        );
     }
 }
