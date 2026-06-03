@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::hash::{BuildHasherDefault, Hash, Hasher};
 
 use crate::cards::{Card, deck};
 use crate::hand_class::HandClass;
@@ -6,6 +7,38 @@ use crate::hand_eval::evaluate_seven;
 use crate::postflop::PostflopCombo;
 use crate::river::Combo;
 use rayon::prelude::*;
+
+type FastHashMap<K, V> = HashMap<K, V, BuildHasherDefault<FastHasher>>;
+
+#[derive(Default)]
+struct FastHasher(u64);
+
+impl Hasher for FastHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        let mut hash = self.0;
+        for byte in bytes {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x100_0000_01b3);
+        }
+        self.0 = hash;
+    }
+
+    fn write_u8(&mut self, value: u8) {
+        self.write_u64(u64::from(value));
+    }
+
+    fn write_u64(&mut self, value: u64) {
+        self.0 = (self.0 ^ value).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    }
+
+    fn write_usize(&mut self, value: usize) {
+        self.write_u64(value as u64);
+    }
+
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Street {
@@ -177,6 +210,7 @@ pub struct PotState {
     pub pot: f64,
     pub stacks: [f64; 2],
     pub committed: [f64; 2],
+    pub invested: [f64; 2],
     pub current_bet: f64,
     pub min_raise: f64,
 }
@@ -187,6 +221,7 @@ impl PotState {
             pot,
             stacks,
             committed: [0.0, 0.0],
+            invested: [0.0, 0.0],
             current_bet: 0.0,
             min_raise: 0.0,
         }
@@ -405,6 +440,109 @@ impl SubgameSpec {
             oop_combo_count: oop_range.len(),
             ip_combo_count: ip_range.len(),
             strategies: trainer.combo_strategies(),
+        })
+    }
+
+    pub fn solve_multistreet_cfr_with_request(
+        &self,
+        request: SubgameSolveRequest,
+    ) -> Result<SubgameCfrResult, SubgameBuildError> {
+        self.validate()?;
+        let oop_range = weighted_postflop_combos(&self.ranges.oop, &self.board);
+        let ip_range = weighted_postflop_combos(&self.ranges.ip, &self.board);
+        if oop_range.is_empty() || ip_range.is_empty() {
+            return Err(SubgameBuildError::NoLegalDeals);
+        }
+
+        let deals = legal_deals(&oop_range, &ip_range);
+        if deals.is_empty() {
+            return Err(SubgameBuildError::NoLegalDeals);
+        }
+        let focused_deals = request
+            .focused_oop_combo_mask
+            .or(request.focused_ip_combo_mask)
+            .map(|_| {
+                focused_deals(
+                    &oop_range,
+                    &ip_range,
+                    &deals,
+                    request.focused_oop_combo_mask,
+                    request.focused_ip_combo_mask,
+                )
+            })
+            .unwrap_or_default();
+        let shard_count = rayon::current_num_threads().min(request.iterations.max(1));
+        let shard_size = request.iterations.div_ceil(shard_count);
+        let (trainer, utility_sum) = (0..shard_count)
+            .into_par_iter()
+            .map(|shard| {
+                let start = shard * shard_size;
+                let end = ((shard + 1) * shard_size).min(request.iterations);
+                let mut trainer = MultistreetCfrTrainer {
+                    spec: self,
+                    oop_range: &oop_range,
+                    ip_range: &ip_range,
+                    node_index: FastHashMap::default(),
+                    nodes: Vec::new(),
+                    equity_cache: FastHashMap::default(),
+                    average_weight: 1.0,
+                    iteration: 1,
+                    variant: request.variant,
+                };
+                let mut utility_sum = 0.0;
+                for iteration in start..end {
+                    trainer.iteration = iteration + 1;
+                    trainer.average_weight = average_strategy_weight(request.variant, iteration + 1);
+                    let focused = !focused_deals.is_empty()
+                        && should_sample_focused(iteration, request.focused_sampling_rate);
+                    let deal_pool = if focused { &focused_deals } else { &deals };
+                    let (oop_index, ip_index) = sample_weighted_deal(iteration, deal_pool);
+                    utility_sum += trainer.cfr(
+                        self.root_player,
+                        self.board.clone(),
+                        self.pot,
+                        0,
+                        ActionHistory::new(),
+                        oop_index,
+                        ip_index,
+                        [1.0, 1.0],
+                    );
+                }
+                (trainer, utility_sum)
+            })
+            .reduce(
+                || {
+                    let trainer = MultistreetCfrTrainer {
+                        spec: self,
+                        oop_range: &oop_range,
+                        ip_range: &ip_range,
+                        node_index: FastHashMap::default(),
+                        nodes: Vec::new(),
+                        equity_cache: FastHashMap::default(),
+                        average_weight: 1.0,
+                        iteration: request.iterations,
+                        variant: request.variant,
+                    };
+                    (trainer, 0.0)
+                },
+                |(mut left, left_utility), (right, right_utility)| {
+                    left.merge_from(right);
+                    (left, left_utility + right_utility)
+                },
+            );
+
+        Ok(SubgameCfrResult {
+            iterations: request.iterations,
+            expected_value_oop: if request.iterations == 0 {
+                0.0
+            } else {
+                utility_sum / request.iterations as f64
+            },
+            root: NodeId(0),
+            node_count: trainer.current_board_node_count(),
+            oop_combo_count: oop_range.len(),
+            ip_combo_count: ip_range.len(),
+            strategies: trainer.combo_strategies_for_board(&self.board),
         })
     }
 }
@@ -773,6 +911,7 @@ fn apply_aggressive(player: Player, mut pot: PotState, amount: f64) -> PotState 
     pot.pot += contribution;
     pot.stacks[index] -= contribution;
     pot.committed[index] += contribution;
+    pot.invested[index] += contribution;
     pot.min_raise = (pot.committed[index] - pot.current_bet).max(pot.min_raise);
     pot.current_bet = pot.current_bet.max(pot.committed[index]);
     pot
@@ -786,6 +925,14 @@ fn apply_call(player: Player, mut pot: PotState) -> PotState {
     pot.pot += contribution;
     pot.stacks[index] -= contribution;
     pot.committed[index] += contribution;
+    pot.invested[index] += contribution;
+    pot
+}
+
+fn advance_street(mut pot: PotState) -> PotState {
+    pot.committed = [0.0, 0.0];
+    pot.current_bet = 0.0;
+    pot.min_raise = 0.0;
     pot
 }
 
@@ -825,6 +972,120 @@ struct SubgameCfrNode {
     actions: Vec<ActionKind>,
     regret_sum: Vec<f64>,
     strategy_sum: Vec<f64>,
+}
+
+struct MultistreetCfrTrainer<'a> {
+    spec: &'a SubgameSpec,
+    oop_range: &'a [WeightedPostflopCombo],
+    ip_range: &'a [WeightedPostflopCombo],
+    node_index: FastHashMap<MultistreetInfoKey, usize>,
+    nodes: Vec<MultistreetCfrNode>,
+    equity_cache: FastHashMap<(u64, usize, usize), f64>,
+    average_weight: f64,
+    iteration: usize,
+    variant: CfrVariant,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HistoryKey {
+    len: u8,
+    code: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MultistreetInfoKey {
+    board_mask: u64,
+    history: HistoryKey,
+    player: Player,
+    combo_mask: u64,
+}
+
+impl Hash for MultistreetInfoKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        state.write_u64(self.board_mask);
+        state.write_u8(self.history.len);
+        state.write_u64(self.history.code);
+        state.write_u8(self.player.index() as u8);
+        state.write_u64(self.combo_mask);
+    }
+}
+
+#[derive(Debug, Clone)]
+struct MultistreetCfrNode {
+    board: Vec<Card>,
+    history: Vec<ActionKind>,
+    player: Player,
+    combo: PostflopCombo,
+    equity: f64,
+    actions: Vec<ActionKind>,
+    regret_sum: Vec<f64>,
+    strategy_sum: Vec<f64>,
+}
+
+struct ActionList {
+    actions: [ActionKind; 8],
+    len: usize,
+}
+
+impl ActionList {
+    fn new() -> Self {
+        Self {
+            actions: [ActionKind::Check; 8],
+            len: 0,
+        }
+    }
+
+    fn push(&mut self, action: ActionKind) {
+        if self.len < self.actions.len() {
+            self.actions[self.len] = action;
+            self.len += 1;
+        }
+    }
+
+    fn as_slice(&self) -> &[ActionKind] {
+        &self.actions[..self.len]
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ActionHistory {
+    actions: [ActionKind; 8],
+    len: usize,
+    code: u64,
+}
+
+impl ActionHistory {
+    fn new() -> Self {
+        Self {
+            actions: [ActionKind::Check; 8],
+            len: 0,
+            code: 0,
+        }
+    }
+
+    fn push(&mut self, action: ActionKind, action_index: usize) {
+        if self.len < self.actions.len() {
+            self.actions[self.len] = action;
+            self.code |= ((action_index as u64) + 1) << (self.len * 4);
+            self.len += 1;
+        }
+    }
+
+    fn as_slice(&self) -> &[ActionKind] {
+        &self.actions[..self.len]
+    }
+
+    fn to_vec(self) -> Vec<ActionKind> {
+        self.as_slice().to_vec()
+    }
+
+    fn checked_through(self) -> bool {
+        self.len >= 2
+            && matches!(
+                self.actions[self.len - 2..self.len],
+                [ActionKind::Check, ActionKind::Check]
+            )
+    }
 }
 
 impl SubgameCfrTrainer<'_> {
@@ -885,8 +1146,8 @@ impl SubgameCfrTrainer<'_> {
     ) -> f64 {
         match terminal {
             TerminalKind::Fold { winner } => {
-                let oop_added = pot.committed[Player::Oop.index()]
-                    - self.spec.pot.committed[Player::Oop.index()];
+                let oop_added = pot.invested[Player::Oop.index()]
+                    - self.spec.pot.invested[Player::Oop.index()];
                 if winner == Player::Oop {
                     pot.pot - oop_added
                 } else {
@@ -895,8 +1156,8 @@ impl SubgameCfrTrainer<'_> {
             }
             TerminalKind::Showdown => {
                 let equity = self.combo_equity(oop_index, ip_index);
-                let oop_added = pot.committed[Player::Oop.index()]
-                    - self.spec.pot.committed[Player::Oop.index()];
+                let oop_added = pot.invested[Player::Oop.index()]
+                    - self.spec.pot.invested[Player::Oop.index()];
                 equity * pot.pot - oop_added
             }
         }
@@ -996,6 +1257,483 @@ impl SubgameCfrTrainer<'_> {
                 .then_with(|| left.combo.label().cmp(&right.combo.label()))
         });
         strategies
+    }
+}
+
+impl MultistreetCfrTrainer<'_> {
+    fn cfr(
+        &mut self,
+        player: Player,
+        board: Vec<Card>,
+        pot: PotState,
+        raises: u8,
+        history: ActionHistory,
+        oop_index: usize,
+        ip_index: usize,
+        reach: [f64; 2],
+    ) -> f64 {
+        let player_index = player.index();
+        let actions = self.legal_actions(player, pot, raises);
+        let key = self.infoset_key(&board, history, player, oop_index, ip_index);
+        let (strategy, node_index) = self.strategy_for(
+            &key,
+            player,
+            board.as_slice(),
+            history,
+            actions.as_slice(),
+            oop_index,
+            ip_index,
+        );
+        let mut action_values = [0.0; 8];
+        let mut node_value = 0.0;
+
+        for (index, action) in actions.as_slice().iter().enumerate() {
+            let mut next_reach = reach;
+            next_reach[player_index] *= strategy[index];
+            action_values[index] = self.apply_action(
+                player,
+                board.clone(),
+                pot,
+                raises,
+                history,
+                *action,
+                index,
+                oop_index,
+                ip_index,
+                next_reach,
+            );
+            node_value += strategy[index] * action_values[index];
+        }
+
+        let node = &mut self.nodes[node_index];
+        let opponent_reach = reach[player.other().index()];
+        for action in 0..actions.len {
+            let regret = if player == Player::Oop {
+                action_values[action] - node_value
+            } else {
+                node_value - action_values[action]
+            };
+            node.update_regret(action, opponent_reach * regret, self.iteration, self.variant);
+            node.strategy_sum[action] +=
+                self.average_weight * reach[player_index] * strategy[action];
+        }
+
+        node_value
+    }
+
+    fn apply_action(
+        &mut self,
+        player: Player,
+        board: Vec<Card>,
+        pot: PotState,
+        raises: u8,
+        mut history: ActionHistory,
+        action: ActionKind,
+        action_index: usize,
+        oop_index: usize,
+        ip_index: usize,
+        reach: [f64; 2],
+    ) -> f64 {
+        history.push(action, action_index);
+        match action {
+            ActionKind::Check if history.checked_through() => {
+                self.finish_betting_round(board, pot, oop_index, ip_index, reach)
+            }
+            ActionKind::Call => {
+                let next_pot = apply_call(player, pot);
+                self.finish_betting_round(board, next_pot, oop_index, ip_index, reach)
+            }
+            ActionKind::Fold => self.fold_utility(player.other(), pot),
+            ActionKind::Check => self.cfr(
+                player.other(),
+                board,
+                pot,
+                raises,
+                history,
+                oop_index,
+                ip_index,
+                reach,
+            ),
+            ActionKind::Bet(amount) => self.cfr(
+                player.other(),
+                board,
+                apply_aggressive(player, pot, amount),
+                raises,
+                history,
+                oop_index,
+                ip_index,
+                reach,
+            ),
+            ActionKind::Raise(amount) | ActionKind::AllIn(amount) => self.cfr(
+                player.other(),
+                board,
+                apply_aggressive(player, pot, amount),
+                raises + 1,
+                history,
+                oop_index,
+                ip_index,
+                reach,
+            ),
+        }
+    }
+
+    fn finish_betting_round(
+        &mut self,
+        board: Vec<Card>,
+        pot: PotState,
+        oop_index: usize,
+        ip_index: usize,
+        reach: [f64; 2],
+    ) -> f64 {
+        if board.len() == 5 {
+            return self.showdown_utility(board.as_slice(), pot, oop_index, ip_index);
+        }
+
+        let next_boards: Vec<_> = self
+            .next_public_boards(board.as_slice())
+            .into_iter()
+            .filter(|next_board| self.board_legal_for_deal(next_board, oop_index, ip_index))
+            .collect();
+        if next_boards.is_empty() {
+            return self.showdown_utility(board.as_slice(), pot, oop_index, ip_index);
+        }
+        let next_board_count = next_boards.len();
+        let chance_probability = 1.0 / next_board_count as f64;
+        let next_pot = advance_street(pot);
+        next_boards
+            .into_iter()
+            .map(|next_board| {
+                let next_reach = [
+                    reach[Player::Oop.index()] * chance_probability,
+                    reach[Player::Ip.index()] * chance_probability,
+                ];
+                self.cfr(
+                    Player::Oop,
+                    next_board,
+                    next_pot,
+                    0,
+                    ActionHistory::new(),
+                    oop_index,
+                    ip_index,
+                    next_reach,
+                )
+            })
+            .sum::<f64>()
+            * chance_probability
+    }
+
+    fn next_public_boards(&self, board: &[Card]) -> Vec<Vec<Card>> {
+        let used_mask = board_mask(board);
+        let available: Vec<_> = deck()
+            .into_iter()
+            .filter(|card| used_mask & card.mask() == 0)
+            .collect();
+        let limit = self.spec.chance.max_runouts().max(1).min(available.len());
+        let mut boards = Vec::with_capacity(limit);
+        let mut seen = HashSet::new();
+        for sample in 0..available.len() {
+            if boards.len() == limit {
+                break;
+            }
+            let card = available[sampled_index(self.iteration + sample + board.len(), available.len())];
+            if seen.insert(card) {
+                let mut next = board.to_vec();
+                next.push(card);
+                boards.push(next);
+            }
+        }
+        boards
+    }
+
+    fn board_legal_for_deal(&self, board: &[Card], oop_index: usize, ip_index: usize) -> bool {
+        let public_mask = board_mask(board);
+        public_mask & self.oop_range[oop_index].combo.mask == 0
+            && public_mask & self.ip_range[ip_index].combo.mask == 0
+    }
+
+    fn legal_actions(&self, player: Player, pot: PotState, raises: u8) -> ActionList {
+        if pot.current_bet <= pot.committed[player.index()] {
+            let mut actions = ActionList::new();
+            actions.push(ActionKind::Check);
+            for size in &self.spec.actions.bet_sizes {
+                let amount = capped_commitment(
+                    player,
+                    pot,
+                    resolve_tree_bet_size(*size, player, &pot, pot.pot),
+                );
+                if amount > pot.committed[player.index()] {
+                    actions.push(sized_aggressive_action(*size, amount, false));
+                }
+            }
+            if self.spec.actions.allow_all_in {
+                let amount = all_in_commitment(player, pot);
+                if amount > pot.committed[player.index()] {
+                    actions.push(ActionKind::AllIn(amount));
+                }
+            }
+            return actions;
+        }
+
+        let mut actions = ActionList::new();
+        actions.push(ActionKind::Fold);
+        actions.push(ActionKind::Call);
+        if raises < self.spec.actions.max_raises {
+            let sizes = if raises == 0 {
+                &self.spec.actions.raise_sizes
+            } else {
+                &self.spec.actions.reraise_sizes
+            };
+            for size in sizes {
+                let amount = capped_commitment(
+                    player,
+                    pot,
+                    resolve_tree_bet_size(*size, player, &pot, pot.current_bet),
+                );
+                if amount > pot.current_bet {
+                    actions.push(sized_aggressive_action(*size, amount, true));
+                }
+            }
+            if self.spec.actions.allow_all_in {
+                let amount = all_in_commitment(player, pot);
+                if amount > pot.current_bet {
+                    actions.push(ActionKind::AllIn(amount));
+                }
+            }
+        }
+        actions
+    }
+
+    fn infoset_key(
+        &self,
+        board: &[Card],
+        history: ActionHistory,
+        player: Player,
+        oop_index: usize,
+        ip_index: usize,
+    ) -> MultistreetInfoKey {
+        let combo_mask = match player {
+            Player::Oop => self.oop_range[oop_index].combo.mask,
+            Player::Ip => self.ip_range[ip_index].combo.mask,
+        };
+        MultistreetInfoKey {
+            board_mask: board_mask(board),
+            history: history_key(history),
+            player,
+            combo_mask,
+        }
+    }
+
+    fn strategy_for(
+        &mut self,
+        key: &MultistreetInfoKey,
+        player: Player,
+        board: &[Card],
+        history: ActionHistory,
+        actions: &[ActionKind],
+        oop_index: usize,
+        ip_index: usize,
+    ) -> ([f64; 8], usize) {
+        if let Some(&index) = self.node_index.get(key) {
+            return (self.nodes[index].strategy(), index);
+        }
+        let node = self.new_node(player, board, history, actions, oop_index, ip_index);
+        let strategy = node.strategy();
+        let index = self.nodes.len();
+        self.nodes.push(node);
+        self.node_index.insert(*key, index);
+        (strategy, index)
+    }
+
+    fn new_node(
+        &mut self,
+        player: Player,
+        board: &[Card],
+        history: ActionHistory,
+        actions: &[ActionKind],
+        oop_index: usize,
+        ip_index: usize,
+    ) -> MultistreetCfrNode {
+        let combo = match player {
+            Player::Oop => self.oop_range[oop_index].combo.clone(),
+            Player::Ip => self.ip_range[ip_index].combo.clone(),
+        };
+        let oop_equity = self.combo_equity_on_board(board, oop_index, ip_index);
+        let equity = match player {
+            Player::Oop => oop_equity,
+            Player::Ip => 1.0 - oop_equity,
+        };
+        MultistreetCfrNode {
+            board: board.to_vec(),
+            history: history.to_vec(),
+            player,
+            combo,
+            equity,
+            actions: actions.to_vec(),
+            regret_sum: vec![0.0; actions.len()],
+            strategy_sum: vec![0.0; actions.len()],
+        }
+    }
+
+    fn combo_equity_on_board(&mut self, board: &[Card], oop_index: usize, ip_index: usize) -> f64 {
+        let key = (board_mask(board), oop_index, ip_index);
+        if let Some(equity) = self.equity_cache.get(&key) {
+            return *equity;
+        }
+        let equity = combo_equity(
+            board,
+            &self.oop_range[oop_index],
+            &self.ip_range[ip_index],
+            self.spec.chance.max_runouts(),
+        );
+        self.equity_cache.insert(key, equity);
+        equity
+    }
+
+    fn fold_utility(&self, winner: Player, pot: PotState) -> f64 {
+        let oop_added =
+            pot.invested[Player::Oop.index()] - self.spec.pot.invested[Player::Oop.index()];
+        if winner == Player::Oop {
+            pot.pot - oop_added
+        } else {
+            -oop_added
+        }
+    }
+
+    fn showdown_utility(
+        &mut self,
+        board: &[Card],
+        pot: PotState,
+        oop_index: usize,
+        ip_index: usize,
+    ) -> f64 {
+        let equity = self.combo_equity_on_board(board, oop_index, ip_index);
+        let oop_added =
+            pot.invested[Player::Oop.index()] - self.spec.pot.invested[Player::Oop.index()];
+        equity * pot.pot - oop_added
+    }
+
+    fn merge_from(&mut self, other: MultistreetCfrTrainer<'_>) {
+        for (key, other_index) in other.node_index {
+            let node_to_add = &other.nodes[other_index];
+            if let Some(&index) = self.node_index.get(&key) {
+                self.nodes[index].add(node_to_add);
+            } else {
+                let index = self.nodes.len();
+                self.nodes.push(node_to_add.zeroed_like());
+                self.nodes[index].add(node_to_add);
+                self.node_index.insert(key, index);
+            }
+        }
+    }
+
+    fn current_board_node_count(&self) -> usize {
+        self.nodes
+            .iter()
+            .filter(|node| node.board == self.spec.board)
+            .count()
+    }
+
+    fn combo_strategies_for_board(&self, board: &[Card]) -> Vec<SubgameComboStrategy> {
+        let mut strategies: Vec<_> = self
+            .nodes
+            .iter()
+            .filter(|node| node.board == board)
+            .map(|node| SubgameComboStrategy {
+                node: NodeId(0),
+                player: node.player,
+                board: node.board.clone(),
+                history: node.history.clone(),
+                combo: node.combo.clone(),
+                equity: node.equity,
+                actions: node.average_strategy(),
+            })
+            .collect();
+        strategies.sort_by(|left, right| {
+            player_key(left.player)
+                .cmp(&player_key(right.player))
+                .then_with(|| left.history.len().cmp(&right.history.len()))
+                .then_with(|| right.equity.total_cmp(&left.equity))
+                .then_with(|| left.combo.label().cmp(&right.combo.label()))
+        });
+        strategies
+    }
+}
+
+impl MultistreetCfrNode {
+    fn update_regret(
+        &mut self,
+        action: usize,
+        instant_regret: f64,
+        iteration: usize,
+        variant: CfrVariant,
+    ) {
+        let discounted =
+            self.regret_sum[action] * regret_discount(self.regret_sum[action], iteration, variant);
+        self.regret_sum[action] = (discounted + instant_regret).max(0.0);
+    }
+
+    fn strategy(&self) -> [f64; 8] {
+        let mut strategy = [0.0; 8];
+        let mut normalizer = 0.0;
+        for regret in &self.regret_sum {
+            normalizer += regret.max(0.0);
+        }
+        if normalizer > 0.0 {
+            for (index, regret) in self.regret_sum.iter().enumerate() {
+                strategy[index] = regret.max(0.0) / normalizer;
+            }
+        } else {
+            let frequency = 1.0 / self.regret_sum.len() as f64;
+            for value in strategy.iter_mut().take(self.regret_sum.len()) {
+                *value = frequency;
+            }
+        }
+        strategy
+    }
+
+    fn average_strategy(&self) -> Vec<SubgameActionFrequency> {
+        let normalizer: f64 = self.strategy_sum.iter().sum();
+        self.actions
+            .iter()
+            .enumerate()
+            .map(|(index, &action)| {
+                let frequency = if normalizer > 0.0 {
+                    self.strategy_sum[index] / normalizer
+                } else {
+                    1.0 / self.strategy_sum.len() as f64
+                };
+                SubgameActionFrequency { action, frequency }
+            })
+            .collect()
+    }
+
+    fn zeroed_like(&self) -> Self {
+        Self {
+            board: self.board.clone(),
+            history: self.history.clone(),
+            player: self.player,
+            combo: self.combo.clone(),
+            equity: self.equity,
+            actions: self.actions.clone(),
+            regret_sum: vec![0.0; self.regret_sum.len()],
+            strategy_sum: vec![0.0; self.strategy_sum.len()],
+        }
+    }
+
+    fn add(&mut self, other: &Self) {
+        for (left, right) in self.regret_sum.iter_mut().zip(other.regret_sum.iter()) {
+            *left += right;
+        }
+        for (left, right) in self.strategy_sum.iter_mut().zip(other.strategy_sum.iter()) {
+            *left += right;
+        }
+    }
+}
+
+fn history_key(history: ActionHistory) -> HistoryKey {
+    HistoryKey {
+        len: history.len as u8,
+        code: history.code,
     }
 }
 

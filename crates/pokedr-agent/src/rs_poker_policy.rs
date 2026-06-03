@@ -397,26 +397,34 @@ fn cfr_postflop_action(
     };
     let hero_mask = pokedr_hand_mask(game_state, idx)?;
 
-    let oop_range = mc_range_prior(
-        game_state,
-        oop_idx,
-        range_classes,
-        (idx == oop_idx).then_some(hero_class),
-        if idx == oop_idx { 0 } else { hero_mask },
-        belief,
-        None,
-        board.as_slice(),
-    )?;
-    let ip_range = mc_range_prior(
-        game_state,
-        ip_idx,
-        range_classes,
-        (idx == ip_idx).then_some(hero_class),
-        if idx == ip_idx { 0 } else { hero_mask },
-        belief,
-        None,
-        board.as_slice(),
-    )?;
+    let (oop_range, ip_range) = rayon::join(
+        || {
+            mc_range_prior(
+                game_state,
+                oop_idx,
+                range_classes,
+                (idx == oop_idx).then_some(hero_class),
+                if idx == oop_idx { 0 } else { hero_mask },
+                belief,
+                None,
+                board.as_slice(),
+            )
+        },
+        || {
+            mc_range_prior(
+                game_state,
+                ip_idx,
+                range_classes,
+                (idx == ip_idx).then_some(hero_class),
+                if idx == ip_idx { 0 } else { hero_mask },
+                belief,
+                None,
+                board.as_slice(),
+            )
+        },
+    );
+    let oop_range = oop_range?;
+    let ip_range = ip_range?;
     if oop_range.is_empty() || ip_range.is_empty() {
         return None;
     }
@@ -428,6 +436,10 @@ fn cfr_postflop_action(
             game_state.stacks[ip_idx] as f64,
         ],
         committed: [
+            game_state.round_data.player_bet[oop_idx] as f64,
+            game_state.round_data.player_bet[ip_idx] as f64,
+        ],
+        invested: [
             game_state.round_data.player_bet[oop_idx] as f64,
             game_state.round_data.player_bet[ip_idx] as f64,
         ],
@@ -444,7 +456,7 @@ fn cfr_postflop_action(
     .ok()
     .map(|spec| spec.with_root_player(root_player))?;
     let result = spec
-        .solve_cfr_with_request(SubgameSolveRequest {
+        .solve_multistreet_cfr_with_request(SubgameSolveRequest {
             iterations,
             focused_oop_combo_mask: (root_player == Player::Oop).then_some(hero_mask),
             focused_ip_combo_mask: (root_player == Player::Ip).then_some(hero_mask),
@@ -654,26 +666,34 @@ fn solve_observed_action_node(
         return None;
     };
     let action_limit = Some((action.round, action.sequence_index));
-    let oop_range = mc_range_prior(
-        game_state,
-        oop_idx,
-        range_classes,
-        None,
-        0,
-        belief,
-        action_limit,
-        action.board.as_slice(),
-    )?;
-    let ip_range = mc_range_prior(
-        game_state,
-        ip_idx,
-        range_classes,
-        None,
-        0,
-        belief,
-        action_limit,
-        action.board.as_slice(),
-    )?;
+    let (oop_range, ip_range) = rayon::join(
+        || {
+            mc_range_prior(
+                game_state,
+                oop_idx,
+                range_classes,
+                None,
+                0,
+                belief,
+                action_limit,
+                action.board.as_slice(),
+            )
+        },
+        || {
+            mc_range_prior(
+                game_state,
+                ip_idx,
+                range_classes,
+                None,
+                0,
+                belief,
+                action_limit,
+                action.board.as_slice(),
+            )
+        },
+    );
+    let oop_range = oop_range?;
+    let ip_range = ip_range?;
     let pot = PotState {
         pot: action.starting_pot as f64,
         stacks: [
@@ -681,6 +701,10 @@ fn solve_observed_action_node(
             stack_before_action(action, ip_idx) as f64,
         ],
         committed: [
+            player_bet_before_action(action, oop_idx) as f64,
+            player_bet_before_action(action, ip_idx) as f64,
+        ],
+        invested: [
             player_bet_before_action(action, oop_idx) as f64,
             player_bet_before_action(action, ip_idx) as f64,
         ],
@@ -696,7 +720,15 @@ fn solve_observed_action_node(
     )
     .ok()?
     .with_root_player(root_player);
-    let result = spec.solve_cfr(iterations).ok()?;
+    let result = spec
+        .solve_multistreet_cfr_with_request(SubgameSolveRequest {
+            iterations,
+            focused_oop_combo_mask: None,
+            focused_ip_combo_mask: None,
+            focused_sampling_rate: 0.0,
+            variant: CfrVariant::CfrPlus,
+        })
+        .ok()?;
     let prior_history = public_history_before(belief, action.round, action.sequence_index);
     store_cfr_likelihoods_from_sequence(
         belief_store,

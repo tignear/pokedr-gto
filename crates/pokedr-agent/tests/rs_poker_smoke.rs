@@ -1,4 +1,5 @@
 use std::cmp::Ordering;
+use std::time::Instant;
 
 use pokedr_agent::rs_poker_policy::{CfrPolicyAgent, EquityPolicyAgent, PreflopRanges};
 use pokedr_core::hand_class::HandClass;
@@ -189,7 +190,19 @@ fn run_heads_up_smoke(
     );
     let mut competition = HoldemCompetition::new(simulation_gen);
 
-    competition.run(hands).expect("rs_poker arena should run");
+    let started = Instant::now();
+    let mut completed = 0;
+    while completed < hands {
+        let chunk = (hands - completed).min(10);
+        competition.run(chunk).expect("rs_poker arena should run");
+        completed += chunk;
+        if std::env::var_os("POKEDR_PROGRESS").is_some() {
+            eprintln!(
+                "heads-up smoke progress: {completed}/{hands} hands elapsed={:.1}s",
+                started.elapsed().as_secs_f64()
+            );
+        }
+    }
     competition.total_change[0] as f64 / competition.num_rounds as f64
 }
 
