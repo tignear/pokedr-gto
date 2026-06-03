@@ -97,6 +97,7 @@ pub struct PublicState {
     pub min_aggressive_amount: u32,
     pub acting_player: Player,
     pub raises_this_street: u8,
+    pub checks_this_street: u8,
 }
 
 #[derive(Debug, Clone)]
@@ -360,7 +361,7 @@ impl SubgameTree {
                 },
             );
         }
-        if state.street == Street::River && state.to_call == 0 && depth > 0 {
+        if state.street == Street::River && state.to_call == 0 && state.checks_this_street >= 2 {
             return self.push_node(
                 parent,
                 PublicNodeKind::Terminal {
@@ -413,8 +414,9 @@ impl SubgameTree {
                 );
             }
             PlayerAction::Check | PlayerAction::Call { .. } => {
+                let advance = should_advance_street(state, action);
                 let next_state = state_after_passive_action(state, action);
-                if should_advance_street(state, action) {
+                if advance {
                     self.expand_chance(Some(parent), next_state, depth, config, builder);
                 } else {
                     self.expand_state(Some(parent), next_state, depth, config, builder);
@@ -468,6 +470,7 @@ impl SubgameTree {
             child_state.to_call = 0;
             child_state.min_aggressive_amount = child_state.pot.max(1);
             child_state.raises_this_street = 0;
+            child_state.checks_this_street = 0;
             self.expand_state(Some(chance), child_state, depth + 1, config, builder);
         }
     }
@@ -523,7 +526,11 @@ fn next_street(street: Street) -> Street {
 }
 
 fn should_advance_street(state: &PublicState, action: PlayerAction) -> bool {
-    matches!(action, PlayerAction::Check | PlayerAction::Call { .. }) && state.to_call == 0
+    match action {
+        PlayerAction::Call { .. } => true,
+        PlayerAction::Check => state.to_call == 0 && state.checks_this_street + 1 >= 2,
+        _ => false,
+    }
 }
 
 fn state_after_passive_action(state: &PublicState, action: PlayerAction) -> PublicState {
@@ -536,6 +543,11 @@ fn state_after_passive_action(state: &PublicState, action: PlayerAction) -> Publ
     next.effective_stack = next.effective_stack.saturating_sub(call_amount);
     next.to_call = 0;
     next.acting_player = state.acting_player.next();
+    next.checks_this_street = match action {
+        PlayerAction::Check => next.checks_this_street.saturating_add(1),
+        PlayerAction::Call { .. } => 0,
+        _ => next.checks_this_street,
+    };
     next
 }
 
@@ -548,6 +560,7 @@ fn state_after_aggressive_action(state: &PublicState, amount: u32) -> PublicStat
     next.min_aggressive_amount = contribution.saturating_mul(2).max(1);
     next.acting_player = state.acting_player.next();
     next.raises_this_street = next.raises_this_street.saturating_add(1);
+    next.checks_this_street = 0;
     next
 }
 
@@ -776,6 +789,35 @@ mod tests {
         ])
     }
 
+    fn root_state(street: Street) -> PublicState {
+        PublicState {
+            street,
+            board: flop(),
+            pot: 100,
+            effective_stack: 300,
+            to_call: 0,
+            min_aggressive_amount: 50,
+            acting_player: Player::Hero,
+            raises_this_street: 0,
+            checks_this_street: 0,
+        }
+    }
+
+    fn compact_tree_config(max_depth: usize) -> SubgameTreeConfig {
+        SubgameTreeConfig {
+            action_set: ActionSetConfig {
+                max_aggressive_actions: 2,
+                flop_bet_fractions: vec![0.5],
+                turn_bet_fractions: vec![0.5],
+                river_bet_fractions: vec![0.5],
+                raise_fractions: vec![1.0],
+                ..ActionSetConfig::default()
+            },
+            max_raises_per_street: 1,
+            max_depth,
+        }
+    }
+
     #[test]
     fn flop_runout_counts_cover_all_turn_river_cards() {
         assert_eq!(ordered_runouts(&flop()).len(), 49 * 48);
@@ -798,36 +840,78 @@ mod tests {
 
     #[test]
     fn subgame_tree_builds_bounded_public_nodes() {
-        let config = SubgameTreeConfig {
-            action_set: ActionSetConfig {
-                max_aggressive_actions: 2,
-                flop_bet_fractions: vec![0.5],
-                turn_bet_fractions: vec![0.5],
-                river_bet_fractions: vec![0.5],
-                raise_fractions: vec![1.0],
-                ..ActionSetConfig::default()
-            },
-            max_raises_per_street: 1,
-            max_depth: 4,
-        };
-        let tree = SubgameTree::build(
-            PublicState {
-                street: Street::Flop,
-                board: flop(),
-                pot: 100,
-                effective_stack: 300,
-                to_call: 0,
-                min_aggressive_amount: 50,
-                acting_player: Player::Hero,
-                raises_this_street: 0,
-            },
-            config,
-        );
+        let tree = SubgameTree::build(root_state(Street::Flop), compact_tree_config(4));
 
         assert!(!tree.nodes().is_empty());
         assert!(tree.decision_count() > 0);
         assert!(tree.chance_count() > 0);
         assert!(tree.terminal_count() > 0);
         assert!(tree.nodes().len() < 20_000);
+    }
+
+    #[test]
+    fn check_then_check_advances_to_turn_chance() {
+        let tree = SubgameTree::build(root_state(Street::Flop), compact_tree_config(3));
+
+        let root_check = tree.nodes()[0].children[0];
+        let PublicNodeKind::Decision {
+            state: checked_state,
+            ..
+        } = &tree.nodes()[root_check].kind
+        else {
+            panic!("first check should keep action on the flop");
+        };
+        assert_eq!(checked_state.street, Street::Flop);
+        assert_eq!(checked_state.checks_this_street, 1);
+
+        let second_check = tree.nodes()[root_check].children[0];
+        let PublicNodeKind::Chance { street, cards, .. } = &tree.nodes()[second_check].kind else {
+            panic!("second check should advance through chance");
+        };
+        assert_eq!(*street, Street::Turn);
+        assert_eq!(cards.len(), 49);
+    }
+
+    #[test]
+    fn bet_call_advances_to_turn_chance() {
+        let tree = SubgameTree::build(root_state(Street::Flop), compact_tree_config(3));
+        let root = &tree.nodes()[0];
+
+        let facing_bet = root
+            .children
+            .iter()
+            .copied()
+            .find(|&child| {
+                matches!(
+                    &tree.nodes()[child].kind,
+                    PublicNodeKind::Decision { state, .. } if state.to_call > 0
+                )
+            })
+            .expect("root should contain at least one bet branch");
+
+        let call_child = tree.nodes()[facing_bet]
+            .children
+            .iter()
+            .copied()
+            .find(|&child| matches!(tree.nodes()[child].kind, PublicNodeKind::Chance { .. }))
+            .expect("call should advance through chance");
+
+        let PublicNodeKind::Chance { street, cards, .. } = &tree.nodes()[call_child].kind else {
+            unreachable!();
+        };
+        assert_eq!(*street, Street::Turn);
+        assert_eq!(cards.len(), 49);
+    }
+
+    #[test]
+    fn river_check_check_ends_at_showdown() {
+        let tree = SubgameTree::build(root_state(Street::River), compact_tree_config(3));
+
+        let root_check = tree.nodes()[0].children[0];
+        let second_check = tree.nodes()[root_check].children[0];
+        let PublicNodeKind::Terminal { kind, .. } = tree.nodes()[second_check].kind else {
+            panic!("river check-check should finish the public tree");
+        };
+        assert_eq!(kind, TerminalKind::Showdown);
     }
 }
