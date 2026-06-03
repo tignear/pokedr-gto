@@ -332,92 +332,129 @@ fn fill_public_tree_iteration(
     batch.action_values.fill(0.0);
     batch.reach_weights.fill(0.0);
     batch.strategy_weights.fill(0.0);
-    let mut value_counts = vec![0.0; batch.action_values.len()];
+    let mut value_weights = vec![0.0; batch.action_values.len()];
     let root_dead = root_board(tree).deck_mask();
 
-    for infoset in 0..layout.infoset_count() {
-        let node_index = layout.infoset_node(infoset);
-        let PublicNodeKind::Decision {
-            state: public_state,
-            actions,
-        } = &tree.nodes()[node_index].kind
-        else {
-            unreachable!("infoset nodes are decisions");
-        };
-        for hero_combo in legal_private_combos(indexer, root_dead) {
-            let hero_cards = combo_cards(indexer.combo(hero_combo));
-            for villain_combo in legal_private_combos(indexer, root_dead | hero_mask(hero_cards)) {
-                let villain_cards = combo_cards(indexer.combo(villain_combo));
-                let mut ctx = PostflopEvaluationContext {
-                    hero_cards,
-                    villain_cards,
-                    max_showdown_runouts: config.max_showdown_runouts.max(1),
-                    equity_cache: HashMap::new(),
+    for hero_combo in legal_private_combos(indexer, root_dead) {
+        let hero_cards = combo_cards(indexer.combo(hero_combo));
+        for villain_combo in legal_private_combos(indexer, root_dead | hero_mask(hero_cards)) {
+            let villain_cards = combo_cards(indexer.combo(villain_combo));
+            let mut ctx = PostflopEvaluationContext {
+                hero_cards,
+                villain_cards,
+                max_showdown_runouts: config.max_showdown_runouts.max(1),
+                equity_cache: HashMap::new(),
+            };
+            traverse_cfr_node(
+                tree,
+                layout,
+                0,
+                None,
+                None,
+                hero_combo,
+                villain_combo,
+                1.0,
+                1.0,
+                cfr_state,
+                &mut ctx,
+                batch,
+                &mut value_weights,
+            );
+        }
+    }
+
+    for (value, weight) in batch.action_values.iter_mut().zip(value_weights) {
+        if weight > 0.0 {
+            *value /= weight;
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn traverse_cfr_node(
+    tree: &SubgameTree,
+    layout: &PostflopDenseLayout,
+    node_index: usize,
+    parent_state: Option<&PublicState>,
+    parent_action: Option<PlayerAction>,
+    hero_combo: usize,
+    villain_combo: usize,
+    hero_reach: f32,
+    villain_reach: f32,
+    cfr_state: &DenseCfrState,
+    ctx: &mut PostflopEvaluationContext,
+    batch: &mut DenseCfrIteration,
+    value_weights: &mut [f32],
+) -> f32 {
+    match &tree.nodes()[node_index].kind {
+        PublicNodeKind::Decision { state, actions } => {
+            let Some(public_infoset) = layout.node_infoset(node_index) else {
+                return 0.0;
+            };
+            let acting_combo = match state.acting_player {
+                Player::Hero => hero_combo,
+                Player::Villain => villain_combo,
+            };
+            let private_infoset =
+                private_infoset(public_infoset, state.acting_player, acting_combo);
+            let offset = private_infoset * layout.max_actions();
+            let mut strategy = vec![0.0; layout.max_actions()];
+            cfr_state.strategy_for(private_infoset, &mut strategy);
+
+            let mut action_values = vec![0.0; actions.len()];
+            for (action_index, action) in actions.iter().enumerate() {
+                let child = layout
+                    .child_for_action(public_infoset, action_index)
+                    .expect("legal action must have a child");
+                let probability = strategy[action_index];
+                let (next_hero_reach, next_villain_reach) = match state.acting_player {
+                    Player::Hero => (hero_reach * probability, villain_reach),
+                    Player::Villain => (hero_reach, villain_reach * probability),
                 };
-                let acting_combo = match public_state.acting_player {
-                    Player::Hero => hero_combo,
-                    Player::Villain => villain_combo,
-                };
-                let private_infoset =
-                    private_infoset(infoset, public_state.acting_player, acting_combo);
-                let offset = private_infoset * layout.max_actions();
-                for action_index in 0..layout.action_count(infoset) {
-                    let child = layout
-                        .child_for_action(infoset, action_index)
-                        .expect("legal action must have a child");
-                    let hero_value = evaluate_action_child(
-                        tree,
-                        layout,
-                        child,
-                        public_state,
-                        actions[action_index].action,
-                        hero_combo,
-                        villain_combo,
-                        cfr_state,
-                        &mut ctx,
-                    );
-                    let player_value = match public_state.acting_player {
+                action_values[action_index] = traverse_cfr_node(
+                    tree,
+                    layout,
+                    child,
+                    Some(state),
+                    Some(action.action),
+                    hero_combo,
+                    villain_combo,
+                    next_hero_reach,
+                    next_villain_reach,
+                    cfr_state,
+                    ctx,
+                    batch,
+                    value_weights,
+                );
+            }
+
+            let opponent_reach = match state.acting_player {
+                Player::Hero => villain_reach,
+                Player::Villain => hero_reach,
+            };
+            let own_reach = match state.acting_player {
+                Player::Hero => hero_reach,
+                Player::Villain => villain_reach,
+            };
+            if opponent_reach > 0.0 || own_reach > 0.0 {
+                for (action_index, hero_value) in action_values.iter().copied().enumerate() {
+                    let player_value = match state.acting_player {
                         Player::Hero => hero_value,
                         Player::Villain => -hero_value,
                     };
-                    batch.action_values[offset + action_index] += player_value;
-                    value_counts[offset + action_index] += 1.0;
+                    batch.action_values[offset + action_index] += opponent_reach * player_value;
+                    value_weights[offset + action_index] += opponent_reach;
                 }
-                batch.reach_weights[private_infoset] = 1.0;
-                batch.strategy_weights[private_infoset] = 1.0;
+                batch.reach_weights[private_infoset] += opponent_reach;
+                batch.strategy_weights[private_infoset] += own_reach;
             }
-        }
-    }
 
-    for (value, count) in batch.action_values.iter_mut().zip(value_counts) {
-        if count > 0.0 {
-            *value /= count;
+            action_values
+                .iter()
+                .zip(strategy)
+                .map(|(value, probability)| value * probability)
+                .sum()
         }
-    }
-}
-
-fn evaluate_action_child(
-    tree: &SubgameTree,
-    layout: &PostflopDenseLayout,
-    node_index: usize,
-    parent_state: &PublicState,
-    parent_action: PlayerAction,
-    hero_combo: usize,
-    villain_combo: usize,
-    cfr_state: &DenseCfrState,
-    ctx: &mut PostflopEvaluationContext,
-) -> f32 {
-    match &tree.nodes()[node_index].kind {
-        PublicNodeKind::Decision { state, .. } => evaluate_decision(
-            tree,
-            layout,
-            node_index,
-            state,
-            hero_combo,
-            villain_combo,
-            cfr_state,
-            ctx,
-        ),
         PublicNodeKind::Chance { cards, .. } => {
             let mut sum = 0.0;
             let mut count = 0;
@@ -425,14 +462,20 @@ fn evaluate_action_child(
                 if card.deck_mask() & private_dead_mask(ctx) != 0 {
                     continue;
                 }
-                sum += evaluate_node(
+                sum += traverse_cfr_node(
                     tree,
                     layout,
                     *child,
+                    None,
+                    None,
                     hero_combo,
                     villain_combo,
+                    hero_reach,
+                    villain_reach,
                     cfr_state,
                     ctx,
+                    batch,
+                    value_weights,
                 );
                 count += 1;
             }
@@ -445,109 +488,15 @@ fn evaluate_action_child(
             hero_invested,
             ..
         } => match kind {
-            TerminalKind::Fold => fold_utility(parent_state, parent_action, *pot, *hero_invested),
+            TerminalKind::Fold => fold_utility(
+                parent_state.expect("fold terminal must have a parent decision"),
+                parent_action.expect("fold terminal must have a parent action"),
+                *pot,
+                *hero_invested,
+            ),
             TerminalKind::Showdown => showdown_utility(*pot, *hero_invested, board, ctx),
         },
     }
-}
-
-fn evaluate_node(
-    tree: &SubgameTree,
-    layout: &PostflopDenseLayout,
-    node_index: usize,
-    hero_combo: usize,
-    villain_combo: usize,
-    cfr_state: &DenseCfrState,
-    ctx: &mut PostflopEvaluationContext,
-) -> f32 {
-    match &tree.nodes()[node_index].kind {
-        PublicNodeKind::Decision { state, .. } => evaluate_decision(
-            tree,
-            layout,
-            node_index,
-            state,
-            hero_combo,
-            villain_combo,
-            cfr_state,
-            ctx,
-        ),
-        PublicNodeKind::Chance { cards, .. } => {
-            let mut sum = 0.0;
-            let mut count = 0;
-            for (card, child) in cards.iter().zip(&tree.nodes()[node_index].children) {
-                if card.deck_mask() & private_dead_mask(ctx) != 0 {
-                    continue;
-                }
-                sum += evaluate_node(
-                    tree,
-                    layout,
-                    *child,
-                    hero_combo,
-                    villain_combo,
-                    cfr_state,
-                    ctx,
-                );
-                count += 1;
-            }
-            if count == 0 { 0.0 } else { sum / count as f32 }
-        }
-        PublicNodeKind::Terminal {
-            kind,
-            board,
-            pot,
-            hero_invested,
-            ..
-        } => match kind {
-            TerminalKind::Fold => 0.0,
-            TerminalKind::Showdown => showdown_utility(*pot, *hero_invested, board, ctx),
-        },
-    }
-}
-
-fn evaluate_decision(
-    tree: &SubgameTree,
-    layout: &PostflopDenseLayout,
-    node_index: usize,
-    state: &PublicState,
-    hero_combo: usize,
-    villain_combo: usize,
-    cfr_state: &DenseCfrState,
-    ctx: &mut PostflopEvaluationContext,
-) -> f32 {
-    let PublicNodeKind::Decision { actions, .. } = &tree.nodes()[node_index].kind else {
-        unreachable!("decision node expected");
-    };
-    let mut values = Vec::with_capacity(actions.len());
-    for (action, child) in actions.iter().zip(&tree.nodes()[node_index].children) {
-        values.push(evaluate_action_child(
-            tree,
-            layout,
-            *child,
-            state,
-            action.action,
-            hero_combo,
-            villain_combo,
-            cfr_state,
-            ctx,
-        ));
-    }
-    let Some(infoset) = layout.node_infoset(node_index) else {
-        return values.iter().sum::<f32>() / values.len().max(1) as f32;
-    };
-    let mut strategy = vec![0.0; layout.max_actions()];
-    let acting_combo = match state.acting_player {
-        Player::Hero => hero_combo,
-        Player::Villain => villain_combo,
-    };
-    cfr_state.strategy_for(
-        private_infoset(infoset, state.acting_player, acting_combo),
-        &mut strategy,
-    );
-    values
-        .iter()
-        .zip(strategy)
-        .map(|(value, probability)| value * probability)
-        .sum()
 }
 
 fn best_average_strategy_action(
@@ -1175,13 +1124,22 @@ mod tests {
         let layout = PostflopDenseLayout::from_tree(&tree);
         let mut dense_config = layout.dense_config(CfrVariant::CfrPlus);
         dense_config.infosets *= PRIVATE_INFOS_PER_PUBLIC;
-        let cfr_state =
-            DenseCfrState::new_with_legal_actions(dense_config, private_legal_actions(&layout));
+        let cfr_state = DenseCfrState::new_with_legal_actions(
+            dense_config.clone(),
+            private_legal_actions(&layout),
+        );
         let hero_combo = hero_combo_index(
             &ComboIndexer::new(),
             [
                 PokedrCard::new(PokedrRank::Nine, PokedrSuit::Clubs),
                 PokedrCard::new(PokedrRank::Ten, PokedrSuit::Diamonds),
+            ],
+        );
+        let villain_combo = hero_combo_index(
+            &ComboIndexer::new(),
+            [
+                PokedrCard::new(PokedrRank::Queen, PokedrSuit::Clubs),
+                PokedrCard::new(PokedrRank::Queen, PokedrSuit::Diamonds),
             ],
         );
         let mut ctx = PostflopEvaluationContext {
@@ -1196,21 +1154,22 @@ mod tests {
             max_showdown_runouts: 1,
             equity_cache: HashMap::new(),
         };
-        let value = evaluate_decision(
+        let mut batch = DenseCfrIteration::new(&dense_config);
+        let mut value_weights = vec![0.0; batch.action_values.len()];
+        let value = traverse_cfr_node(
             &tree,
             &layout,
             0,
-            &root_public_state(&tree),
+            None,
+            None,
             hero_combo,
-            hero_combo_index(
-                &ComboIndexer::new(),
-                [
-                    PokedrCard::new(PokedrRank::Queen, PokedrSuit::Clubs),
-                    PokedrCard::new(PokedrRank::Queen, PokedrSuit::Diamonds),
-                ],
-            ),
+            villain_combo,
+            1.0,
+            1.0,
             &cfr_state,
             &mut ctx,
+            &mut batch,
+            &mut value_weights,
         );
 
         assert!(value.is_finite());
@@ -1236,12 +1195,5 @@ mod tests {
         assert_eq!(classify_preflop_hand(&queens), PreflopClass::Premium);
         assert_eq!(classify_preflop_hand(&ace_king), PreflopClass::Strong);
         assert!(!classify_preflop_hand(&ace_king).four_bets());
-    }
-
-    fn root_public_state(tree: &SubgameTree) -> PublicState {
-        let PublicNodeKind::Decision { state, .. } = &tree.nodes()[0].kind else {
-            panic!("root should be a decision");
-        };
-        state.clone()
     }
 }
