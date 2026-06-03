@@ -16,8 +16,11 @@ fn main() {
         Some("gpu-smoke") => run_gpu_smoke(),
         Some("postflop-smoke") => run_postflop_smoke(),
         Some("rs-poker-smoke") => run_rs_poker_smoke(),
+        Some("rs-poker-trace") => run_rs_poker_trace(),
         _ => {
-            eprintln!("usage: {program} <gpu-info|gpu-smoke|postflop-smoke|rs-poker-smoke>");
+            eprintln!(
+                "usage: {program} <gpu-info|gpu-smoke|postflop-smoke|rs-poker-smoke|rs-poker-trace>"
+            );
             std::process::exit(2);
         }
     }
@@ -190,6 +193,26 @@ fn run_rs_poker_smoke() {
     println!("hands: {}", summary.hands);
     println!("hero_net: {:.2}", summary.hero_net);
     println!("villain_net: {:.2}", summary.villain_net);
+}
+
+fn run_rs_poker_trace() {
+    for trace in pokedr_agent::run_traced_heads_up_match(8, 7) {
+        println!(
+            "hand {} hero [{}] villain [{}] board [{}] hero_net {:.2} villain_net {:.2}",
+            trace.hand_index,
+            trace.hero_cards,
+            trace.villain_cards,
+            trace.board,
+            trace.hero_net,
+            trace.villain_net
+        );
+        for action in &trace.actions {
+            println!("  {action}");
+        }
+        for award in &trace.awards {
+            println!("  {award}");
+        }
+    }
 }
 
 fn smoke_postflop_tree() -> SubgameTree {

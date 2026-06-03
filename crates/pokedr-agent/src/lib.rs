@@ -16,8 +16,10 @@ use pokedr_core::{
 use rs_poker::{
     arena::{
         Agent,
+        action::Action,
         action::AgentAction,
         game_state::{GameState, Round},
+        historian::{HistoryRecord, VecHistorian},
     },
     core::{Card as RsCard, Suit as RsSuit, Value as RsValue},
 };
@@ -66,6 +68,18 @@ pub struct MatchSummary {
     pub hands: usize,
     pub hero_net: f32,
     pub villain_net: f32,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct HandTrace {
+    pub hand_index: usize,
+    pub hero_cards: String,
+    pub villain_cards: String,
+    pub board: String,
+    pub hero_net: f32,
+    pub villain_net: f32,
+    pub actions: Vec<String>,
+    pub awards: Vec<String>,
 }
 
 impl Default for PokedrAgent {
@@ -181,6 +195,48 @@ pub fn run_heads_up_match(hands: usize, seed: u64) -> MatchSummary {
         hero_net,
         villain_net,
     }
+}
+
+pub fn run_traced_heads_up_match(hands: usize, seed: u64) -> Vec<HandTrace> {
+    use rand::{SeedableRng, rngs::StdRng};
+    use rs_poker::arena::{HoldemSimulationBuilder, agent::RandomPotControlAgent};
+
+    let mut rng = StdRng::seed_from_u64(seed);
+    let mut traces = Vec::with_capacity(hands);
+    for hand in 0..hands {
+        let game_state = GameState::new_starting(vec![100.0, 100.0], 2.0, 1.0, 0.0, hand % 2);
+        let historian = VecHistorian::new();
+        let records = historian.get_storage();
+        let mut sim = HoldemSimulationBuilder::default()
+            .game_state(game_state)
+            .agents(vec![
+                Box::new(PokedrAgent::default()),
+                Box::new(RandomPotControlAgent::new(vec![0.65, 0.55, 0.45])),
+            ])
+            .historians(vec![Box::new(historian)])
+            .build()
+            .unwrap();
+        sim.run(&mut rng);
+        let borrowed_records = records.borrow();
+        let hole_cards = dealt_hole_cards(&borrowed_records, 2);
+        traces.push(HandTrace {
+            hand_index: hand,
+            hero_cards: format_cards(&hole_cards[0]),
+            villain_cards: format_cards(&hole_cards[1]),
+            board: format_cards(&sim.game_state.board),
+            hero_net: sim.game_state.stacks[0] - sim.game_state.starting_stacks[0],
+            villain_net: sim.game_state.stacks[1] - sim.game_state.starting_stacks[1],
+            actions: borrowed_records
+                .iter()
+                .filter_map(|record| format_trace_action(&record.action))
+                .collect(),
+            awards: borrowed_records
+                .iter()
+                .filter_map(|record| format_award(&record.action))
+                .collect(),
+        });
+    }
+    traces
 }
 
 pub fn gpu_backend_mode() -> BackendMode {
@@ -500,6 +556,64 @@ fn evaluate_seven(
 
 fn hero_mask(hero_cards: [PokedrCard; 2]) -> u64 {
     hero_cards[0].deck_mask() | hero_cards[1].deck_mask()
+}
+
+fn dealt_hole_cards(records: &[HistoryRecord], players: usize) -> Vec<Vec<RsCard>> {
+    let mut cards = vec![Vec::new(); players];
+    for record in records {
+        let Action::DealStartingHand(payload) = &record.action else {
+            continue;
+        };
+        if payload.idx < cards.len() {
+            cards[payload.idx].push(payload.card);
+        }
+    }
+    cards
+}
+
+fn format_cards(cards: &[RsCard]) -> String {
+    cards
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn format_trace_action(action: &Action) -> Option<String> {
+    match action {
+        Action::ForcedBet(payload) => Some(format!(
+            "p{} forced {:?} {:.2} stack {:.2}",
+            payload.idx, payload.forced_bet_type, payload.bet, payload.player_stack
+        )),
+        Action::PlayedAction(payload) => Some(format!(
+            "{:?} p{} {:?} pot {:.2}->{:.2} bet {:.2}->{:.2} stack {:.2}",
+            payload.round,
+            payload.idx,
+            payload.action,
+            payload.starting_pot,
+            payload.final_pot,
+            payload.starting_bet,
+            payload.final_bet,
+            payload.player_stack
+        )),
+        Action::FailedAction(payload) => Some(format!(
+            "{:?} p{} failed {:?} -> {:?}",
+            payload.result.round, payload.result.idx, payload.action, payload.result.action
+        )),
+        Action::DealCommunity(card) => Some(format!("deal {card}")),
+        Action::RoundAdvance(round) => Some(format!("round {round}")),
+        _ => None,
+    }
+}
+
+fn format_award(action: &Action) -> Option<String> {
+    let Action::Award(payload) = action else {
+        return None;
+    };
+    Some(format!(
+        "p{} award {:.2} total_pot {:.2} rank {:?} hand {:?}",
+        payload.idx, payload.award_amount, payload.total_pot, payload.rank, payload.hand
+    ))
 }
 
 fn public_state_from_game(game_state: &GameState) -> Option<PublicState> {
