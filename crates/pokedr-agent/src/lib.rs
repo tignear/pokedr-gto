@@ -544,6 +544,7 @@ fn solve_public_tree_cfr(
     let mut batch = DenseCfrIteration::new(&dense_config);
     let indexer = ComboIndexer::new();
     let gpu_backend = cfr_gpu_backend();
+    let matrix_cache = RefCell::new(HashMap::new());
 
     for iteration in 1..=config.cfr_iterations.max(1) {
         let iteration_started = Instant::now();
@@ -555,6 +556,7 @@ fn solve_public_tree_cfr(
             &state,
             config,
             villain_weights,
+            &matrix_cache,
             &mut batch,
         );
         let average_weight = iteration as f32;
@@ -619,6 +621,7 @@ fn fill_public_tree_iteration(
     cfr_state: &DenseCfrState,
     config: &PokedrAgentConfig,
     villain_weights: &[f32],
+    matrix_cache: &RefCell<HashMap<u64, Vec<f32>>>,
     batch: &mut DenseCfrIteration,
 ) {
     batch.action_values.fill(0.0);
@@ -626,7 +629,6 @@ fn fill_public_tree_iteration(
     batch.strategy_weights.fill(0.0);
     let mut value_weights = vec![0.0; batch.action_values.len()];
     let root_dead = root_board(tree).deck_mask();
-    let matrix_cache = RefCell::new(HashMap::new());
 
     for hero_combo in legal_private_combos(indexer, root_dead) {
         let hero_cards = combo_cards(indexer.combo(hero_combo));
@@ -638,7 +640,7 @@ fn fill_public_tree_iteration(
                 hero_combo,
                 villain_combo,
                 gpu_backend,
-                matrix_cache: &matrix_cache,
+                matrix_cache,
                 max_showdown_runouts: config.max_showdown_runouts.max(1),
                 equity_cache: HashMap::new(),
             };

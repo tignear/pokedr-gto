@@ -564,6 +564,10 @@ pub struct GpuDenseCfrBackend {
     adapter_info: wgpu::AdapterInfo,
     pipeline: wgpu::ComputePipeline,
     bind_group_layout: wgpu::BindGroupLayout,
+    showdown_pipeline: wgpu::ComputePipeline,
+    showdown_bind_group_layout: wgpu::BindGroupLayout,
+    showdown_matrix_pipeline: wgpu::ComputePipeline,
+    showdown_matrix_bind_group_layout: wgpu::BindGroupLayout,
 }
 
 pub struct GpuDenseCfrState {
@@ -670,12 +674,72 @@ impl GpuDenseCfrBackend {
             compilation_options: wgpu::PipelineCompilationOptions::default(),
             cache: None,
         });
+        let showdown_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("showdown equity shader"),
+            source: wgpu::ShaderSource::Wgsl(SHOWDOWN_SHADER.into()),
+        });
+        let showdown_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("showdown equity bind group layout"),
+                entries: &[
+                    storage_entry(0, true),
+                    storage_entry(1, false),
+                    storage_entry(2, true),
+                ],
+            });
+        let showdown_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("showdown equity pipeline layout"),
+                bind_group_layouts: &[Some(&showdown_bind_group_layout)],
+                immediate_size: 0,
+            });
+        let showdown_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("showdown equity pipeline"),
+            layout: Some(&showdown_pipeline_layout),
+            module: &showdown_shader,
+            entry_point: Some("showdown"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            cache: None,
+        });
+        let showdown_matrix_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("showdown matrix shader"),
+            source: wgpu::ShaderSource::Wgsl(SHOWDOWN_MATRIX_SHADER.into()),
+        });
+        let showdown_matrix_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("showdown matrix bind group layout"),
+                entries: &[
+                    storage_entry(0, true),
+                    storage_entry(1, true),
+                    storage_entry(2, false),
+                    storage_entry(3, true),
+                ],
+            });
+        let showdown_matrix_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("showdown matrix pipeline layout"),
+                bind_group_layouts: &[Some(&showdown_matrix_bind_group_layout)],
+                immediate_size: 0,
+            });
+        let showdown_matrix_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("showdown matrix pipeline"),
+                layout: Some(&showdown_matrix_pipeline_layout),
+                module: &showdown_matrix_shader,
+                entry_point: Some("matrix"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                cache: None,
+            });
         Ok(Self {
             device,
             queue,
             adapter_info,
             pipeline,
             bind_group_layout,
+            showdown_pipeline,
+            showdown_bind_group_layout,
+            showdown_matrix_pipeline,
+            showdown_matrix_bind_group_layout,
         })
     }
 
@@ -780,47 +844,13 @@ impl GpuDenseCfrBackend {
             return Ok(Vec::new());
         }
 
-        let shader = self
-            .device
-            .create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("showdown equity shader"),
-                source: wgpu::ShaderSource::Wgsl(SHOWDOWN_SHADER.into()),
-            });
-        let layout = self
-            .device
-            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("showdown equity bind group layout"),
-                entries: &[
-                    storage_entry(0, true),
-                    storage_entry(1, false),
-                    storage_entry(2, true),
-                ],
-            });
-        let pipeline_layout = self
-            .device
-            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("showdown equity pipeline layout"),
-                bind_group_layouts: &[Some(&layout)],
-                immediate_size: 0,
-            });
-        let pipeline = self
-            .device
-            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("showdown equity pipeline"),
-                layout: Some(&pipeline_layout),
-                module: &shader,
-                entry_point: Some("showdown"),
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-                cache: None,
-            });
-
         let task_buffer = readonly_buffer(&self.device, "showdown tasks", tasks);
         let mut output = vec![0.0f32; tasks.len()];
         let output_buffer = storage_buffer(&self.device, "showdown equities", &output);
         let params = readonly_buffer(&self.device, "showdown params", &[tasks.len() as u32]);
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("showdown equity bind group"),
-            layout: &layout,
+            layout: &self.showdown_bind_group_layout,
             entries: &[
                 bind_entry(0, &task_buffer),
                 bind_entry(1, &output_buffer),
@@ -837,7 +867,7 @@ impl GpuDenseCfrBackend {
                 label: Some("showdown equity pass"),
                 timestamp_writes: None,
             });
-            pass.set_pipeline(&pipeline);
+            pass.set_pipeline(&self.showdown_pipeline);
             pass.set_bind_group(0, &bind_group, &[]);
             let groups = (tasks.len() as u32).div_ceil(WORKGROUP_SIZE);
             pass.dispatch_workgroups(groups, 1, 1);
@@ -868,40 +898,6 @@ impl GpuDenseCfrBackend {
             "showdown matrix needs at least one final board"
         );
 
-        let shader = self
-            .device
-            .create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("showdown matrix shader"),
-                source: wgpu::ShaderSource::Wgsl(SHOWDOWN_MATRIX_SHADER.into()),
-            });
-        let layout = self
-            .device
-            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("showdown matrix bind group layout"),
-                entries: &[
-                    storage_entry(0, true),
-                    storage_entry(1, true),
-                    storage_entry(2, false),
-                    storage_entry(3, true),
-                ],
-            });
-        let pipeline_layout = self
-            .device
-            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("showdown matrix pipeline layout"),
-                bind_group_layouts: &[Some(&layout)],
-                immediate_size: 0,
-            });
-        let pipeline = self
-            .device
-            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("showdown matrix pipeline"),
-                layout: Some(&pipeline_layout),
-                module: &shader,
-                entry_point: Some("matrix"),
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-                cache: None,
-            });
         let pair_count = combos.len() * combos.len();
         let combo_buffer = readonly_buffer(&self.device, "showdown matrix combos", combos);
         let board_buffer = readonly_buffer(&self.device, "showdown matrix boards", final_boards);
@@ -914,7 +910,7 @@ impl GpuDenseCfrBackend {
         );
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("showdown matrix bind group"),
-            layout: &layout,
+            layout: &self.showdown_matrix_bind_group_layout,
             entries: &[
                 bind_entry(0, &combo_buffer),
                 bind_entry(1, &board_buffer),
@@ -932,7 +928,7 @@ impl GpuDenseCfrBackend {
                 label: Some("showdown matrix pass"),
                 timestamp_writes: None,
             });
-            pass.set_pipeline(&pipeline);
+            pass.set_pipeline(&self.showdown_matrix_pipeline);
             pass.set_bind_group(0, &bind_group, &[]);
             let groups = (pair_count as u32).div_ceil(WORKGROUP_SIZE);
             pass.dispatch_workgroups(groups, 1, 1);
