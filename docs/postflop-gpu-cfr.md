@@ -453,6 +453,77 @@ This is the correct escape from the current `pair x node` bottleneck. It still
 has pairwise work at terminal convolutions and denominator reductions, but it no
 longer multiplies every pair by every public node.
 
+### Blocker Aggregates For Denominators
+
+The denominator reductions do not need a combo-vs-combo loop. For each public
+decision infoset `I`, store 53 aggregate slots per player:
+
+```text
+A_p[I,0]      = sum_c r_p[n(I), c]
+A_p[I,k + 1]  = sum_{c contains card k} r_p[n(I), c]
+```
+
+For acting combo `c = {x,y}`, the opponent non-colliding mass is:
+
+```text
+M_opp[I,c] =
+  A_opp[I,0] - A_opp[I,x+1] - A_opp[I,y+1] + r_opp[n(I), c]
+```
+
+The last term restores the exact combo `{x,y}`, which was subtracted once for
+each card. This changes decision denominators from:
+
+```text
+O(|private_infosets| * |C|)
+```
+
+to:
+
+```text
+O(|public_infosets| * 53 * |C|) + O(|private_infosets|)
+```
+
+This is the same algebra used by fold terminal values and should be preferred
+wherever only card blockers, not hand strength order, determine legal opponent
+mass.
+
+### Strength-Prefix Terminal Target
+
+Showdown terminal CFV still has genuine strength-dependent pairwise work. For a
+fixed terminal `z` and final board `b`, define opponent reach buckets by hand
+strength:
+
+```text
+B_v[s] = sum_{v: S[b,v] = s} r_v[z,v]
+P_v[s] = sum_{t < s} B_v[t]
+E_v[s] = B_v[s]
+```
+
+Ignoring blockers for the moment, hero combo `h` with strength `s_h` has:
+
+```text
+win_mass  = P_v[s_h]
+tie_mass  = E_v[s_h]
+eq_mass   = win_mass + 0.5 * tie_mass
+total     = P_v[+inf]
+```
+
+Card blockers must subtract the same prefix/equal aggregates restricted to
+opponent combos containing either private card of `h`. Therefore the useful GPU
+object is not an equity matrix; it is a per-board prefix table with blocker
+lanes:
+
+```text
+prefix_total[b, strength_rank]
+prefix_card[b, card, strength_rank]
+equal_total[b, strength_rank]
+equal_card[b, card, strength_rank]
+```
+
+Then each terminal CFV row becomes a small number of prefix lookups per final
+board instead of scanning every opponent combo. This is the next fundamental
+speed target for terminal CFV.
+
 ## Next Mathematical Cut
 
 The current implementation is still too close to "run a public tree program on

@@ -1307,6 +1307,65 @@ fn tree_aggregate(@builtin(global_invocation_id) id: vec3<u32>) {
 }
 "#;
 
+const PUBLIC_TREE_DECISION_AGGREGATE_SHADER: &str = r#"
+struct Combo { cards: array<u32, 2>, };
+struct Params {
+    combo_count: u32,
+    infoset_count: u32,
+    slots_per_infoset: u32,
+    output_len: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+    _pad3: u32,
+};
+
+@group(0) @binding(0) var<storage, read> decision_nodes: array<u32>;
+@group(0) @binding(1) var<storage, read> combos: array<Combo>;
+@group(0) @binding(2) var<storage, read> hero_reaches: array<f32>;
+@group(0) @binding(3) var<storage, read> villain_reaches: array<f32>;
+@group(0) @binding(4) var<storage, read_write> hero_aggregates: array<f32>;
+@group(0) @binding(5) var<storage, read_write> villain_aggregates: array<f32>;
+@group(0) @binding(6) var<uniform> params: Params;
+
+@compute @workgroup_size(64)
+fn decision_aggregate(@builtin(global_invocation_id) id: vec3<u32>) {
+    let index = id.x + id.y * params.output_len;
+    let output_count = params.infoset_count * params.slots_per_infoset;
+    if index >= output_count {
+        return;
+    }
+    let slot = index % params.slots_per_infoset;
+    let public_infoset = index / params.slots_per_infoset;
+    let node_index = decision_nodes[public_infoset];
+    if node_index == 0xffffffffu {
+        hero_aggregates[index] = 0.0;
+        villain_aggregates[index] = 0.0;
+        return;
+    }
+    let node_offset = node_index * params.combo_count;
+    var hero_sum = 0.0;
+    var villain_sum = 0.0;
+    if slot == 0u {
+        for (var combo = 0u; combo < params.combo_count; combo = combo + 1u) {
+            hero_sum = hero_sum + hero_reaches[node_offset + combo];
+            villain_sum = villain_sum + villain_reaches[node_offset + combo];
+        }
+    } else {
+        let card = slot - 1u;
+        for (var combo = 0u; combo < params.combo_count; combo = combo + 1u) {
+            let private_combo = combos[combo];
+            if private_combo.cards[0] == card || private_combo.cards[1] == card {
+                hero_sum = hero_sum + hero_reaches[node_offset + combo];
+                villain_sum = villain_sum + villain_reaches[node_offset + combo];
+            }
+        }
+    }
+    hero_aggregates[index] = hero_sum;
+    villain_aggregates[index] = villain_sum;
+}
+"#;
+
 const PUBLIC_TREE_DENOMINATOR_SHADER: &str = r#"
 struct Combo { cards: array<u32, 2>, };
 struct TreeNode {
@@ -1339,13 +1398,10 @@ struct Params {
 @group(0) @binding(2) var<storage, read> decision_nodes: array<u32>;
 @group(0) @binding(3) var<storage, read> hero_reaches: array<f32>;
 @group(0) @binding(4) var<storage, read> villain_reaches: array<f32>;
-@group(0) @binding(5) var<storage, read_write> output: array<f32>;
-@group(0) @binding(6) var<uniform> params: Params;
-
-fn collide(left: Combo, right: Combo) -> bool {
-    return left.cards[0] == right.cards[0] || left.cards[0] == right.cards[1]
-        || left.cards[1] == right.cards[0] || left.cards[1] == right.cards[1];
-}
+@group(0) @binding(5) var<storage, read> hero_aggregates: array<f32>;
+@group(0) @binding(6) var<storage, read> villain_aggregates: array<f32>;
+@group(0) @binding(7) var<storage, read_write> output: array<f32>;
+@group(0) @binding(8) var<uniform> params: Params;
 
 @compute @workgroup_size(64)
 fn denominator_mass(@builtin(global_invocation_id) id: vec3<u32>) {
@@ -1371,17 +1427,22 @@ fn denominator_mass(@builtin(global_invocation_id) id: vec3<u32>) {
         return;
     }
 
-    var value_weight = 0.0;
     let node_base = node_index * params.combo_count;
-    for (var opponent = 0u; opponent < params.combo_count; opponent = opponent + 1u) {
-        if collide(combos[acting_combo], combos[opponent]) {
-            continue;
-        }
-        if node.acting_player == 0u {
-            value_weight = value_weight + villain_reaches[node_base + opponent];
-        } else {
-            value_weight = value_weight + hero_reaches[node_base + opponent];
-        }
+    let private_combo = combos[acting_combo];
+    let aggregate_base = public_infoset * 53u;
+    var value_weight = 0.0;
+    if node.acting_player == 0u {
+        let self_reach = villain_reaches[node_base + acting_combo];
+        value_weight = villain_aggregates[aggregate_base]
+            - villain_aggregates[aggregate_base + private_combo.cards[0] + 1u]
+            - villain_aggregates[aggregate_base + private_combo.cards[1] + 1u]
+            + self_reach;
+    } else {
+        let self_reach = hero_reaches[node_base + acting_combo];
+        value_weight = hero_aggregates[aggregate_base]
+            - hero_aggregates[aggregate_base + private_combo.cards[0] + 1u]
+            - hero_aggregates[aggregate_base + private_combo.cards[1] + 1u]
+            + self_reach;
     }
     output[params.output_len * params.max_actions * 2u + private_infoset] = node._pad1 * value_weight;
 }
@@ -1420,6 +1481,8 @@ pub struct GpuDenseCfrBackend {
     public_tree_fold_value_bind_group_layout: wgpu::BindGroupLayout,
     public_tree_backup_pipeline: wgpu::ComputePipeline,
     public_tree_backup_bind_group_layout: wgpu::BindGroupLayout,
+    public_tree_decision_aggregate_pipeline: wgpu::ComputePipeline,
+    public_tree_decision_aggregate_bind_group_layout: wgpu::BindGroupLayout,
     public_tree_denominator_pipeline: wgpu::ComputePipeline,
     public_tree_denominator_bind_group_layout: wgpu::BindGroupLayout,
     public_tree_aggregate_pipeline: wgpu::ComputePipeline,
@@ -1898,6 +1961,39 @@ impl GpuDenseCfrBackend {
                 label: Some("public tree denominator shader"),
                 source: wgpu::ShaderSource::Wgsl(PUBLIC_TREE_DENOMINATOR_SHADER.into()),
             });
+        let public_tree_decision_aggregate_shader =
+            device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("public tree decision aggregate shader"),
+                source: wgpu::ShaderSource::Wgsl(PUBLIC_TREE_DECISION_AGGREGATE_SHADER.into()),
+            });
+        let public_tree_decision_aggregate_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("public tree decision aggregate bind group layout"),
+                entries: &[
+                    storage_entry(0, true),
+                    storage_entry(1, true),
+                    storage_entry(2, true),
+                    storage_entry(3, true),
+                    storage_entry(4, false),
+                    storage_entry(5, false),
+                    uniform_entry(6),
+                ],
+            });
+        let public_tree_decision_aggregate_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("public tree decision aggregate pipeline layout"),
+                bind_group_layouts: &[Some(&public_tree_decision_aggregate_bind_group_layout)],
+                immediate_size: 0,
+            });
+        let public_tree_decision_aggregate_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("public tree decision aggregate pipeline"),
+                layout: Some(&public_tree_decision_aggregate_pipeline_layout),
+                module: &public_tree_decision_aggregate_shader,
+                entry_point: Some("decision_aggregate"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                cache: None,
+            });
         let public_tree_denominator_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("public tree denominator bind group layout"),
@@ -1907,8 +2003,10 @@ impl GpuDenseCfrBackend {
                     storage_entry(2, true),
                     storage_entry(3, true),
                     storage_entry(4, true),
-                    storage_entry(5, false),
-                    uniform_entry(6),
+                    storage_entry(5, true),
+                    storage_entry(6, true),
+                    storage_entry(7, false),
+                    uniform_entry(8),
                 ],
             });
         let public_tree_denominator_pipeline_layout =
@@ -1987,6 +2085,8 @@ impl GpuDenseCfrBackend {
             public_tree_fold_value_bind_group_layout,
             public_tree_backup_pipeline,
             public_tree_backup_bind_group_layout,
+            public_tree_decision_aggregate_pipeline,
+            public_tree_decision_aggregate_bind_group_layout,
             public_tree_denominator_pipeline,
             public_tree_denominator_bind_group_layout,
             public_tree_aggregate_pipeline,
@@ -2867,6 +2967,60 @@ impl GpuDenseCfrBackend {
             nodes.len(),
             actions,
         )?;
+        const DECISION_AGGREGATE_SLOTS: usize = 53;
+        let decision_aggregate_len = public_infoset_count * DECISION_AGGREGATE_SLOTS;
+        let hero_decision_aggregates_buffer = storage_buffer(
+            &self.device,
+            "public tree hero decision aggregates",
+            &vec![0.0f32; decision_aggregate_len],
+        );
+        let villain_decision_aggregates_buffer = storage_buffer(
+            &self.device,
+            "public tree villain decision aggregates",
+            &vec![0.0f32; decision_aggregate_len],
+        );
+        let (
+            decision_aggregate_x_groups,
+            decision_aggregate_y_groups,
+            decision_aggregate_x_invocations,
+        ) = dispatch_grid(decision_aggregate_len);
+        let decision_aggregate_params = uniform_buffer(
+            &self.device,
+            "public tree decision aggregate params",
+            &[GpuPublicTreeParams {
+                combo_count: combos.len() as u32,
+                node_count: public_infoset_count as u32,
+                max_actions: DECISION_AGGREGATE_SLOTS as u32,
+                output_len: decision_aggregate_x_invocations,
+                pair_start: 0,
+                chunk_pairs: 0,
+                _pad0: 0,
+                _pad1: 0,
+            }],
+        );
+        let decision_aggregate_bind_group =
+            self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("public tree decision aggregate bind group"),
+                layout: &self.public_tree_decision_aggregate_bind_group_layout,
+                entries: &[
+                    bind_entry(0, &decision_nodes_buffer),
+                    bind_entry(1, &combo_buffer),
+                    bind_entry(2, &hero_reaches_buffer),
+                    bind_entry(3, &villain_reaches_buffer),
+                    bind_entry(4, &hero_decision_aggregates_buffer),
+                    bind_entry(5, &villain_decision_aggregates_buffer),
+                    bind_entry(6, &decision_aggregate_params),
+                ],
+            });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("public tree decision aggregate pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.public_tree_decision_aggregate_pipeline);
+            pass.set_bind_group(0, &decision_aggregate_bind_group, &[]);
+            pass.dispatch_workgroups(decision_aggregate_x_groups, decision_aggregate_y_groups, 1);
+        }
         for (label, value_player) in [("hero", 0u32), ("villain", 1u32)] {
             let denominator_params = uniform_buffer(
                 &self.device,
@@ -2892,8 +3046,10 @@ impl GpuDenseCfrBackend {
                         bind_entry(2, &decision_nodes_buffer),
                         bind_entry(3, &hero_reaches_buffer),
                         bind_entry(4, &villain_reaches_buffer),
-                        bind_entry(5, &output_buffer),
-                        bind_entry(6, &denominator_params),
+                        bind_entry(5, &hero_decision_aggregates_buffer),
+                        bind_entry(6, &villain_decision_aggregates_buffer),
+                        bind_entry(7, &output_buffer),
+                        bind_entry(8, &denominator_params),
                     ],
                 });
             {
