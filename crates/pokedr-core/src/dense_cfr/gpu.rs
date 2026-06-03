@@ -799,9 +799,9 @@ struct Params {
     terminal_count: u32,
     tile_count: u32,
     tile_size: u32,
-    value_player: u32,
+    board_tile_count: u32,
     x_invocations: u32,
-    _pad2: u32,
+    board_tile_size: u32,
     _pad3: u32,
 };
 
@@ -837,13 +837,15 @@ fn combo_hits_board(combo: Combo, board: FinalBoard) -> bool {
 @compute @workgroup_size(64)
 fn terminal_partial(@builtin(global_invocation_id) id: vec3<u32>) {
     let index = id.x + id.y * params.x_invocations;
-    let output_count = params.terminal_count * params.combo_count * params.tile_count;
+    let tile_stride = params.tile_count * params.board_tile_count;
+    let output_count = params.terminal_count * params.combo_count * tile_stride;
     if index >= output_count {
         return;
     }
-    let tile = index % params.tile_count;
-    let combo = (index / params.tile_count) % params.combo_count;
-    let terminal_slot = index / (params.tile_count * params.combo_count);
+    let board_tile = index % params.board_tile_count;
+    let tile = (index / params.board_tile_count) % params.tile_count;
+    let combo = (index / tile_stride) % params.combo_count;
+    let terminal_slot = index / (tile_stride * params.combo_count);
     let node_index = terminal_nodes[terminal_slot];
     let node = nodes[node_index];
     let node_offset = node_index * params.combo_count;
@@ -874,19 +876,22 @@ fn terminal_partial(@builtin(global_invocation_id) id: vec3<u32>) {
         }
     } else {
         let board_count = node._pad0;
+        let board_start = board_tile * params.board_tile_size;
+        let board_end = min(board_start + params.board_tile_size, board_count);
         for (var opponent = opponent_start; opponent < opponent_end; opponent = opponent + 1u) {
             if collide(combos[combo], combos[opponent]) {
                 continue;
             }
             var equity_sum = 0.0;
-            var valid_boards = 0u;
-            for (var board = 0u; board < board_count; board = board + 1u) {
+            var valid_boards_tile = 0u;
+            var valid_boards_total = 0u;
+            for (var board = board_start; board < board_end; board = board + 1u) {
                 let final_board_index = node.showdown_offset + board;
                 let final_board = boards[final_board_index];
                 if combo_hits_board(combos[combo], final_board) || combo_hits_board(combos[opponent], final_board) {
                     continue;
                 }
-                valid_boards = valid_boards + 1u;
+                valid_boards_tile = valid_boards_tile + 1u;
                 let strength_offset = final_board_index * params.combo_count;
                 let combo_strength = strengths[strength_offset + combo];
                 let opponent_strength = strengths[strength_offset + opponent];
@@ -896,9 +901,30 @@ fn terminal_partial(@builtin(global_invocation_id) id: vec3<u32>) {
                     equity_sum = equity_sum + 0.5;
                 }
             }
-            let equity = select(0.5, equity_sum / f32(valid_boards), valid_boards > 0u);
-            let hero_payoff = equity * node.pot - node.hero_invested;
-            let villain_payoff = equity * node.pot - (node.pot - node.hero_invested);
+            if params.board_tile_count == 1u {
+                valid_boards_total = valid_boards_tile;
+            } else {
+                valid_boards_total = 0u;
+                for (var board = 0u; board < board_count; board = board + 1u) {
+                    let final_board_index = node.showdown_offset + board;
+                    let final_board = boards[final_board_index];
+                    if combo_hits_board(combos[combo], final_board) || combo_hits_board(combos[opponent], final_board) {
+                        continue;
+                    }
+                    valid_boards_total = valid_boards_total + 1u;
+                }
+            }
+            var hero_payoff = 0.0;
+            var villain_payoff = 0.0;
+            if valid_boards_total > 0u {
+                let board_weight = f32(valid_boards_tile) / f32(valid_boards_total);
+                let equity_share = equity_sum / f32(valid_boards_total);
+                hero_payoff = equity_share * node.pot - board_weight * node.hero_invested;
+                villain_payoff = equity_share * node.pot - board_weight * (node.pot - node.hero_invested);
+            } else if board_tile == 0u {
+                hero_payoff = 0.5 * node.pot - node.hero_invested;
+                villain_payoff = 0.5 * node.pot - (node.pot - node.hero_invested);
+            }
             hero_value = hero_value + villain_reaches[node_offset + opponent] * hero_payoff;
             villain_value = villain_value + hero_reaches[node_offset + opponent] * villain_payoff;
         }
@@ -914,7 +940,7 @@ struct Params {
     terminal_count: u32,
     tile_count: u32,
     output_len: u32,
-    value_player: u32,
+    board_tile_count: u32,
     x_invocations: u32,
     _pad2: u32,
     _pad3: u32,
@@ -937,12 +963,13 @@ fn terminal_reduce(@builtin(global_invocation_id) id: vec3<u32>) {
     let combo = index % params.combo_count;
     let terminal_slot = index / params.combo_count;
     let node_index = terminal_nodes[terminal_slot];
-    let partial_base = (terminal_slot * params.combo_count + combo) * params.tile_count;
+    let partial_count = params.tile_count * params.board_tile_count;
+    let partial_base = (terminal_slot * params.combo_count + combo) * partial_count;
     var hero_value = 0.0;
     var villain_value = 0.0;
-    for (var tile = 0u; tile < params.tile_count; tile = tile + 1u) {
-        hero_value = hero_value + hero_partials[partial_base + tile];
-        villain_value = villain_value + villain_partials[partial_base + tile];
+    for (var partial = 0u; partial < partial_count; partial = partial + 1u) {
+        hero_value = hero_value + hero_partials[partial_base + partial];
+        villain_value = villain_value + villain_partials[partial_base + partial];
     }
     let value_index = node_index * params.combo_count + combo;
     hero_values[value_index] = hero_value;
@@ -2382,16 +2409,19 @@ impl GpuDenseCfrBackend {
         combo_count: usize,
         tile_count: usize,
         tile_size: usize,
+        board_tile_count: usize,
+        board_tile_size: usize,
         terminal_chunk_size: usize,
     ) -> Result<(), GpuCfrError> {
-        if terminal_nodes.is_empty() || combo_count == 0 || tile_count == 0 {
+        if terminal_nodes.is_empty() || combo_count == 0 || tile_count == 0 || board_tile_count == 0
+        {
             return Ok(());
         }
         for terminal_chunk in terminal_nodes.chunks(terminal_chunk_size.max(1)) {
             let terminal_count = terminal_chunk.len();
             let terminal_nodes_buffer =
                 readonly_buffer(&self.device, "public tree terminal nodes", terminal_chunk);
-            let partial_invocations = terminal_count * combo_count * tile_count;
+            let partial_invocations = terminal_count * combo_count * tile_count * board_tile_count;
             let (partial_x_groups, partial_y_groups, partial_x_invocations) =
                 dispatch_grid(partial_invocations);
             let partial_params = uniform_buffer(
@@ -2402,9 +2432,9 @@ impl GpuDenseCfrBackend {
                     node_count: terminal_count as u32,
                     max_actions: tile_count as u32,
                     output_len: tile_size as u32,
-                    pair_start: 0,
+                    pair_start: board_tile_count as u32,
                     chunk_pairs: partial_x_invocations,
-                    _pad0: 0,
+                    _pad0: board_tile_size as u32,
                     _pad1: 0,
                 }],
             );
@@ -2436,7 +2466,7 @@ impl GpuDenseCfrBackend {
                     node_count: terminal_count as u32,
                     max_actions: tile_count as u32,
                     output_len: 0,
-                    pair_start: 0,
+                    pair_start: board_tile_count as u32,
                     chunk_pairs: reduce_x_invocations,
                     _pad0: 0,
                     _pad1: 0,
@@ -2644,23 +2674,49 @@ impl GpuDenseCfrBackend {
             .max(1)
             .min(combos.len().max(1));
         let terminal_tile_size = combos.len().div_ceil(terminal_tile_count);
-        let max_terminal_partial_values = 32_000_000usize;
-        let terminal_chunk_size =
-            (max_terminal_partial_values / (combos.len() * terminal_tile_count)).max(1);
+        let max_showdown_boards = showdown_terminal_nodes
+            .iter()
+            .map(|node_index| nodes[*node_index as usize]._pad0 as usize)
+            .max()
+            .unwrap_or(1)
+            .max(1);
+        let terminal_board_tile_count = std::env::var("POKEDR_GPU_BOARD_TILES")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(1)
+            .max(1)
+            .min(max_showdown_boards);
+        let terminal_board_tile_size = max_showdown_boards.div_ceil(terminal_board_tile_count);
+        let terminal_parallel_factor = terminal_tile_count * terminal_board_tile_count;
+        let default_max_terminal_partial_values = if terminal_parallel_factor > 1 {
+            16_000_000usize
+        } else {
+            32_000_000usize
+        };
+        let max_terminal_partial_values = std::env::var("POKEDR_GPU_MAX_TERMINAL_PARTIAL_VALUES")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(default_max_terminal_partial_values)
+            .max(combos.len() * terminal_parallel_factor);
+        let terminal_chunk_size = (max_terminal_partial_values
+            / (combos.len() * terminal_tile_count * terminal_board_tile_count))
+            .max(1);
         let terminal_partial_len = terminal_chunk_size
             .min(showdown_terminal_nodes.len())
             .max(1)
             * combos.len()
-            * terminal_tile_count;
+            * terminal_tile_count
+            * terminal_board_tile_count;
         if std::env::var_os("POKEDR_SOLVER_PROGRESS_OFF").is_none() {
             eprintln!(
-                "pokedr: gpu public tree cfv nodes={} combos={} node_combo_values={} folds={} showdowns={} terminal_tiles={} terminal_chunk={}",
+                "pokedr: gpu public tree cfv nodes={} combos={} node_combo_values={} folds={} showdowns={} terminal_tiles={} board_tiles={} terminal_chunk={}",
                 nodes.len(),
                 combos.len(),
                 node_combo_len,
                 fold_terminal_nodes.len(),
                 showdown_terminal_nodes.len(),
                 terminal_tile_count,
+                terminal_board_tile_count,
                 terminal_chunk_size
             );
         }
@@ -2792,6 +2848,8 @@ impl GpuDenseCfrBackend {
             combos.len(),
             terminal_tile_count,
             terminal_tile_size,
+            terminal_board_tile_count,
+            terminal_board_tile_size,
             terminal_chunk_size,
         )?;
 
