@@ -1047,11 +1047,12 @@ struct Params {
 @group(0) @binding(0) var<storage, read> nodes: array<TreeNode>;
 @group(0) @binding(1) var<storage, read> children: array<u32>;
 @group(0) @binding(2) var<storage, read> combos: array<Combo>;
-@group(0) @binding(3) var<storage, read> hero_reaches: array<f32>;
-@group(0) @binding(4) var<storage, read> villain_reaches: array<f32>;
-@group(0) @binding(5) var<storage, read> values: array<f32>;
-@group(0) @binding(6) var<storage, read_write> output: array<f32>;
-@group(0) @binding(7) var<uniform> params: Params;
+@group(0) @binding(3) var<storage, read> decision_nodes: array<u32>;
+@group(0) @binding(4) var<storage, read> hero_reaches: array<f32>;
+@group(0) @binding(5) var<storage, read> villain_reaches: array<f32>;
+@group(0) @binding(6) var<storage, read> values: array<f32>;
+@group(0) @binding(7) var<storage, read_write> output: array<f32>;
+@group(0) @binding(8) var<uniform> params: Params;
 
 fn collide(left: Combo, right: Combo) -> bool {
     return left.cards[0] == right.cards[0] || left.cards[0] == right.cards[1]
@@ -1074,16 +1075,8 @@ fn tree_aggregate(@builtin(global_invocation_id) id: vec3<u32>) {
         return;
     }
 
-    var node_index = 0u;
-    var found = false;
-    for (var i = 0u; i < params.node_count; i = i + 1u) {
-        let node = nodes[i];
-        if node.kind == 0u && node.public_infoset == public_infoset {
-            node_index = i;
-            found = true;
-        }
-    }
-    if !found {
+    let node_index = decision_nodes[public_infoset];
+    if node_index == 0xffffffffu {
         output[index] = 0.0;
         output[action_len + index] = 0.0;
         return;
@@ -1514,8 +1507,9 @@ impl GpuDenseCfrBackend {
                     storage_entry(3, true),
                     storage_entry(4, true),
                     storage_entry(5, true),
-                    storage_entry(6, false),
-                    uniform_entry(7),
+                    storage_entry(6, true),
+                    storage_entry(7, false),
+                    uniform_entry(8),
                 ],
             });
         let public_tree_aggregate_pipeline_layout =
@@ -2041,6 +2035,15 @@ impl GpuDenseCfrBackend {
             .enumerate()
             .filter_map(|(index, node)| (node.kind != 0 && node.kind != 1).then_some(index as u32))
             .collect();
+        let public_infoset_count = nodes_public_infoset_count(nodes);
+        let mut decision_nodes = vec![u32::MAX; public_infoset_count];
+        for (index, node) in nodes.iter().enumerate() {
+            if node.kind == 0 {
+                decision_nodes[node.public_infoset as usize] = index as u32;
+            }
+        }
+        let decision_nodes_buffer =
+            readonly_buffer(&self.device, "public tree decision nodes", &decision_nodes);
         let terminal_tile_count = std::env::var("POKEDR_GPU_TERMINAL_TILES")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
@@ -2225,11 +2228,12 @@ impl GpuDenseCfrBackend {
                 bind_entry(0, &node_buffer),
                 bind_entry(1, &child_buffer),
                 bind_entry(2, &combo_buffer),
-                bind_entry(3, &hero_reaches_buffer),
-                bind_entry(4, &villain_reaches_buffer),
-                bind_entry(5, &values_buffer),
-                bind_entry(6, &output_buffer),
-                bind_entry(7, &hero_aggregate_params),
+                bind_entry(3, &decision_nodes_buffer),
+                bind_entry(4, &hero_reaches_buffer),
+                bind_entry(5, &villain_reaches_buffer),
+                bind_entry(6, &values_buffer),
+                bind_entry(7, &output_buffer),
+                bind_entry(8, &hero_aggregate_params),
             ],
         });
         let mut encoder = self
@@ -2354,11 +2358,12 @@ impl GpuDenseCfrBackend {
                     bind_entry(0, &node_buffer),
                     bind_entry(1, &child_buffer),
                     bind_entry(2, &combo_buffer),
-                    bind_entry(3, &hero_reaches_buffer),
-                    bind_entry(4, &villain_reaches_buffer),
-                    bind_entry(5, &values_buffer),
-                    bind_entry(6, &output_buffer),
-                    bind_entry(7, &villain_aggregate_params),
+                    bind_entry(3, &decision_nodes_buffer),
+                    bind_entry(4, &hero_reaches_buffer),
+                    bind_entry(5, &villain_reaches_buffer),
+                    bind_entry(6, &values_buffer),
+                    bind_entry(7, &output_buffer),
+                    bind_entry(8, &villain_aggregate_params),
                 ],
             });
         let mut encoder = self

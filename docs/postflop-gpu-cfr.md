@@ -121,7 +121,24 @@ regret[I,c,a] += reach_weight[I,c] *
 
 ## GPU Work Split
 
-The correct reusable GPU table is:
+The solver target is not "recursive CFR that happens to run in GPU shaders".
+The target is a sequence of vector and sparse-matrix operations over a fixed
+public tree. CPU code may build the sparse structure, but each iteration should
+be GPU-resident linear algebra:
+
+```text
+reach propagation:   r_next = T(sigma) * r
+terminal CFV:        v_z    = U_z * r_opp
+chance/decision DP:  v_n    = B_n(sigma) * v_children
+infoset aggregate:   A      = G * v
+regret update:       R      = f(R, A, reach_weight, strategy_weight)
+```
+
+Where `T`, `U_z`, `B_n`, and `G` are implicit sparse/dense operators encoded as
+GPU buffers. They do not need to be materialized as full matrices, but kernels
+must use their row/column structure rather than CPU-style recursive traversal.
+
+The correct reusable card table is:
 
 ```text
 strength[final_board_index][combo] -> u32
@@ -152,22 +169,55 @@ The intended GPU iteration is:
 
 1. Build or reuse `strength[b, c]` for final boards reachable from the public
    tree.
-2. For combo-pair chunks, run public-tree forward reach:
+2. Run public-tree forward reach as a sparse transition operator. For each
+   public edge `e = n -> child(n,a)`:
 
 ```text
-(pi_h, pi_v, pi_c)[node, pair]
+r_h[child, h] += T_h[e, h] * r_h[n, h]
+r_v[child, v] += T_v[e, v] * r_v[n, v]
 ```
 
-3. Run public-tree backward value. At showdown terminals compute:
+   At a hero decision edge, `T_h[e,h] = sigma[I(n),h,a]` and
+   `T_v[e,v] = 1`. At a villain decision edge this is reversed. At chance
+   edges, `T_*` is the card-blocking mask.
+
+3. Run terminal CFV as matrix-vector products. For each terminal `z`:
 
 ```text
-W = compare(strength[b, c_h], strength[b, c_v])
-V_h = p(z) * W - i_h(z)
+V_h[z, h] = sum_v U_h[z, h, v] * r_v[z, v]
+V_v[z, v] = sum_h U_v[z, h, v] * r_h[z, h]
 ```
 
-4. Reduce chunk contributions into `A`, `M`, `reach_weight`, and
-   `strategy_weight`.
-5. Apply dense CFR regret/strategy update on GPU.
+   This is the main dense GEMV-like operation. A GPU implementation must split
+   rows/columns into tiles:
+
+```text
+partial[z, h, tile] = sum_{v in tile} U_h[z,h,v] * r_v[z,v]
+V_h[z,h]            = sum_tile partial[z,h,tile]
+```
+
+   The same applies to villain values. `U` is implicit: the shader compares
+   `strength[b,h]` and `strength[b,v]`, applies pot/investment, and multiplies
+   by reach.
+
+4. Run non-terminal backup as a sparse edge operator over reverse topological
+   layers:
+
+```text
+V_p[n, c] = sum_{child} B_p[n, child, c] * V_p[child, c]
+```
+
+   At own decision nodes, `B` contains strategy probabilities. At opponent
+   decision nodes and chance nodes, `B` is usually a masked sum.
+
+5. Aggregate action values and CFR weights as a sparse gather:
+
+```text
+A[I,c,a] = sum_{n maps to I} V[child(n,a), c]
+M[I,c,a] = sum_{n maps to I} opponent_reach_mass[n,c]
+```
+
+6. Apply dense CFR regret/strategy update on GPU.
 
 The chunk boundary may split combo pairs, but it must not change math. The
 chunk outputs are additive numerators and denominators; division happens only
@@ -183,7 +233,7 @@ after all chunks are reduced.
   correctness test; use small deterministic fixtures for equality and invariants
   for large runs.
 
-## Implemented Direction
+## Implemented Direction And Gap
 
 The implementation has moved away from pair chunks. It now uses the ordinary
 counterfactual value vector shape:
@@ -200,11 +250,40 @@ The reusable showdown object is still the final-board strength table:
 strengths: array<u32> indexed by board_index * combo_count + combo
 ```
 
-The value shader computes terminal payoff by comparing two strength lookups and
-reducing over the opponent reach vector. It computes hero values, aggregates
-hero infosets, then reuses the same value buffer for villain values and
-aggregates villain infosets. This avoids keeping both `value_h` and `value_v`
-resident at the same time.
+The value path computes hero values, aggregates hero infosets, then reuses the
+same value buffer for villain values and aggregates villain infosets. This
+avoids keeping both `value_h` and `value_v` resident at the same time.
+
+The current terminal CFV path is partially matrix-shaped:
+
+```text
+partial[z, c, tile] = sum_{opp in tile} U[z,c,opp] * reach_opp[z,opp]
+value[z,c]          = sum_tile partial[z,c,tile]
+```
+
+This removed the worst per-thread opponent loop, but it is not yet the full
+linear-algebra solver. The remaining gaps are:
+
+- reach propagation is still one shader thread per combo walking all public
+  nodes;
+- non-terminal backup is still scheduled by CPU node chunks, not by reverse
+  sparse layers;
+- action aggregation still searches public nodes inside the shader instead of
+  using a compact gather table;
+- terminal partial chunks are synchronized separately to respect the DZN/wgpu
+  storage binding limit.
+
+The next implementation step is therefore not another recursive traversal
+optimization. It is to add explicit sparse operator buffers:
+
+```text
+decision_edges[player, public_infoset, action, child]
+chance_edges[parent, child, card]
+aggregate_rows[private_infoset, action] -> node/action rows
+reverse_layers[k] -> node range/list
+```
+
+and make reach, backup, and aggregate kernels consume those buffers directly.
 
 ## First Measurement
 
