@@ -562,7 +562,6 @@ fn state_after_aggressive_action(state: &PublicState, amount: u32) -> PublicStat
     let contribution = amount.min(state.effective_stack);
     let mut next = state.clone();
     next.pot = next.pot.saturating_add(contribution);
-    next.effective_stack = next.effective_stack.saturating_sub(contribution);
     next.to_call = contribution;
     next.min_aggressive_amount = contribution.saturating_mul(2).max(1);
     next.acting_player = state.acting_player.next();
@@ -911,6 +910,18 @@ mod tests {
         };
         assert_eq!(*street, Street::Turn);
         assert_eq!(cards.len(), 49);
+    }
+
+    #[test]
+    fn large_bet_keeps_next_actor_able_to_call() {
+        let state = PublicState {
+            effective_stack: 100,
+            ..root_state(Street::Flop)
+        };
+        let next = state_after_aggressive_action(&state, 75);
+
+        assert_eq!(next.to_call, 75);
+        assert_eq!(next.effective_stack, 100);
     }
 
     #[test]

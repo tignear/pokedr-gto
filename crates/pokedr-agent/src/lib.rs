@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use pokedr_core::{
     cards::{Board, Card as PokedrCard, Rank as PokedrRank, Suit as PokedrSuit, evaluate},
     dense_cfr::gpu::{GpuCfrError, GpuDenseCfrBackend},
+    dense_cfr::{CfrVariant, DenseCfrIteration, DenseCfrState},
     postflop::{
         ActionSetConfig, Player, PlayerAction, PublicNodeKind, PublicState, Street, SubgameTree,
         SubgameTreeConfig, TerminalKind,
@@ -124,8 +125,8 @@ impl PokedrAgent {
         let Some(hero_cards) = hero_cards_from_game(game_state) else {
             return AgentAction::Call;
         };
-        let values = solve_public_tree_values(&tree, &layout, hero_cards, &self.config);
-        let action_index = best_legal_action(&layout, &values);
+        let state = solve_public_tree_cfr(&tree, &layout, hero_cards, &self.config);
+        let action_index = best_average_strategy_action(&layout, &state);
         let action = layout
             .action(&tree, 0, action_index)
             .map(|candidate| candidate.action)
@@ -198,13 +199,18 @@ struct PostflopEvaluationContext {
     equity_cache: HashMap<u64, f32>,
 }
 
-fn solve_public_tree_values(
+fn solve_public_tree_cfr(
     tree: &SubgameTree,
     layout: &PostflopDenseLayout,
     hero_cards: [PokedrCard; 2],
     config: &PokedrAgentConfig,
-) -> Vec<f32> {
-    let mut values = vec![0.0; layout.infoset_count() * layout.max_actions()];
+) -> DenseCfrState {
+    let dense_config = layout.dense_config(CfrVariant::CfrPlus);
+    let mut state = DenseCfrState::new_with_legal_actions(
+        dense_config.clone(),
+        layout.legal_actions().to_vec(),
+    );
+    let mut batch = DenseCfrIteration::new(&dense_config);
     let mut ctx = PostflopEvaluationContext {
         hero_cards,
         indexer: ComboIndexer::new(),
@@ -212,9 +218,37 @@ fn solve_public_tree_values(
         equity_cache: HashMap::new(),
     };
 
+    for iteration in 1..=config.cfr_iterations.max(1) {
+        fill_public_tree_iteration(tree, layout, &state, &mut ctx, &mut batch);
+        batch.validate(&dense_config);
+        state.update_all_infosets(
+            &batch.action_values,
+            &batch.reach_weights,
+            &batch.strategy_weights,
+            iteration,
+        );
+    }
+    state
+}
+
+fn fill_public_tree_iteration(
+    tree: &SubgameTree,
+    layout: &PostflopDenseLayout,
+    cfr_state: &DenseCfrState,
+    ctx: &mut PostflopEvaluationContext,
+    batch: &mut DenseCfrIteration,
+) {
+    batch.action_values.fill(0.0);
+    batch.reach_weights.fill(0.0);
+    batch.strategy_weights.fill(0.0);
+
     for infoset in 0..layout.infoset_count() {
         let node_index = layout.infoset_node(infoset);
-        let PublicNodeKind::Decision { state, actions } = &tree.nodes()[node_index].kind else {
+        let PublicNodeKind::Decision {
+            state: public_state,
+            actions,
+        } = &tree.nodes()[node_index].kind
+        else {
             unreachable!("infoset nodes are decisions");
         };
         let offset = infoset * layout.max_actions();
@@ -222,22 +256,36 @@ fn solve_public_tree_values(
             let child = layout
                 .child_for_action(infoset, action_index)
                 .expect("legal action must have a child");
-            values[offset + action_index] =
-                evaluate_action_child(tree, child, state, actions[action_index].action, &mut ctx);
+            batch.action_values[offset + action_index] = evaluate_action_child(
+                tree,
+                layout,
+                child,
+                public_state,
+                actions[action_index].action,
+                cfr_state,
+                ctx,
+            );
+        }
+        if public_state.acting_player == Player::Hero {
+            batch.reach_weights[infoset] = 1.0;
+            batch.strategy_weights[infoset] = 1.0;
         }
     }
-    values
 }
 
 fn evaluate_action_child(
     tree: &SubgameTree,
+    layout: &PostflopDenseLayout,
     node_index: usize,
     parent_state: &PublicState,
     parent_action: PlayerAction,
+    cfr_state: &DenseCfrState,
     ctx: &mut PostflopEvaluationContext,
 ) -> f32 {
     match &tree.nodes()[node_index].kind {
-        PublicNodeKind::Decision { state, .. } => evaluate_decision(tree, node_index, state, ctx),
+        PublicNodeKind::Decision { state, .. } => {
+            evaluate_decision(tree, layout, node_index, state, cfr_state, ctx)
+        }
         PublicNodeKind::Chance { cards, .. } => {
             let mut sum = 0.0;
             let mut count = 0;
@@ -245,7 +293,7 @@ fn evaluate_action_child(
                 if card.deck_mask() & hero_mask(ctx.hero_cards) != 0 {
                     continue;
                 }
-                sum += evaluate_node(tree, *child, ctx);
+                sum += evaluate_node(tree, layout, *child, cfr_state, ctx);
                 count += 1;
             }
             if count == 0 { 0.0 } else { sum / count as f32 }
@@ -259,11 +307,15 @@ fn evaluate_action_child(
 
 fn evaluate_node(
     tree: &SubgameTree,
+    layout: &PostflopDenseLayout,
     node_index: usize,
+    cfr_state: &DenseCfrState,
     ctx: &mut PostflopEvaluationContext,
 ) -> f32 {
     match &tree.nodes()[node_index].kind {
-        PublicNodeKind::Decision { state, .. } => evaluate_decision(tree, node_index, state, ctx),
+        PublicNodeKind::Decision { state, .. } => {
+            evaluate_decision(tree, layout, node_index, state, cfr_state, ctx)
+        }
         PublicNodeKind::Chance { cards, .. } => {
             let mut sum = 0.0;
             let mut count = 0;
@@ -271,7 +323,7 @@ fn evaluate_node(
                 if card.deck_mask() & hero_mask(ctx.hero_cards) != 0 {
                     continue;
                 }
-                sum += evaluate_node(tree, *child, ctx);
+                sum += evaluate_node(tree, layout, *child, cfr_state, ctx);
                 count += 1;
             }
             if count == 0 { 0.0 } else { sum / count as f32 }
@@ -285,8 +337,10 @@ fn evaluate_node(
 
 fn evaluate_decision(
     tree: &SubgameTree,
+    layout: &PostflopDenseLayout,
     node_index: usize,
     state: &PublicState,
+    cfr_state: &DenseCfrState,
     ctx: &mut PostflopEvaluationContext,
 ) -> f32 {
     let PublicNodeKind::Decision { actions, .. } = &tree.nodes()[node_index].kind else {
@@ -296,17 +350,43 @@ fn evaluate_decision(
     for (action, child) in actions.iter().zip(&tree.nodes()[node_index].children) {
         values.push(evaluate_action_child(
             tree,
+            layout,
             *child,
             state,
             action.action,
+            cfr_state,
             ctx,
         ));
     }
-    if state.acting_player == Player::Hero {
-        values.into_iter().fold(f32::NEG_INFINITY, f32::max)
-    } else {
-        values.iter().sum::<f32>() / values.len().max(1) as f32
+    let Some(infoset) = layout.node_infoset(node_index) else {
+        return values.iter().sum::<f32>() / values.len().max(1) as f32;
+    };
+    let mut strategy = vec![0.0; layout.max_actions()];
+    cfr_state.strategy_for(infoset, &mut strategy);
+    values
+        .iter()
+        .zip(strategy)
+        .map(|(value, probability)| value * probability)
+        .sum()
+}
+
+fn best_average_strategy_action(layout: &PostflopDenseLayout, state: &DenseCfrState) -> usize {
+    let mut strategy = vec![0.0; layout.max_actions()];
+    state.average_strategy_for(0, &mut strategy);
+    let mut best = 0;
+    let mut best_probability = f32::NEG_INFINITY;
+    for (action, probability) in strategy
+        .iter()
+        .copied()
+        .enumerate()
+        .take(layout.action_count(0))
+    {
+        if probability > best_probability {
+            best = action;
+            best_probability = probability;
+        }
     }
+    best
 }
 
 fn fold_utility(parent_state: &PublicState, parent_action: PlayerAction, pot: u32) -> f32 {
@@ -417,19 +497,6 @@ fn evaluate_seven(
 
 fn hero_mask(hero_cards: [PokedrCard; 2]) -> u64 {
     hero_cards[0].deck_mask() | hero_cards[1].deck_mask()
-}
-
-fn best_legal_action(layout: &PostflopDenseLayout, values: &[f32]) -> usize {
-    let mut best = 0;
-    let mut best_value = f32::NEG_INFINITY;
-    for action in 0..layout.action_count(0) {
-        let value = values[action];
-        if value > best_value {
-            best = action;
-            best_value = value;
-        }
-    }
-    best
 }
 
 fn public_state_from_game(game_state: &GameState) -> Option<PublicState> {
@@ -607,5 +674,58 @@ mod tests {
         };
 
         assert!(showdown_equity(&board, &mut strong) > showdown_equity(&board, &mut weak));
+    }
+
+    #[test]
+    fn public_tree_cfr_produces_normalized_root_strategy() {
+        let tree = SubgameTree::build(
+            PublicState {
+                street: Street::Flop,
+                board: Board::new(vec![
+                    PokedrCard::new(PokedrRank::Ace, PokedrSuit::Spades),
+                    PokedrCard::new(PokedrRank::Seven, PokedrSuit::Hearts),
+                    PokedrCard::new(PokedrRank::Two, PokedrSuit::Clubs),
+                ]),
+                pot: 10,
+                effective_stack: 30,
+                to_call: 0,
+                min_aggressive_amount: 5,
+                acting_player: Player::Hero,
+                raises_this_street: 0,
+                checks_this_street: 0,
+            },
+            SubgameTreeConfig {
+                action_set: ActionSetConfig {
+                    max_aggressive_actions: 1,
+                    flop_bet_fractions: vec![0.5],
+                    turn_bet_fractions: vec![0.5],
+                    river_bet_fractions: vec![0.5],
+                    raise_fractions: vec![1.0],
+                    ..ActionSetConfig::default()
+                },
+                max_raises_per_street: 1,
+                max_depth: 3,
+            },
+        );
+        let layout = PostflopDenseLayout::from_tree(&tree);
+        let state = solve_public_tree_cfr(
+            &tree,
+            &layout,
+            [
+                PokedrCard::new(PokedrRank::Ace, PokedrSuit::Clubs),
+                PokedrCard::new(PokedrRank::King, PokedrSuit::Diamonds),
+            ],
+            &PokedrAgentConfig {
+                cfr_iterations: 4,
+                max_showdown_runouts: 8,
+                ..PokedrAgentConfig::default()
+            },
+        );
+        let mut strategy = vec![0.0; layout.max_actions()];
+        state.average_strategy_for(0, &mut strategy);
+        let legal_sum: f32 = strategy.iter().take(layout.action_count(0)).sum();
+
+        assert!((legal_sum - 1.0).abs() < 1e-5);
+        assert!(strategy.iter().all(|value| value.is_finite()));
     }
 }
