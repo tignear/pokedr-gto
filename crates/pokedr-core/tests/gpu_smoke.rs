@@ -40,7 +40,7 @@ fn run_one_shot_update(backend: &GpuDenseCfrBackend) {
     for variant in [
         CfrVariant::CfrPlus,
         CfrVariant::Discounted,
-        CfrVariant::DcfrPlus,
+        CfrVariant::dcfr_plus_default(),
     ] {
         let config = DenseCfrConfig {
             infosets: 4,
@@ -111,7 +111,7 @@ fn run_resident_updates(backend: &GpuDenseCfrBackend) {
     for variant in [
         CfrVariant::CfrPlus,
         CfrVariant::Discounted,
-        CfrVariant::DcfrPlus,
+        CfrVariant::dcfr_plus_default(),
     ] {
         let config = DenseCfrConfig {
             infosets: 8,

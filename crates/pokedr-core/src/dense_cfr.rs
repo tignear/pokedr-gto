@@ -1,8 +1,24 @@
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub const DEFAULT_DCFR_PLUS_ALPHA: f32 = 1.5;
+pub const DEFAULT_DCFR_PLUS_GAMMA: f32 = 4.0;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum CfrVariant {
     CfrPlus,
     Discounted,
-    DcfrPlus,
+    DcfrPlus { alpha: f32, gamma: f32 },
+}
+
+impl CfrVariant {
+    pub const fn dcfr_plus_default() -> Self {
+        Self::DcfrPlus {
+            alpha: DEFAULT_DCFR_PLUS_ALPHA,
+            gamma: DEFAULT_DCFR_PLUS_GAMMA,
+        }
+    }
+
+    pub fn is_dcfr_plus(self) -> bool {
+        matches!(self, Self::DcfrPlus { .. })
+    }
 }
 
 pub mod gpu;
@@ -172,7 +188,10 @@ impl DenseCfrState {
             let slot = &mut self.regrets[offset + action];
             *slot *= discount;
             *slot += regret;
-            if matches!(self.variant, CfrVariant::CfrPlus | CfrVariant::DcfrPlus) {
+            if matches!(
+                self.variant,
+                CfrVariant::CfrPlus | CfrVariant::DcfrPlus { .. }
+            ) {
                 *slot = slot.max(0.0);
             }
             self.strategy_sum[offset + action] *=
@@ -303,11 +322,11 @@ fn regret_discount(variant: CfrVariant, iteration: usize) -> f32 {
             let t = iteration.max(1) as f32;
             t / (t + 1.0)
         }
-        CfrVariant::DcfrPlus => {
+        CfrVariant::DcfrPlus { alpha, .. } => {
             if iteration <= 1 {
                 0.0
             } else {
-                let weighted = ((iteration - 1) as f32).powf(1.5);
+                let weighted = ((iteration - 1) as f32).powf(alpha);
                 weighted / (weighted + 1.5)
             }
         }
@@ -316,8 +335,8 @@ fn regret_discount(variant: CfrVariant, iteration: usize) -> f32 {
 
 fn average_strategy_discount(variant: CfrVariant, iteration: usize) -> f32 {
     match variant {
-        CfrVariant::DcfrPlus if iteration > 1 => {
-            (((iteration - 1) as f32) / iteration as f32).powf(4.0)
+        CfrVariant::DcfrPlus { gamma, .. } if iteration > 1 => {
+            (((iteration - 1) as f32) / iteration as f32).powf(gamma)
         }
         _ => 1.0,
     }
@@ -387,7 +406,7 @@ mod tests {
         let mut state = DenseCfrState::new(DenseCfrConfig {
             infosets: 1,
             actions: 2,
-            variant: CfrVariant::DcfrPlus,
+            variant: CfrVariant::dcfr_plus_default(),
         });
         state.update_infoset(0, &[1.0, -1.0], 1.0, 1.0, 1);
         assert_eq!(state.regrets()[1], 0.0);

@@ -325,7 +325,12 @@ fn env_cfr_variant(name: &str) -> Option<CfrVariant> {
     match value.trim().to_ascii_lowercase().replace('_', "-").as_str() {
         "cfr" | "cfr-plus" | "cfrplus" | "plus" => Some(CfrVariant::CfrPlus),
         "discounted" | "dcfr" => Some(CfrVariant::Discounted),
-        "dcfr-plus" | "dcfrplus" | "dcfr+" => Some(CfrVariant::DcfrPlus),
+        "dcfr-plus" | "dcfrplus" | "dcfr+" => Some(CfrVariant::DcfrPlus {
+            alpha: env_f32("POKEDR_DCFR_ALPHA")
+                .unwrap_or(pokedr_core::dense_cfr::DEFAULT_DCFR_PLUS_ALPHA),
+            gamma: env_f32("POKEDR_DCFR_GAMMA")
+                .unwrap_or(pokedr_core::dense_cfr::DEFAULT_DCFR_PLUS_GAMMA),
+        }),
         other => {
             eprintln!("unknown {name}={other}; expected cfr-plus, discounted, or dcfr-plus");
             std::process::exit(2);
@@ -334,6 +339,12 @@ fn env_cfr_variant(name: &str) -> Option<CfrVariant> {
 }
 
 fn env_usize(name: &str) -> Option<usize> {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse().ok())
+}
+
+fn env_f32(name: &str) -> Option<f32> {
     std::env::var(name)
         .ok()
         .and_then(|value| value.parse().ok())

@@ -938,7 +938,7 @@ fn solve_public_tree_cfr(
             &matrix_cache,
             &mut batch,
         );
-        if config.cfr_variant != CfrVariant::DcfrPlus {
+        if !config.cfr_variant.is_dcfr_plus() {
             let average_weight = iteration as f32;
             for weight in &mut batch.strategy_weights {
                 *weight *= average_weight;
