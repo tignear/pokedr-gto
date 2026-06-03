@@ -20,12 +20,12 @@
 			"type": "volume"
 		},
 		{
-			"source": "/usr/lib/wsl/lib/libdxcore.so",
+			"source": "\\\\wsl.localhost\\Ubuntu-24.04\\usr\\lib\\wsl\\lib\\libdxcore.so",
 			"target": "/usr/lib/libdxcore.so",
 			"type": "bind"
 		},
 		{
-			"source": "/usr/lib/wsl/lib",
+			"source": "\\\\wsl.localhost\\Ubuntu-24.04\\usr\\lib\\wsl\\lib",
 			"target": "/usr/lib/wsl/lib",
 			"type": "bind"
 		},
