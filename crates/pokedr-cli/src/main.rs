@@ -15,8 +15,9 @@ fn main() {
         Some("gpu-info") => print_gpu_info(),
         Some("gpu-smoke") => run_gpu_smoke(),
         Some("postflop-smoke") => run_postflop_smoke(),
+        Some("rs-poker-smoke") => run_rs_poker_smoke(),
         _ => {
-            eprintln!("usage: {program} <gpu-info|gpu-smoke|postflop-smoke>");
+            eprintln!("usage: {program} <gpu-info|gpu-smoke|postflop-smoke|rs-poker-smoke>");
             std::process::exit(2);
         }
     }
@@ -182,6 +183,13 @@ fn run_postflop_smoke() {
         "strategy sums must stay finite"
     );
     println!("postflop GPU CFR smoke passed");
+}
+
+fn run_rs_poker_smoke() {
+    let summary = pokedr_agent::run_heads_up_match(16, 7);
+    println!("hands: {}", summary.hands);
+    println!("hero_net: {:.2}", summary.hero_net);
+    println!("villain_net: {:.2}", summary.villain_net);
 }
 
 fn smoke_postflop_tree() -> SubgameTree {

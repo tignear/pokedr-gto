@@ -6,5 +6,5 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+pokedr-agent = { path = "../pokedr-agent" }
 pokedr-core = { path = "../pokedr-core" }
-
