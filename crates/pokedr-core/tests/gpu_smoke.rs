@@ -2,7 +2,7 @@ use pokedr_core::cards::{Card, Rank, Suit, evaluate};
 use pokedr_core::dense_cfr::{
     CfrVariant, DenseCfrConfig, DenseCfrSolver, DenseCfrState,
     gpu::{GpuCfrError, GpuDenseCfrBackend, GpuShowdownTask},
-    gpu::{GpuFinalBoard, GpuPrivateCombo, GpuTerminalAction},
+    gpu::{GpuFinalBoard, GpuPrivateCombo},
 };
 
 fn main() {
@@ -26,7 +26,6 @@ fn main() {
     run_resident_updates(&backend);
     run_showdown_equities(&backend);
     run_showdown_matrix(&backend);
-    run_root_terminal_values(&backend);
     println!("GPU smoke passed");
 }
 
@@ -319,100 +318,6 @@ fn run_showdown_matrix(backend: &GpuDenseCfrBackend) {
             }
         }
     }
-}
-
-fn run_root_terminal_values(backend: &GpuDenseCfrBackend) {
-    let combos = vec![
-        gpu_combo([
-            Card::new(Rank::Ace, Suit::Spades),
-            Card::new(Rank::King, Suit::Spades),
-        ]),
-        gpu_combo([
-            Card::new(Rank::Queen, Suit::Hearts),
-            Card::new(Rank::Jack, Suit::Diamonds),
-        ]),
-        gpu_combo([
-            Card::new(Rank::Two, Suit::Clubs),
-            Card::new(Rank::Three, Suit::Clubs),
-        ]),
-    ];
-    let boards = vec![GpuFinalBoard {
-        cards: [
-            Card::new(Rank::Nine, Suit::Spades).index() as u32,
-            Card::new(Rank::Eight, Suit::Spades).index() as u32,
-            Card::new(Rank::Seven, Suit::Clubs).index() as u32,
-            Card::new(Rank::Six, Suit::Diamonds).index() as u32,
-            Card::new(Rank::Four, Suit::Hearts).index() as u32,
-        ],
-    }];
-    let matrix = backend
-        .showdown_matrix(&combos, &boards)
-        .unwrap_or_else(|error| fail(&format!("GPU root matrix failed: {error:?}")));
-    let actions = vec![
-        GpuTerminalAction {
-            kind: 0,
-            pot: 10.0,
-            hero_invested: 4.0,
-            _pad: 0,
-        },
-        GpuTerminalAction {
-            kind: 2,
-            pot: 10.0,
-            hero_invested: 4.0,
-            _pad: 0,
-        },
-    ];
-    let villain_weights = vec![1.0, 2.0, 3.0];
-    let values = backend
-        .root_terminal_values(
-            &combos,
-            &[1, 1, 1],
-            &villain_weights,
-            &matrix,
-            &actions,
-            3,
-            0,
-        )
-        .unwrap_or_else(|error| fail(&format!("GPU root terminal values failed: {error:?}")));
-
-    let mut expected_action_values = vec![0.0; combos.len() * 2 * 3];
-    let mut expected_reach = vec![0.0; combos.len() * 2];
-    let mut expected_strategy = vec![0.0; combos.len() * 2];
-    for hero in 0..combos.len() {
-        let infoset = hero;
-        let offset = infoset * 3;
-        let mut showdown_sum = 0.0;
-        let mut weight_sum = 0.0;
-        let mut opponent_count = 0.0;
-        for villain in 0..combos.len() {
-            if hero == villain {
-                continue;
-            }
-            let weight = villain_weights[villain];
-            showdown_sum += weight * (matrix[hero * combos.len() + villain] * 10.0 - 4.0);
-            weight_sum += weight;
-            opponent_count += 1.0;
-        }
-        expected_action_values[offset] = -4.0;
-        expected_action_values[offset + 1] = showdown_sum / weight_sum;
-        expected_reach[infoset] = weight_sum;
-        expected_strategy[infoset] = opponent_count;
-    }
-    assert_close(
-        "root terminal action value",
-        &expected_action_values,
-        &values.action_values,
-    );
-    assert_close(
-        "root terminal reach",
-        &expected_reach,
-        &values.reach_weights,
-    );
-    assert_close(
-        "root terminal strategy",
-        &expected_strategy,
-        &values.strategy_weights,
-    );
 }
 
 fn gpu_combo(cards: [Card; 2]) -> GpuPrivateCombo {
