@@ -446,6 +446,18 @@ pub fn solve_fixed_flop_metrics(
     let villain_weights = vec![1.0; COMBO_COUNT];
     let indexer = ComboIndexer::new();
     let root_dead = root_board(&tree).deck_mask();
+    if let Some(rows) = try_solve_fixed_flop_metrics_gpu(
+        &tree,
+        &layout,
+        &base_config,
+        &villain_weights,
+        &indexer,
+        root_dead,
+        &flop,
+        iteration_counts,
+    ) {
+        return rows;
+    }
     let mut previous_root_strategy: Option<Vec<f32>> = None;
     let mut rows = Vec::with_capacity(iteration_counts.len());
     for iterations in iteration_counts.iter().copied() {
@@ -475,6 +487,78 @@ pub fn solve_fixed_flop_metrics(
         previous_root_strategy = Some(root_strategy);
     }
     rows
+}
+
+#[allow(clippy::too_many_arguments)]
+fn try_solve_fixed_flop_metrics_gpu(
+    tree: &SubgameTree,
+    layout: &PostflopDenseLayout,
+    base_config: &PokedrAgentConfig,
+    villain_weights: &[f32],
+    indexer: &ComboIndexer,
+    root_dead: u64,
+    flop: &[PokedrCard; 3],
+    iteration_counts: &[usize],
+) -> Option<Vec<FixedFlopMetricRow>> {
+    let backend = cfr_gpu_backend()?;
+    let matrix_cache = RefCell::new(ShowdownMatrixCache::new(showdown_matrix_cache_capacity()));
+    let linearized = linearize_gpu_public_tree(tree, layout, &backend, base_config, &matrix_cache)?;
+    let mut dense_config = layout.dense_config(base_config.cfr_variant);
+    dense_config.infosets *= PRIVATE_INFOS_PER_PUBLIC;
+    let combos = gpu_private_combos();
+    let combo_legal: Vec<u32> = indexer
+        .combos()
+        .iter()
+        .map(|combo| (!combo.collides_with(root_dead)) as u32)
+        .collect();
+    let mut gpu_state =
+        backend.zeroed_state_with_legal_actions(dense_config, private_legal_actions(layout));
+    if solver_progress_enabled() {
+        eprintln!(
+            "pokedr: gpu resident public tree checkpoints nodes={} showdown_boards={} iterations={:?}",
+            linearized.nodes.len(),
+            linearized.showdown_boards.len(),
+            iteration_counts
+        );
+    }
+    let snapshots = backend
+        .public_tree_run_iteration_checkpoints(
+            &linearized.nodes,
+            &linearized.children,
+            &linearized.child_cards,
+            &combos,
+            &combo_legal,
+            villain_weights,
+            &linearized.showdown_boards,
+            &mut gpu_state,
+            iteration_counts,
+        )
+        .ok()?;
+
+    let mut previous_root_strategy: Option<Vec<f32>> = None;
+    let mut rows = Vec::with_capacity(snapshots.len());
+    for (iterations, state, elapsed_secs) in snapshots {
+        let root_strategy = root_average_strategy(layout, &state, indexer, root_dead);
+        let root_strategy_l1_delta = previous_root_strategy
+            .as_ref()
+            .map(|previous| mean_l1_delta(previous, &root_strategy));
+        let root_action_probabilities = root_action_probabilities(layout, &root_strategy);
+        let diagnostics = cfr_state_diagnostics(&state);
+        rows.push(FixedFlopMetricRow {
+            board: format_pokedr_cards(flop),
+            iterations,
+            elapsed_secs,
+            root_strategy_l1_delta,
+            root_action_probabilities,
+            positive_regret_mass: diagnostics.positive_regret_mass,
+            illegal_strategy_mass: diagnostics.illegal_strategy_mass,
+            current_strategy_norm_error: diagnostics.current_strategy_norm_error,
+            average_strategy_norm_error: diagnostics.average_strategy_norm_error,
+            finite: diagnostics.finite,
+        });
+        previous_root_strategy = Some(root_strategy);
+    }
+    Some(rows)
 }
 
 struct CfrDiagnostics {

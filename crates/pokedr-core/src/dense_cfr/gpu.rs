@@ -4294,6 +4294,77 @@ impl GpuDenseCfrBackend {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn public_tree_run_iteration_checkpoints(
+        &self,
+        nodes: &[GpuPublicTreeNode],
+        children: &[u32],
+        child_cards: &[u32],
+        combos: &[GpuPrivateCombo],
+        combo_legal: &[u32],
+        villain_weights: &[f32],
+        showdown_boards: &[GpuFinalBoard],
+        state: &mut GpuDenseCfrState,
+        checkpoints: &[usize],
+    ) -> Result<Vec<(usize, DenseCfrState, f32)>, GpuCfrError> {
+        let mut checkpoints: Vec<_> = checkpoints
+            .iter()
+            .copied()
+            .map(|value| value.max(1))
+            .collect();
+        checkpoints.sort_unstable();
+        checkpoints.dedup();
+        let Some(&last_checkpoint) = checkpoints.last() else {
+            return Ok(Vec::new());
+        };
+
+        let profile = Self::gpu_profile_enabled();
+        let setup_start = profile.then(Instant::now);
+        let context = self.public_tree_iteration_context(
+            nodes,
+            children,
+            child_cards,
+            combos,
+            combo_legal,
+            villain_weights,
+            showdown_boards,
+            state.infosets,
+            state.actions,
+        );
+        if let Some(start) = setup_start {
+            eprintln!(
+                "pokedr: gpu profile phase=cfv_setup elapsed_ms={:.3}",
+                start.elapsed().as_secs_f64() * 1000.0
+            );
+        }
+
+        let flush_interval = std::env::var("POKEDR_GPU_ITERATION_FLUSH")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(4)
+            .max(1);
+        let mut checkpoint_index = 0usize;
+        let mut states = Vec::with_capacity(checkpoints.len());
+        let started = Instant::now();
+        for iteration in 1..=last_checkpoint {
+            self.public_tree_update_state_with_context(&context, state, iteration)?;
+            if iteration % flush_interval == 0 {
+                self.device
+                    .poll(wgpu::PollType::Wait {
+                        submission_index: None,
+                        timeout: None,
+                    })
+                    .map_err(|error| GpuCfrError::MapFailed(error.to_string()))?;
+            }
+            if checkpoints.get(checkpoint_index) == Some(&iteration) {
+                let downloaded = state.download(self)?;
+                states.push((iteration, downloaded, started.elapsed().as_secs_f32()));
+                checkpoint_index += 1;
+            }
+        }
+        Ok(states)
+    }
+
     pub fn upload_state(&self, state: &DenseCfrState) -> GpuDenseCfrState {
         let legal_actions = legal_actions_u32(&state.legal_actions);
         GpuDenseCfrState {
