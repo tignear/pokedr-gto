@@ -1,7 +1,7 @@
 use pokedr_core::cards::{Card, Rank, Suit, evaluate};
 use pokedr_core::dense_cfr::{
     CfrVariant, DenseCfrConfig, DenseCfrSolver, DenseCfrState,
-    gpu::{GpuCfrError, GpuDenseCfrBackend, GpuShowdownTask},
+    gpu::{GpuCfrError, GpuDenseCfrBackend, GpuPublicTreeNode, GpuShowdownTask},
     gpu::{GpuFinalBoard, GpuPrivateCombo},
 };
 
@@ -26,6 +26,7 @@ fn main() {
     run_resident_updates(&backend);
     run_showdown_equities(&backend);
     run_showdown_matrix(&backend);
+    run_public_tree_terminal_values(&backend);
     println!("GPU smoke passed");
 }
 
@@ -316,6 +317,109 @@ fn run_showdown_matrix(backend: &GpuDenseCfrBackend) {
                     "showdown matrix[{hero},{villain}] mismatch: expected {expected}, actual {actual}"
                 ));
             }
+        }
+    }
+}
+
+fn run_public_tree_terminal_values(backend: &GpuDenseCfrBackend) {
+    let combos = vec![
+        gpu_combo([
+            Card::new(Rank::Ace, Suit::Spades),
+            Card::new(Rank::King, Suit::Spades),
+        ]),
+        gpu_combo([
+            Card::new(Rank::Ace, Suit::Clubs),
+            Card::new(Rank::Ace, Suit::Diamonds),
+        ]),
+        gpu_combo([
+            Card::new(Rank::Queen, Suit::Hearts),
+            Card::new(Rank::Jack, Suit::Hearts),
+        ]),
+    ];
+    let nodes = vec![
+        GpuPublicTreeNode {
+            kind: 0,
+            acting_player: 0,
+            public_infoset: 0,
+            first_child: 0,
+            child_count: 2,
+            terminal_kind: 0,
+            showdown_offset: 0,
+            _pad0: 0,
+            pot: 10.0,
+            hero_invested: 4.0,
+            _pad1: 1.0,
+            _pad2: 0.0,
+        },
+        GpuPublicTreeNode {
+            kind: 2,
+            acting_player: 0,
+            public_infoset: 0,
+            first_child: 0,
+            child_count: 0,
+            terminal_kind: 0,
+            showdown_offset: 0,
+            _pad0: 0,
+            pot: 10.0,
+            hero_invested: 4.0,
+            _pad1: 1.0,
+            _pad2: 0.0,
+        },
+        GpuPublicTreeNode {
+            kind: 2,
+            acting_player: 0,
+            public_infoset: 0,
+            first_child: 0,
+            child_count: 0,
+            terminal_kind: 1,
+            showdown_offset: 0,
+            _pad0: 0,
+            pot: 10.0,
+            hero_invested: 4.0,
+            _pad1: 1.0,
+            _pad2: 0.0,
+        },
+    ];
+    let children = vec![1, 2];
+    let boards = vec![GpuFinalBoard {
+        cards: [
+            Card::new(Rank::Two, Suit::Clubs).index() as u32,
+            Card::new(Rank::Three, Suit::Diamonds).index() as u32,
+            Card::new(Rank::Four, Suit::Hearts).index() as u32,
+            Card::new(Rank::Five, Suit::Spades).index() as u32,
+            Card::new(Rank::Six, Suit::Clubs).index() as u32,
+        ],
+    }];
+    let state = DenseCfrState::new_with_legal_actions(
+        DenseCfrConfig {
+            infosets: combos.len() * 2,
+            actions: 2,
+            variant: CfrVariant::CfrPlus,
+        },
+        vec![true; combos.len() * 2 * 2],
+    );
+    let values = backend
+        .public_tree_iteration_values(
+            &nodes,
+            &children,
+            &[0],
+            &combos,
+            &vec![1; combos.len()],
+            &vec![1.0; combos.len()],
+            &boards,
+            &state,
+        )
+        .unwrap_or_else(|error| fail(&format!("GPU public tree values failed: {error:?}")));
+
+    for combo in 0..combos.len() {
+        let offset = combo * 2;
+        let fold = values.action_values[offset];
+        let win = values.action_values[offset + 1];
+        if (fold + 4.0).abs() >= 1e-5 || (win - 6.0).abs() >= 1e-5 {
+            fail(&format!(
+                "public tree action values combo {combo} mismatch: fold={fold}, win={win}, reach_weight={}, strategy_weight={}",
+                values.reach_weights[combo], values.strategy_weights[combo],
+            ));
         }
     }
 }

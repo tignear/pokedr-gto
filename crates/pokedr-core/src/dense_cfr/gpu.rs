@@ -846,6 +846,177 @@ fn tree_value(@builtin(global_invocation_id) id: vec3<u32>) {
 }
 "#;
 
+const PUBLIC_TREE_TERMINAL_PARTIAL_SHADER: &str = r#"
+struct Combo { cards: array<u32, 2>, };
+struct FinalBoard { cards: array<u32, 5>, };
+struct TreeNode {
+    kind: u32,
+    acting_player: u32,
+    public_infoset: u32,
+    first_child: u32,
+    child_count: u32,
+    terminal_kind: u32,
+    showdown_offset: u32,
+    _pad0: u32,
+    pot: f32,
+    hero_invested: f32,
+    _pad1: f32,
+    _pad2: f32,
+};
+struct Params {
+    combo_count: u32,
+    terminal_count: u32,
+    tile_count: u32,
+    tile_size: u32,
+    value_player: u32,
+    x_invocations: u32,
+    _pad2: u32,
+    _pad3: u32,
+};
+
+@group(0) @binding(0) var<storage, read> nodes: array<TreeNode>;
+@group(0) @binding(1) var<storage, read> terminal_nodes: array<u32>;
+@group(0) @binding(2) var<storage, read> boards: array<FinalBoard>;
+@group(0) @binding(3) var<storage, read> combos: array<Combo>;
+@group(0) @binding(4) var<storage, read> strengths: array<f32>;
+@group(0) @binding(5) var<storage, read> hero_reaches: array<f32>;
+@group(0) @binding(6) var<storage, read> villain_reaches: array<f32>;
+@group(0) @binding(7) var<storage, read_write> partials: array<f32>;
+@group(0) @binding(8) var<uniform> params: Params;
+
+fn collide(left: Combo, right: Combo) -> bool {
+    return left.cards[0] == right.cards[0] || left.cards[0] == right.cards[1]
+        || left.cards[1] == right.cards[0] || left.cards[1] == right.cards[1];
+}
+
+fn combo_hits_board(combo: Combo, board: FinalBoard) -> bool {
+    return combo.cards[0] == board.cards[0]
+        || combo.cards[0] == board.cards[1]
+        || combo.cards[0] == board.cards[2]
+        || combo.cards[0] == board.cards[3]
+        || combo.cards[0] == board.cards[4]
+        || combo.cards[1] == board.cards[0]
+        || combo.cards[1] == board.cards[1]
+        || combo.cards[1] == board.cards[2]
+        || combo.cards[1] == board.cards[3]
+        || combo.cards[1] == board.cards[4];
+}
+
+@compute @workgroup_size(64)
+fn terminal_partial(@builtin(global_invocation_id) id: vec3<u32>) {
+    let index = id.x + id.y * params.x_invocations;
+    let output_count = params.terminal_count * params.combo_count * params.tile_count;
+    if index >= output_count {
+        return;
+    }
+    let tile = index % params.tile_count;
+    let combo = (index / params.tile_count) % params.combo_count;
+    let terminal_slot = index / (params.tile_count * params.combo_count);
+    let node_index = terminal_nodes[terminal_slot];
+    let node = nodes[node_index];
+    let node_offset = node_index * params.combo_count;
+    let opponent_start = tile * params.tile_size;
+    let opponent_end = min(opponent_start + params.tile_size, params.combo_count);
+    var value = 0.0;
+
+    if node.terminal_kind == 0u {
+        let payoff = -node.hero_invested;
+        for (var opponent = opponent_start; opponent < opponent_end; opponent = opponent + 1u) {
+            if collide(combos[combo], combos[opponent]) {
+                continue;
+            }
+            if params.value_player == 0u {
+                value = value + villain_reaches[node_offset + opponent] * payoff;
+            } else {
+                value = value + hero_reaches[node_offset + opponent] * (-payoff);
+            }
+        }
+    } else if node.terminal_kind == 1u {
+        let payoff = node.pot - node.hero_invested;
+        for (var opponent = opponent_start; opponent < opponent_end; opponent = opponent + 1u) {
+            if collide(combos[combo], combos[opponent]) {
+                continue;
+            }
+            if params.value_player == 0u {
+                value = value + villain_reaches[node_offset + opponent] * payoff;
+            } else {
+                value = value + hero_reaches[node_offset + opponent] * (-payoff);
+            }
+        }
+    } else {
+        let board_count = node._pad0;
+        for (var opponent = opponent_start; opponent < opponent_end; opponent = opponent + 1u) {
+            if collide(combos[combo], combos[opponent]) {
+                continue;
+            }
+            var equity_sum = 0.0;
+            var valid_boards = 0u;
+            for (var board = 0u; board < board_count; board = board + 1u) {
+                let final_board_index = node.showdown_offset + board;
+                let final_board = boards[final_board_index];
+                if combo_hits_board(combos[combo], final_board) || combo_hits_board(combos[opponent], final_board) {
+                    continue;
+                }
+                valid_boards = valid_boards + 1u;
+                let strength_offset = final_board_index * params.combo_count;
+                let combo_strength = strengths[strength_offset + combo];
+                let opponent_strength = strengths[strength_offset + opponent];
+                if combo_strength > opponent_strength {
+                    equity_sum = equity_sum + 1.0;
+                } else if combo_strength == opponent_strength {
+                    equity_sum = equity_sum + 0.5;
+                }
+            }
+            let equity = select(0.5, equity_sum / f32(valid_boards), valid_boards > 0u);
+            if params.value_player == 0u {
+                let hero_payoff = equity * node.pot - node.hero_invested;
+                value = value + villain_reaches[node_offset + opponent] * hero_payoff;
+            } else {
+                let villain_payoff = equity * node.pot - (node.pot - node.hero_invested);
+                value = value + hero_reaches[node_offset + opponent] * villain_payoff;
+            }
+        }
+    }
+    partials[index] = value * node._pad1;
+}
+"#;
+
+const PUBLIC_TREE_TERMINAL_REDUCE_SHADER: &str = r#"
+struct Params {
+    combo_count: u32,
+    terminal_count: u32,
+    tile_count: u32,
+    output_len: u32,
+    value_player: u32,
+    x_invocations: u32,
+    _pad2: u32,
+    _pad3: u32,
+};
+
+@group(0) @binding(0) var<storage, read> terminal_nodes: array<u32>;
+@group(0) @binding(1) var<storage, read> partials: array<f32>;
+@group(0) @binding(2) var<storage, read_write> values: array<f32>;
+@group(0) @binding(3) var<uniform> params: Params;
+
+@compute @workgroup_size(64)
+fn terminal_reduce(@builtin(global_invocation_id) id: vec3<u32>) {
+    let index = id.x + id.y * params.x_invocations;
+    let output_count = params.terminal_count * params.combo_count;
+    if index >= output_count {
+        return;
+    }
+    let combo = index % params.combo_count;
+    let terminal_slot = index / params.combo_count;
+    let node_index = terminal_nodes[terminal_slot];
+    let partial_base = (terminal_slot * params.combo_count + combo) * params.tile_count;
+    var value = 0.0;
+    for (var tile = 0u; tile < params.tile_count; tile = tile + 1u) {
+        value = value + partials[partial_base + tile];
+    }
+    values[node_index * params.combo_count + combo] = value;
+}
+"#;
+
 const PUBLIC_TREE_AGGREGATE_SHADER: &str = r#"
 struct Combo { cards: array<u32, 2>, };
 struct TreeNode {
@@ -899,6 +1070,9 @@ fn tree_aggregate(@builtin(global_invocation_id) id: vec3<u32>) {
     let public_infoset = private_infoset / (params.combo_count * 2u);
     let player_slot = (private_infoset / params.combo_count) % 2u;
     let acting_combo = private_infoset % params.combo_count;
+    if player_slot != params.value_player {
+        return;
+    }
 
     var node_index = 0u;
     var found = false;
@@ -915,7 +1089,7 @@ fn tree_aggregate(@builtin(global_invocation_id) id: vec3<u32>) {
         return;
     }
     let node = nodes[node_index];
-    if action >= node.child_count || player_slot != node.acting_player || player_slot != params.value_player {
+    if action >= node.child_count || player_slot != node.acting_player {
         output[index] = 0.0;
         output[action_len + index] = 0.0;
         return;
@@ -972,6 +1146,10 @@ pub struct GpuDenseCfrBackend {
     public_tree_reach_bind_group_layout: wgpu::BindGroupLayout,
     public_tree_value_pipeline: wgpu::ComputePipeline,
     public_tree_value_bind_group_layout: wgpu::BindGroupLayout,
+    public_tree_terminal_partial_pipeline: wgpu::ComputePipeline,
+    public_tree_terminal_partial_bind_group_layout: wgpu::BindGroupLayout,
+    public_tree_terminal_reduce_pipeline: wgpu::ComputePipeline,
+    public_tree_terminal_reduce_bind_group_layout: wgpu::BindGroupLayout,
     public_tree_aggregate_pipeline: wgpu::ComputePipeline,
     public_tree_aggregate_bind_group_layout: wgpu::BindGroupLayout,
 }
@@ -1256,6 +1434,71 @@ impl GpuDenseCfrBackend {
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
                 cache: None,
             });
+        let public_tree_terminal_partial_shader =
+            device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("public tree terminal partial shader"),
+                source: wgpu::ShaderSource::Wgsl(PUBLIC_TREE_TERMINAL_PARTIAL_SHADER.into()),
+            });
+        let public_tree_terminal_partial_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("public tree terminal partial bind group layout"),
+                entries: &[
+                    storage_entry(0, true),
+                    storage_entry(1, true),
+                    storage_entry(2, true),
+                    storage_entry(3, true),
+                    storage_entry(4, true),
+                    storage_entry(5, true),
+                    storage_entry(6, true),
+                    storage_entry(7, false),
+                    uniform_entry(8),
+                ],
+            });
+        let public_tree_terminal_partial_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("public tree terminal partial pipeline layout"),
+                bind_group_layouts: &[Some(&public_tree_terminal_partial_bind_group_layout)],
+                immediate_size: 0,
+            });
+        let public_tree_terminal_partial_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("public tree terminal partial pipeline"),
+                layout: Some(&public_tree_terminal_partial_pipeline_layout),
+                module: &public_tree_terminal_partial_shader,
+                entry_point: Some("terminal_partial"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                cache: None,
+            });
+        let public_tree_terminal_reduce_shader =
+            device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("public tree terminal reduce shader"),
+                source: wgpu::ShaderSource::Wgsl(PUBLIC_TREE_TERMINAL_REDUCE_SHADER.into()),
+            });
+        let public_tree_terminal_reduce_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("public tree terminal reduce bind group layout"),
+                entries: &[
+                    storage_entry(0, true),
+                    storage_entry(1, true),
+                    storage_entry(2, false),
+                    uniform_entry(3),
+                ],
+            });
+        let public_tree_terminal_reduce_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("public tree terminal reduce pipeline layout"),
+                bind_group_layouts: &[Some(&public_tree_terminal_reduce_bind_group_layout)],
+                immediate_size: 0,
+            });
+        let public_tree_terminal_reduce_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("public tree terminal reduce pipeline"),
+                layout: Some(&public_tree_terminal_reduce_pipeline_layout),
+                module: &public_tree_terminal_reduce_shader,
+                entry_point: Some("terminal_reduce"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                cache: None,
+            });
         let public_tree_aggregate_shader =
             device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("public tree aggregate shader"),
@@ -1305,6 +1548,10 @@ impl GpuDenseCfrBackend {
             public_tree_reach_bind_group_layout,
             public_tree_value_pipeline,
             public_tree_value_bind_group_layout,
+            public_tree_terminal_partial_pipeline,
+            public_tree_terminal_partial_bind_group_layout,
+            public_tree_terminal_reduce_pipeline,
+            public_tree_terminal_reduce_bind_group_layout,
             public_tree_aggregate_pipeline,
             public_tree_aggregate_bind_group_layout,
         })
@@ -1593,6 +1840,138 @@ impl GpuDenseCfrBackend {
     }
 
     #[allow(clippy::too_many_arguments)]
+    fn fill_terminal_values(
+        &self,
+        node_buffer: &wgpu::Buffer,
+        terminal_nodes: &[u32],
+        board_buffer: &wgpu::Buffer,
+        combo_buffer: &wgpu::Buffer,
+        strength_buffer: &wgpu::Buffer,
+        hero_reaches_buffer: &wgpu::Buffer,
+        villain_reaches_buffer: &wgpu::Buffer,
+        values_buffer: &wgpu::Buffer,
+        terminal_partials_buffer: &wgpu::Buffer,
+        combo_count: usize,
+        tile_count: usize,
+        tile_size: usize,
+        terminal_chunk_size: usize,
+        value_player: u32,
+    ) -> Result<(), GpuCfrError> {
+        if terminal_nodes.is_empty() || combo_count == 0 || tile_count == 0 {
+            return Ok(());
+        }
+        for terminal_chunk in terminal_nodes.chunks(terminal_chunk_size.max(1)) {
+            let terminal_count = terminal_chunk.len();
+            let terminal_nodes_buffer =
+                readonly_buffer(&self.device, "public tree terminal nodes", terminal_chunk);
+            let partial_invocations = terminal_count * combo_count * tile_count;
+            let (partial_x_groups, partial_y_groups, partial_x_invocations) =
+                dispatch_grid(partial_invocations);
+            let partial_params = uniform_buffer(
+                &self.device,
+                "public tree terminal partial params",
+                &[GpuPublicTreeParams {
+                    combo_count: combo_count as u32,
+                    node_count: terminal_count as u32,
+                    max_actions: tile_count as u32,
+                    output_len: tile_size as u32,
+                    pair_start: value_player,
+                    chunk_pairs: partial_x_invocations,
+                    _pad0: 0,
+                    _pad1: 0,
+                }],
+            );
+            let partial_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("public tree terminal partial bind group"),
+                layout: &self.public_tree_terminal_partial_bind_group_layout,
+                entries: &[
+                    bind_entry(0, node_buffer),
+                    bind_entry(1, &terminal_nodes_buffer),
+                    bind_entry(2, board_buffer),
+                    bind_entry(3, combo_buffer),
+                    bind_entry(4, strength_buffer),
+                    bind_entry(5, hero_reaches_buffer),
+                    bind_entry(6, villain_reaches_buffer),
+                    bind_entry(7, terminal_partials_buffer),
+                    bind_entry(8, &partial_params),
+                ],
+            });
+
+            let reduce_invocations = terminal_count * combo_count;
+            let (reduce_x_groups, reduce_y_groups, reduce_x_invocations) =
+                dispatch_grid(reduce_invocations);
+            let reduce_params = uniform_buffer(
+                &self.device,
+                "public tree terminal reduce params",
+                &[GpuPublicTreeParams {
+                    combo_count: combo_count as u32,
+                    node_count: terminal_count as u32,
+                    max_actions: tile_count as u32,
+                    output_len: 0,
+                    pair_start: value_player,
+                    chunk_pairs: reduce_x_invocations,
+                    _pad0: 0,
+                    _pad1: 0,
+                }],
+            );
+            let reduce_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("public tree terminal reduce bind group"),
+                layout: &self.public_tree_terminal_reduce_bind_group_layout,
+                entries: &[
+                    bind_entry(0, &terminal_nodes_buffer),
+                    bind_entry(1, terminal_partials_buffer),
+                    bind_entry(2, values_buffer),
+                    bind_entry(3, &reduce_params),
+                ],
+            });
+            let mut encoder = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("public tree terminal partial encoder"),
+                });
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("public tree terminal partial pass"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.public_tree_terminal_partial_pipeline);
+                pass.set_bind_group(0, &partial_bind_group, &[]);
+                pass.dispatch_workgroups(partial_x_groups, partial_y_groups, 1);
+            }
+            let submission = self.queue.submit(Some(encoder.finish()));
+            self.device
+                .poll(wgpu::PollType::Wait {
+                    submission_index: Some(submission),
+                    timeout: None,
+                })
+                .map_err(|error| GpuCfrError::MapFailed(error.to_string()))?;
+
+            let mut encoder = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("public tree terminal reduce encoder"),
+                });
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("public tree terminal reduce pass"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.public_tree_terminal_reduce_pipeline);
+                pass.set_bind_group(0, &reduce_bind_group, &[]);
+                pass.dispatch_workgroups(reduce_x_groups, reduce_y_groups, 1);
+            }
+            let submission = self.queue.submit(Some(encoder.finish()));
+            self.device
+                .poll(wgpu::PollType::Wait {
+                    submission_index: Some(submission),
+                    timeout: None,
+                })
+                .map_err(|error| GpuCfrError::MapFailed(error.to_string()))?;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub fn public_tree_iteration_values(
         &self,
         nodes: &[GpuPublicTreeNode],
@@ -1637,14 +2016,6 @@ impl GpuDenseCfrBackend {
             "public tree final board strengths",
             &strength_values,
         );
-        if std::env::var_os("POKEDR_SOLVER_PROGRESS_OFF").is_none() {
-            eprintln!(
-                "pokedr: gpu public tree cfv nodes={} combos={} node_combo_values={}",
-                nodes.len(),
-                combos.len(),
-                node_combo_len
-            );
-        }
         let hero_reaches_buffer = storage_buffer(
             &self.device,
             "public tree hero reaches",
@@ -1664,6 +2035,40 @@ impl GpuDenseCfrBackend {
             &self.device,
             "public tree iteration output",
             &vec![0.0f32; output_len],
+        );
+        let terminal_nodes: Vec<_> = nodes
+            .iter()
+            .enumerate()
+            .filter_map(|(index, node)| (node.kind != 0 && node.kind != 1).then_some(index as u32))
+            .collect();
+        let terminal_tile_count = std::env::var("POKEDR_GPU_TERMINAL_TILES")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(8)
+            .max(1)
+            .min(combos.len().max(1));
+        let terminal_tile_size = combos.len().div_ceil(terminal_tile_count);
+        let max_terminal_partial_values = 32_000_000usize;
+        let terminal_chunk_size =
+            (max_terminal_partial_values / (combos.len() * terminal_tile_count)).max(1);
+        let terminal_partial_len = terminal_chunk_size.min(terminal_nodes.len()).max(1)
+            * combos.len()
+            * terminal_tile_count;
+        if std::env::var_os("POKEDR_SOLVER_PROGRESS_OFF").is_none() {
+            eprintln!(
+                "pokedr: gpu public tree cfv nodes={} combos={} node_combo_values={} terminals={} terminal_tiles={} terminal_chunk={}",
+                nodes.len(),
+                combos.len(),
+                node_combo_len,
+                terminal_nodes.len(),
+                terminal_tile_count,
+                terminal_chunk_size
+            );
+        }
+        let terminal_partials_buffer = storage_buffer(
+            &self.device,
+            "public tree terminal partial values",
+            &vec![0.0f32; terminal_partial_len],
         );
         let reach_params = uniform_buffer(
             &self.device,
@@ -1716,6 +2121,23 @@ impl GpuDenseCfrBackend {
             })
             .map_err(|error| GpuCfrError::MapFailed(error.to_string()))?;
 
+        self.fill_terminal_values(
+            &node_buffer,
+            &terminal_nodes,
+            &board_buffer,
+            &combo_buffer,
+            &strength_buffer,
+            &hero_reaches_buffer,
+            &villain_reaches_buffer,
+            &values_buffer,
+            &terminal_partials_buffer,
+            combos.len(),
+            terminal_tile_count,
+            terminal_tile_size,
+            terminal_chunk_size,
+            0,
+        )?;
+
         let node_chunk = std::env::var("POKEDR_GPU_VALUE_NODE_CHUNK")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
@@ -1730,6 +2152,9 @@ impl GpuDenseCfrBackend {
                     label: Some("public tree hero value encoder"),
                 });
             for target_node in (start..end).rev() {
+                if nodes[target_node].kind != 0 && nodes[target_node].kind != 1 {
+                    continue;
+                }
                 let hero_value_params = uniform_buffer(
                     &self.device,
                     "public tree hero value params",
@@ -1829,6 +2254,23 @@ impl GpuDenseCfrBackend {
             })
             .map_err(|error| GpuCfrError::MapFailed(error.to_string()))?;
 
+        self.fill_terminal_values(
+            &node_buffer,
+            &terminal_nodes,
+            &board_buffer,
+            &combo_buffer,
+            &strength_buffer,
+            &hero_reaches_buffer,
+            &villain_reaches_buffer,
+            &values_buffer,
+            &terminal_partials_buffer,
+            combos.len(),
+            terminal_tile_count,
+            terminal_tile_size,
+            terminal_chunk_size,
+            1,
+        )?;
+
         let mut end = nodes.len();
         while end > 0 {
             let start = end.saturating_sub(node_chunk);
@@ -1838,6 +2280,9 @@ impl GpuDenseCfrBackend {
                     label: Some("public tree villain value encoder"),
                 });
             for target_node in (start..end).rev() {
+                if nodes[target_node].kind != 0 && nodes[target_node].kind != 1 {
+                    continue;
+                }
                 let villain_value_params = uniform_buffer(
                     &self.device,
                     "public tree villain value params",
@@ -2223,6 +2668,14 @@ fn uniform_buffer<T: bytemuck::NoUninit>(
         contents: bytemuck::cast_slice(data),
         usage: wgpu::BufferUsages::UNIFORM,
     })
+}
+
+fn dispatch_grid(invocations: usize) -> (u32, u32, u32) {
+    let groups = (invocations as u32).div_ceil(WORKGROUP_SIZE).max(1);
+    let x_groups = groups.min(65_535);
+    let y_groups = groups.div_ceil(x_groups);
+    let x_invocations = x_groups * WORKGROUP_SIZE;
+    (x_groups, y_groups, x_invocations)
 }
 
 fn readback_buffer(device: &wgpu::Device, len: usize) -> wgpu::Buffer {
