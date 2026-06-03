@@ -2141,6 +2141,7 @@ impl GpuDenseCfrBackend {
     #[allow(clippy::too_many_arguments)]
     fn fill_fold_values(
         &self,
+        encoder: &mut wgpu::CommandEncoder,
         node_buffer: &wgpu::Buffer,
         fold_terminal_nodes: &[u32],
         combo_buffer: &wgpu::Buffer,
@@ -2235,11 +2236,6 @@ impl GpuDenseCfrBackend {
             ],
         });
 
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("public tree fold value encoder"),
-            });
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("public tree fold aggregate pass"),
@@ -2258,13 +2254,13 @@ impl GpuDenseCfrBackend {
             pass.set_bind_group(0, &value_bind_group, &[]);
             pass.dispatch_workgroups(value_x_groups, value_y_groups, 1);
         }
-        self.queue.submit(Some(encoder.finish()));
         Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
     fn fill_terminal_values(
         &self,
+        encoder: &mut wgpu::CommandEncoder,
         node_buffer: &wgpu::Buffer,
         terminal_nodes: &[u32],
         board_buffer: &wgpu::Buffer,
@@ -2351,11 +2347,6 @@ impl GpuDenseCfrBackend {
                     bind_entry(5, &reduce_params),
                 ],
             });
-            let mut encoder = self
-                .device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("public tree terminal partial encoder"),
-                });
             {
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("public tree terminal partial pass"),
@@ -2365,13 +2356,7 @@ impl GpuDenseCfrBackend {
                 pass.set_bind_group(0, &partial_bind_group, &[]);
                 pass.dispatch_workgroups(partial_x_groups, partial_y_groups, 1);
             }
-            self.queue.submit(Some(encoder.finish()));
 
-            let mut encoder = self
-                .device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("public tree terminal reduce encoder"),
-                });
             {
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("public tree terminal reduce pass"),
@@ -2381,7 +2366,6 @@ impl GpuDenseCfrBackend {
                 pass.set_bind_group(0, &reduce_bind_group, &[]);
                 pass.dispatch_workgroups(reduce_x_groups, reduce_y_groups, 1);
             }
-            self.queue.submit(Some(encoder.finish()));
         }
         Ok(())
     }
@@ -2389,6 +2373,7 @@ impl GpuDenseCfrBackend {
     #[allow(clippy::too_many_arguments)]
     fn backup_nonterminal_values(
         &self,
+        encoder: &mut wgpu::CommandEncoder,
         node_buffer: &wgpu::Buffer,
         child_buffer: &wgpu::Buffer,
         backup_nodes_buffer: &wgpu::Buffer,
@@ -2436,11 +2421,6 @@ impl GpuDenseCfrBackend {
                     bind_entry(7, &params),
                 ],
             });
-            let mut encoder = self
-                .device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("public tree backup encoder"),
-                });
             {
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("public tree backup pass"),
@@ -2450,7 +2430,6 @@ impl GpuDenseCfrBackend {
                 pass.set_bind_group(0, &bind_group, &[]);
                 pass.dispatch_workgroups(x_groups, y_groups, 1);
             }
-            self.queue.submit(Some(encoder.finish()));
         }
         Ok(())
     }
@@ -2588,6 +2567,11 @@ impl GpuDenseCfrBackend {
             "public tree villain terminal partial values",
             &vec![0.0f32; terminal_partial_len],
         );
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("public tree iteration encoder"),
+            });
         let (init_x_groups, init_y_groups, init_x_invocations) = dispatch_grid(node_combo_len);
         let reach_init_params = uniform_buffer(
             &self.device,
@@ -2617,11 +2601,6 @@ impl GpuDenseCfrBackend {
                 bind_entry(7, &reach_init_params),
             ],
         });
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("public tree reach init encoder"),
-            });
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("public tree reach init pass"),
@@ -2631,7 +2610,6 @@ impl GpuDenseCfrBackend {
             pass.set_bind_group(0, &reach_init_bind_group, &[]);
             pass.dispatch_workgroups(init_x_groups, init_y_groups, 1);
         }
-        self.queue.submit(Some(encoder.finish()));
 
         for &(layer_start, layer_end) in &reach_layer_ranges {
             let layer_edge_count = layer_end - layer_start;
@@ -2668,11 +2646,6 @@ impl GpuDenseCfrBackend {
                     bind_entry(7, &reach_edge_params),
                 ],
             });
-            let mut encoder = self
-                .device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("public tree reach edge encoder"),
-                });
             {
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("public tree reach edge pass"),
@@ -2682,10 +2655,10 @@ impl GpuDenseCfrBackend {
                 pass.set_bind_group(0, &reach_edge_bind_group, &[]);
                 pass.dispatch_workgroups(x_groups, y_groups, 1);
             }
-            self.queue.submit(Some(encoder.finish()));
         }
 
         self.fill_fold_values(
+            &mut encoder,
             &node_buffer,
             &fold_terminal_nodes,
             &combo_buffer,
@@ -2697,6 +2670,7 @@ impl GpuDenseCfrBackend {
         )?;
 
         self.fill_terminal_values(
+            &mut encoder,
             &node_buffer,
             &showdown_terminal_nodes,
             &board_buffer,
@@ -2715,6 +2689,7 @@ impl GpuDenseCfrBackend {
         )?;
 
         self.backup_nonterminal_values(
+            &mut encoder,
             &node_buffer,
             &child_buffer,
             &backup_nodes_buffer,
@@ -2756,11 +2731,6 @@ impl GpuDenseCfrBackend {
                 bind_entry(8, &hero_aggregate_params),
             ],
         });
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("public tree hero aggregate encoder"),
-            });
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("public tree hero aggregate pass"),
@@ -2770,7 +2740,6 @@ impl GpuDenseCfrBackend {
             pass.set_bind_group(0, &hero_aggregate_bind_group, &[]);
             pass.dispatch_workgroups((action_len as u32).div_ceil(WORKGROUP_SIZE), 1, 1);
         }
-        self.queue.submit(Some(encoder.finish()));
 
         let villain_aggregate_params = uniform_buffer(
             &self.device,
@@ -2801,11 +2770,6 @@ impl GpuDenseCfrBackend {
                     bind_entry(7, &output_buffer),
                     bind_entry(8, &villain_aggregate_params),
                 ],
-            });
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("public tree final encoder"),
             });
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
