@@ -361,6 +361,9 @@ fn evaluate_decision(
     let Some(infoset) = layout.node_infoset(node_index) else {
         return values.iter().sum::<f32>() / values.len().max(1) as f32;
     };
+    if state.acting_player == Player::Villain {
+        return values.into_iter().fold(f32::INFINITY, f32::min);
+    }
     let mut strategy = vec![0.0; layout.max_actions()];
     cfr_state.strategy_for(infoset, &mut strategy);
     values
@@ -727,5 +730,68 @@ mod tests {
 
         assert!((legal_sum - 1.0).abs() < 1e-5);
         assert!(strategy.iter().all(|value| value.is_finite()));
+    }
+
+    #[test]
+    fn villain_decision_minimizes_hero_value() {
+        let tree = SubgameTree::build(
+            PublicState {
+                street: Street::River,
+                board: Board::new(vec![
+                    PokedrCard::new(PokedrRank::Ace, PokedrSuit::Spades),
+                    PokedrCard::new(PokedrRank::Seven, PokedrSuit::Hearts),
+                    PokedrCard::new(PokedrRank::Two, PokedrSuit::Clubs),
+                    PokedrCard::new(PokedrRank::King, PokedrSuit::Diamonds),
+                    PokedrCard::new(PokedrRank::Three, PokedrSuit::Spades),
+                ]),
+                pot: 100,
+                effective_stack: 100,
+                to_call: 20,
+                min_aggressive_amount: 60,
+                acting_player: Player::Villain,
+                raises_this_street: 0,
+                checks_this_street: 0,
+            },
+            SubgameTreeConfig {
+                action_set: ActionSetConfig {
+                    max_aggressive_actions: 1,
+                    raise_fractions: vec![1.0],
+                    ..ActionSetConfig::default()
+                },
+                max_raises_per_street: 0,
+                max_depth: 1,
+            },
+        );
+        let layout = PostflopDenseLayout::from_tree(&tree);
+        let cfr_state = DenseCfrState::new_with_legal_actions(
+            layout.dense_config(CfrVariant::CfrPlus),
+            layout.legal_actions().to_vec(),
+        );
+        let mut ctx = PostflopEvaluationContext {
+            hero_cards: [
+                PokedrCard::new(PokedrRank::Nine, PokedrSuit::Clubs),
+                PokedrCard::new(PokedrRank::Ten, PokedrSuit::Diamonds),
+            ],
+            indexer: ComboIndexer::new(),
+            max_showdown_runouts: 1,
+            equity_cache: HashMap::new(),
+        };
+        let value = evaluate_decision(
+            &tree,
+            &layout,
+            0,
+            &root_public_state(&tree),
+            &cfr_state,
+            &mut ctx,
+        );
+
+        assert!(value <= 0.0);
+    }
+
+    fn root_public_state(tree: &SubgameTree) -> PublicState {
+        let PublicNodeKind::Decision { state, .. } = &tree.nodes()[0].kind else {
+            panic!("root should be a decision");
+        };
+        state.clone()
     }
 }
