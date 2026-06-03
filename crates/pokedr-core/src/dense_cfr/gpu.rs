@@ -2131,13 +2131,7 @@ impl GpuDenseCfrBackend {
             pass.set_bind_group(0, &value_bind_group, &[]);
             pass.dispatch_workgroups(value_x_groups, value_y_groups, 1);
         }
-        let submission = self.queue.submit(Some(encoder.finish()));
-        self.device
-            .poll(wgpu::PollType::Wait {
-                submission_index: Some(submission),
-                timeout: None,
-            })
-            .map_err(|error| GpuCfrError::MapFailed(error.to_string()))?;
+        self.queue.submit(Some(encoder.finish()));
         Ok(())
     }
 
@@ -2244,13 +2238,7 @@ impl GpuDenseCfrBackend {
                 pass.set_bind_group(0, &partial_bind_group, &[]);
                 pass.dispatch_workgroups(partial_x_groups, partial_y_groups, 1);
             }
-            let submission = self.queue.submit(Some(encoder.finish()));
-            self.device
-                .poll(wgpu::PollType::Wait {
-                    submission_index: Some(submission),
-                    timeout: None,
-                })
-                .map_err(|error| GpuCfrError::MapFailed(error.to_string()))?;
+            self.queue.submit(Some(encoder.finish()));
 
             let mut encoder = self
                 .device
@@ -2266,13 +2254,7 @@ impl GpuDenseCfrBackend {
                 pass.set_bind_group(0, &reduce_bind_group, &[]);
                 pass.dispatch_workgroups(reduce_x_groups, reduce_y_groups, 1);
             }
-            let submission = self.queue.submit(Some(encoder.finish()));
-            self.device
-                .poll(wgpu::PollType::Wait {
-                    submission_index: Some(submission),
-                    timeout: None,
-                })
-                .map_err(|error| GpuCfrError::MapFailed(error.to_string()))?;
+            self.queue.submit(Some(encoder.finish()));
         }
         Ok(())
     }
@@ -2341,13 +2323,7 @@ impl GpuDenseCfrBackend {
                 pass.set_bind_group(0, &bind_group, &[]);
                 pass.dispatch_workgroups(x_groups, y_groups, 1);
             }
-            let submission = self.queue.submit(Some(encoder.finish()));
-            self.device
-                .poll(wgpu::PollType::Wait {
-                    submission_index: Some(submission),
-                    timeout: None,
-                })
-                .map_err(|error| GpuCfrError::MapFailed(error.to_string()))?;
+            self.queue.submit(Some(encoder.finish()));
         }
         Ok(())
     }
@@ -2532,13 +2508,7 @@ impl GpuDenseCfrBackend {
             pass.set_bind_group(0, &reach_init_bind_group, &[]);
             pass.dispatch_workgroups(init_x_groups, init_y_groups, 1);
         }
-        let submission = self.queue.submit(Some(encoder.finish()));
-        self.device
-            .poll(wgpu::PollType::Wait {
-                submission_index: Some(submission),
-                timeout: None,
-            })
-            .map_err(|error| GpuCfrError::MapFailed(error.to_string()))?;
+        self.queue.submit(Some(encoder.finish()));
 
         for &(layer_start, layer_end) in &reach_layer_ranges {
             let layer_edge_count = layer_end - layer_start;
@@ -2589,13 +2559,7 @@ impl GpuDenseCfrBackend {
                 pass.set_bind_group(0, &reach_edge_bind_group, &[]);
                 pass.dispatch_workgroups(x_groups, y_groups, 1);
             }
-            let submission = self.queue.submit(Some(encoder.finish()));
-            self.device
-                .poll(wgpu::PollType::Wait {
-                    submission_index: Some(submission),
-                    timeout: None,
-                })
-                .map_err(|error| GpuCfrError::MapFailed(error.to_string()))?;
+            self.queue.submit(Some(encoder.finish()));
         }
 
         self.fill_fold_values(
@@ -2683,13 +2647,7 @@ impl GpuDenseCfrBackend {
             pass.set_bind_group(0, &hero_aggregate_bind_group, &[]);
             pass.dispatch_workgroups((action_len as u32).div_ceil(WORKGROUP_SIZE), 1, 1);
         }
-        let submission = self.queue.submit(Some(encoder.finish()));
-        self.device
-            .poll(wgpu::PollType::Wait {
-                submission_index: Some(submission),
-                timeout: None,
-            })
-            .map_err(|error| GpuCfrError::MapFailed(error.to_string()))?;
+        self.queue.submit(Some(encoder.finish()));
 
         let villain_aggregate_params = uniform_buffer(
             &self.device,
