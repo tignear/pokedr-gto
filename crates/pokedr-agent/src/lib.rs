@@ -645,6 +645,20 @@ fn solve_public_tree_cfr(
     let indexer = ComboIndexer::new();
     let gpu_backend = cfr_gpu_backend();
     let matrix_cache = RefCell::new(ShowdownMatrixCache::new(showdown_matrix_cache_capacity()));
+    if let Some(backend) = &gpu_backend
+        && let Some(gpu_state) = try_solve_gpu_public_tree_resident(
+            tree,
+            layout,
+            &indexer,
+            backend,
+            &dense_config,
+            config,
+            villain_weights,
+            &matrix_cache,
+        )
+    {
+        return gpu_state;
+    }
 
     for iteration in 1..=config.cfr_iterations.max(1) {
         let iteration_started = Instant::now();
@@ -727,6 +741,59 @@ fn showdown_matrix_cache_capacity() -> usize {
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(2)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn try_solve_gpu_public_tree_resident(
+    tree: &SubgameTree,
+    layout: &PostflopDenseLayout,
+    indexer: &ComboIndexer,
+    backend: &GpuDenseCfrBackend,
+    dense_config: &pokedr_core::dense_cfr::DenseCfrConfig,
+    config: &PokedrAgentConfig,
+    villain_weights: &[f32],
+    matrix_cache: &RefCell<ShowdownMatrixCache>,
+) -> Option<DenseCfrState> {
+    let linearized = linearize_gpu_public_tree(tree, layout, backend, config, matrix_cache)?;
+    if solver_progress_enabled() {
+        eprintln!(
+            "pokedr: gpu resident public tree nodes={} showdown_boards={} iterations={}",
+            linearized.nodes.len(),
+            linearized.showdown_boards.len(),
+            config.cfr_iterations.max(1)
+        );
+    }
+    let combos = gpu_private_combos();
+    let root_dead = root_board(tree).deck_mask();
+    let combo_legal: Vec<u32> = indexer
+        .combos()
+        .iter()
+        .map(|combo| (!combo.collides_with(root_dead)) as u32)
+        .collect();
+    let mut gpu_state = backend
+        .zeroed_state_with_legal_actions(dense_config.clone(), private_legal_actions(layout));
+    let cfr_started = Instant::now();
+    backend
+        .public_tree_run_iterations(
+            &linearized.nodes,
+            &linearized.children,
+            &linearized.child_cards,
+            &combos,
+            &combo_legal,
+            villain_weights,
+            &linearized.showdown_boards,
+            &mut gpu_state,
+            config.cfr_iterations.max(1),
+        )
+        .ok()?;
+    if solver_progress_enabled() {
+        eprintln!(
+            "pokedr: gpu resident cfr queued {} iterations elapsed={:.2}s",
+            config.cfr_iterations.max(1),
+            cfr_started.elapsed().as_secs_f32()
+        );
+    }
+    gpu_state.download(backend).ok()
 }
 
 fn fill_public_tree_iteration(

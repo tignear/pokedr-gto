@@ -92,6 +92,102 @@ fn update(@builtin(global_invocation_id) id: vec3<u32>) {
 }
 "#;
 
+const PUBLIC_TREE_CFR_UPDATE_SHADER: &str = r#"
+@group(0) @binding(0) var<storage, read_write> regrets: array<f32>;
+@group(0) @binding(1) var<storage, read_write> strategy_sum: array<f32>;
+@group(0) @binding(2) var<storage, read> output: array<f32>;
+@group(0) @binding(3) var<storage, read> params: array<u32>;
+@group(0) @binding(4) var<storage, read> legal_actions: array<u32>;
+
+fn positive(value: f32) -> f32 {
+    return max(value, 0.0);
+}
+
+fn strategy_at(offset: u32, action: u32, actions: u32, normalizer: f32) -> f32 {
+    if legal_actions[offset + action] == 0u {
+        return 0.0;
+    }
+    if normalizer > 0.0 {
+        return positive(regrets[offset + action]) / normalizer;
+    }
+    return 1.0 / f32(actions);
+}
+
+fn action_value(action_offset: u32, action_len: u32) -> f32 {
+    let weight = output[action_len + action_offset];
+    if weight > 0.0 {
+        return output[action_offset] / weight;
+    }
+    return 0.0;
+}
+
+@compute @workgroup_size(64)
+fn update(@builtin(global_invocation_id) id: vec3<u32>) {
+    let infoset = id.x;
+    let infosets = params[0];
+    let actions = params[1];
+    let variant = params[2];
+    let iteration = params[3];
+    let action_len = params[4];
+    let reach_start = params[5];
+    let strategy_start = params[6];
+    if infoset >= infosets {
+        return;
+    }
+
+    let offset = infoset * actions;
+    var normalizer = 0.0;
+    var legal_count = 0u;
+    for (var action = 0u; action < actions; action = action + 1u) {
+        if legal_actions[offset + action] != 0u {
+            legal_count = legal_count + 1u;
+            normalizer = normalizer + positive(regrets[offset + action]);
+        }
+    }
+
+    var node_value = 0.0;
+    for (var action = 0u; action < actions; action = action + 1u) {
+        if legal_actions[offset + action] == 0u {
+            continue;
+        }
+        let strategy = select(
+            1.0 / f32(max(legal_count, 1u)),
+            strategy_at(offset, action, actions, normalizer),
+            normalizer > 0.0
+        );
+        node_value = node_value + strategy * action_value(offset + action, action_len);
+    }
+
+    var discount = 1.0;
+    if variant == 1u {
+        let t = f32(max(iteration, 1u));
+        discount = t / (t + 1.0);
+    }
+
+    let reach_weight = output[reach_start + infoset];
+    let strategy_weight = output[strategy_start + infoset] * f32(iteration);
+    for (var action = 0u; action < actions; action = action + 1u) {
+        if legal_actions[offset + action] == 0u {
+            regrets[offset + action] = 0.0;
+            strategy_sum[offset + action] = 0.0;
+            continue;
+        }
+        let strategy = select(
+            1.0 / f32(max(legal_count, 1u)),
+            strategy_at(offset, action, actions, normalizer),
+            normalizer > 0.0
+        );
+        let regret = (action_value(offset + action, action_len) - node_value) * reach_weight;
+        var updated = regrets[offset + action] * discount + regret;
+        if variant == 0u {
+            updated = max(updated, 0.0);
+        }
+        regrets[offset + action] = updated;
+        strategy_sum[offset + action] = strategy_sum[offset + action] + strategy_weight * strategy;
+    }
+}
+"#;
+
 const SHOWDOWN_SHADER: &str = r#"
 struct ShowdownTask {
     cards: array<u32, 9>,
@@ -1207,6 +1303,8 @@ pub struct GpuDenseCfrBackend {
     adapter_info: wgpu::AdapterInfo,
     pipeline: wgpu::ComputePipeline,
     bind_group_layout: wgpu::BindGroupLayout,
+    public_tree_cfr_update_pipeline: wgpu::ComputePipeline,
+    public_tree_cfr_update_bind_group_layout: wgpu::BindGroupLayout,
     showdown_pipeline: wgpu::ComputePipeline,
     showdown_bind_group_layout: wgpu::BindGroupLayout,
     showdown_matrix_pipeline: wgpu::ComputePipeline,
@@ -1388,6 +1486,37 @@ impl GpuDenseCfrBackend {
             compilation_options: wgpu::PipelineCompilationOptions::default(),
             cache: None,
         });
+        let public_tree_cfr_update_shader =
+            device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("public tree CFR update shader"),
+                source: wgpu::ShaderSource::Wgsl(PUBLIC_TREE_CFR_UPDATE_SHADER.into()),
+            });
+        let public_tree_cfr_update_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("public tree CFR update bind group layout"),
+                entries: &[
+                    storage_entry(0, false),
+                    storage_entry(1, false),
+                    storage_entry(2, true),
+                    storage_entry(3, true),
+                    storage_entry(4, true),
+                ],
+            });
+        let public_tree_cfr_update_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("public tree CFR update pipeline layout"),
+                bind_group_layouts: &[Some(&public_tree_cfr_update_bind_group_layout)],
+                immediate_size: 0,
+            });
+        let public_tree_cfr_update_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("public tree CFR update pipeline"),
+                layout: Some(&public_tree_cfr_update_pipeline_layout),
+                module: &public_tree_cfr_update_shader,
+                entry_point: Some("update"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                cache: None,
+            });
         let showdown_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("showdown equity shader"),
             source: wgpu::ShaderSource::Wgsl(SHOWDOWN_SHADER.into()),
@@ -1706,6 +1835,8 @@ impl GpuDenseCfrBackend {
             adapter_info,
             pipeline,
             bind_group_layout,
+            public_tree_cfr_update_pipeline,
+            public_tree_cfr_update_bind_group_layout,
             showdown_pipeline,
             showdown_bind_group_layout,
             showdown_matrix_pipeline,
@@ -1948,13 +2079,17 @@ impl GpuDenseCfrBackend {
         read_f32_buffer(&self.device, &readback, output_count)
     }
 
-    fn final_board_strengths(
+    fn final_board_strength_buffer(
         &self,
         combos: &[GpuPrivateCombo],
         final_boards: &[GpuFinalBoard],
-    ) -> Result<Vec<f32>, GpuCfrError> {
+    ) -> Result<wgpu::Buffer, GpuCfrError> {
         if combos.is_empty() || final_boards.is_empty() {
-            return Ok(Vec::new());
+            return Ok(storage_buffer(
+                &self.device,
+                "final board strengths",
+                &[0.0f32],
+            ));
         }
         let output_count = combos.len() * final_boards.len();
         let combo_buffer = readonly_buffer(&self.device, "strength combos", combos);
@@ -1999,16 +2134,8 @@ impl GpuDenseCfrBackend {
             let groups = (output_count as u32).div_ceil(WORKGROUP_SIZE);
             pass.dispatch_workgroups(groups.min(65_535), groups.div_ceil(65_535), 1);
         }
-        let readback = readback_buffer(&self.device, output_count);
-        copy_buffer(&mut encoder, &output_buffer, &readback, output_count);
-        let submission = self.queue.submit(Some(encoder.finish()));
-        self.device
-            .poll(wgpu::PollType::Wait {
-                submission_index: Some(submission),
-                timeout: None,
-            })
-            .map_err(|error| GpuCfrError::MapFailed(error.to_string()))?;
-        read_f32_buffer(&self.device, &readback, output_count)
+        self.queue.submit(Some(encoder.finish()));
+        Ok(output_buffer)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2329,7 +2456,7 @@ impl GpuDenseCfrBackend {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn public_tree_iteration_values(
+    fn public_tree_iteration_output(
         &self,
         nodes: &[GpuPublicTreeNode],
         children: &[u32],
@@ -2338,18 +2465,21 @@ impl GpuDenseCfrBackend {
         combo_legal: &[u32],
         villain_weights: &[f32],
         showdown_boards: &[GpuFinalBoard],
-        state: &DenseCfrState,
-    ) -> Result<GpuRootTerminalValues, GpuCfrError> {
+        strength_buffer: &wgpu::Buffer,
+        regrets_buffer: &wgpu::Buffer,
+        infosets: usize,
+        actions: usize,
+    ) -> Result<(wgpu::Buffer, usize, usize), GpuCfrError> {
         assert!(!nodes.is_empty());
         assert_eq!(combo_legal.len(), combos.len());
         assert_eq!(villain_weights.len(), combos.len());
         assert_eq!(
-            state.infosets,
+            infosets,
             nodes_public_infoset_count(nodes) * combos.len() * 2
         );
 
-        let action_len = state.infosets * state.actions;
-        let output_len = action_len * 2 + state.infosets * 2;
+        let action_len = infosets * actions;
+        let output_len = action_len * 2 + infosets * 2;
         let node_combo_len = nodes.len() * combos.len();
         let (reach_edges, reach_layer_ranges) =
             public_tree_reach_layers(nodes, children, child_cards);
@@ -2371,13 +2501,6 @@ impl GpuDenseCfrBackend {
             .collect();
         let root_weights_buffer =
             readonly_buffer(&self.device, "public tree root weights", &root_weights);
-        let regrets_buffer = readonly_buffer(&self.device, "public tree regrets", &state.regrets);
-        let strength_values = self.final_board_strengths(combos, showdown_boards)?;
-        let strength_buffer = readonly_buffer(
-            &self.device,
-            "public tree final board strengths",
-            &strength_values,
-        );
         let hero_reaches_buffer = storage_buffer(
             &self.device,
             "public tree hero reaches",
@@ -2472,7 +2595,7 @@ impl GpuDenseCfrBackend {
             &[GpuPublicTreeParams {
                 combo_count: combos.len() as u32,
                 node_count: nodes.len() as u32,
-                max_actions: state.actions as u32,
+                max_actions: actions as u32,
                 output_len: init_x_invocations,
                 pair_start: 0,
                 chunk_pairs: 0,
@@ -2523,7 +2646,7 @@ impl GpuDenseCfrBackend {
                 &[GpuPublicTreeParams {
                     combo_count: combos.len() as u32,
                     node_count: nodes.len() as u32,
-                    max_actions: state.actions as u32,
+                    max_actions: actions as u32,
                     output_len: x_invocations,
                     pair_start: 0,
                     chunk_pairs: layer_start as u32,
@@ -2602,7 +2725,7 @@ impl GpuDenseCfrBackend {
             &backup_layer_ranges,
             combos.len(),
             nodes.len(),
-            state.actions,
+            actions,
         )?;
         let hero_aggregate_params = uniform_buffer(
             &self.device,
@@ -2610,7 +2733,7 @@ impl GpuDenseCfrBackend {
             &[GpuPublicTreeParams {
                 combo_count: combos.len() as u32,
                 node_count: nodes.len() as u32,
-                max_actions: state.actions as u32,
+                max_actions: actions as u32,
                 output_len: action_len as u32,
                 pair_start: 0,
                 chunk_pairs: 0,
@@ -2655,7 +2778,7 @@ impl GpuDenseCfrBackend {
             &[GpuPublicTreeParams {
                 combo_count: combos.len() as u32,
                 node_count: nodes.len() as u32,
-                max_actions: state.actions as u32,
+                max_actions: actions as u32,
                 output_len: action_len as u32,
                 pair_start: 1,
                 chunk_pairs: 0,
@@ -2693,7 +2816,43 @@ impl GpuDenseCfrBackend {
             pass.set_bind_group(0, &villain_aggregate_bind_group, &[]);
             pass.dispatch_workgroups((action_len as u32).div_ceil(WORKGROUP_SIZE), 1, 1);
         }
+        self.queue.submit(Some(encoder.finish()));
+        Ok((output_buffer, output_len, action_len))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn public_tree_iteration_values(
+        &self,
+        nodes: &[GpuPublicTreeNode],
+        children: &[u32],
+        child_cards: &[u32],
+        combos: &[GpuPrivateCombo],
+        combo_legal: &[u32],
+        villain_weights: &[f32],
+        showdown_boards: &[GpuFinalBoard],
+        state: &DenseCfrState,
+    ) -> Result<GpuRootTerminalValues, GpuCfrError> {
+        let regrets_buffer = readonly_buffer(&self.device, "public tree regrets", &state.regrets);
+        let strength_buffer = self.final_board_strength_buffer(combos, showdown_boards)?;
+        let (output_buffer, output_len, action_len) = self.public_tree_iteration_output(
+            nodes,
+            children,
+            child_cards,
+            combos,
+            combo_legal,
+            villain_weights,
+            showdown_boards,
+            &strength_buffer,
+            &regrets_buffer,
+            state.infosets,
+            state.actions,
+        )?;
         let readback = readback_buffer(&self.device, output_len);
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("public tree readback encoder"),
+            });
         copy_buffer(&mut encoder, &output_buffer, &readback, output_len);
         let submission = self.queue.submit(Some(encoder.finish()));
         self.device
@@ -2719,6 +2878,137 @@ impl GpuDenseCfrBackend {
             reach_weights: output[reach_start..strategy_start].to_vec(),
             strategy_weights: output[strategy_start..strategy_start + state.infosets].to_vec(),
         })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn public_tree_update_state(
+        &self,
+        nodes: &[GpuPublicTreeNode],
+        children: &[u32],
+        child_cards: &[u32],
+        combos: &[GpuPrivateCombo],
+        combo_legal: &[u32],
+        villain_weights: &[f32],
+        showdown_boards: &[GpuFinalBoard],
+        state: &mut GpuDenseCfrState,
+        iteration: usize,
+    ) -> Result<(), GpuCfrError> {
+        let strength_buffer = self.final_board_strength_buffer(combos, showdown_boards)?;
+        self.public_tree_update_state_with_strengths(
+            nodes,
+            children,
+            child_cards,
+            combos,
+            combo_legal,
+            villain_weights,
+            showdown_boards,
+            &strength_buffer,
+            state,
+            iteration,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn public_tree_update_state_with_strengths(
+        &self,
+        nodes: &[GpuPublicTreeNode],
+        children: &[u32],
+        child_cards: &[u32],
+        combos: &[GpuPrivateCombo],
+        combo_legal: &[u32],
+        villain_weights: &[f32],
+        showdown_boards: &[GpuFinalBoard],
+        strength_buffer: &wgpu::Buffer,
+        state: &mut GpuDenseCfrState,
+        iteration: usize,
+    ) -> Result<(), GpuCfrError> {
+        let (output_buffer, _output_len, action_len) = self.public_tree_iteration_output(
+            nodes,
+            children,
+            child_cards,
+            combos,
+            combo_legal,
+            villain_weights,
+            showdown_boards,
+            strength_buffer,
+            &state.regrets,
+            state.infosets,
+            state.actions,
+        )?;
+        let reach_start = action_len * 2;
+        let strategy_start = reach_start + state.infosets;
+        let params = readonly_buffer(
+            &self.device,
+            "public tree CFR update params",
+            &[
+                state.infosets as u32,
+                state.actions as u32,
+                variant_code(state.variant),
+                iteration as u32,
+                action_len as u32,
+                reach_start as u32,
+                strategy_start as u32,
+            ],
+        );
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("public tree CFR update bind group"),
+            layout: &self.public_tree_cfr_update_bind_group_layout,
+            entries: &[
+                bind_entry(0, &state.regrets),
+                bind_entry(1, &state.strategy_sum),
+                bind_entry(2, &output_buffer),
+                bind_entry(3, &params),
+                bind_entry(4, &state.legal_actions_buffer),
+            ],
+        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("public tree CFR update encoder"),
+            });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("public tree CFR update pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.public_tree_cfr_update_pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            let groups = (state.infosets as u32).div_ceil(WORKGROUP_SIZE);
+            pass.dispatch_workgroups(groups, 1, 1);
+        }
+        self.queue.submit(Some(encoder.finish()));
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn public_tree_run_iterations(
+        &self,
+        nodes: &[GpuPublicTreeNode],
+        children: &[u32],
+        child_cards: &[u32],
+        combos: &[GpuPrivateCombo],
+        combo_legal: &[u32],
+        villain_weights: &[f32],
+        showdown_boards: &[GpuFinalBoard],
+        state: &mut GpuDenseCfrState,
+        iterations: usize,
+    ) -> Result<(), GpuCfrError> {
+        let strength_buffer = self.final_board_strength_buffer(combos, showdown_boards)?;
+        for iteration in 1..=iterations.max(1) {
+            self.public_tree_update_state_with_strengths(
+                nodes,
+                children,
+                child_cards,
+                combos,
+                combo_legal,
+                villain_weights,
+                showdown_boards,
+                &strength_buffer,
+                state,
+                iteration,
+            )?;
+        }
+        Ok(())
     }
 
     pub fn upload_state(&self, state: &DenseCfrState) -> GpuDenseCfrState {
