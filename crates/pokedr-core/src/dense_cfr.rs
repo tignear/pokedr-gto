@@ -2,6 +2,7 @@
 pub enum CfrVariant {
     CfrPlus,
     Discounted,
+    DcfrPlus,
 }
 
 pub mod gpu;
@@ -171,9 +172,11 @@ impl DenseCfrState {
             let slot = &mut self.regrets[offset + action];
             *slot *= discount;
             *slot += regret;
-            if matches!(self.variant, CfrVariant::CfrPlus) {
+            if matches!(self.variant, CfrVariant::CfrPlus | CfrVariant::DcfrPlus) {
                 *slot = slot.max(0.0);
             }
+            self.strategy_sum[offset + action] *=
+                average_strategy_discount(self.variant, iteration);
             self.strategy_sum[offset + action] += strategy_weight * strategy[action];
         }
     }
@@ -300,6 +303,23 @@ fn regret_discount(variant: CfrVariant, iteration: usize) -> f32 {
             let t = iteration.max(1) as f32;
             t / (t + 1.0)
         }
+        CfrVariant::DcfrPlus => {
+            if iteration <= 1 {
+                0.0
+            } else {
+                let weighted = ((iteration - 1) as f32).powf(1.5);
+                weighted / (weighted + 1.5)
+            }
+        }
+    }
+}
+
+fn average_strategy_discount(variant: CfrVariant, iteration: usize) -> f32 {
+    match variant {
+        CfrVariant::DcfrPlus if iteration > 1 => {
+            (((iteration - 1) as f32) / iteration as f32).powf(4.0)
+        }
+        _ => 1.0,
     }
 }
 
@@ -360,6 +380,24 @@ mod tests {
         let mut strategy = [0.0; 2];
         state.strategy_for(0, &mut strategy);
         assert_eq!(strategy, [1.0, 0.0]);
+    }
+
+    #[test]
+    fn dcfr_plus_clips_regrets_and_discounts_average_strategy() {
+        let mut state = DenseCfrState::new(DenseCfrConfig {
+            infosets: 1,
+            actions: 2,
+            variant: CfrVariant::DcfrPlus,
+        });
+        state.update_infoset(0, &[1.0, -1.0], 1.0, 1.0, 1);
+        assert_eq!(state.regrets()[1], 0.0);
+        assert_eq!(state.strategy_sum(), &[0.5, 0.5]);
+
+        state.update_infoset(0, &[1.0, -1.0], 1.0, 1.0, 2);
+        let discount = (1.0_f32 / 2.0).powf(4.0);
+        assert!((state.strategy_sum()[0] - (0.5 * discount + 1.0)).abs() < 1e-6);
+        assert!((state.strategy_sum()[1] - (0.5 * discount)).abs() < 1e-6);
+        assert!(state.regrets().iter().all(|value| *value >= 0.0));
     }
 
     #[test]

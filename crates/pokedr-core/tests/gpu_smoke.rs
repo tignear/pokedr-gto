@@ -31,36 +31,44 @@ fn main() {
 }
 
 fn run_one_shot_update(backend: &GpuDenseCfrBackend) {
-    let config = DenseCfrConfig {
-        infosets: 4,
-        actions: 3,
-        variant: CfrVariant::CfrPlus,
-    };
-    let mut cpu = DenseCfrState::new(config.clone());
-    let mut gpu = DenseCfrState::new(config);
     let action_values = [
         1.0, -0.5, 0.25, -1.0, 2.0, 0.0, 0.5, 0.25, -0.75, 3.0, 1.0, -2.0,
     ];
     let reach_weights = [1.0, 0.5, 2.0, 0.25];
     let strategy_weights = [1.0, 1.0, 0.5, 2.0];
 
-    cpu.update_all_infosets(&action_values, &reach_weights, &strategy_weights, 1);
-    backend
-        .update_all_infosets(
-            &mut gpu,
-            &action_values,
-            &reach_weights,
-            &strategy_weights,
-            1,
-        )
-        .unwrap_or_else(|error| fail(&format!("GPU one-shot update failed: {error:?}")));
+    for variant in [
+        CfrVariant::CfrPlus,
+        CfrVariant::Discounted,
+        CfrVariant::DcfrPlus,
+    ] {
+        let config = DenseCfrConfig {
+            infosets: 4,
+            actions: 3,
+            variant,
+        };
+        let mut cpu = DenseCfrState::new(config.clone());
+        let mut gpu = DenseCfrState::new(config);
+        for iteration in 1..=3 {
+            cpu.update_all_infosets(&action_values, &reach_weights, &strategy_weights, iteration);
+            backend
+                .update_all_infosets(
+                    &mut gpu,
+                    &action_values,
+                    &reach_weights,
+                    &strategy_weights,
+                    iteration,
+                )
+                .unwrap_or_else(|error| fail(&format!("GPU one-shot update failed: {error:?}")));
+        }
 
-    assert_close("one-shot regret", cpu.regrets(), gpu.regrets());
-    assert_close(
-        "one-shot strategy_sum",
-        cpu.strategy_sum(),
-        gpu.strategy_sum(),
-    );
+        assert_close("one-shot regret", cpu.regrets(), gpu.regrets());
+        assert_close(
+            "one-shot strategy_sum",
+            cpu.strategy_sum(),
+            gpu.strategy_sum(),
+        );
+    }
 }
 
 fn run_masked_one_shot_update(backend: &GpuDenseCfrBackend) {
@@ -100,31 +108,37 @@ fn run_masked_one_shot_update(backend: &GpuDenseCfrBackend) {
 }
 
 fn run_resident_updates(backend: &GpuDenseCfrBackend) {
-    let config = DenseCfrConfig {
-        infosets: 8,
-        actions: 4,
-        variant: CfrVariant::Discounted,
-    };
-    let mut cpu = DenseCfrSolver::new(config.clone());
-    let mut gpu = backend.resident_solver(config);
+    for variant in [
+        CfrVariant::CfrPlus,
+        CfrVariant::Discounted,
+        CfrVariant::DcfrPlus,
+    ] {
+        let config = DenseCfrConfig {
+            infosets: 8,
+            actions: 4,
+            variant,
+        };
+        let mut cpu = DenseCfrSolver::new(config.clone());
+        let mut gpu = backend.resident_solver(config);
 
-    cpu.run_iterations(5, fill_fixture_iteration_with_state);
-    gpu.run_iterations(backend, 5, fill_fixture_iteration)
-        .unwrap_or_else(|error| fail(&format!("GPU resident update failed: {error:?}")));
+        cpu.run_iterations(5, fill_fixture_iteration_with_state);
+        gpu.run_iterations(backend, 5, fill_fixture_iteration)
+            .unwrap_or_else(|error| fail(&format!("GPU resident update failed: {error:?}")));
 
-    let downloaded = gpu
-        .download(backend)
-        .unwrap_or_else(|error| fail(&format!("GPU download failed: {error:?}")));
-    assert_close(
-        "resident regret",
-        cpu.state().regrets(),
-        downloaded.regrets(),
-    );
-    assert_close(
-        "resident strategy_sum",
-        cpu.state().strategy_sum(),
-        downloaded.strategy_sum(),
-    );
+        let downloaded = gpu
+            .download(backend)
+            .unwrap_or_else(|error| fail(&format!("GPU download failed: {error:?}")));
+        assert_close(
+            "resident regret",
+            cpu.state().regrets(),
+            downloaded.regrets(),
+        );
+        assert_close(
+            "resident strategy_sum",
+            cpu.state().strategy_sum(),
+            downloaded.strategy_sum(),
+        );
+    }
 }
 
 fn fill_fixture_iteration(iteration: usize, batch: &mut pokedr_core::dense_cfr::DenseCfrIteration) {

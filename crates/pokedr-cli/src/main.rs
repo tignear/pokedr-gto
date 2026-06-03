@@ -230,8 +230,8 @@ fn run_solve_flop(flop_arg: Option<&str>) {
     });
     let config = fixed_flop_config();
     println!(
-        "solving fixed flop iterations={} depth={} equity_runout_cap={} terminal_runouts=full",
-        config.cfr_iterations, config.max_depth, config.max_showdown_runouts
+        "solving fixed flop iterations={} variant={:?} depth={} equity_runout_cap={} terminal_runouts=full",
+        config.cfr_iterations, config.cfr_variant, config.max_depth, config.max_showdown_runouts
     );
     let summary = pokedr_agent::solve_fixed_flop_once(flop, config);
     println!("board: {}", summary.board);
@@ -253,8 +253,8 @@ fn run_solve_flop_metrics(flop_arg: Option<&str>) {
     let config = match_config();
     let iterations = metric_iterations();
     println!(
-        "solving fixed flop metrics depth={} equity_runout_cap={} terminal_runouts=full iterations={:?}",
-        config.max_depth, config.max_showdown_runouts, iterations
+        "solving fixed flop metrics variant={:?} depth={} equity_runout_cap={} terminal_runouts=full iterations={:?}",
+        config.cfr_variant, config.max_depth, config.max_showdown_runouts, iterations
     );
     for row in pokedr_agent::solve_fixed_flop_metrics(flop, config, &iterations) {
         let delta = row
@@ -313,10 +313,24 @@ fn fixed_flop_config() -> pokedr_agent::PokedrAgentConfig {
 fn match_config() -> pokedr_agent::PokedrAgentConfig {
     let mut config = pokedr_agent::PokedrAgentConfig::default();
     config.cfr_iterations = env_usize("POKEDR_CFR_ITERATIONS").unwrap_or(config.cfr_iterations);
+    config.cfr_variant = env_cfr_variant("POKEDR_CFR_VARIANT").unwrap_or(config.cfr_variant);
     config.max_depth = env_usize("POKEDR_MAX_DEPTH").unwrap_or(config.max_depth);
     config.max_showdown_runouts =
         env_usize("POKEDR_MAX_SHOWDOWN_RUNOUTS").unwrap_or(config.max_showdown_runouts);
     config
+}
+
+fn env_cfr_variant(name: &str) -> Option<CfrVariant> {
+    let value = std::env::var(name).ok()?;
+    match value.trim().to_ascii_lowercase().replace('_', "-").as_str() {
+        "cfr" | "cfr-plus" | "cfrplus" | "plus" => Some(CfrVariant::CfrPlus),
+        "discounted" | "dcfr" => Some(CfrVariant::Discounted),
+        "dcfr-plus" | "dcfrplus" | "dcfr+" => Some(CfrVariant::DcfrPlus),
+        other => {
+            eprintln!("unknown {name}={other}; expected cfr-plus, discounted, or dcfr-plus");
+            std::process::exit(2);
+        }
+    }
 }
 
 fn env_usize(name: &str) -> Option<usize> {

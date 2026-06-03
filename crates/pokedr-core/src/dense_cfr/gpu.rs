@@ -32,6 +32,29 @@ fn strategy_at(offset: u32, action: u32, actions: u32, normalizer: f32) -> f32 {
     return 1.0 / f32(actions);
 }
 
+fn regret_discount(variant: u32, iteration: u32) -> f32 {
+    if variant == 1u {
+        let t = f32(max(iteration, 1u));
+        return t / (t + 1.0);
+    }
+    if variant == 2u {
+        if iteration <= 1u {
+            return 0.0;
+        }
+        let weighted = pow(f32(iteration - 1u), 1.5);
+        return weighted / (weighted + 1.5);
+    }
+    return 1.0;
+}
+
+fn average_strategy_discount(variant: u32, iteration: u32) -> f32 {
+    if variant == 2u && iteration > 1u {
+        let t = f32(iteration);
+        return pow((t - 1.0) / t, 4.0);
+    }
+    return 1.0;
+}
+
 @compute @workgroup_size(64)
 fn update(@builtin(global_invocation_id) id: vec3<u32>) {
     let infoset = id.x;
@@ -66,11 +89,8 @@ fn update(@builtin(global_invocation_id) id: vec3<u32>) {
         node_value = node_value + strategy * action_values[offset + action];
     }
 
-    var discount = 1.0;
-    if variant == 1u {
-        let t = f32(max(iteration, 1u));
-        discount = t / (t + 1.0);
-    }
+    let discount = regret_discount(variant, iteration);
+    let average_discount = average_strategy_discount(variant, iteration);
 
     for (var action = 0u; action < actions; action = action + 1u) {
         if legal_actions[offset + action] == 0u {
@@ -85,11 +105,11 @@ fn update(@builtin(global_invocation_id) id: vec3<u32>) {
         );
         let regret = (action_values[offset + action] - node_value) * reach_weights[infoset];
         var updated = regrets[offset + action] * discount + regret;
-        if variant == 0u {
+        if variant == 0u || variant == 2u {
             updated = max(updated, 0.0);
         }
         regrets[offset + action] = updated;
-        strategy_sum[offset + action] = strategy_sum[offset + action] + strategy_weights[infoset] * strategy;
+        strategy_sum[offset + action] = strategy_sum[offset + action] * average_discount + strategy_weights[infoset] * strategy;
     }
 }
 "#;
@@ -121,6 +141,29 @@ fn action_value(action_offset: u32, action_len: u32) -> f32 {
         return output[action_offset] / weight;
     }
     return 0.0;
+}
+
+fn regret_discount(variant: u32, iteration: u32) -> f32 {
+    if variant == 1u {
+        let t = f32(max(iteration, 1u));
+        return t / (t + 1.0);
+    }
+    if variant == 2u {
+        if iteration <= 1u {
+            return 0.0;
+        }
+        let weighted = pow(f32(iteration - 1u), 1.5);
+        return weighted / (weighted + 1.5);
+    }
+    return 1.0;
+}
+
+fn average_strategy_discount(variant: u32, iteration: u32) -> f32 {
+    if variant == 2u && iteration > 1u {
+        let t = f32(iteration);
+        return pow((t - 1.0) / t, 4.0);
+    }
+    return 1.0;
 }
 
 @compute @workgroup_size(64)
@@ -160,14 +203,15 @@ fn update(@builtin(global_invocation_id) id: vec3<u32>) {
         node_value = node_value + strategy * action_value(offset + action, action_len);
     }
 
-    var discount = 1.0;
-    if variant == 1u {
-        let t = f32(max(iteration, 1u));
-        discount = t / (t + 1.0);
-    }
+    let discount = regret_discount(variant, iteration);
+    let average_discount = average_strategy_discount(variant, iteration);
 
     let reach_weight = output[reach_start + infoset];
-    let strategy_weight = output[strategy_start + infoset] * f32(iteration);
+    let raw_strategy_weight = output[strategy_start + infoset];
+    var strategy_weight = raw_strategy_weight * f32(iteration);
+    if variant == 2u {
+        strategy_weight = raw_strategy_weight;
+    }
     for (var action = 0u; action < actions; action = action + 1u) {
         if legal_actions[offset + action] == 0u {
             regrets[offset + action] = 0.0;
@@ -181,11 +225,11 @@ fn update(@builtin(global_invocation_id) id: vec3<u32>) {
         );
         let regret = (action_value(offset + action, action_len) - node_value) * reach_weight;
         var updated = regrets[offset + action] * discount + regret;
-        if variant == 0u {
+        if variant == 0u || variant == 2u {
             updated = max(updated, 0.0);
         }
         regrets[offset + action] = updated;
-        strategy_sum[offset + action] = strategy_sum[offset + action] + strategy_weight * strategy;
+        strategy_sum[offset + action] = strategy_sum[offset + action] * average_discount + strategy_weight * strategy;
     }
 }
 "#;
@@ -4593,6 +4637,7 @@ fn variant_code(variant: super::CfrVariant) -> u32 {
     match variant {
         super::CfrVariant::CfrPlus => 0,
         super::CfrVariant::Discounted => 1,
+        super::CfrVariant::DcfrPlus => 2,
     }
 }
 

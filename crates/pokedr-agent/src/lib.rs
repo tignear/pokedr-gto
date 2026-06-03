@@ -42,6 +42,7 @@ pub struct PokedrAgent {
 #[derive(Debug, Clone)]
 pub struct PokedrAgentConfig {
     pub cfr_iterations: usize,
+    pub cfr_variant: CfrVariant,
     pub action_set: ActionSetConfig,
     pub max_raises_per_street: u8,
     pub max_depth: usize,
@@ -52,6 +53,7 @@ impl Default for PokedrAgentConfig {
     fn default() -> Self {
         Self {
             cfr_iterations: 8,
+            cfr_variant: CfrVariant::CfrPlus,
             action_set: ActionSetConfig {
                 max_aggressive_actions: 2,
                 flop_bet_fractions: vec![0.5],
@@ -809,7 +811,7 @@ fn solve_public_tree_cfr(
     config: &PokedrAgentConfig,
     villain_weights: &[f32],
 ) -> DenseCfrState {
-    let mut dense_config = layout.dense_config(CfrVariant::CfrPlus);
+    let mut dense_config = layout.dense_config(config.cfr_variant);
     dense_config.infosets *= PRIVATE_INFOS_PER_PUBLIC;
     let mut state =
         DenseCfrState::new_with_legal_actions(dense_config.clone(), private_legal_actions(layout));
@@ -852,9 +854,11 @@ fn solve_public_tree_cfr(
             &matrix_cache,
             &mut batch,
         );
-        let average_weight = iteration as f32;
-        for weight in &mut batch.strategy_weights {
-            *weight *= average_weight;
+        if config.cfr_variant != CfrVariant::DcfrPlus {
+            let average_weight = iteration as f32;
+            for weight in &mut batch.strategy_weights {
+                *weight *= average_weight;
+            }
         }
         batch.validate(&dense_config);
         if let Some(backend) = gpu_backend.as_deref() {
