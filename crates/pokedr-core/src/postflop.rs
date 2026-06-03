@@ -1,5 +1,7 @@
 use std::cmp::Ordering;
 
+use crate::cards::{Board, Card};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Street {
     Flop,
@@ -77,6 +79,77 @@ impl ActionSetRequest {
 
 pub struct ActionSetBuilder {
     config: ActionSetConfig,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Player {
+    Hero,
+    Villain,
+}
+
+#[derive(Debug, Clone)]
+pub struct PublicState {
+    pub street: Street,
+    pub board: Board,
+    pub pot: u32,
+    pub effective_stack: u32,
+    pub to_call: u32,
+    pub min_aggressive_amount: u32,
+    pub acting_player: Player,
+    pub raises_this_street: u8,
+}
+
+#[derive(Debug, Clone)]
+pub struct SubgameTreeConfig {
+    pub action_set: ActionSetConfig,
+    pub max_raises_per_street: u8,
+    pub max_depth: usize,
+}
+
+impl Default for SubgameTreeConfig {
+    fn default() -> Self {
+        Self {
+            action_set: ActionSetConfig::default(),
+            max_raises_per_street: 2,
+            max_depth: 16,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalKind {
+    Fold,
+    Showdown,
+}
+
+#[derive(Debug, Clone)]
+pub enum PublicNodeKind {
+    Decision {
+        state: PublicState,
+        actions: Vec<ActionCandidate>,
+    },
+    Chance {
+        street: Street,
+        board: Board,
+        cards: Vec<Card>,
+    },
+    Terminal {
+        kind: TerminalKind,
+        board: Board,
+        pot: u32,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct PublicNode {
+    pub parent: Option<usize>,
+    pub children: Vec<usize>,
+    pub kind: PublicNodeKind,
+}
+
+#[derive(Debug, Clone)]
+pub struct SubgameTree {
+    nodes: Vec<PublicNode>,
 }
 
 impl ActionSetBuilder {
@@ -214,6 +287,270 @@ impl ActionSetBuilder {
     }
 }
 
+impl Player {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Hero => Self::Villain,
+            Self::Villain => Self::Hero,
+        }
+    }
+}
+
+impl SubgameTree {
+    pub fn build(root: PublicState, config: SubgameTreeConfig) -> Self {
+        let builder = ActionSetBuilder::new(config.action_set.clone());
+        let mut tree = Self { nodes: Vec::new() };
+        tree.expand_state(None, root, 0, &config, &builder);
+        tree
+    }
+
+    pub fn nodes(&self) -> &[PublicNode] {
+        &self.nodes
+    }
+
+    pub fn decision_count(&self) -> usize {
+        self.nodes
+            .iter()
+            .filter(|node| matches!(node.kind, PublicNodeKind::Decision { .. }))
+            .count()
+    }
+
+    pub fn chance_count(&self) -> usize {
+        self.nodes
+            .iter()
+            .filter(|node| matches!(node.kind, PublicNodeKind::Chance { .. }))
+            .count()
+    }
+
+    pub fn terminal_count(&self) -> usize {
+        self.nodes
+            .iter()
+            .filter(|node| matches!(node.kind, PublicNodeKind::Terminal { .. }))
+            .count()
+    }
+
+    fn push_node(&mut self, parent: Option<usize>, kind: PublicNodeKind) -> usize {
+        let index = self.nodes.len();
+        self.nodes.push(PublicNode {
+            parent,
+            children: Vec::new(),
+            kind,
+        });
+        if let Some(parent) = parent {
+            self.nodes[parent].children.push(index);
+        }
+        index
+    }
+
+    fn expand_state(
+        &mut self,
+        parent: Option<usize>,
+        state: PublicState,
+        depth: usize,
+        config: &SubgameTreeConfig,
+        builder: &ActionSetBuilder,
+    ) -> usize {
+        if depth >= config.max_depth || state.effective_stack == 0 {
+            return self.push_node(
+                parent,
+                PublicNodeKind::Terminal {
+                    kind: TerminalKind::Showdown,
+                    board: state.board,
+                    pot: state.pot,
+                },
+            );
+        }
+        if state.street == Street::River && state.to_call == 0 && depth > 0 {
+            return self.push_node(
+                parent,
+                PublicNodeKind::Terminal {
+                    kind: TerminalKind::Showdown,
+                    board: state.board,
+                    pot: state.pot,
+                },
+            );
+        }
+
+        let actions = builder.build(&ActionSetRequest {
+            street: state.street,
+            pot: state.pot,
+            stack: state.effective_stack,
+            to_call: state.to_call,
+            min_aggressive_amount: state.min_aggressive_amount,
+            observed_aggressive_amounts: Vec::new(),
+        });
+        let node = self.push_node(
+            parent,
+            PublicNodeKind::Decision {
+                state: state.clone(),
+                actions: actions.clone(),
+            },
+        );
+        for action in actions {
+            self.expand_action(node, &state, action.action, depth + 1, config, builder);
+        }
+        node
+    }
+
+    fn expand_action(
+        &mut self,
+        parent: usize,
+        state: &PublicState,
+        action: PlayerAction,
+        depth: usize,
+        config: &SubgameTreeConfig,
+        builder: &ActionSetBuilder,
+    ) {
+        match action {
+            PlayerAction::Fold => {
+                self.push_node(
+                    Some(parent),
+                    PublicNodeKind::Terminal {
+                        kind: TerminalKind::Fold,
+                        board: state.board.clone(),
+                        pot: state.pot,
+                    },
+                );
+            }
+            PlayerAction::Check | PlayerAction::Call { .. } => {
+                let next_state = state_after_passive_action(state, action);
+                if should_advance_street(state, action) {
+                    self.expand_chance(Some(parent), next_state, depth, config, builder);
+                } else {
+                    self.expand_state(Some(parent), next_state, depth, config, builder);
+                }
+            }
+            PlayerAction::Bet { amount }
+            | PlayerAction::Raise { amount }
+            | PlayerAction::AllIn { amount } => {
+                if state.raises_this_street >= config.max_raises_per_street {
+                    return;
+                }
+                let next_state = state_after_aggressive_action(state, amount);
+                self.expand_state(Some(parent), next_state, depth, config, builder);
+            }
+        }
+    }
+
+    fn expand_chance(
+        &mut self,
+        parent: Option<usize>,
+        state: PublicState,
+        depth: usize,
+        config: &SubgameTreeConfig,
+        builder: &ActionSetBuilder,
+    ) {
+        if state.street == Street::River {
+            self.push_node(
+                parent,
+                PublicNodeKind::Terminal {
+                    kind: TerminalKind::Showdown,
+                    board: state.board,
+                    pot: state.pot,
+                },
+            );
+            return;
+        }
+
+        let cards = remaining_cards(state.board.deck_mask());
+        let chance = self.push_node(
+            parent,
+            PublicNodeKind::Chance {
+                street: next_street(state.street),
+                board: state.board.clone(),
+                cards: cards.clone(),
+            },
+        );
+        for card in cards {
+            let mut child_state = state.clone();
+            child_state.street = next_street(state.street);
+            child_state.board = state.board.with_card(card);
+            child_state.to_call = 0;
+            child_state.min_aggressive_amount = child_state.pot.max(1);
+            child_state.raises_this_street = 0;
+            self.expand_state(Some(chance), child_state, depth + 1, config, builder);
+        }
+    }
+}
+
+pub fn ordered_runouts(board: &Board) -> Vec<(Card, Card)> {
+    assert_eq!(board.cards().len(), 3, "ordered runouts require a flop");
+    ordered_runouts_from_dead_mask(board.deck_mask())
+}
+
+pub fn ordered_runouts_from_dead_mask(dead_mask: u64) -> Vec<(Card, Card)> {
+    let cards = remaining_cards(dead_mask);
+    let mut runouts = Vec::with_capacity(cards.len() * (cards.len() - 1));
+    for &turn in &cards {
+        for &river in &cards {
+            if turn != river {
+                runouts.push((turn, river));
+            }
+        }
+    }
+    runouts
+}
+
+pub fn unordered_runouts(board: &Board) -> Vec<(Card, Card)> {
+    assert_eq!(board.cards().len(), 3, "unordered runouts require a flop");
+    unordered_runouts_from_dead_mask(board.deck_mask())
+}
+
+pub fn unordered_runouts_from_dead_mask(dead_mask: u64) -> Vec<(Card, Card)> {
+    let cards = remaining_cards(dead_mask);
+    let mut runouts = Vec::with_capacity(cards.len() * (cards.len() - 1) / 2);
+    for first in 0..cards.len() {
+        for second in first + 1..cards.len() {
+            runouts.push((cards[first], cards[second]));
+        }
+    }
+    runouts
+}
+
+fn remaining_cards(dead_mask: u64) -> Vec<Card> {
+    (0..Card::COUNT as u8)
+        .map(Card::from_index)
+        .filter(|card| card.deck_mask() & dead_mask == 0)
+        .collect()
+}
+
+fn next_street(street: Street) -> Street {
+    match street {
+        Street::Flop => Street::Turn,
+        Street::Turn => Street::River,
+        Street::River => Street::River,
+    }
+}
+
+fn should_advance_street(state: &PublicState, action: PlayerAction) -> bool {
+    matches!(action, PlayerAction::Check | PlayerAction::Call { .. }) && state.to_call == 0
+}
+
+fn state_after_passive_action(state: &PublicState, action: PlayerAction) -> PublicState {
+    let call_amount = match action {
+        PlayerAction::Call { amount } => amount,
+        _ => 0,
+    };
+    let mut next = state.clone();
+    next.pot = next.pot.saturating_add(call_amount);
+    next.effective_stack = next.effective_stack.saturating_sub(call_amount);
+    next.to_call = 0;
+    next.acting_player = state.acting_player.next();
+    next
+}
+
+fn state_after_aggressive_action(state: &PublicState, amount: u32) -> PublicState {
+    let contribution = amount.min(state.effective_stack);
+    let mut next = state.clone();
+    next.pot = next.pot.saturating_add(contribution);
+    next.effective_stack = next.effective_stack.saturating_sub(contribution);
+    next.to_call = contribution;
+    next.min_aggressive_amount = contribution.saturating_mul(2).max(1);
+    next.acting_player = state.acting_player.next();
+    next.raises_this_street = next.raises_this_street.saturating_add(1);
+    next
+}
+
 #[derive(Debug, Clone, Copy)]
 struct AggressiveSizing {
     amount: u32,
@@ -312,6 +649,7 @@ fn sizing_rank(request: &ActionSetRequest, sizing: AggressiveSizing) -> (u8, u32
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cards::{Card, Rank, Suit};
 
     fn builder() -> ActionSetBuilder {
         ActionSetBuilder::new(ActionSetConfig::default())
@@ -428,5 +766,68 @@ mod tests {
                 .iter()
                 .any(|candidate| candidate.action == PlayerAction::AllIn { amount: 1000 })
         );
+    }
+
+    fn flop() -> Board {
+        Board::new(vec![
+            Card::new(Rank::Ace, Suit::Spades),
+            Card::new(Rank::Seven, Suit::Hearts),
+            Card::new(Rank::Two, Suit::Clubs),
+        ])
+    }
+
+    #[test]
+    fn flop_runout_counts_cover_all_turn_river_cards() {
+        assert_eq!(ordered_runouts(&flop()).len(), 49 * 48);
+        assert_eq!(unordered_runouts(&flop()).len(), 49 * 48 / 2);
+    }
+
+    #[test]
+    fn combo_specific_runout_counts_exclude_private_cards() {
+        let board = flop();
+        let hero_combo = Card::new(Rank::King, Suit::Spades).deck_mask()
+            | Card::new(Rank::Queen, Suit::Spades).deck_mask();
+        let dead_mask = board.deck_mask() | hero_combo;
+
+        assert_eq!(ordered_runouts_from_dead_mask(dead_mask).len(), 47 * 46);
+        assert_eq!(
+            unordered_runouts_from_dead_mask(dead_mask).len(),
+            47 * 46 / 2
+        );
+    }
+
+    #[test]
+    fn subgame_tree_builds_bounded_public_nodes() {
+        let config = SubgameTreeConfig {
+            action_set: ActionSetConfig {
+                max_aggressive_actions: 2,
+                flop_bet_fractions: vec![0.5],
+                turn_bet_fractions: vec![0.5],
+                river_bet_fractions: vec![0.5],
+                raise_fractions: vec![1.0],
+                ..ActionSetConfig::default()
+            },
+            max_raises_per_street: 1,
+            max_depth: 4,
+        };
+        let tree = SubgameTree::build(
+            PublicState {
+                street: Street::Flop,
+                board: flop(),
+                pot: 100,
+                effective_stack: 300,
+                to_call: 0,
+                min_aggressive_amount: 50,
+                acting_player: Player::Hero,
+                raises_this_street: 0,
+            },
+            config,
+        );
+
+        assert!(!tree.nodes().is_empty());
+        assert!(tree.decision_count() > 0);
+        assert!(tree.chance_count() > 0);
+        assert!(tree.terminal_count() > 0);
+        assert!(tree.nodes().len() < 20_000);
     }
 }
