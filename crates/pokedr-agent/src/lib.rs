@@ -1943,6 +1943,166 @@ mod tests {
     }
 
     #[test]
+    fn board_locked_showdown_is_exact_tie_for_both_players() {
+        let board = Board::new(vec![
+            PokedrCard::new(PokedrRank::Ace, PokedrSuit::Spades),
+            PokedrCard::new(PokedrRank::King, PokedrSuit::Spades),
+            PokedrCard::new(PokedrRank::Queen, PokedrSuit::Spades),
+            PokedrCard::new(PokedrRank::Jack, PokedrSuit::Spades),
+            PokedrCard::new(PokedrRank::Ten, PokedrSuit::Spades),
+        ]);
+        let indexer = ComboIndexer::new();
+        let matrix_cache = RefCell::new(ShowdownMatrixCache::new(1));
+        let hero_cards = [
+            PokedrCard::new(PokedrRank::Two, PokedrSuit::Clubs),
+            PokedrCard::new(PokedrRank::Three, PokedrSuit::Diamonds),
+        ];
+        let villain_cards = [
+            PokedrCard::new(PokedrRank::Four, PokedrSuit::Clubs),
+            PokedrCard::new(PokedrRank::Five, PokedrSuit::Diamonds),
+        ];
+        let mut hero_view = PostflopEvaluationContext {
+            hero_cards,
+            villain_cards,
+            hero_combo: hero_combo_index(&indexer, hero_cards),
+            villain_combo: hero_combo_index(&indexer, villain_cards),
+            gpu_backend: None,
+            matrix_cache: &matrix_cache,
+            max_showdown_runouts: 1,
+            equity_cache: HashMap::new(),
+        };
+        let mut villain_view = PostflopEvaluationContext {
+            hero_cards: villain_cards,
+            villain_cards: hero_cards,
+            hero_combo: hero_combo_index(&indexer, villain_cards),
+            villain_combo: hero_combo_index(&indexer, hero_cards),
+            gpu_backend: None,
+            matrix_cache: &matrix_cache,
+            max_showdown_runouts: 1,
+            equity_cache: HashMap::new(),
+        };
+
+        assert!((showdown_equity(&board, &mut hero_view) - 0.5).abs() < 1e-6);
+        assert!((showdown_equity(&board, &mut villain_view) - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn fold_terminal_payoff_matches_pot_accounting() {
+        let hero_facing_bet = PublicState {
+            street: Street::River,
+            board: Board::new(vec![]),
+            pot: 100,
+            hero_invested: 40,
+            villain_invested: 60,
+            effective_stack: 100,
+            to_call: 20,
+            min_aggressive_amount: 60,
+            acting_player: Player::Hero,
+            raises_this_street: 0,
+            checks_this_street: 0,
+        };
+        let villain_facing_bet = PublicState {
+            acting_player: Player::Villain,
+            hero_invested: 60,
+            villain_invested: 40,
+            ..hero_facing_bet.clone()
+        };
+
+        assert_eq!(
+            fold_utility(&hero_facing_bet, PlayerAction::Fold, 100, 40),
+            -40.0
+        );
+        assert_eq!(
+            fold_utility(&villain_facing_bet, PlayerAction::Fold, 100, 60),
+            40.0
+        );
+    }
+
+    #[test]
+    fn river_fold_call_values_match_hand_calculation() {
+        let tree = SubgameTree::build(
+            PublicState {
+                street: Street::River,
+                board: Board::new(vec![
+                    PokedrCard::new(PokedrRank::Ace, PokedrSuit::Spades),
+                    PokedrCard::new(PokedrRank::Seven, PokedrSuit::Hearts),
+                    PokedrCard::new(PokedrRank::Two, PokedrSuit::Clubs),
+                    PokedrCard::new(PokedrRank::King, PokedrSuit::Diamonds),
+                    PokedrCard::new(PokedrRank::Three, PokedrSuit::Spades),
+                ]),
+                pot: 100,
+                hero_invested: 40,
+                villain_invested: 60,
+                effective_stack: 100,
+                to_call: 20,
+                min_aggressive_amount: 60,
+                acting_player: Player::Hero,
+                raises_this_street: 0,
+                checks_this_street: 0,
+            },
+            SubgameTreeConfig {
+                action_set: ActionSetConfig {
+                    max_aggressive_actions: 0,
+                    ..ActionSetConfig::default()
+                },
+                max_raises_per_street: 0,
+                max_depth: 1,
+            },
+        );
+        let layout = PostflopDenseLayout::from_tree(&tree);
+        let mut dense_config = layout.dense_config(CfrVariant::CfrPlus);
+        dense_config.infosets *= PRIVATE_INFOS_PER_PUBLIC;
+        let cfr_state = DenseCfrState::new_with_legal_actions(
+            dense_config.clone(),
+            private_legal_actions(&layout),
+        );
+        let indexer = ComboIndexer::new();
+        let hero_cards = [
+            PokedrCard::new(PokedrRank::Ace, PokedrSuit::Clubs),
+            PokedrCard::new(PokedrRank::Ace, PokedrSuit::Diamonds),
+        ];
+        let villain_cards = [
+            PokedrCard::new(PokedrRank::Queen, PokedrSuit::Clubs),
+            PokedrCard::new(PokedrRank::Queen, PokedrSuit::Diamonds),
+        ];
+        let hero_combo = hero_combo_index(&indexer, hero_cards);
+        let villain_combo = hero_combo_index(&indexer, villain_cards);
+        let matrix_cache = RefCell::new(ShowdownMatrixCache::new(1));
+        let mut ctx = PostflopEvaluationContext {
+            hero_cards,
+            villain_cards,
+            hero_combo,
+            villain_combo,
+            gpu_backend: None,
+            matrix_cache: &matrix_cache,
+            max_showdown_runouts: 1,
+            equity_cache: HashMap::new(),
+        };
+        let mut batch = DenseCfrIteration::new(&dense_config);
+        let mut value_weights = vec![0.0; batch.action_values.len()];
+        traverse_cfr_node(
+            &tree,
+            &layout,
+            0,
+            None,
+            None,
+            hero_combo,
+            villain_combo,
+            1.0,
+            1.0,
+            1.0,
+            &cfr_state,
+            &mut ctx,
+            &mut batch,
+            &mut value_weights,
+        );
+
+        let offset = private_infoset(0, Player::Hero, hero_combo) * layout.max_actions();
+        assert!((batch.action_values[offset] - -40.0).abs() < 1e-6);
+        assert!((batch.action_values[offset + 1] - 60.0).abs() < 1e-6);
+    }
+
+    #[test]
     fn public_tree_cfr_produces_normalized_root_strategy() {
         let tree = SubgameTree::build(
             PublicState {
