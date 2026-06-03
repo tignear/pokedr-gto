@@ -1577,9 +1577,6 @@ unsafe impl bytemuck::Zeroable for GpuPublicTreeEdge {}
 unsafe impl bytemuck::Pod for GpuPublicTreeEdge {}
 
 struct GpuPublicTreeIterationContext {
-    nodes: Vec<GpuPublicTreeNode>,
-    combos: Vec<GpuPrivateCombo>,
-    showdown_boards: Vec<GpuFinalBoard>,
     nodes_len: usize,
     combos_len: usize,
     infosets: usize,
@@ -1603,6 +1600,7 @@ struct GpuPublicTreeIterationContext {
     output_buffer: wgpu::Buffer,
     fold_terminal_nodes: Vec<u32>,
     showdown_terminal_nodes: Vec<u32>,
+    showdown_terminal_groups: Vec<GpuTerminalGroupCache>,
     decision_nodes_buffer: wgpu::Buffer,
     terminal_tile_count: usize,
     terminal_board_tile_count: usize,
@@ -1610,8 +1608,17 @@ struct GpuPublicTreeIterationContext {
     terminal_blocker_neighbors_buffer: wgpu::Buffer,
     terminal_blocker_neighbor_stride: usize,
     terminal_prefix_pair_budget: usize,
+    terminal_prefix_pairs_buffer: wgpu::Buffer,
     hero_decision_aggregates_buffer: wgpu::Buffer,
     villain_decision_aggregates_buffer: wgpu::Buffer,
+}
+
+struct GpuTerminalGroupCache {
+    board_base: usize,
+    board_count: usize,
+    terminal_nodes: Vec<u32>,
+    combo_order: Vec<u32>,
+    combo_bounds: Vec<GpuShowdownComboBounds>,
 }
 
 #[repr(C)]
@@ -1718,6 +1725,39 @@ fn showdown_blocker_neighbors(combos: &[GpuPrivateCombo]) -> (Vec<u32>, usize) {
         }
     }
     (blocker_neighbors, blocker_neighbor_stride)
+}
+
+fn terminal_group_caches(
+    nodes: &[GpuPublicTreeNode],
+    terminal_nodes: &[u32],
+    combos: &[GpuPrivateCombo],
+    showdown_boards: &[GpuFinalBoard],
+) -> Vec<GpuTerminalGroupCache> {
+    let mut groups: BTreeMap<(usize, usize), Vec<u32>> = BTreeMap::new();
+    for &node_index in terminal_nodes {
+        let node = nodes[node_index as usize];
+        groups
+            .entry((node.showdown_offset as usize, node._pad0 as usize))
+            .or_default()
+            .push(node_index);
+    }
+    groups
+        .into_iter()
+        .filter_map(|((board_base, board_count), terminal_nodes)| {
+            if board_count == 0 {
+                return None;
+            }
+            let boards = &showdown_boards[board_base..board_base + board_count];
+            let (combo_order, combo_bounds) = showdown_strength_order_data(combos, boards);
+            Some(GpuTerminalGroupCache {
+                board_base,
+                board_count,
+                terminal_nodes,
+                combo_order,
+                combo_bounds,
+            })
+        })
+        .collect()
 }
 
 fn combos_collide_for_order(left: GpuPrivateCombo, right: GpuPrivateCombo) -> bool {
@@ -2725,30 +2765,20 @@ impl GpuDenseCfrBackend {
     #[allow(clippy::too_many_arguments)]
     fn fill_terminal_values_streaming(
         &self,
-        nodes: &[GpuPublicTreeNode],
         node_buffer: &wgpu::Buffer,
-        terminal_nodes: &[u32],
-        combos: &[GpuPrivateCombo],
-        showdown_boards: &[GpuFinalBoard],
+        terminal_groups: &[GpuTerminalGroupCache],
         blocker_neighbors_buffer: &wgpu::Buffer,
         hero_reaches_buffer: &wgpu::Buffer,
         villain_reaches_buffer: &wgpu::Buffer,
         hero_values_buffer: &wgpu::Buffer,
         villain_values_buffer: &wgpu::Buffer,
+        terminal_prefix_pairs_buffer: &wgpu::Buffer,
         combo_count: usize,
         blocker_neighbor_stride: usize,
         max_terminal_prefix_pairs: usize,
     ) -> Result<(), GpuCfrError> {
-        if terminal_nodes.is_empty() || combo_count == 0 || showdown_boards.is_empty() {
+        if terminal_groups.is_empty() || combo_count == 0 {
             return Ok(());
-        }
-        let mut groups: BTreeMap<(usize, usize), Vec<u32>> = BTreeMap::new();
-        for &node_index in terminal_nodes {
-            let node = nodes[node_index as usize];
-            groups
-                .entry((node.showdown_offset as usize, node._pad0 as usize))
-                .or_default()
-                .push(node_index);
         }
         let poll_interval = std::env::var("POKEDR_GPU_TERMINAL_STREAM_POLL")
             .ok()
@@ -2756,41 +2786,29 @@ impl GpuDenseCfrBackend {
             .unwrap_or(16)
             .max(1);
         let mut submitted_chunks = 0usize;
-        for ((board_base, board_count), group_nodes) in groups {
-            if board_count == 0 {
-                continue;
-            }
-            let boards = &showdown_boards[board_base..board_base + board_count];
-            let (combo_order, combo_bounds) = showdown_strength_order_data(combos, boards);
+        for group in terminal_groups {
             let combo_order_buffer = readonly_buffer(
                 &self.device,
                 "public tree streamed terminal combo strength order",
-                &combo_order,
+                &group.combo_order,
             );
             let combo_bounds_buffer = readonly_buffer(
                 &self.device,
                 "public tree streamed terminal combo strength bounds",
-                &combo_bounds,
+                &group.combo_bounds,
             );
-            let prefix_pairs_per_terminal = board_count * (combo_count + 1);
+            let prefix_pairs_per_terminal = group.board_count * (combo_count + 1);
             let terminal_chunk_size = (max_terminal_prefix_pairs / prefix_pairs_per_terminal)
                 .max(1)
-                .min(group_nodes.len().max(1));
-            for terminal_chunk in group_nodes.chunks(terminal_chunk_size) {
+                .min(group.terminal_nodes.len().max(1));
+            for terminal_chunk in group.terminal_nodes.chunks(terminal_chunk_size) {
                 let terminal_count = terminal_chunk.len();
                 let terminal_nodes_buffer = readonly_buffer(
                     &self.device,
                     "public tree streamed terminal nodes",
                     terminal_chunk,
                 );
-                let terminal_prefix_pair_len = terminal_count * board_count * (combo_count + 1);
-                let terminal_prefix_pairs_buffer = uninit_storage_buffer(
-                    &self.device,
-                    "public tree streamed terminal prefix pairs",
-                    terminal_prefix_pair_len * 2,
-                    false,
-                );
-                let partial_invocations = terminal_count * board_count;
+                let partial_invocations = terminal_count * group.board_count;
                 let (partial_x_groups, partial_y_groups, partial_x_invocations) =
                     dispatch_grid(partial_invocations);
                 let partial_params = uniform_buffer(
@@ -2799,11 +2817,11 @@ impl GpuDenseCfrBackend {
                     &[GpuPublicTreeParams {
                         combo_count: combo_count as u32,
                         node_count: terminal_count as u32,
-                        max_actions: board_count as u32,
+                        max_actions: group.board_count as u32,
                         output_len: (combo_count + 1) as u32,
                         pair_start: combo_count as u32,
                         chunk_pairs: partial_x_invocations,
-                        _pad0: board_base as u32,
+                        _pad0: group.board_base as u32,
                         _pad1: 0,
                     }],
                 );
@@ -2818,7 +2836,7 @@ impl GpuDenseCfrBackend {
                             bind_entry(3, &combo_bounds_buffer),
                             bind_entry(4, hero_reaches_buffer),
                             bind_entry(5, villain_reaches_buffer),
-                            bind_entry(6, &terminal_prefix_pairs_buffer),
+                            bind_entry(6, terminal_prefix_pairs_buffer),
                             bind_entry(7, &partial_params),
                         ],
                     });
@@ -2832,11 +2850,11 @@ impl GpuDenseCfrBackend {
                     &[GpuPublicTreeParams {
                         combo_count: combo_count as u32,
                         node_count: terminal_count as u32,
-                        max_actions: board_count as u32,
+                        max_actions: group.board_count as u32,
                         output_len: (combo_count + 1) as u32,
                         pair_start: blocker_neighbor_stride as u32,
                         chunk_pairs: reduce_x_invocations,
-                        _pad0: board_base as u32,
+                        _pad0: group.board_base as u32,
                         _pad1: 0,
                     }],
                 );
@@ -2850,7 +2868,7 @@ impl GpuDenseCfrBackend {
                         bind_entry(3, blocker_neighbors_buffer),
                         bind_entry(4, hero_reaches_buffer),
                         bind_entry(5, villain_reaches_buffer),
-                        bind_entry(6, &terminal_prefix_pairs_buffer),
+                        bind_entry(6, terminal_prefix_pairs_buffer),
                         bind_entry(7, hero_values_buffer),
                         bind_entry(8, villain_values_buffer),
                         bind_entry(9, &reduce_params),
@@ -3043,6 +3061,8 @@ impl GpuDenseCfrBackend {
                     .then_some(index as u32)
             })
             .collect();
+        let showdown_terminal_groups =
+            terminal_group_caches(nodes, &showdown_terminal_nodes, combos, showdown_boards);
         let public_infoset_count = nodes_public_infoset_count(nodes);
         let mut decision_nodes = vec![u32::MAX; public_infoset_count];
         for (index, node) in nodes.iter().enumerate() {
@@ -3076,6 +3096,12 @@ impl GpuDenseCfrBackend {
             .max(max_showdown_boards * (combos.len() + 1));
         let terminal_chunk_size =
             (max_terminal_prefix_pairs / (max_showdown_boards * (combos.len() + 1))).max(1);
+        let terminal_prefix_pairs_buffer = uninit_storage_buffer(
+            &self.device,
+            "public tree streamed terminal prefix pairs scratch",
+            max_terminal_prefix_pairs * 2,
+            false,
+        );
         const DECISION_AGGREGATE_SLOTS: usize = 53;
         let decision_aggregate_len = public_infoset_count * DECISION_AGGREGATE_SLOTS;
         let hero_decision_aggregates_buffer = uninit_storage_buffer(
@@ -3092,9 +3118,6 @@ impl GpuDenseCfrBackend {
         );
 
         GpuPublicTreeIterationContext {
-            nodes: nodes.to_vec(),
-            combos: combos.to_vec(),
-            showdown_boards: showdown_boards.to_vec(),
             nodes_len: nodes.len(),
             combos_len: combos.len(),
             infosets,
@@ -3118,6 +3141,7 @@ impl GpuDenseCfrBackend {
             output_buffer,
             fold_terminal_nodes,
             showdown_terminal_nodes,
+            showdown_terminal_groups,
             decision_nodes_buffer,
             terminal_tile_count,
             terminal_board_tile_count,
@@ -3125,6 +3149,7 @@ impl GpuDenseCfrBackend {
             terminal_blocker_neighbors_buffer,
             terminal_blocker_neighbor_stride: blocker_neighbor_stride,
             terminal_prefix_pair_budget: max_terminal_prefix_pairs,
+            terminal_prefix_pairs_buffer,
             hero_decision_aggregates_buffer,
             villain_decision_aggregates_buffer,
         }
@@ -3256,16 +3281,14 @@ impl GpuDenseCfrBackend {
         )?;
         self.queue.submit(Some(encoder.finish()));
         self.fill_terminal_values_streaming(
-            &ctx.nodes,
             &ctx.node_buffer,
-            &ctx.showdown_terminal_nodes,
-            &ctx.combos,
-            &ctx.showdown_boards,
+            &ctx.showdown_terminal_groups,
             &ctx.terminal_blocker_neighbors_buffer,
             &ctx.hero_reaches_buffer,
             &ctx.villain_reaches_buffer,
             &ctx.hero_values_buffer,
             &ctx.villain_values_buffer,
+            &ctx.terminal_prefix_pairs_buffer,
             ctx.combos_len,
             ctx.terminal_blocker_neighbor_stride,
             ctx.terminal_prefix_pair_budget,
@@ -3528,6 +3551,8 @@ impl GpuDenseCfrBackend {
                     .then_some(index as u32)
             })
             .collect();
+        let showdown_terminal_groups =
+            terminal_group_caches(nodes, &showdown_terminal_nodes, combos, showdown_boards);
         let public_infoset_count = nodes_public_infoset_count(nodes);
         let mut decision_nodes = vec![u32::MAX; public_infoset_count];
         for (index, node) in nodes.iter().enumerate() {
@@ -3561,6 +3586,12 @@ impl GpuDenseCfrBackend {
             .max(max_showdown_boards * (combos.len() + 1));
         let terminal_chunk_size =
             (max_terminal_prefix_pairs / (max_showdown_boards * (combos.len() + 1))).max(1);
+        let terminal_prefix_pairs_buffer = uninit_storage_buffer(
+            &self.device,
+            "public tree streamed terminal prefix pairs scratch",
+            max_terminal_prefix_pairs * 2,
+            false,
+        );
         if std::env::var_os("POKEDR_SOLVER_PROGRESS_OFF").is_none() {
             eprintln!(
                 "pokedr: gpu public tree cfv nodes={} combos={} node_combo_values={} folds={} showdowns={} terminal_tiles={} board_tiles={} terminal_chunk={}",
@@ -3687,16 +3718,14 @@ impl GpuDenseCfrBackend {
 
         self.queue.submit(Some(encoder.finish()));
         self.fill_terminal_values_streaming(
-            nodes,
             &node_buffer,
-            &showdown_terminal_nodes,
-            combos,
-            showdown_boards,
+            &showdown_terminal_groups,
             &terminal_blocker_neighbors_buffer,
             &hero_reaches_buffer,
             &villain_reaches_buffer,
             &hero_values_buffer,
             &villain_values_buffer,
+            &terminal_prefix_pairs_buffer,
             combos.len(),
             blocker_neighbor_stride,
             max_terminal_prefix_pairs,
