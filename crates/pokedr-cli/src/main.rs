@@ -225,6 +225,8 @@ fn smoke_postflop_tree() -> SubgameTree {
                 Card::new(Rank::Two, Suit::Clubs),
             ]),
             pot: 100,
+            hero_invested: 50,
+            villain_invested: 50,
             effective_stack: 300,
             to_call: 0,
             min_aggressive_amount: 50,

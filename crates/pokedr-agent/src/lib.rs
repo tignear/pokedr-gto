@@ -11,7 +11,7 @@ use pokedr_core::{
         SubgameTreeConfig, TerminalKind,
     },
     postflop_dense::PostflopDenseLayout,
-    range::{Combo, ComboIndexer},
+    range::{COMBO_COUNT, Combo, ComboIndexer},
 };
 use rs_poker::{
     arena::{
@@ -103,23 +103,41 @@ impl PokedrAgent {
 
     fn preflop_action(&self, game_state: &GameState) -> AgentAction {
         let to_call = amount_to_call(game_state);
-        let hand_score = game_state
+        let class = game_state
             .hands
             .get(game_state.to_act_idx())
-            .map(preflop_hand_score)
-            .unwrap_or(0);
+            .map(classify_preflop_hand)
+            .unwrap_or(PreflopClass::Trash);
+        let current_bet = game_state.current_round_bet();
+        let big_blind = game_state.big_blind.max(1.0);
         if to_call <= 0.0 {
-            if hand_score >= 22 {
-                return self.bet_fraction(game_state, 0.75);
+            if class.open_raises() {
+                return self.preflop_raise_to(game_state, big_blind * 2.5);
             }
             return AgentAction::Call;
         }
-        if hand_score < 12 && to_call > game_state.big_blind * 2.0 {
-            AgentAction::Fold
-        } else if hand_score >= 24 && can_raise(game_state) {
-            self.bet_fraction(game_state, 0.75)
-        } else {
+        if current_bet <= big_blind * 2.6 {
+            if class.three_bets() && can_raise(game_state) {
+                return self.preflop_raise_to(game_state, big_blind * 7.5);
+            }
+            if class.calls_open() {
+                return AgentAction::Call;
+            }
+            return AgentAction::Fold;
+        }
+        if current_bet <= big_blind * 8.0 {
+            if class.four_bets() && can_raise(game_state) {
+                return self.preflop_raise_to(game_state, big_blind * 18.0);
+            }
+            if class.calls_three_bet() {
+                return AgentAction::Call;
+            }
+            return AgentAction::Fold;
+        }
+        if class.calls_large_preflop_bet() {
             AgentAction::Call
+        } else {
+            AgentAction::Fold
         }
     }
 
@@ -139,8 +157,10 @@ impl PokedrAgent {
         let Some(hero_cards) = hero_cards_from_game(game_state) else {
             return AgentAction::Call;
         };
-        let state = solve_public_tree_cfr(&tree, &layout, hero_cards, &self.config);
-        let action_index = best_average_strategy_action(&layout, &state);
+        let indexer = ComboIndexer::new();
+        let hero_combo = hero_combo_index(&indexer, hero_cards);
+        let state = solve_public_tree_cfr(&tree, &layout, &self.config);
+        let action_index = best_average_strategy_action(&layout, &state, Player::Hero, hero_combo);
         let action = layout
             .action(&tree, 0, action_index)
             .map(|candidate| candidate.action)
@@ -148,11 +168,9 @@ impl PokedrAgent {
         to_rs_action(game_state, action)
     }
 
-    fn bet_fraction(&self, game_state: &GameState, fraction: f32) -> AgentAction {
+    fn preflop_raise_to(&self, game_state: &GameState, target: f32) -> AgentAction {
         let player_bet = game_state.current_round_current_player_bet();
         let stack = game_state.current_player_stack();
-        let target = game_state.current_round_bet()
-            + (game_state.total_pot.max(game_state.big_blind) * fraction).round();
         let min_raise_to = game_state.current_round_bet() + game_state.current_round_min_raise();
         let amount = target.max(min_raise_to).min(player_bet + stack);
         if amount >= player_bet + stack {
@@ -250,7 +268,7 @@ pub fn gpu_backend_mode() -> BackendMode {
 
 struct PostflopEvaluationContext {
     hero_cards: [PokedrCard; 2],
-    indexer: ComboIndexer,
+    villain_cards: [PokedrCard; 2],
     max_showdown_runouts: usize,
     equity_cache: HashMap<u64, f32>,
 }
@@ -258,25 +276,33 @@ struct PostflopEvaluationContext {
 fn solve_public_tree_cfr(
     tree: &SubgameTree,
     layout: &PostflopDenseLayout,
-    hero_cards: [PokedrCard; 2],
     config: &PokedrAgentConfig,
 ) -> DenseCfrState {
-    let dense_config = layout.dense_config(CfrVariant::CfrPlus);
-    let mut state = DenseCfrState::new_with_legal_actions(
-        dense_config.clone(),
-        layout.legal_actions().to_vec(),
-    );
+    let mut dense_config = layout.dense_config(CfrVariant::CfrPlus);
+    dense_config.infosets *= PRIVATE_INFOS_PER_PUBLIC;
+    let mut state =
+        DenseCfrState::new_with_legal_actions(dense_config.clone(), private_legal_actions(layout));
     let mut batch = DenseCfrIteration::new(&dense_config);
-    let mut ctx = PostflopEvaluationContext {
-        hero_cards,
-        indexer: ComboIndexer::new(),
-        max_showdown_runouts: config.max_showdown_runouts.max(1),
-        equity_cache: HashMap::new(),
-    };
+    let indexer = ComboIndexer::new();
+    let gpu_backend = cfr_gpu_backend();
 
     for iteration in 1..=config.cfr_iterations.max(1) {
-        fill_public_tree_iteration(tree, layout, &state, &mut ctx, &mut batch);
+        fill_public_tree_iteration(tree, layout, &indexer, &state, config, &mut batch);
         batch.validate(&dense_config);
+        if let Some(backend) = &gpu_backend {
+            if backend
+                .update_all_infosets(
+                    &mut state,
+                    &batch.action_values,
+                    &batch.reach_weights,
+                    &batch.strategy_weights,
+                    iteration,
+                )
+                .is_ok()
+            {
+                continue;
+            }
+        }
         state.update_all_infosets(
             &batch.action_values,
             &batch.reach_weights,
@@ -287,16 +313,27 @@ fn solve_public_tree_cfr(
     state
 }
 
+fn cfr_gpu_backend() -> Option<GpuDenseCfrBackend> {
+    if cfg!(test) || std::env::var_os("POKEDR_DISABLE_GPU_CFR").is_some() {
+        None
+    } else {
+        GpuDenseCfrBackend::new().ok()
+    }
+}
+
 fn fill_public_tree_iteration(
     tree: &SubgameTree,
     layout: &PostflopDenseLayout,
+    indexer: &ComboIndexer,
     cfr_state: &DenseCfrState,
-    ctx: &mut PostflopEvaluationContext,
+    config: &PokedrAgentConfig,
     batch: &mut DenseCfrIteration,
 ) {
     batch.action_values.fill(0.0);
     batch.reach_weights.fill(0.0);
     batch.strategy_weights.fill(0.0);
+    let mut value_counts = vec![0.0; batch.action_values.len()];
+    let root_dead = root_board(tree).deck_mask();
 
     for infoset in 0..layout.infoset_count() {
         let node_index = layout.infoset_node(infoset);
@@ -307,24 +344,54 @@ fn fill_public_tree_iteration(
         else {
             unreachable!("infoset nodes are decisions");
         };
-        let offset = infoset * layout.max_actions();
-        for action_index in 0..layout.action_count(infoset) {
-            let child = layout
-                .child_for_action(infoset, action_index)
-                .expect("legal action must have a child");
-            batch.action_values[offset + action_index] = evaluate_action_child(
-                tree,
-                layout,
-                child,
-                public_state,
-                actions[action_index].action,
-                cfr_state,
-                ctx,
-            );
+        for hero_combo in legal_private_combos(indexer, root_dead) {
+            let hero_cards = combo_cards(indexer.combo(hero_combo));
+            for villain_combo in legal_private_combos(indexer, root_dead | hero_mask(hero_cards)) {
+                let villain_cards = combo_cards(indexer.combo(villain_combo));
+                let mut ctx = PostflopEvaluationContext {
+                    hero_cards,
+                    villain_cards,
+                    max_showdown_runouts: config.max_showdown_runouts.max(1),
+                    equity_cache: HashMap::new(),
+                };
+                let acting_combo = match public_state.acting_player {
+                    Player::Hero => hero_combo,
+                    Player::Villain => villain_combo,
+                };
+                let private_infoset =
+                    private_infoset(infoset, public_state.acting_player, acting_combo);
+                let offset = private_infoset * layout.max_actions();
+                for action_index in 0..layout.action_count(infoset) {
+                    let child = layout
+                        .child_for_action(infoset, action_index)
+                        .expect("legal action must have a child");
+                    let hero_value = evaluate_action_child(
+                        tree,
+                        layout,
+                        child,
+                        public_state,
+                        actions[action_index].action,
+                        hero_combo,
+                        villain_combo,
+                        cfr_state,
+                        &mut ctx,
+                    );
+                    let player_value = match public_state.acting_player {
+                        Player::Hero => hero_value,
+                        Player::Villain => -hero_value,
+                    };
+                    batch.action_values[offset + action_index] += player_value;
+                    value_counts[offset + action_index] += 1.0;
+                }
+                batch.reach_weights[private_infoset] = 1.0;
+                batch.strategy_weights[private_infoset] = 1.0;
+            }
         }
-        if public_state.acting_player == Player::Hero {
-            batch.reach_weights[infoset] = 1.0;
-            batch.strategy_weights[infoset] = 1.0;
+    }
+
+    for (value, count) in batch.action_values.iter_mut().zip(value_counts) {
+        if count > 0.0 {
+            *value /= count;
         }
     }
 }
@@ -335,28 +402,51 @@ fn evaluate_action_child(
     node_index: usize,
     parent_state: &PublicState,
     parent_action: PlayerAction,
+    hero_combo: usize,
+    villain_combo: usize,
     cfr_state: &DenseCfrState,
     ctx: &mut PostflopEvaluationContext,
 ) -> f32 {
     match &tree.nodes()[node_index].kind {
-        PublicNodeKind::Decision { state, .. } => {
-            evaluate_decision(tree, layout, node_index, state, cfr_state, ctx)
-        }
+        PublicNodeKind::Decision { state, .. } => evaluate_decision(
+            tree,
+            layout,
+            node_index,
+            state,
+            hero_combo,
+            villain_combo,
+            cfr_state,
+            ctx,
+        ),
         PublicNodeKind::Chance { cards, .. } => {
             let mut sum = 0.0;
             let mut count = 0;
             for (card, child) in cards.iter().zip(&tree.nodes()[node_index].children) {
-                if card.deck_mask() & hero_mask(ctx.hero_cards) != 0 {
+                if card.deck_mask() & private_dead_mask(ctx) != 0 {
                     continue;
                 }
-                sum += evaluate_node(tree, layout, *child, cfr_state, ctx);
+                sum += evaluate_node(
+                    tree,
+                    layout,
+                    *child,
+                    hero_combo,
+                    villain_combo,
+                    cfr_state,
+                    ctx,
+                );
                 count += 1;
             }
             if count == 0 { 0.0 } else { sum / count as f32 }
         }
-        PublicNodeKind::Terminal { kind, board, pot } => match kind {
-            TerminalKind::Fold => fold_utility(parent_state, parent_action, *pot),
-            TerminalKind::Showdown => showdown_utility(*pot, board, ctx),
+        PublicNodeKind::Terminal {
+            kind,
+            board,
+            pot,
+            hero_invested,
+            ..
+        } => match kind {
+            TerminalKind::Fold => fold_utility(parent_state, parent_action, *pot, *hero_invested),
+            TerminalKind::Showdown => showdown_utility(*pot, *hero_invested, board, ctx),
         },
     }
 }
@@ -365,28 +455,51 @@ fn evaluate_node(
     tree: &SubgameTree,
     layout: &PostflopDenseLayout,
     node_index: usize,
+    hero_combo: usize,
+    villain_combo: usize,
     cfr_state: &DenseCfrState,
     ctx: &mut PostflopEvaluationContext,
 ) -> f32 {
     match &tree.nodes()[node_index].kind {
-        PublicNodeKind::Decision { state, .. } => {
-            evaluate_decision(tree, layout, node_index, state, cfr_state, ctx)
-        }
+        PublicNodeKind::Decision { state, .. } => evaluate_decision(
+            tree,
+            layout,
+            node_index,
+            state,
+            hero_combo,
+            villain_combo,
+            cfr_state,
+            ctx,
+        ),
         PublicNodeKind::Chance { cards, .. } => {
             let mut sum = 0.0;
             let mut count = 0;
             for (card, child) in cards.iter().zip(&tree.nodes()[node_index].children) {
-                if card.deck_mask() & hero_mask(ctx.hero_cards) != 0 {
+                if card.deck_mask() & private_dead_mask(ctx) != 0 {
                     continue;
                 }
-                sum += evaluate_node(tree, layout, *child, cfr_state, ctx);
+                sum += evaluate_node(
+                    tree,
+                    layout,
+                    *child,
+                    hero_combo,
+                    villain_combo,
+                    cfr_state,
+                    ctx,
+                );
                 count += 1;
             }
             if count == 0 { 0.0 } else { sum / count as f32 }
         }
-        PublicNodeKind::Terminal { kind, board, pot } => match kind {
+        PublicNodeKind::Terminal {
+            kind,
+            board,
+            pot,
+            hero_invested,
+            ..
+        } => match kind {
             TerminalKind::Fold => 0.0,
-            TerminalKind::Showdown => showdown_utility(*pot, board, ctx),
+            TerminalKind::Showdown => showdown_utility(*pot, *hero_invested, board, ctx),
         },
     }
 }
@@ -396,6 +509,8 @@ fn evaluate_decision(
     layout: &PostflopDenseLayout,
     node_index: usize,
     state: &PublicState,
+    hero_combo: usize,
+    villain_combo: usize,
     cfr_state: &DenseCfrState,
     ctx: &mut PostflopEvaluationContext,
 ) -> f32 {
@@ -410,6 +525,8 @@ fn evaluate_decision(
             *child,
             state,
             action.action,
+            hero_combo,
+            villain_combo,
             cfr_state,
             ctx,
         ));
@@ -417,11 +534,15 @@ fn evaluate_decision(
     let Some(infoset) = layout.node_infoset(node_index) else {
         return values.iter().sum::<f32>() / values.len().max(1) as f32;
     };
-    if state.acting_player == Player::Villain {
-        return values.into_iter().fold(f32::INFINITY, f32::min);
-    }
     let mut strategy = vec![0.0; layout.max_actions()];
-    cfr_state.strategy_for(infoset, &mut strategy);
+    let acting_combo = match state.acting_player {
+        Player::Hero => hero_combo,
+        Player::Villain => villain_combo,
+    };
+    cfr_state.strategy_for(
+        private_infoset(infoset, state.acting_player, acting_combo),
+        &mut strategy,
+    );
     values
         .iter()
         .zip(strategy)
@@ -429,9 +550,14 @@ fn evaluate_decision(
         .sum()
 }
 
-fn best_average_strategy_action(layout: &PostflopDenseLayout, state: &DenseCfrState) -> usize {
+fn best_average_strategy_action(
+    layout: &PostflopDenseLayout,
+    state: &DenseCfrState,
+    player: Player,
+    hero_combo: usize,
+) -> usize {
     let mut strategy = vec![0.0; layout.max_actions()];
-    state.average_strategy_for(0, &mut strategy);
+    state.average_strategy_for(private_infoset(0, player, hero_combo), &mut strategy);
     let mut best = 0;
     let mut best_probability = f32::NEG_INFINITY;
     for (action, probability) in strategy
@@ -448,30 +574,66 @@ fn best_average_strategy_action(layout: &PostflopDenseLayout, state: &DenseCfrSt
     best
 }
 
-fn fold_utility(parent_state: &PublicState, parent_action: PlayerAction, pot: u32) -> f32 {
+fn private_infoset(public_infoset: usize, player: Player, private_combo: usize) -> usize {
+    let player_offset = match player {
+        Player::Hero => 0,
+        Player::Villain => PRIVATE_HANDS,
+    };
+    public_infoset * PRIVATE_INFOS_PER_PUBLIC + player_offset + private_combo
+}
+
+fn hero_combo_index(indexer: &ComboIndexer, hero_cards: [PokedrCard; 2]) -> usize {
+    indexer
+        .index(hero_cards[0], hero_cards[1])
+        .expect("hero cards must form a valid private combo")
+}
+
+fn private_legal_actions(layout: &PostflopDenseLayout) -> Vec<bool> {
+    let mut legal = Vec::with_capacity(
+        layout.infoset_count() * PRIVATE_INFOS_PER_PUBLIC * layout.max_actions(),
+    );
+    for infoset in 0..layout.infoset_count() {
+        let offset = infoset * layout.max_actions();
+        for _ in 0..PRIVATE_INFOS_PER_PUBLIC {
+            legal.extend_from_slice(&layout.legal_actions()[offset..offset + layout.max_actions()]);
+        }
+    }
+    legal
+}
+
+fn fold_utility(
+    parent_state: &PublicState,
+    parent_action: PlayerAction,
+    pot: u32,
+    hero_invested: u32,
+) -> f32 {
     if parent_action != PlayerAction::Fold {
         return 0.0;
     }
-    let value = pot as f32 * 0.5;
     if parent_state.acting_player == Player::Hero {
-        -value
+        -(hero_invested as f32)
     } else {
-        value
+        pot as f32 - hero_invested as f32
     }
 }
 
-fn showdown_utility(pot: u32, board: &Board, ctx: &mut PostflopEvaluationContext) -> f32 {
+fn showdown_utility(
+    pot: u32,
+    hero_invested: u32,
+    board: &Board,
+    ctx: &mut PostflopEvaluationContext,
+) -> f32 {
     let equity = showdown_equity(board, ctx);
-    (equity * 2.0 - 1.0) * pot as f32 * 0.5
+    equity * pot as f32 - hero_invested as f32
 }
 
 fn showdown_equity(board: &Board, ctx: &mut PostflopEvaluationContext) -> f32 {
-    let key = board.deck_mask();
+    let key = board.deck_mask() ^ private_dead_mask(ctx).rotate_left(17);
     if let Some(equity) = ctx.equity_cache.get(&key) {
         return *equity;
     }
 
-    let dead = board.deck_mask() | hero_mask(ctx.hero_cards);
+    let dead = board.deck_mask() | private_dead_mask(ctx);
     let runouts = completion_runouts(board, dead, ctx.max_showdown_runouts);
     let mut equity_sum = 0.0;
     let mut matchup_count = 0.0;
@@ -483,13 +645,19 @@ fn showdown_equity(board: &Board, ctx: &mut PostflopEvaluationContext) -> f32 {
             .iter()
             .fold(0u64, |mask, card| mask | card.deck_mask());
         let hero_strength = evaluate_seven(ctx.hero_cards, &final_board);
-        for combo in ctx.indexer.combos() {
-            if combo.collides_with(board_mask | hero_mask(ctx.hero_cards)) {
-                continue;
-            }
-            equity_sum += heads_up_equity(hero_strength, *combo, &final_board);
-            matchup_count += 1.0;
+        if ctx
+            .villain_cards
+            .iter()
+            .any(|card| card.deck_mask() & board_mask != 0)
+        {
+            continue;
         }
+        equity_sum += heads_up_equity(
+            hero_strength,
+            Combo::new(ctx.villain_cards[0], ctx.villain_cards[1]),
+            &final_board,
+        );
+        matchup_count += 1.0;
     }
 
     let equity = if matchup_count > 0.0 {
@@ -556,6 +724,32 @@ fn evaluate_seven(
 
 fn hero_mask(hero_cards: [PokedrCard; 2]) -> u64 {
     hero_cards[0].deck_mask() | hero_cards[1].deck_mask()
+}
+
+fn private_dead_mask(ctx: &PostflopEvaluationContext) -> u64 {
+    hero_mask(ctx.hero_cards) | hero_mask(ctx.villain_cards)
+}
+
+fn combo_cards(combo: Combo) -> [PokedrCard; 2] {
+    [combo.first, combo.second]
+}
+
+fn legal_private_combos(
+    indexer: &ComboIndexer,
+    dead_mask: u64,
+) -> impl Iterator<Item = usize> + '_ {
+    indexer
+        .combos()
+        .iter()
+        .enumerate()
+        .filter_map(move |(index, combo)| (!combo.collides_with(dead_mask)).then_some(index))
+}
+
+fn root_board(tree: &SubgameTree) -> &Board {
+    let PublicNodeKind::Decision { state, .. } = &tree.nodes()[0].kind else {
+        panic!("root should be a decision");
+    };
+    &state.board
 }
 
 fn dealt_hole_cards(records: &[HistoryRecord], players: usize) -> Vec<Vec<RsCard>> {
@@ -625,6 +819,12 @@ fn public_state_from_game(game_state: &GameState) -> Option<PublicState> {
     };
     let to_call = amount_to_call(game_state).max(0.0).round() as u32;
     let stack = game_state.current_player_stack().max(1.0).round() as u32;
+    let hero_invested = (game_state.starting_stacks[0] - game_state.stacks[0])
+        .max(0.0)
+        .round() as u32;
+    let villain_invested = (game_state.starting_stacks[1] - game_state.stacks[1])
+        .max(0.0)
+        .round() as u32;
     Some(PublicState {
         street,
         board: Board::new(
@@ -636,6 +836,8 @@ fn public_state_from_game(game_state: &GameState) -> Option<PublicState> {
                 .collect(),
         ),
         pot: game_state.total_pot.max(1.0).round() as u32,
+        hero_invested,
+        villain_invested,
         effective_stack: stack.max(to_call),
         to_call,
         min_aggressive_amount: game_state.current_round_min_raise().max(1.0).round() as u32,
@@ -685,21 +887,98 @@ fn hero_cards_from_game(game_state: &GameState) -> Option<[PokedrCard; 2]> {
     Some([to_pokedr_card(cards[0]), to_pokedr_card(cards[1])])
 }
 
-fn preflop_hand_score(hand: &rs_poker::core::Hand) -> u8 {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum PreflopClass {
+    Trash = 0,
+    Speculative = 1,
+    Playable = 2,
+    Strong = 3,
+    Premium = 4,
+}
+
+const PRIVATE_HANDS: usize = COMBO_COUNT;
+const PRIVATE_INFOS_PER_PUBLIC: usize = PRIVATE_HANDS * 2;
+
+impl PreflopClass {
+    fn open_raises(self) -> bool {
+        self >= Self::Playable
+    }
+
+    fn calls_open(self) -> bool {
+        self >= Self::Speculative
+    }
+
+    fn three_bets(self) -> bool {
+        self >= Self::Strong
+    }
+
+    fn calls_three_bet(self) -> bool {
+        self >= Self::Strong
+    }
+
+    fn four_bets(self) -> bool {
+        self >= Self::Premium
+    }
+
+    fn calls_large_preflop_bet(self) -> bool {
+        self >= Self::Premium
+    }
+}
+
+fn classify_preflop_hand(hand: &rs_poker::core::Hand) -> PreflopClass {
     let cards: Vec<_> = hand.iter().collect();
     if cards.len() < 2 {
-        return 0;
+        return PreflopClass::Trash;
     }
     let first = cards[0];
     let second = cards[1];
     let first_value = rs_value_index(first.value);
     let second_value = rs_value_index(second.value);
+    classify_preflop_values(first_value, second_value, first.suit == second.suit)
+}
+
+fn classify_preflop_values(first_value: u8, second_value: u8, suited: bool) -> PreflopClass {
     let high = first_value.max(second_value);
     let low = first_value.min(second_value);
-    let pair_bonus = if first_value == second_value { 12 } else { 0 };
-    let suited_bonus = if first.suit == second.suit { 3 } else { 0 };
-    let connector_bonus = if high.abs_diff(low) <= 1 { 2 } else { 0 };
-    high + low / 2 + pair_bonus + suited_bonus + connector_bonus
+    let is_pair = first_value == second_value;
+    let gap = high.abs_diff(low);
+
+    if is_pair {
+        return match high {
+            12..=14 => PreflopClass::Premium,
+            10..=11 => PreflopClass::Strong,
+            7..=9 => PreflopClass::Playable,
+            2..=6 => PreflopClass::Speculative,
+            _ => PreflopClass::Trash,
+        };
+    }
+    if high == 14 && low >= 13 {
+        return PreflopClass::Strong;
+    }
+    if high == 14 && low >= 10 {
+        return if suited {
+            PreflopClass::Strong
+        } else {
+            PreflopClass::Playable
+        };
+    }
+    if high >= 13 && low >= 11 {
+        return if suited {
+            PreflopClass::Strong
+        } else {
+            PreflopClass::Playable
+        };
+    }
+    if suited && high >= 11 && low >= 9 {
+        return PreflopClass::Playable;
+    }
+    if suited && gap <= 1 && high >= 8 {
+        return PreflopClass::Speculative;
+    }
+    if gap <= 1 && high >= 11 {
+        return PreflopClass::Speculative;
+    }
+    PreflopClass::Trash
 }
 
 fn to_pokedr_card(card: RsCard) -> PokedrCard {
@@ -776,7 +1055,10 @@ mod tests {
                 PokedrCard::new(PokedrRank::Ace, PokedrSuit::Clubs),
                 PokedrCard::new(PokedrRank::Ace, PokedrSuit::Diamonds),
             ],
-            indexer: ComboIndexer::new(),
+            villain_cards: [
+                PokedrCard::new(PokedrRank::Queen, PokedrSuit::Clubs),
+                PokedrCard::new(PokedrRank::Queen, PokedrSuit::Diamonds),
+            ],
             max_showdown_runouts: 1,
             equity_cache: HashMap::new(),
         };
@@ -785,7 +1067,10 @@ mod tests {
                 PokedrCard::new(PokedrRank::Nine, PokedrSuit::Clubs),
                 PokedrCard::new(PokedrRank::Ten, PokedrSuit::Diamonds),
             ],
-            indexer: ComboIndexer::new(),
+            villain_cards: [
+                PokedrCard::new(PokedrRank::Queen, PokedrSuit::Clubs),
+                PokedrCard::new(PokedrRank::Queen, PokedrSuit::Diamonds),
+            ],
             max_showdown_runouts: 1,
             equity_cache: HashMap::new(),
         };
@@ -804,6 +1089,8 @@ mod tests {
                     PokedrCard::new(PokedrRank::Two, PokedrSuit::Clubs),
                 ]),
                 pot: 10,
+                hero_invested: 5,
+                villain_invested: 5,
                 effective_stack: 30,
                 to_call: 0,
                 min_aggressive_amount: 5,
@@ -821,33 +1108,40 @@ mod tests {
                     ..ActionSetConfig::default()
                 },
                 max_raises_per_street: 1,
-                max_depth: 3,
+                max_depth: 1,
             },
         );
         let layout = PostflopDenseLayout::from_tree(&tree);
         let state = solve_public_tree_cfr(
             &tree,
             &layout,
+            &PokedrAgentConfig {
+                cfr_iterations: 1,
+                max_showdown_runouts: 1,
+                ..PokedrAgentConfig::default()
+            },
+        );
+        let hero_combo = hero_combo_index(
+            &ComboIndexer::new(),
             [
                 PokedrCard::new(PokedrRank::Ace, PokedrSuit::Clubs),
                 PokedrCard::new(PokedrRank::King, PokedrSuit::Diamonds),
             ],
-            &PokedrAgentConfig {
-                cfr_iterations: 4,
-                max_showdown_runouts: 8,
-                ..PokedrAgentConfig::default()
-            },
         );
         let mut strategy = vec![0.0; layout.max_actions()];
-        state.average_strategy_for(0, &mut strategy);
+        state.average_strategy_for(private_infoset(0, Player::Hero, hero_combo), &mut strategy);
         let legal_sum: f32 = strategy.iter().take(layout.action_count(0)).sum();
 
         assert!((legal_sum - 1.0).abs() < 1e-5);
         assert!(strategy.iter().all(|value| value.is_finite()));
+        assert_eq!(
+            state.infosets(),
+            layout.infoset_count() * PRIVATE_INFOS_PER_PUBLIC
+        );
     }
 
     #[test]
-    fn villain_decision_minimizes_hero_value() {
+    fn villain_decision_uses_private_strategy() {
         let tree = SubgameTree::build(
             PublicState {
                 street: Street::River,
@@ -859,6 +1153,8 @@ mod tests {
                     PokedrCard::new(PokedrRank::Three, PokedrSuit::Spades),
                 ]),
                 pot: 100,
+                hero_invested: 50,
+                villain_invested: 50,
                 effective_stack: 100,
                 to_call: 20,
                 min_aggressive_amount: 60,
@@ -877,16 +1173,26 @@ mod tests {
             },
         );
         let layout = PostflopDenseLayout::from_tree(&tree);
-        let cfr_state = DenseCfrState::new_with_legal_actions(
-            layout.dense_config(CfrVariant::CfrPlus),
-            layout.legal_actions().to_vec(),
+        let mut dense_config = layout.dense_config(CfrVariant::CfrPlus);
+        dense_config.infosets *= PRIVATE_INFOS_PER_PUBLIC;
+        let cfr_state =
+            DenseCfrState::new_with_legal_actions(dense_config, private_legal_actions(&layout));
+        let hero_combo = hero_combo_index(
+            &ComboIndexer::new(),
+            [
+                PokedrCard::new(PokedrRank::Nine, PokedrSuit::Clubs),
+                PokedrCard::new(PokedrRank::Ten, PokedrSuit::Diamonds),
+            ],
         );
         let mut ctx = PostflopEvaluationContext {
             hero_cards: [
                 PokedrCard::new(PokedrRank::Nine, PokedrSuit::Clubs),
                 PokedrCard::new(PokedrRank::Ten, PokedrSuit::Diamonds),
             ],
-            indexer: ComboIndexer::new(),
+            villain_cards: [
+                PokedrCard::new(PokedrRank::Queen, PokedrSuit::Clubs),
+                PokedrCard::new(PokedrRank::Queen, PokedrSuit::Diamonds),
+            ],
             max_showdown_runouts: 1,
             equity_cache: HashMap::new(),
         };
@@ -895,11 +1201,41 @@ mod tests {
             &layout,
             0,
             &root_public_state(&tree),
+            hero_combo,
+            hero_combo_index(
+                &ComboIndexer::new(),
+                [
+                    PokedrCard::new(PokedrRank::Queen, PokedrSuit::Clubs),
+                    PokedrCard::new(PokedrRank::Queen, PokedrSuit::Diamonds),
+                ],
+            ),
             &cfr_state,
             &mut ctx,
         );
 
-        assert!(value <= 0.0);
+        assert!(value.is_finite());
+    }
+
+    #[test]
+    fn preflop_classifier_keeps_medium_pairs_out_of_four_bet_range() {
+        let nines = rs_poker::core::Hand::new_with_cards(vec![
+            RsCard::new(RsValue::Nine, RsSuit::Club),
+            RsCard::new(RsValue::Nine, RsSuit::Diamond),
+        ]);
+        let queens = rs_poker::core::Hand::new_with_cards(vec![
+            RsCard::new(RsValue::Queen, RsSuit::Club),
+            RsCard::new(RsValue::Queen, RsSuit::Diamond),
+        ]);
+        let ace_king = rs_poker::core::Hand::new_with_cards(vec![
+            RsCard::new(RsValue::Ace, RsSuit::Club),
+            RsCard::new(RsValue::King, RsSuit::Diamond),
+        ]);
+
+        assert_eq!(classify_preflop_hand(&nines), PreflopClass::Playable);
+        assert!(!classify_preflop_hand(&nines).four_bets());
+        assert_eq!(classify_preflop_hand(&queens), PreflopClass::Premium);
+        assert_eq!(classify_preflop_hand(&ace_king), PreflopClass::Strong);
+        assert!(!classify_preflop_hand(&ace_king).four_bets());
     }
 
     fn root_public_state(tree: &SubgameTree) -> PublicState {

@@ -138,6 +138,8 @@ mod tests {
                 street: Street::Flop,
                 board: flop(),
                 pot: 100,
+                hero_invested: 50,
+                villain_invested: 50,
                 effective_stack: 300,
                 to_call: 0,
                 min_aggressive_amount: 50,

@@ -92,6 +92,8 @@ pub struct PublicState {
     pub street: Street,
     pub board: Board,
     pub pot: u32,
+    pub hero_invested: u32,
+    pub villain_invested: u32,
     pub effective_stack: u32,
     pub to_call: u32,
     pub min_aggressive_amount: u32,
@@ -138,6 +140,8 @@ pub enum PublicNodeKind {
         kind: TerminalKind,
         board: Board,
         pot: u32,
+        hero_invested: u32,
+        villain_invested: u32,
     },
 }
 
@@ -358,6 +362,8 @@ impl SubgameTree {
                     kind: TerminalKind::Showdown,
                     board: state.board,
                     pot: state.pot,
+                    hero_invested: state.hero_invested,
+                    villain_invested: state.villain_invested,
                 },
             );
         }
@@ -368,6 +374,8 @@ impl SubgameTree {
                     kind: TerminalKind::Showdown,
                     board: state.board,
                     pot: state.pot,
+                    hero_invested: state.hero_invested,
+                    villain_invested: state.villain_invested,
                 },
             );
         }
@@ -413,6 +421,8 @@ impl SubgameTree {
                         kind: TerminalKind::Fold,
                         board: state.board.clone(),
                         pot: state.pot,
+                        hero_invested: state.hero_invested,
+                        villain_invested: state.villain_invested,
                     },
                 );
             }
@@ -449,6 +459,8 @@ impl SubgameTree {
                     kind: TerminalKind::Showdown,
                     board: state.board,
                     pot: state.pot,
+                    hero_invested: state.hero_invested,
+                    villain_invested: state.villain_invested,
                 },
             );
             return;
@@ -547,6 +559,7 @@ fn state_after_passive_action(state: &PublicState, action: PlayerAction) -> Publ
     };
     let mut next = state.clone();
     next.pot = next.pot.saturating_add(call_amount);
+    add_investment(&mut next, state.acting_player, call_amount);
     next.effective_stack = next.effective_stack.saturating_sub(call_amount);
     next.to_call = 0;
     next.acting_player = state.acting_player.next();
@@ -562,12 +575,20 @@ fn state_after_aggressive_action(state: &PublicState, amount: u32) -> PublicStat
     let contribution = amount.min(state.effective_stack);
     let mut next = state.clone();
     next.pot = next.pot.saturating_add(contribution);
+    add_investment(&mut next, state.acting_player, contribution);
     next.to_call = contribution;
     next.min_aggressive_amount = contribution.saturating_mul(2).max(1);
     next.acting_player = state.acting_player.next();
     next.raises_this_street = next.raises_this_street.saturating_add(1);
     next.checks_this_street = 0;
     next
+}
+
+fn add_investment(state: &mut PublicState, player: Player, amount: u32) {
+    match player {
+        Player::Hero => state.hero_invested = state.hero_invested.saturating_add(amount),
+        Player::Villain => state.villain_invested = state.villain_invested.saturating_add(amount),
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -803,6 +824,8 @@ mod tests {
             street,
             board: flop(),
             pot: 100,
+            hero_invested: 50,
+            villain_invested: 50,
             effective_stack: 300,
             to_call: 0,
             min_aggressive_amount: 50,
