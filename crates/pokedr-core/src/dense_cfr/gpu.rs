@@ -923,9 +923,6 @@ fn terminal_partial(@builtin(global_invocation_id) id: vec3<u32>) {
                 let equity_share = equity_sum / f32(valid_boards_total);
                 hero_payoff = equity_share * node.pot - board_weight * node.hero_invested;
                 villain_payoff = equity_share * node.pot - board_weight * (node.pot - node.hero_invested);
-            } else if board_tile == 0u {
-                hero_payoff = 0.5 * node.pot - node.hero_invested;
-                villain_payoff = 0.5 * node.pot - (node.pot - node.hero_invested);
             }
             hero_value = hero_value + villain_reaches[node_offset + opponent] * hero_payoff;
             villain_value = villain_value + hero_reaches[node_offset + opponent] * villain_payoff;

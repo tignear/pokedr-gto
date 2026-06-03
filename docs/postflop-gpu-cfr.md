@@ -453,6 +453,20 @@ This is the correct escape from the current `pair x node` bottleneck. It still
 has pairwise work at terminal convolutions and denominator reductions, but it no
 longer multiplies every pair by every public node.
 
+Blocked final boards are not neutral showdowns. If a private pair blocks every
+runout represented by a terminal, that pair has no valid public outcome in that
+terminal branch and contributes zero mass to terminal CFV:
+
+```text
+valid(z,h,v) = { b in boards(z) | b disjoint from h and v }
+
+if |valid(z,h,v)| = 0:
+  contribution(z,h,v) = 0
+```
+
+Do not substitute `0.5` equity for this case. A tie equity only applies to a
+valid board where both hands can actually reach showdown.
+
 ### Blocker Aggregates For Denominators
 
 The denominator reductions do not need a combo-vs-combo loop. For each public
