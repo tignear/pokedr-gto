@@ -309,6 +309,248 @@ fn showdown(@builtin(global_invocation_id) id: vec3<u32>) {
 }
 "#;
 
+const SHOWDOWN_MATRIX_SHADER: &str = r#"
+struct Combo {
+    cards: array<u32, 2>,
+};
+
+struct FinalBoard {
+    cards: array<u32, 5>,
+};
+
+@group(0) @binding(0) var<storage, read> combos: array<Combo>;
+@group(0) @binding(1) var<storage, read> boards: array<FinalBoard>;
+@group(0) @binding(2) var<storage, read_write> equities: array<f32>;
+@group(0) @binding(3) var<storage, read> params: array<u32>;
+
+fn card_mask(card: u32) -> u32 {
+    return 1u << card;
+}
+
+fn rank_bit(card: u32) -> u32 {
+    let rank = card % 13u;
+    if rank == 12u {
+        return (1u << 0u) | (1u << 13u);
+    }
+    return 1u << (rank + 1u);
+}
+
+fn suit_value(card: u32) -> u32 {
+    return card / 13u;
+}
+
+fn pack(category: u32, a: u32, b: u32, c: u32, d: u32, e: u32) -> u32 {
+    return (category << 20u) | (a << 16u) | (b << 12u) | (c << 8u) | (d << 4u) | e;
+}
+
+fn straight_high(rank_mask: u32) -> u32 {
+    var high = 13u;
+    loop {
+        let window = 31u << (high - 4u);
+        if (rank_mask & window) == window {
+            return high;
+        }
+        if high == 4u {
+            break;
+        }
+        high = high - 1u;
+    }
+    return 0u;
+}
+
+fn highest_from_mask(mask: u32, skip_a: u32, skip_b: u32, take: u32, slot: u32) -> u32 {
+    var seen = 0u;
+    var rank = 13u;
+    loop {
+        if rank != skip_a && rank != skip_b && (mask & (1u << rank)) != 0u {
+            if seen == slot {
+                return rank;
+            }
+            seen = seen + 1u;
+            if seen >= take {
+                return 0u;
+            }
+        }
+        if rank == 1u {
+            break;
+        }
+        rank = rank - 1u;
+    }
+    return 0u;
+}
+
+fn evaluate_combo_board(private_cards: Combo, board: FinalBoard) -> u32 {
+    var rank_mask = 0u;
+    var suit_masks = array<u32, 4>(0u, 0u, 0u, 0u);
+    var counts = array<u32, 13>(0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u);
+
+    for (var i = 0u; i < 7u; i = i + 1u) {
+        var card = private_cards.cards[0];
+        if i == 1u {
+            card = private_cards.cards[1];
+        }
+        if i >= 2u {
+            card = board.cards[i - 2u];
+        }
+        rank_mask = rank_mask | rank_bit(card);
+        let suit = suit_value(card);
+        suit_masks[suit] = suit_masks[suit] | rank_bit(card);
+        counts[card % 13u] = counts[card % 13u] + 1u;
+    }
+
+    var flush_mask = 0u;
+    for (var suit = 0u; suit < 4u; suit = suit + 1u) {
+        if countOneBits(suit_masks[suit]) >= 5u {
+            flush_mask = suit_masks[suit];
+        }
+    }
+    if flush_mask != 0u {
+        let sf = straight_high(flush_mask);
+        if sf != 0u {
+            return pack(8u, sf, 0u, 0u, 0u, 0u);
+        }
+    }
+
+    var four = 0u;
+    var trip1 = 0u;
+    var trip2 = 0u;
+    var pair1 = 0u;
+    var pair2 = 0u;
+    var rank = 13u;
+    loop {
+        let count = counts[rank - 1u];
+        if count == 4u && four == 0u {
+            four = rank;
+        }
+        if count == 3u {
+            if trip1 == 0u {
+                trip1 = rank;
+            } else if trip2 == 0u {
+                trip2 = rank;
+            }
+        }
+        if count == 2u {
+            if pair1 == 0u {
+                pair1 = rank;
+            } else if pair2 == 0u {
+                pair2 = rank;
+            }
+        }
+        if rank == 1u {
+            break;
+        }
+        rank = rank - 1u;
+    }
+
+    if four != 0u {
+        return pack(7u, four, highest_from_mask(rank_mask, four, 0u, 1u, 0u), 0u, 0u, 0u);
+    }
+    if trip1 != 0u && (pair1 != 0u || trip2 != 0u) {
+        return pack(6u, trip1, select(pair1, trip2, pair1 == 0u), 0u, 0u, 0u);
+    }
+    if flush_mask != 0u {
+        return pack(
+            5u,
+            highest_from_mask(flush_mask, 0u, 0u, 5u, 0u),
+            highest_from_mask(flush_mask, 0u, 0u, 5u, 1u),
+            highest_from_mask(flush_mask, 0u, 0u, 5u, 2u),
+            highest_from_mask(flush_mask, 0u, 0u, 5u, 3u),
+            highest_from_mask(flush_mask, 0u, 0u, 5u, 4u)
+        );
+    }
+    let straight = straight_high(rank_mask);
+    if straight != 0u {
+        return pack(4u, straight, 0u, 0u, 0u, 0u);
+    }
+    if trip1 != 0u {
+        return pack(
+            3u,
+            trip1,
+            highest_from_mask(rank_mask, trip1, 0u, 2u, 0u),
+            highest_from_mask(rank_mask, trip1, 0u, 2u, 1u),
+            0u,
+            0u
+        );
+    }
+    if pair1 != 0u && pair2 != 0u {
+        return pack(2u, pair1, pair2, highest_from_mask(rank_mask, pair1, pair2, 1u, 0u), 0u, 0u);
+    }
+    if pair1 != 0u {
+        return pack(
+            1u,
+            pair1,
+            highest_from_mask(rank_mask, pair1, 0u, 3u, 0u),
+            highest_from_mask(rank_mask, pair1, 0u, 3u, 1u),
+            highest_from_mask(rank_mask, pair1, 0u, 3u, 2u),
+            0u
+        );
+    }
+    return pack(
+        0u,
+        highest_from_mask(rank_mask, 0u, 0u, 5u, 0u),
+        highest_from_mask(rank_mask, 0u, 0u, 5u, 1u),
+        highest_from_mask(rank_mask, 0u, 0u, 5u, 2u),
+        highest_from_mask(rank_mask, 0u, 0u, 5u, 3u),
+        highest_from_mask(rank_mask, 0u, 0u, 5u, 4u)
+    );
+}
+
+fn combo_mask(combo: Combo) -> u32 {
+    return card_mask(combo.cards[0]) | card_mask(combo.cards[1]);
+}
+
+fn board_mask(board: FinalBoard) -> u32 {
+    return card_mask(board.cards[0])
+        | card_mask(board.cards[1])
+        | card_mask(board.cards[2])
+        | card_mask(board.cards[3])
+        | card_mask(board.cards[4]);
+}
+
+@compute @workgroup_size(64)
+fn matrix(@builtin(global_invocation_id) id: vec3<u32>) {
+    let index = id.x;
+    let combo_count = params[0];
+    let board_count = params[1];
+    let pair_count = combo_count * combo_count;
+    if index >= pair_count {
+        return;
+    }
+    let hero_index = index / combo_count;
+    let villain_index = index % combo_count;
+    let hero = combos[hero_index];
+    let villain = combos[villain_index];
+    let private_mask = combo_mask(hero) | combo_mask(villain);
+    if countOneBits(private_mask) < 4u {
+        equities[index] = 0.5;
+        return;
+    }
+
+    var sum = 0.0;
+    var count = 0u;
+    for (var board_index = 0u; board_index < board_count; board_index = board_index + 1u) {
+        let board = boards[board_index];
+        if (board_mask(board) & private_mask) != 0u {
+            continue;
+        }
+        let hero_strength = evaluate_combo_board(hero, board);
+        let villain_strength = evaluate_combo_board(villain, board);
+        if hero_strength > villain_strength {
+            sum = sum + 1.0;
+        } else if hero_strength == villain_strength {
+            sum = sum + 0.5;
+        }
+        count = count + 1u;
+    }
+
+    if count == 0u {
+        equities[index] = 0.5;
+    } else {
+        equities[index] = sum / f32(count);
+    }
+}
+"#;
+
 #[derive(Debug)]
 pub enum GpuCfrError {
     NoAdapter,
@@ -348,6 +590,24 @@ pub struct GpuShowdownTask {
 
 unsafe impl bytemuck::Zeroable for GpuShowdownTask {}
 unsafe impl bytemuck::Pod for GpuShowdownTask {}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct GpuPrivateCombo {
+    pub cards: [u32; 2],
+}
+
+unsafe impl bytemuck::Zeroable for GpuPrivateCombo {}
+unsafe impl bytemuck::Pod for GpuPrivateCombo {}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct GpuFinalBoard {
+    pub cards: [u32; 5],
+}
+
+unsafe impl bytemuck::Zeroable for GpuFinalBoard {}
+unsafe impl bytemuck::Pod for GpuFinalBoard {}
 
 impl GpuDenseCfrBackend {
     pub fn new() -> Result<Self, GpuCfrError> {
@@ -593,6 +853,100 @@ impl GpuDenseCfrBackend {
             .map_err(|error| GpuCfrError::MapFailed(error.to_string()))?;
         output = read_f32_buffer(&self.device, &readback, tasks.len())?;
         Ok(output)
+    }
+
+    pub fn showdown_matrix(
+        &self,
+        combos: &[GpuPrivateCombo],
+        final_boards: &[GpuFinalBoard],
+    ) -> Result<Vec<f32>, GpuCfrError> {
+        if combos.is_empty() {
+            return Ok(Vec::new());
+        }
+        assert!(
+            !final_boards.is_empty(),
+            "showdown matrix needs at least one final board"
+        );
+
+        let shader = self
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("showdown matrix shader"),
+                source: wgpu::ShaderSource::Wgsl(SHOWDOWN_MATRIX_SHADER.into()),
+            });
+        let layout = self
+            .device
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("showdown matrix bind group layout"),
+                entries: &[
+                    storage_entry(0, true),
+                    storage_entry(1, true),
+                    storage_entry(2, false),
+                    storage_entry(3, true),
+                ],
+            });
+        let pipeline_layout = self
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("showdown matrix pipeline layout"),
+                bind_group_layouts: &[Some(&layout)],
+                immediate_size: 0,
+            });
+        let pipeline = self
+            .device
+            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("showdown matrix pipeline"),
+                layout: Some(&pipeline_layout),
+                module: &shader,
+                entry_point: Some("matrix"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                cache: None,
+            });
+        let pair_count = combos.len() * combos.len();
+        let combo_buffer = readonly_buffer(&self.device, "showdown matrix combos", combos);
+        let board_buffer = readonly_buffer(&self.device, "showdown matrix boards", final_boards);
+        let output = vec![0.0f32; pair_count];
+        let output_buffer = storage_buffer(&self.device, "showdown matrix equities", &output);
+        let params = readonly_buffer(
+            &self.device,
+            "showdown matrix params",
+            &[combos.len() as u32, final_boards.len() as u32],
+        );
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("showdown matrix bind group"),
+            layout: &layout,
+            entries: &[
+                bind_entry(0, &combo_buffer),
+                bind_entry(1, &board_buffer),
+                bind_entry(2, &output_buffer),
+                bind_entry(3, &params),
+            ],
+        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("showdown matrix encoder"),
+            });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("showdown matrix pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            let groups = (pair_count as u32).div_ceil(WORKGROUP_SIZE);
+            pass.dispatch_workgroups(groups, 1, 1);
+        }
+        let readback = readback_buffer(&self.device, pair_count);
+        copy_buffer(&mut encoder, &output_buffer, &readback, pair_count);
+        let submission = self.queue.submit(Some(encoder.finish()));
+        self.device
+            .poll(wgpu::PollType::Wait {
+                submission_index: Some(submission),
+                timeout: None,
+            })
+            .map_err(|error| GpuCfrError::MapFailed(error.to_string()))?;
+        read_f32_buffer(&self.device, &readback, pair_count)
     }
 
     pub fn upload_state(&self, state: &DenseCfrState) -> GpuDenseCfrState {

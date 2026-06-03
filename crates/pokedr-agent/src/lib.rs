@@ -4,7 +4,9 @@ use std::{cell::RefCell, collections::HashMap, rc::Rc, time::Instant};
 
 use pokedr_core::{
     cards::{Board, Card as PokedrCard, Rank as PokedrRank, Suit as PokedrSuit, evaluate},
-    dense_cfr::gpu::{GpuCfrError, GpuDenseCfrBackend, GpuShowdownTask},
+    dense_cfr::gpu::{
+        GpuCfrError, GpuDenseCfrBackend, GpuFinalBoard, GpuPrivateCombo, GpuShowdownTask,
+    },
     dense_cfr::{CfrVariant, DenseCfrIteration, DenseCfrState},
     postflop::{
         ActionSetConfig, Player, PlayerAction, PublicNodeKind, PublicState, Street, SubgameTree,
@@ -340,7 +342,10 @@ pub fn gpu_backend_mode() -> BackendMode {
 struct PostflopEvaluationContext<'a> {
     hero_cards: [PokedrCard; 2],
     villain_cards: [PokedrCard; 2],
+    hero_combo: usize,
+    villain_combo: usize,
     gpu_backend: Option<&'a GpuDenseCfrBackend>,
+    matrix_cache: &'a RefCell<HashMap<u64, Vec<f32>>>,
     max_showdown_runouts: usize,
     equity_cache: HashMap<u64, f32>,
 }
@@ -621,6 +626,7 @@ fn fill_public_tree_iteration(
     batch.strategy_weights.fill(0.0);
     let mut value_weights = vec![0.0; batch.action_values.len()];
     let root_dead = root_board(tree).deck_mask();
+    let matrix_cache = RefCell::new(HashMap::new());
 
     for hero_combo in legal_private_combos(indexer, root_dead) {
         let hero_cards = combo_cards(indexer.combo(hero_combo));
@@ -629,7 +635,10 @@ fn fill_public_tree_iteration(
             let mut ctx = PostflopEvaluationContext {
                 hero_cards,
                 villain_cards,
+                hero_combo,
+                villain_combo,
                 gpu_backend,
+                matrix_cache: &matrix_cache,
                 max_showdown_runouts: config.max_showdown_runouts.max(1),
                 equity_cache: HashMap::new(),
             };
@@ -900,6 +909,10 @@ fn showdown_utility(
 }
 
 fn showdown_equity(board: &Board, ctx: &mut PostflopEvaluationContext) -> f32 {
+    if let Some(equity) = gpu_showdown_matrix_equity(board, ctx) {
+        return equity;
+    }
+
     let key = board.deck_mask() ^ private_dead_mask(ctx).rotate_left(17);
     if let Some(equity) = ctx.equity_cache.get(&key) {
         return *equity;
@@ -943,6 +956,25 @@ fn showdown_equity(board: &Board, ctx: &mut PostflopEvaluationContext) -> f32 {
     };
     ctx.equity_cache.insert(key, equity);
     equity
+}
+
+fn gpu_showdown_matrix_equity(
+    board: &Board,
+    ctx: &mut PostflopEvaluationContext<'_>,
+) -> Option<f32> {
+    let backend = ctx.gpu_backend?;
+    let key = board.deck_mask();
+    if !ctx.matrix_cache.borrow().contains_key(&key) {
+        let combos = gpu_private_combos();
+        let final_boards = gpu_final_boards(board, ctx.max_showdown_runouts);
+        let matrix = backend.showdown_matrix(&combos, &final_boards).ok()?;
+        ctx.matrix_cache.borrow_mut().insert(key, matrix);
+    }
+    let cache = ctx.matrix_cache.borrow();
+    let matrix = cache.get(&key)?;
+    matrix
+        .get(ctx.hero_combo * COMBO_COUNT + ctx.villain_combo)
+        .copied()
 }
 
 fn gpu_showdown_equity(
@@ -1019,6 +1051,36 @@ fn completion_runouts(board: &Board, dead: u64, limit: usize) -> Vec<Vec<PokedrC
         }
     }
     runouts
+}
+
+fn gpu_private_combos() -> Vec<GpuPrivateCombo> {
+    ComboIndexer::new()
+        .combos()
+        .iter()
+        .map(|combo| GpuPrivateCombo {
+            cards: [combo.first.index() as u32, combo.second.index() as u32],
+        })
+        .collect()
+}
+
+fn gpu_final_boards(board: &Board, limit: usize) -> Vec<GpuFinalBoard> {
+    let runouts = completion_runouts(board, board.deck_mask(), limit.max(1));
+    runouts
+        .into_iter()
+        .filter_map(|runout| {
+            let mut final_board = board.cards().to_vec();
+            final_board.extend(runout);
+            (final_board.len() == 5).then(|| GpuFinalBoard {
+                cards: [
+                    final_board[0].index() as u32,
+                    final_board[1].index() as u32,
+                    final_board[2].index() as u32,
+                    final_board[3].index() as u32,
+                    final_board[4].index() as u32,
+                ],
+            })
+        })
+        .collect()
 }
 
 fn heads_up_equity(
@@ -1413,6 +1475,8 @@ mod tests {
             PokedrCard::new(PokedrRank::King, PokedrSuit::Diamonds),
             PokedrCard::new(PokedrRank::Three, PokedrSuit::Spades),
         ]);
+        let indexer = ComboIndexer::new();
+        let matrix_cache = RefCell::new(HashMap::new());
         let mut strong = PostflopEvaluationContext {
             hero_cards: [
                 PokedrCard::new(PokedrRank::Ace, PokedrSuit::Clubs),
@@ -1422,7 +1486,22 @@ mod tests {
                 PokedrCard::new(PokedrRank::Queen, PokedrSuit::Clubs),
                 PokedrCard::new(PokedrRank::Queen, PokedrSuit::Diamonds),
             ],
+            hero_combo: hero_combo_index(
+                &indexer,
+                [
+                    PokedrCard::new(PokedrRank::Ace, PokedrSuit::Clubs),
+                    PokedrCard::new(PokedrRank::Ace, PokedrSuit::Diamonds),
+                ],
+            ),
+            villain_combo: hero_combo_index(
+                &indexer,
+                [
+                    PokedrCard::new(PokedrRank::Queen, PokedrSuit::Clubs),
+                    PokedrCard::new(PokedrRank::Queen, PokedrSuit::Diamonds),
+                ],
+            ),
             gpu_backend: None,
+            matrix_cache: &matrix_cache,
             max_showdown_runouts: 1,
             equity_cache: HashMap::new(),
         };
@@ -1435,7 +1514,22 @@ mod tests {
                 PokedrCard::new(PokedrRank::Queen, PokedrSuit::Clubs),
                 PokedrCard::new(PokedrRank::Queen, PokedrSuit::Diamonds),
             ],
+            hero_combo: hero_combo_index(
+                &indexer,
+                [
+                    PokedrCard::new(PokedrRank::Nine, PokedrSuit::Clubs),
+                    PokedrCard::new(PokedrRank::Ten, PokedrSuit::Diamonds),
+                ],
+            ),
+            villain_combo: hero_combo_index(
+                &indexer,
+                [
+                    PokedrCard::new(PokedrRank::Queen, PokedrSuit::Clubs),
+                    PokedrCard::new(PokedrRank::Queen, PokedrSuit::Diamonds),
+                ],
+            ),
             gpu_backend: None,
+            matrix_cache: &matrix_cache,
             max_showdown_runouts: 1,
             equity_cache: HashMap::new(),
         };
@@ -1569,7 +1663,10 @@ mod tests {
                 PokedrCard::new(PokedrRank::Queen, PokedrSuit::Clubs),
                 PokedrCard::new(PokedrRank::Queen, PokedrSuit::Diamonds),
             ],
+            hero_combo,
+            villain_combo,
             gpu_backend: None,
+            matrix_cache: &RefCell::new(HashMap::new()),
             max_showdown_runouts: 1,
             equity_cache: HashMap::new(),
         };

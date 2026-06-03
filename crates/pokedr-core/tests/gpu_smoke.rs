@@ -2,6 +2,7 @@ use pokedr_core::cards::{Card, Rank, Suit, evaluate};
 use pokedr_core::dense_cfr::{
     CfrVariant, DenseCfrConfig, DenseCfrSolver, DenseCfrState,
     gpu::{GpuCfrError, GpuDenseCfrBackend, GpuShowdownTask},
+    gpu::{GpuFinalBoard, GpuPrivateCombo},
 };
 
 fn main() {
@@ -24,6 +25,7 @@ fn main() {
     run_masked_one_shot_update(&backend);
     run_resident_updates(&backend);
     run_showdown_equities(&backend);
+    run_showdown_matrix(&backend);
     println!("GPU smoke passed");
 }
 
@@ -250,6 +252,77 @@ fn cpu_showdown(board: [Card; 5], hero: [Card; 2], villain: [Card; 2]) -> f32 {
         std::cmp::Ordering::Greater => 1.0,
         std::cmp::Ordering::Equal => 0.5,
         std::cmp::Ordering::Less => 0.0,
+    }
+}
+
+fn run_showdown_matrix(backend: &GpuDenseCfrBackend) {
+    let combos = vec![
+        gpu_combo([
+            Card::new(Rank::Ace, Suit::Spades),
+            Card::new(Rank::King, Suit::Spades),
+        ]),
+        gpu_combo([
+            Card::new(Rank::Ace, Suit::Clubs),
+            Card::new(Rank::Ace, Suit::Diamonds),
+        ]),
+        gpu_combo([
+            Card::new(Rank::Jack, Suit::Spades),
+            Card::new(Rank::Ten, Suit::Spades),
+        ]),
+    ];
+    let boards = vec![GpuFinalBoard {
+        cards: [
+            Card::new(Rank::Queen, Suit::Spades).index() as u32,
+            Card::new(Rank::Nine, Suit::Spades).index() as u32,
+            Card::new(Rank::Two, Suit::Clubs).index() as u32,
+            Card::new(Rank::Three, Suit::Diamonds).index() as u32,
+            Card::new(Rank::Four, Suit::Hearts).index() as u32,
+        ],
+    }];
+    let matrix = backend
+        .showdown_matrix(&combos, &boards)
+        .unwrap_or_else(|error| fail(&format!("GPU showdown matrix failed: {error:?}")));
+    let board = [
+        Card::new(Rank::Queen, Suit::Spades),
+        Card::new(Rank::Nine, Suit::Spades),
+        Card::new(Rank::Two, Suit::Clubs),
+        Card::new(Rank::Three, Suit::Diamonds),
+        Card::new(Rank::Four, Suit::Hearts),
+    ];
+    let combo_cards = [
+        [
+            Card::new(Rank::Ace, Suit::Spades),
+            Card::new(Rank::King, Suit::Spades),
+        ],
+        [
+            Card::new(Rank::Ace, Suit::Clubs),
+            Card::new(Rank::Ace, Suit::Diamonds),
+        ],
+        [
+            Card::new(Rank::Jack, Suit::Spades),
+            Card::new(Rank::Ten, Suit::Spades),
+        ],
+    ];
+    for hero in 0..combo_cards.len() {
+        for villain in 0..combo_cards.len() {
+            let expected = if hero == villain {
+                0.5
+            } else {
+                cpu_showdown(board, combo_cards[hero], combo_cards[villain])
+            };
+            let actual = matrix[hero * combo_cards.len() + villain];
+            if (expected - actual).abs() >= 1e-5 {
+                fail(&format!(
+                    "showdown matrix[{hero},{villain}] mismatch: expected {expected}, actual {actual}"
+                ));
+            }
+        }
+    }
+}
+
+fn gpu_combo(cards: [Card; 2]) -> GpuPrivateCombo {
+    GpuPrivateCombo {
+        cards: [cards[0].index() as u32, cards[1].index() as u32],
     }
 }
 
