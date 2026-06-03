@@ -24,6 +24,19 @@ Implementation order:
 4. Belief update from average strategy for every private bucket.
 5. GPU backend for regret, strategy, belief, and batched leaf evaluation.
 
+Postflop action abstraction:
+
+- Build a small canonical action set per node instead of taking the raw union of
+  every plausible sizing.
+- Check/call/fold are forced when legal.
+- Standard bet/raise sizes are street-aware and intentionally sparse.
+- Observed opponent sizings are forced into the abstraction, but nearby standard
+  sizes are replaced instead of added. This avoids splitting strategy frequency
+  across near-equivalent actions.
+- Near all-in sizings are absorbed into all-in.
+- Aggressive actions are capped; observed sizings and all-in have higher priority
+  than generic standard sizes.
+
 Acceptance targets:
 
 - Correctness first: CPU reference and GPU dense kernels must match within `1e-5`
