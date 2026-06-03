@@ -9,7 +9,7 @@ GPU smoke integration test is expected to prove anything.
 Use the pinned toolchain explicitly:
 
 ```bash
-cargo +1.95.0 test --workspace
+cargo test --workspace
 ```
 
 Run that command with escalation. A non-escalated run can hide `/dev/dxg` or
