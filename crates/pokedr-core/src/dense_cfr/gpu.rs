@@ -551,6 +551,116 @@ fn matrix(@builtin(global_invocation_id) id: vec3<u32>) {
 }
 "#;
 
+const ROOT_TERMINAL_VALUES_SHADER: &str = r#"
+struct Combo {
+    cards: array<u32, 2>,
+};
+
+struct ActionSpec {
+    kind: u32,
+    pot: f32,
+    hero_invested: f32,
+    _pad: u32,
+};
+
+struct RootTerminalParams {
+    combo_count: u32,
+    action_count: u32,
+    max_actions: u32,
+    acting_player: u32,
+};
+
+@group(0) @binding(0) var<storage, read> combos: array<Combo>;
+@group(0) @binding(1) var<storage, read> combo_legal: array<u32>;
+@group(0) @binding(2) var<storage, read> villain_weights: array<f32>;
+@group(0) @binding(3) var<storage, read> showdown_matrix: array<f32>;
+@group(0) @binding(4) var<storage, read> actions: array<ActionSpec>;
+@group(0) @binding(5) var<storage, read_write> action_values: array<f32>;
+@group(0) @binding(6) var<storage, read_write> reach_weights: array<f32>;
+@group(0) @binding(7) var<storage, read_write> strategy_weights: array<f32>;
+@group(0) @binding(8) var<uniform> params: RootTerminalParams;
+
+fn collide(left: Combo, right: Combo) -> bool {
+    return left.cards[0] == right.cards[0]
+        || left.cards[0] == right.cards[1]
+        || left.cards[1] == right.cards[0]
+        || left.cards[1] == right.cards[1];
+}
+
+fn hero_utility(action: ActionSpec, hero_combo: u32, villain_combo: u32, combo_count: u32) -> f32 {
+    if action.kind == 0u {
+        return -action.hero_invested;
+    }
+    if action.kind == 1u {
+        return action.pot - action.hero_invested;
+    }
+    let equity = showdown_matrix[hero_combo * combo_count + villain_combo];
+    return equity * action.pot - action.hero_invested;
+}
+
+@compute @workgroup_size(64)
+fn root_values(@builtin(global_invocation_id) id: vec3<u32>) {
+    let index = id.x;
+    let combo_count = params.combo_count;
+    let action_count = params.action_count;
+    let max_actions = params.max_actions;
+    let acting_player = params.acting_player;
+    if index >= combo_count * action_count {
+        return;
+    }
+
+    let acting_combo = index / action_count;
+    let action_index = index % action_count;
+    let infoset_offset = acting_player * combo_count + acting_combo;
+    let value_offset = infoset_offset * max_actions + action_index;
+    if combo_legal[acting_combo] == 0u {
+        action_values[value_offset] = 0.0;
+        return;
+    }
+
+    let action = actions[action_index];
+    var weighted_value = 0.0;
+    var value_weight = 0.0;
+    var strategy_weight = 0.0;
+    var opponent = 0u;
+    loop {
+        if opponent >= combo_count {
+            break;
+        }
+        if combo_legal[opponent] != 0u && !collide(combos[acting_combo], combos[opponent]) {
+            var hero_combo = acting_combo;
+            var villain_combo = opponent;
+            var opponent_reach = villain_weights[opponent];
+            var own_reach = 1.0;
+            if acting_player == 1u {
+                hero_combo = opponent;
+                villain_combo = acting_combo;
+                opponent_reach = 1.0;
+                own_reach = villain_weights[acting_combo];
+            }
+            var value = hero_utility(action, hero_combo, villain_combo, combo_count);
+            if acting_player == 1u {
+                value = -value;
+            }
+            weighted_value = weighted_value + opponent_reach * value;
+            value_weight = value_weight + opponent_reach;
+            strategy_weight = strategy_weight + own_reach;
+        }
+        opponent = opponent + 1u;
+    }
+
+    if value_weight > 0.0 {
+        action_values[value_offset] = weighted_value / value_weight;
+    } else {
+        action_values[value_offset] = 0.0;
+    }
+    if action_index == 0u {
+        reach_weights[infoset_offset] = value_weight;
+        strategy_weights[infoset_offset] = strategy_weight;
+    }
+}
+"#;
+
 #[derive(Debug)]
 pub enum GpuCfrError {
     NoAdapter,
@@ -568,6 +678,8 @@ pub struct GpuDenseCfrBackend {
     showdown_bind_group_layout: wgpu::BindGroupLayout,
     showdown_matrix_pipeline: wgpu::ComputePipeline,
     showdown_matrix_bind_group_layout: wgpu::BindGroupLayout,
+    root_terminal_values_pipeline: wgpu::ComputePipeline,
+    root_terminal_values_bind_group_layout: wgpu::BindGroupLayout,
 }
 
 pub struct GpuDenseCfrState {
@@ -612,6 +724,36 @@ pub struct GpuFinalBoard {
 
 unsafe impl bytemuck::Zeroable for GpuFinalBoard {}
 unsafe impl bytemuck::Pod for GpuFinalBoard {}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct GpuTerminalAction {
+    pub kind: u32,
+    pub pot: f32,
+    pub hero_invested: f32,
+    pub _pad: u32,
+}
+
+unsafe impl bytemuck::Zeroable for GpuTerminalAction {}
+unsafe impl bytemuck::Pod for GpuTerminalAction {}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct GpuRootTerminalParams {
+    combo_count: u32,
+    action_count: u32,
+    max_actions: u32,
+    acting_player: u32,
+}
+
+unsafe impl bytemuck::Zeroable for GpuRootTerminalParams {}
+unsafe impl bytemuck::Pod for GpuRootTerminalParams {}
+
+pub struct GpuRootTerminalValues {
+    pub action_values: Vec<f32>,
+    pub reach_weights: Vec<f32>,
+    pub strategy_weights: Vec<f32>,
+}
 
 impl GpuDenseCfrBackend {
     pub fn new() -> Result<Self, GpuCfrError> {
@@ -730,6 +872,41 @@ impl GpuDenseCfrBackend {
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
                 cache: None,
             });
+        let root_terminal_values_shader =
+            device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("root terminal values shader"),
+                source: wgpu::ShaderSource::Wgsl(ROOT_TERMINAL_VALUES_SHADER.into()),
+            });
+        let root_terminal_values_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("root terminal values bind group layout"),
+                entries: &[
+                    storage_entry(0, true),
+                    storage_entry(1, true),
+                    storage_entry(2, true),
+                    storage_entry(3, true),
+                    storage_entry(4, true),
+                    storage_entry(5, false),
+                    storage_entry(6, false),
+                    storage_entry(7, false),
+                    uniform_entry(8),
+                ],
+            });
+        let root_terminal_values_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("root terminal values pipeline layout"),
+                bind_group_layouts: &[Some(&root_terminal_values_bind_group_layout)],
+                immediate_size: 0,
+            });
+        let root_terminal_values_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("root terminal values pipeline"),
+                layout: Some(&root_terminal_values_pipeline_layout),
+                module: &root_terminal_values_shader,
+                entry_point: Some("root_values"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                cache: None,
+            });
         Ok(Self {
             device,
             queue,
@@ -740,6 +917,8 @@ impl GpuDenseCfrBackend {
             showdown_bind_group_layout,
             showdown_matrix_pipeline,
             showdown_matrix_bind_group_layout,
+            root_terminal_values_pipeline,
+            root_terminal_values_bind_group_layout,
         })
     }
 
@@ -943,6 +1122,135 @@ impl GpuDenseCfrBackend {
             })
             .map_err(|error| GpuCfrError::MapFailed(error.to_string()))?;
         read_f32_buffer(&self.device, &readback, pair_count)
+    }
+
+    pub fn root_terminal_values(
+        &self,
+        combos: &[GpuPrivateCombo],
+        combo_legal: &[u32],
+        villain_weights: &[f32],
+        showdown_matrix: &[f32],
+        actions: &[GpuTerminalAction],
+        max_actions: usize,
+        acting_player: u32,
+    ) -> Result<GpuRootTerminalValues, GpuCfrError> {
+        assert_eq!(combo_legal.len(), combos.len());
+        assert_eq!(villain_weights.len(), combos.len());
+        assert_eq!(showdown_matrix.len(), combos.len() * combos.len());
+        assert!(actions.len() <= max_actions);
+        if combos.is_empty() || actions.is_empty() {
+            return Ok(GpuRootTerminalValues {
+                action_values: Vec::new(),
+                reach_weights: Vec::new(),
+                strategy_weights: Vec::new(),
+            });
+        }
+
+        let infosets = combos.len() * 2;
+        let action_value_len = infosets * max_actions;
+        let combo_buffer = readonly_buffer(&self.device, "root terminal combos", combos);
+        let combo_legal_buffer =
+            readonly_buffer(&self.device, "root terminal combo legal", combo_legal);
+        let villain_weights_buffer = readonly_buffer(
+            &self.device,
+            "root terminal villain weights",
+            villain_weights,
+        );
+        let matrix_buffer = readonly_buffer(
+            &self.device,
+            "root terminal showdown matrix",
+            showdown_matrix,
+        );
+        let actions_buffer = readonly_buffer(&self.device, "root terminal actions", actions);
+        let action_values = vec![0.0f32; action_value_len];
+        let reach_weights = vec![0.0f32; infosets];
+        let strategy_weights = vec![0.0f32; infosets];
+        let action_values_buffer =
+            storage_buffer(&self.device, "root terminal action values", &action_values);
+        let reach_weights_buffer =
+            storage_buffer(&self.device, "root terminal reach weights", &reach_weights);
+        let strategy_weights_buffer = storage_buffer(
+            &self.device,
+            "root terminal strategy weights",
+            &strategy_weights,
+        );
+        let params = uniform_buffer(
+            &self.device,
+            "root terminal params",
+            &[GpuRootTerminalParams {
+                combo_count: combos.len() as u32,
+                action_count: actions.len() as u32,
+                max_actions: max_actions as u32,
+                acting_player,
+            }],
+        );
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("root terminal values bind group"),
+            layout: &self.root_terminal_values_bind_group_layout,
+            entries: &[
+                bind_entry(0, &combo_buffer),
+                bind_entry(1, &combo_legal_buffer),
+                bind_entry(2, &villain_weights_buffer),
+                bind_entry(3, &matrix_buffer),
+                bind_entry(4, &actions_buffer),
+                bind_entry(5, &action_values_buffer),
+                bind_entry(6, &reach_weights_buffer),
+                bind_entry(7, &strategy_weights_buffer),
+                bind_entry(8, &params),
+            ],
+        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("root terminal values encoder"),
+            });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("root terminal values pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.root_terminal_values_pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            let groups = ((combos.len() * actions.len()) as u32).div_ceil(WORKGROUP_SIZE);
+            pass.dispatch_workgroups(groups, 1, 1);
+        }
+        let action_values_readback = readback_buffer(&self.device, action_value_len);
+        let reach_weights_readback = readback_buffer(&self.device, infosets);
+        let strategy_weights_readback = readback_buffer(&self.device, infosets);
+        copy_buffer(
+            &mut encoder,
+            &action_values_buffer,
+            &action_values_readback,
+            action_value_len,
+        );
+        copy_buffer(
+            &mut encoder,
+            &reach_weights_buffer,
+            &reach_weights_readback,
+            infosets,
+        );
+        copy_buffer(
+            &mut encoder,
+            &strategy_weights_buffer,
+            &strategy_weights_readback,
+            infosets,
+        );
+        let submission = self.queue.submit(Some(encoder.finish()));
+        self.device
+            .poll(wgpu::PollType::Wait {
+                submission_index: Some(submission),
+                timeout: None,
+            })
+            .map_err(|error| GpuCfrError::MapFailed(error.to_string()))?;
+        Ok(GpuRootTerminalValues {
+            action_values: read_f32_buffer(
+                &self.device,
+                &action_values_readback,
+                action_value_len,
+            )?,
+            reach_weights: read_f32_buffer(&self.device, &reach_weights_readback, infosets)?,
+            strategy_weights: read_f32_buffer(&self.device, &strategy_weights_readback, infosets)?,
+        })
     }
 
     pub fn upload_state(&self, state: &DenseCfrState) -> GpuDenseCfrState {
@@ -1160,6 +1468,19 @@ fn storage_entry(binding: u32, read_only: bool) -> wgpu::BindGroupLayoutEntry {
     }
 }
 
+fn uniform_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Uniform,
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
+    }
+}
+
 fn bind_entry(binding: u32, buffer: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_> {
     wgpu::BindGroupEntry {
         binding,
@@ -1184,6 +1505,18 @@ fn readonly_buffer<T: bytemuck::NoUninit>(
         label: Some(label),
         contents: bytemuck::cast_slice(data),
         usage: wgpu::BufferUsages::STORAGE,
+    })
+}
+
+fn uniform_buffer<T: bytemuck::NoUninit>(
+    device: &wgpu::Device,
+    label: &str,
+    data: &[T],
+) -> wgpu::Buffer {
+    device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some(label),
+        contents: bytemuck::cast_slice(data),
+        usage: wgpu::BufferUsages::UNIFORM,
     })
 }
 

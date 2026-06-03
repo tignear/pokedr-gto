@@ -6,6 +6,7 @@ use pokedr_core::{
     cards::{Board, Card as PokedrCard, Rank as PokedrRank, Suit as PokedrSuit, evaluate},
     dense_cfr::gpu::{
         GpuCfrError, GpuDenseCfrBackend, GpuFinalBoard, GpuPrivateCombo, GpuShowdownTask,
+        GpuTerminalAction,
     },
     dense_cfr::{CfrVariant, DenseCfrIteration, DenseCfrState},
     postflop::{
@@ -629,6 +630,19 @@ fn fill_public_tree_iteration(
     batch.strategy_weights.fill(0.0);
     let mut value_weights = vec![0.0; batch.action_values.len()];
     let root_dead = root_board(tree).deck_mask();
+    if try_fill_root_terminal_iteration(
+        tree,
+        layout,
+        indexer,
+        gpu_backend,
+        config,
+        villain_weights,
+        matrix_cache,
+        batch,
+        root_dead,
+    ) {
+        return;
+    }
 
     for hero_combo in legal_private_combos(indexer, root_dead) {
         let hero_cards = combo_cards(indexer.combo(hero_combo));
@@ -668,6 +682,108 @@ fn fill_public_tree_iteration(
             *value /= weight;
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn try_fill_root_terminal_iteration(
+    tree: &SubgameTree,
+    layout: &PostflopDenseLayout,
+    indexer: &ComboIndexer,
+    gpu_backend: Option<&GpuDenseCfrBackend>,
+    config: &PokedrAgentConfig,
+    villain_weights: &[f32],
+    matrix_cache: &RefCell<HashMap<u64, Vec<f32>>>,
+    batch: &mut DenseCfrIteration,
+    root_dead: u64,
+) -> bool {
+    let Some(backend) = gpu_backend else {
+        return false;
+    };
+    if layout.infoset_count() != 1 || layout.node_infoset(0) != Some(0) {
+        return false;
+    }
+    let PublicNodeKind::Decision { state, actions } = &tree.nodes()[0].kind else {
+        return false;
+    };
+    if actions.len() != tree.nodes()[0].children.len() {
+        return false;
+    }
+    let mut gpu_actions = Vec::with_capacity(actions.len());
+    for (action, &child) in actions.iter().zip(&tree.nodes()[0].children) {
+        let PublicNodeKind::Terminal {
+            kind,
+            pot,
+            hero_invested,
+            ..
+        } = &tree.nodes()[child].kind
+        else {
+            return false;
+        };
+        let kind = match kind {
+            TerminalKind::Fold if action.action == PlayerAction::Fold => {
+                match state.acting_player {
+                    Player::Hero => 0,
+                    Player::Villain => 1,
+                }
+            }
+            TerminalKind::Showdown => 2,
+            TerminalKind::Fold => return false,
+        };
+        gpu_actions.push(GpuTerminalAction {
+            kind,
+            pot: *pot as f32,
+            hero_invested: *hero_invested as f32,
+            _pad: 0,
+        });
+    }
+
+    let board = root_board(tree);
+    let key = board.deck_mask();
+    if !matrix_cache.borrow().contains_key(&key) {
+        let combos = gpu_private_combos();
+        let final_boards = gpu_final_boards(&board, config.max_showdown_runouts.max(1));
+        let Ok(matrix) = backend.showdown_matrix(&combos, &final_boards) else {
+            return false;
+        };
+        matrix_cache.borrow_mut().insert(key, matrix);
+    }
+    let matrix_cache_ref = matrix_cache.borrow();
+    let Some(matrix) = matrix_cache_ref.get(&key) else {
+        return false;
+    };
+    let combos = gpu_private_combos();
+    let combo_legal: Vec<u32> = indexer
+        .combos()
+        .iter()
+        .map(|combo| (!combo.collides_with(root_dead)) as u32)
+        .collect();
+    let acting_player = match state.acting_player {
+        Player::Hero => 0,
+        Player::Villain => 1,
+    };
+    let Ok(values) = backend.root_terminal_values(
+        &combos,
+        &combo_legal,
+        villain_weights,
+        matrix,
+        &gpu_actions,
+        layout.max_actions(),
+        acting_player,
+    ) else {
+        return false;
+    };
+    if values.action_values.len() != batch.action_values.len()
+        || values.reach_weights.len() != batch.reach_weights.len()
+        || values.strategy_weights.len() != batch.strategy_weights.len()
+    {
+        return false;
+    }
+    batch.action_values.copy_from_slice(&values.action_values);
+    batch.reach_weights.copy_from_slice(&values.reach_weights);
+    batch
+        .strategy_weights
+        .copy_from_slice(&values.strategy_weights);
+    true
 }
 
 #[allow(clippy::too_many_arguments)]
