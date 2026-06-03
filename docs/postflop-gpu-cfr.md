@@ -452,3 +452,258 @@ action_value[I,v,a] = value_v[child_a,v] /
 This is the correct escape from the current `pair x node` bottleneck. It still
 has pairwise work at terminal convolutions and denominator reductions, but it no
 longer multiplies every pair by every public node.
+
+## Next Mathematical Cut
+
+The current implementation is still too close to "run a public tree program on
+the GPU". The next solver step is to freeze one explicit algebraic interface
+between the public tree and the kernels. The interface should be small enough
+that each operation can be checked independently.
+
+For a fixed subgame, define:
+
+```text
+C = set of private combos, |C| = 1326 before board blockers
+N = public nodes
+D = public decision nodes
+Z = terminal public nodes
+E = public edges
+```
+
+For each player `p in {h, v}` and combo `c in C`, each iteration stores:
+
+```text
+r_p[n,c]       private reach at public node n
+u_p[n,c]       counterfactual value at public node n
+sigma_p[d,c,a] current regret-matched strategy
+R_p[d,c,a]     cumulative regret
+S_p[d,c,a]     cumulative average strategy numerator
+```
+
+The iteration should be decomposed into these operators:
+
+```text
+1. sigma = regret_match(R)
+2. r     = ForwardReach(sigma)
+3. u_Z   = TerminalCfv(r)
+4. u     = BackwardValue(sigma, u_Z)
+5. q,m   = ActionValueGather(r, u)
+6. R,S   = CfrUpdate(R,S,q,m,r,sigma)
+```
+
+Only steps 1 and 6 are dense per-infoset operations. Steps 2, 4, and 5 are
+sparse public-tree operators. Step 3 is the only dense combo-vs-combo operation.
+
+### Forward Reach
+
+Use public topological layers. For each edge `e = n -> child(n,a)`:
+
+Hero acting node:
+
+```text
+r_h[child,h] += r_h[n,h] * sigma_h[I(n),h,a]
+r_v[child,v] += r_v[n,v]
+```
+
+Villain acting node:
+
+```text
+r_h[child,h] += r_h[n,h]
+r_v[child,v] += r_v[n,v] * sigma_v[I(n),v,a]
+```
+
+Chance edge for public card `k`:
+
+```text
+r_h[child,h] += r_h[n,h] * 1[k notin h]
+r_v[child,v] += r_v[n,v] * 1[k notin v]
+```
+
+The public chance probability `pi_c(n)` should be represented separately as a
+scalar per node or folded into terminal/action denominators. Do not duplicate it
+inside every private reach vector unless measurement proves it is cheaper.
+
+### Terminal CFV
+
+At showdown terminal `z`, the expensive operation is:
+
+```text
+u_h[z,h] = pi_c(z) * sum_v M_z[h,v] * r_v[z,v]
+u_v[z,v] = pi_c(z) * sum_h N_z[v,h] * r_h[z,h]
+```
+
+where:
+
+```text
+M_z[h,v] = 1[not collide(h,v)] * (p(z) * W[b(z),h,v] - i_h(z))
+N_z[v,h] = -M_z[h,v]
+```
+
+`M_z` and `N_z` are implicit. The shader derives them from:
+
+```text
+strength[board(z), combo]
+pot[z]
+hero_invested[z]
+combo card masks
+```
+
+Fold terminals are not combo-vs-combo dense products. They are rank-one style
+opponent reach reductions:
+
+Hero wins by villain fold:
+
+```text
+u_h[z,h] = pi_c(z) * (p(z) - i_h(z)) *
+           sum_v 1[not collide(h,v)] * r_v[z,v]
+u_v[z,v] = -pi_c(z) * i_v(z) *
+           sum_h 1[not collide(h,v)] * r_h[z,h]
+```
+
+Villain wins by hero fold is symmetric. This is why fold terminals should stay
+on a specialized path.
+
+### Backward Value
+
+Use reverse public layers. For decision node `n`:
+
+Hero acting:
+
+```text
+u_h[n,h] = sum_a sigma_h[I(n),h,a] * u_h[child(n,a),h]
+u_v[n,v] = sum_a u_v[child(n,a),v]
+```
+
+Villain acting:
+
+```text
+u_h[n,h] = sum_a u_h[child(n,a),h]
+u_v[n,v] = sum_a sigma_v[I(n),v,a] * u_v[child(n,a),v]
+```
+
+Chance node:
+
+```text
+u_p[n,c] = sum_k 1[k notin c] * u_p[child_k,c]
+```
+
+If public chance probability is stored separately, do not divide here; keep
+`u_p` and the denominators in the same convention until action-value gather.
+
+### Action Value And Denominator Gather
+
+At decision node `d`, action values are child CFVs normalized by opponent
+counterfactual reach mass.
+
+Hero acting:
+
+```text
+q_h[d,h,a] = u_h[child(d,a),h] / m_h[d,h]
+m_h[d,h]   = pi_c(d) * sum_v 1[not collide(h,v)] * r_v[d,v]
+```
+
+Villain acting:
+
+```text
+q_v[d,v,a] = u_v[child(d,a),v] / m_v[d,v]
+m_v[d,v]   = pi_c(d) * sum_h 1[not collide(h,v)] * r_h[d,h]
+```
+
+The same denominator is used for all legal actions at `(d,c)`. This matters:
+do not compute one denominator per action unless chance or abstraction semantics
+actually make opponent reach action-dependent.
+
+Average strategy reach uses the acting player's own reach:
+
+Hero acting:
+
+```text
+s_weight_h[d,h] = pi_c(d) * r_h[d,h]
+```
+
+Villain acting:
+
+```text
+s_weight_v[d,v] = pi_c(d) * r_v[d,v]
+```
+
+### CFR Update
+
+For acting player `p` at `(d,c)`:
+
+```text
+node_value[d,c] = sum_a sigma_p[d,c,a] * q_p[d,c,a]
+R_p[d,c,a]     += m_p[d,c] * (q_p[d,c,a] - node_value[d,c])
+S_p[d,c,a]     += t * s_weight_p[d,c] * sigma_p[d,c,a]
+```
+
+For CFR+:
+
+```text
+R_p[d,c,a] = max(R_p[d,c,a], 0)
+```
+
+For DCFR-style discounting, apply the discount to old regret before adding the
+new instantaneous regret. The current code already follows this shape for dense
+updates; the important part is that `q`, `m`, and `s_weight` come from the same
+reach convention.
+
+## Convergence Diagnostics
+
+Arena win rate is too noisy to be the first convergence signal. Add solver-local
+metrics before trusting match results.
+
+For every sampled fixed flop and iteration count, record:
+
+```text
+root_strategy_l1_delta(t) =
+  sum_{h,a} |avg_sigma_t[root,h,a] - avg_sigma_{t/2}[root,h,a]|
+  / number_of_legal_entries
+
+root_value_delta(t) =
+  mean_h |q_t[root,h,best_avg_action] - q_{t/2}[root,h,best_avg_action]|
+
+regret_mass(t) =
+  sum_{d,c,a} max(R[d,c,a], 0)
+
+illegal_strategy_mass(t) =
+  sum_{illegal d,c,a} S[d,c,a]
+```
+
+Expected invariants:
+
+```text
+illegal_strategy_mass(t) == 0
+all regrets, strategy sums, reaches, and values are finite
+for every legal (d,c): sum_a current_sigma[d,c,a] = 1
+for every legal (d,c) with positive strategy sum:
+  sum_a avg_sigma[d,c,a] = 1
+```
+
+For small trees, additionally compute a one-step best-response check by fixing
+one player's average strategy and enumerating the other player's actions. This
+is not a full production exploitability calculation, but it catches sign errors,
+wrong denominator choices, and strategy applied to the wrong player.
+
+## Immediate Implementation Order
+
+1. Add a `solve-flop-metrics` CLI path that runs one fixed flop for iteration
+   counts like `1,2,4,8,16,32` and prints root strategy deltas, value deltas,
+   regret mass, illegal mass, runtime, and peak-ish resident sizes.
+2. Add compact gather buffers for action values:
+
+```text
+decision_rows: [node, public_infoset, acting_player, first_child, child_count]
+```
+
+   The kernel should stop searching public nodes and consume this table.
+3. Split terminal CFV into two explicit kernel families:
+
+```text
+showdown_cfv_tiles
+fold_cfv_reductions
+```
+
+   Keep their outputs in the same `u_p[z,c]` convention.
+4. Only after the metrics are stable, benchmark arena matches at increasing
+   iteration counts. A match win alone is not evidence of convergence.
