@@ -1,11 +1,17 @@
 pub use pokedr_core::{dense_cfr, postflop, postflop_dense, range};
 
-use std::{cell::RefCell, collections::HashMap, rc::Rc, time::Instant};
+use std::{
+    cell::RefCell,
+    collections::{HashMap, VecDeque},
+    rc::Rc,
+    time::Instant,
+};
 
 use pokedr_core::{
     cards::{Board, Card as PokedrCard, Rank as PokedrRank, Suit as PokedrSuit, evaluate},
     dense_cfr::gpu::{
-        GpuCfrError, GpuDenseCfrBackend, GpuFinalBoard, GpuPrivateCombo, GpuShowdownTask,
+        GpuCfrError, GpuDenseCfrBackend, GpuFinalBoard, GpuPrivateCombo, GpuPublicTreeNode,
+        GpuShowdownTask,
     },
     dense_cfr::{CfrVariant, DenseCfrIteration, DenseCfrState},
     postflop::{
@@ -84,6 +90,19 @@ pub struct HandTrace {
     pub villain_net: f32,
     pub actions: Vec<String>,
     pub awards: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct FixedFlopSolveSummary {
+    pub board: String,
+    pub iterations: usize,
+    pub decisions: usize,
+    pub chance: usize,
+    pub terminals: usize,
+    pub public_infosets: usize,
+    pub private_infosets: usize,
+    pub max_actions: usize,
+    pub elapsed_secs: f32,
 }
 
 impl Default for PokedrAgent {
@@ -339,15 +358,96 @@ pub fn gpu_backend_mode() -> BackendMode {
     }
 }
 
+pub fn solve_fixed_flop_once(
+    flop: [PokedrCard; 3],
+    config: PokedrAgentConfig,
+) -> FixedFlopSolveSummary {
+    let started = Instant::now();
+    let public_state = PublicState {
+        street: Street::Flop,
+        board: Board::new(flop.to_vec()),
+        pot: 4,
+        hero_invested: 2,
+        villain_invested: 2,
+        effective_stack: 100,
+        to_call: 0,
+        min_aggressive_amount: 2,
+        acting_player: Player::Hero,
+        raises_this_street: 0,
+        checks_this_street: 0,
+    };
+    let tree = SubgameTree::build(
+        public_state,
+        SubgameTreeConfig {
+            action_set: config.action_set.clone(),
+            max_raises_per_street: config.max_raises_per_street,
+            max_depth: config.max_depth,
+        },
+    );
+    let layout = PostflopDenseLayout::from_tree(&tree);
+    let villain_weights = vec![1.0; COMBO_COUNT];
+    let state = solve_public_tree_cfr(&tree, &layout, &config, &villain_weights);
+    FixedFlopSolveSummary {
+        board: format_pokedr_cards(&flop),
+        iterations: config.cfr_iterations.max(1),
+        decisions: tree.decision_count(),
+        chance: tree.chance_count(),
+        terminals: tree.terminal_count(),
+        public_infosets: layout.infoset_count(),
+        private_infosets: state.infosets(),
+        max_actions: layout.max_actions(),
+        elapsed_secs: started.elapsed().as_secs_f32(),
+    }
+}
+
 struct PostflopEvaluationContext<'a> {
     hero_cards: [PokedrCard; 2],
     villain_cards: [PokedrCard; 2],
     hero_combo: usize,
     villain_combo: usize,
     gpu_backend: Option<&'a GpuDenseCfrBackend>,
-    matrix_cache: &'a RefCell<HashMap<u64, Vec<f32>>>,
+    matrix_cache: &'a RefCell<ShowdownMatrixCache>,
     max_showdown_runouts: usize,
     equity_cache: HashMap<u64, f32>,
+}
+
+struct ShowdownMatrixCache {
+    entries: HashMap<u64, Vec<f32>>,
+    order: VecDeque<u64>,
+    capacity: usize,
+}
+
+impl ShowdownMatrixCache {
+    fn new(capacity: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            order: VecDeque::new(),
+            capacity: capacity.max(1),
+        }
+    }
+
+    fn contains_key(&self, key: &u64) -> bool {
+        self.entries.contains_key(key)
+    }
+
+    fn get(&self, key: &u64) -> Option<&Vec<f32>> {
+        self.entries.get(key)
+    }
+
+    fn insert(&mut self, key: u64, matrix: Vec<f32>) {
+        if !self.entries.contains_key(&key) {
+            self.order.push_back(key);
+        }
+        self.entries.insert(key, matrix);
+        while self.entries.len() > self.capacity {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            if oldest != key {
+                self.entries.remove(&oldest);
+            }
+        }
+    }
 }
 
 struct PostflopPlan {
@@ -544,7 +644,7 @@ fn solve_public_tree_cfr(
     let mut batch = DenseCfrIteration::new(&dense_config);
     let indexer = ComboIndexer::new();
     let gpu_backend = cfr_gpu_backend();
-    let matrix_cache = RefCell::new(HashMap::new());
+    let matrix_cache = RefCell::new(ShowdownMatrixCache::new(showdown_matrix_cache_capacity()));
 
     for iteration in 1..=config.cfr_iterations.max(1) {
         let iteration_started = Instant::now();
@@ -572,7 +672,7 @@ fn solve_public_tree_cfr(
         }
         batch.validate(&dense_config);
         if let Some(backend) = &gpu_backend {
-            if backend
+            backend
                 .update_all_infosets(
                     &mut state,
                     &batch.action_values,
@@ -580,11 +680,13 @@ fn solve_public_tree_cfr(
                     &batch.strategy_weights,
                     iteration,
                 )
-                .is_ok()
-            {
-                continue;
-            }
+                .expect("GPU CFR regret update failed");
+            continue;
         }
+        assert!(
+            cfg!(test),
+            "GPU CFR backend is required for postflop solving"
+        );
         state.update_all_infosets(
             &batch.action_values,
             &batch.reach_weights,
@@ -620,6 +722,13 @@ fn cfr_gpu_backend() -> Option<GpuDenseCfrBackend> {
     }
 }
 
+fn showdown_matrix_cache_capacity() -> usize {
+    std::env::var("POKEDR_SHOWDOWN_MATRIX_CACHE")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(2)
+}
+
 fn fill_public_tree_iteration(
     tree: &SubgameTree,
     layout: &PostflopDenseLayout,
@@ -628,7 +737,7 @@ fn fill_public_tree_iteration(
     cfr_state: &DenseCfrState,
     config: &PokedrAgentConfig,
     villain_weights: &[f32],
-    matrix_cache: &RefCell<HashMap<u64, Vec<f32>>>,
+    matrix_cache: &RefCell<ShowdownMatrixCache>,
     batch: &mut DenseCfrIteration,
 ) {
     batch.action_values.fill(0.0);
@@ -636,15 +745,47 @@ fn fill_public_tree_iteration(
     batch.strategy_weights.fill(0.0);
     let mut value_weights = vec![0.0; batch.action_values.len()];
     let root_dead = root_board(tree).deck_mask();
-    for hero_combo in legal_private_combos(indexer, root_dead) {
-        let hero_cards = combo_cards(indexer.combo(hero_combo));
-        for villain_combo in legal_private_combos(indexer, root_dead | hero_mask(hero_cards)) {
-            let villain_cards = combo_cards(indexer.combo(villain_combo));
+    if try_fill_gpu_public_tree_iteration(
+        tree,
+        layout,
+        indexer,
+        gpu_backend,
+        cfr_state,
+        config,
+        villain_weights,
+        matrix_cache,
+        batch,
+        root_dead,
+    ) {
+        return;
+    }
+    assert!(
+        cfg!(test),
+        "GPU public-tree CFR path is required for postflop solving"
+    );
+    let legal_combos: Vec<_> = legal_private_combos(indexer, root_dead)
+        .map(|combo_index| {
+            let cards = combo_cards(indexer.combo(combo_index));
+            (combo_index, cards, hero_mask(cards))
+        })
+        .collect();
+    for (hero_offset, (hero_combo, hero_cards, hero_dead)) in legal_combos.iter().enumerate() {
+        if solver_progress_enabled() && hero_offset % 64 == 0 {
+            eprintln!(
+                "pokedr: cfr combo block {}/{}",
+                hero_offset + 1,
+                legal_combos.len()
+            );
+        }
+        for (villain_combo, villain_cards, villain_dead) in &legal_combos {
+            if hero_dead & villain_dead != 0 {
+                continue;
+            }
             let mut ctx = PostflopEvaluationContext {
-                hero_cards,
-                villain_cards,
-                hero_combo,
-                villain_combo,
+                hero_cards: *hero_cards,
+                villain_cards: *villain_cards,
+                hero_combo: *hero_combo,
+                villain_combo: *villain_combo,
                 gpu_backend,
                 matrix_cache,
                 max_showdown_runouts: config.max_showdown_runouts.max(1),
@@ -656,10 +797,10 @@ fn fill_public_tree_iteration(
                 0,
                 None,
                 None,
-                hero_combo,
-                villain_combo,
+                *hero_combo,
+                *villain_combo,
                 1.0,
-                villain_weights[villain_combo],
+                villain_weights[*villain_combo],
                 1.0,
                 cfr_state,
                 &mut ctx,
@@ -674,6 +815,231 @@ fn fill_public_tree_iteration(
             *value /= weight;
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn try_fill_gpu_public_tree_iteration(
+    tree: &SubgameTree,
+    layout: &PostflopDenseLayout,
+    indexer: &ComboIndexer,
+    gpu_backend: Option<&GpuDenseCfrBackend>,
+    cfr_state: &DenseCfrState,
+    config: &PokedrAgentConfig,
+    villain_weights: &[f32],
+    matrix_cache: &RefCell<ShowdownMatrixCache>,
+    batch: &mut DenseCfrIteration,
+    root_dead: u64,
+) -> bool {
+    let Some(backend) = gpu_backend else {
+        return false;
+    };
+    let Some(linearized) = linearize_gpu_public_tree(tree, layout, backend, config, matrix_cache)
+    else {
+        return false;
+    };
+    if solver_progress_enabled() {
+        eprintln!(
+            "pokedr: gpu public tree nodes={} showdown_boards={}",
+            linearized.nodes.len(),
+            linearized.showdown_boards.len()
+        );
+    }
+    let combos = gpu_private_combos();
+    let combo_legal: Vec<u32> = indexer
+        .combos()
+        .iter()
+        .map(|combo| (!combo.collides_with(root_dead)) as u32)
+        .collect();
+    let Ok(values) = backend.public_tree_iteration_values(
+        &linearized.nodes,
+        &linearized.children,
+        &linearized.child_cards,
+        &combos,
+        &combo_legal,
+        villain_weights,
+        &linearized.showdown_boards,
+        cfr_state,
+    ) else {
+        return false;
+    };
+    if values.action_values.len() != batch.action_values.len()
+        || values.reach_weights.len() != batch.reach_weights.len()
+        || values.strategy_weights.len() != batch.strategy_weights.len()
+    {
+        return false;
+    }
+    batch.action_values.copy_from_slice(&values.action_values);
+    batch.reach_weights.copy_from_slice(&values.reach_weights);
+    batch
+        .strategy_weights
+        .copy_from_slice(&values.strategy_weights);
+    true
+}
+
+struct GpuLinearizedPublicTree {
+    nodes: Vec<GpuPublicTreeNode>,
+    children: Vec<u32>,
+    child_cards: Vec<u32>,
+    showdown_boards: Vec<GpuFinalBoard>,
+}
+
+fn linearize_gpu_public_tree(
+    tree: &SubgameTree,
+    layout: &PostflopDenseLayout,
+    _backend: &GpuDenseCfrBackend,
+    config: &PokedrAgentConfig,
+    _matrix_cache: &RefCell<ShowdownMatrixCache>,
+) -> Option<GpuLinearizedPublicTree> {
+    let mut nodes = Vec::with_capacity(tree.nodes().len());
+    let mut children = Vec::new();
+    let mut child_cards = Vec::new();
+    let mut showdown_boards = Vec::new();
+    let mut showdown_offsets = HashMap::new();
+    let public_chance_reach = public_chance_reaches(tree);
+
+    for (node_index, node) in tree.nodes().iter().enumerate() {
+        let first_child = children.len() as u32;
+        let child_count = node.children.len() as u32;
+        children.extend(node.children.iter().map(|child| *child as u32));
+        match &node.kind {
+            PublicNodeKind::Decision { state, .. } => {
+                child_cards.extend(std::iter::repeat_n(52, node.children.len()));
+                nodes.push(GpuPublicTreeNode {
+                    kind: 0,
+                    acting_player: player_code(state.acting_player),
+                    public_infoset: layout.node_infoset(node_index)? as u32,
+                    first_child,
+                    child_count,
+                    terminal_kind: 0,
+                    showdown_offset: 0,
+                    _pad0: 0,
+                    pot: 0.0,
+                    hero_invested: 0.0,
+                    _pad1: public_chance_reach[node_index],
+                    _pad2: 0.0,
+                });
+            }
+            PublicNodeKind::Chance { cards, .. } => {
+                if cards.len() != node.children.len() {
+                    return None;
+                }
+                child_cards.extend(cards.iter().map(|card| card.index() as u32));
+                nodes.push(GpuPublicTreeNode {
+                    kind: 1,
+                    acting_player: 0,
+                    public_infoset: 0,
+                    first_child,
+                    child_count,
+                    terminal_kind: 0,
+                    showdown_offset: 0,
+                    _pad0: 0,
+                    pot: 0.0,
+                    hero_invested: 0.0,
+                    _pad1: public_chance_reach[node_index],
+                    _pad2: 0.0,
+                });
+            }
+            PublicNodeKind::Terminal {
+                kind,
+                board,
+                pot,
+                hero_invested,
+                ..
+            } => {
+                child_cards.extend(std::iter::repeat_n(52, node.children.len()));
+                let (terminal_kind, showdown_offset, showdown_count) = match kind {
+                    TerminalKind::Fold => (fold_terminal_code(tree, node_index)?, 0, 0),
+                    TerminalKind::Showdown => {
+                        let key = board.deck_mask();
+                        let (offset, count) = if let Some(offset_count) = showdown_offsets.get(&key)
+                        {
+                            *offset_count
+                        } else {
+                            let offset = showdown_boards.len() as u32;
+                            let final_boards =
+                                gpu_final_boards(board, config.max_showdown_runouts.max(1));
+                            let count = final_boards.len() as u32;
+                            showdown_boards.extend(final_boards);
+                            showdown_offsets.insert(key, (offset, count));
+                            (offset, count)
+                        };
+                        (2, offset, count)
+                    }
+                };
+                nodes.push(GpuPublicTreeNode {
+                    kind: 2,
+                    acting_player: 0,
+                    public_infoset: 0,
+                    first_child,
+                    child_count,
+                    terminal_kind,
+                    showdown_offset,
+                    _pad0: showdown_count,
+                    pot: *pot as f32,
+                    hero_invested: *hero_invested as f32,
+                    _pad1: public_chance_reach[node_index],
+                    _pad2: 0.0,
+                });
+            }
+        }
+    }
+    Some(GpuLinearizedPublicTree {
+        nodes,
+        children,
+        child_cards,
+        showdown_boards,
+    })
+}
+
+fn public_chance_reaches(tree: &SubgameTree) -> Vec<f32> {
+    let mut reaches = vec![0.0; tree.nodes().len()];
+    reaches[0] = 1.0;
+    for node_index in 0..tree.nodes().len() {
+        let reach = reaches[node_index];
+        if reach == 0.0 {
+            continue;
+        }
+        match &tree.nodes()[node_index].kind {
+            PublicNodeKind::Decision { .. } => {
+                for child in &tree.nodes()[node_index].children {
+                    reaches[*child] += reach;
+                }
+            }
+            PublicNodeKind::Chance { cards, .. } => {
+                let denominator = cards.len().saturating_sub(4).max(1) as f32;
+                for child in &tree.nodes()[node_index].children {
+                    reaches[*child] += reach / denominator;
+                }
+            }
+            PublicNodeKind::Terminal { .. } => {}
+        }
+    }
+    reaches
+}
+
+fn player_code(player: Player) -> u32 {
+    match player {
+        Player::Hero => 0,
+        Player::Villain => 1,
+    }
+}
+
+fn fold_terminal_code(tree: &SubgameTree, node_index: usize) -> Option<u32> {
+    let parent = tree.nodes()[node_index].parent?;
+    let child_position = tree.nodes()[parent]
+        .children
+        .iter()
+        .position(|child| *child == node_index)?;
+    let PublicNodeKind::Decision { state, actions } = &tree.nodes()[parent].kind else {
+        return None;
+    };
+    if actions.get(child_position)?.action != PlayerAction::Fold {
+        return None;
+    }
+    Some(match state.acting_player {
+        Player::Hero => 0,
+        Player::Villain => 1,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1165,6 +1531,37 @@ fn format_cards(cards: &[RsCard]) -> String {
         .join(" ")
 }
 
+fn format_pokedr_cards(cards: &[PokedrCard]) -> String {
+    cards
+        .iter()
+        .map(|card| {
+            let rank = match card.rank() {
+                PokedrRank::Two => "2",
+                PokedrRank::Three => "3",
+                PokedrRank::Four => "4",
+                PokedrRank::Five => "5",
+                PokedrRank::Six => "6",
+                PokedrRank::Seven => "7",
+                PokedrRank::Eight => "8",
+                PokedrRank::Nine => "9",
+                PokedrRank::Ten => "T",
+                PokedrRank::Jack => "J",
+                PokedrRank::Queen => "Q",
+                PokedrRank::King => "K",
+                PokedrRank::Ace => "A",
+            };
+            let suit = match card.suit() {
+                PokedrSuit::Clubs => "c",
+                PokedrSuit::Diamonds => "d",
+                PokedrSuit::Hearts => "h",
+                PokedrSuit::Spades => "s",
+            };
+            format!("{rank}{suit}")
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn format_trace_action(action: &Action) -> Option<String> {
     match action {
         Action::ForcedBet(payload) => Some(format!(
@@ -1484,7 +1881,7 @@ mod tests {
             PokedrCard::new(PokedrRank::Three, PokedrSuit::Spades),
         ]);
         let indexer = ComboIndexer::new();
-        let matrix_cache = RefCell::new(HashMap::new());
+        let matrix_cache = RefCell::new(ShowdownMatrixCache::new(1));
         let mut strong = PostflopEvaluationContext {
             hero_cards: [
                 PokedrCard::new(PokedrRank::Ace, PokedrSuit::Clubs),
@@ -1674,7 +2071,7 @@ mod tests {
             hero_combo,
             villain_combo,
             gpu_backend: None,
-            matrix_cache: &RefCell::new(HashMap::new()),
+            matrix_cache: &RefCell::new(ShowdownMatrixCache::new(1)),
             max_showdown_runouts: 1,
             equity_cache: HashMap::new(),
         };

@@ -512,12 +512,14 @@ fn matrix(@builtin(global_invocation_id) id: vec3<u32>) {
     let index = id.x;
     let combo_count = params[0];
     let board_count = params[1];
-    let pair_count = combo_count * combo_count;
-    if index >= pair_count {
+    let pair_start = params[2];
+    let output_count = params[3];
+    if index >= output_count {
         return;
     }
-    let hero_index = index / combo_count;
-    let villain_index = index % combo_count;
+    let pair = pair_start + index;
+    let hero_index = pair / combo_count;
+    let villain_index = pair % combo_count;
     let hero = combos[hero_index];
     let villain = combos[villain_index];
     let private_mask = combo_mask(hero) | combo_mask(villain);
@@ -549,6 +551,403 @@ fn matrix(@builtin(global_invocation_id) id: vec3<u32>) {
         equities[index] = sum / f32(count);
     }
 }
+
+@compute @workgroup_size(64)
+fn strengths(@builtin(global_invocation_id) id: vec3<u32>) {
+    let index = id.x + id.y * 4194240u;
+    let combo_count = params[0];
+    let board_count = params[1];
+    if index >= combo_count * board_count {
+        return;
+    }
+    let board_index = index / combo_count;
+    let combo_index = index % combo_count;
+    equities[index] = f32(evaluate_combo_board(combos[combo_index], boards[board_index]));
+}
+"#;
+
+const PUBLIC_TREE_REACH_SHADER: &str = r#"
+struct Combo { cards: array<u32, 2>, };
+struct TreeNode {
+    kind: u32,
+    acting_player: u32,
+    public_infoset: u32,
+    first_child: u32,
+    child_count: u32,
+    terminal_kind: u32,
+    showdown_offset: u32,
+    _pad0: u32,
+    pot: f32,
+    hero_invested: f32,
+    _pad1: f32,
+    _pad2: f32,
+};
+struct Params {
+    combo_count: u32,
+    node_count: u32,
+    max_actions: u32,
+    output_len: u32,
+    value_player: u32,
+    target_node: u32,
+    _pad2: u32,
+    _pad3: u32,
+};
+
+@group(0) @binding(0) var<storage, read> nodes: array<TreeNode>;
+@group(0) @binding(1) var<storage, read> children: array<u32>;
+@group(0) @binding(2) var<storage, read> child_cards: array<u32>;
+@group(0) @binding(3) var<storage, read> combos: array<Combo>;
+@group(0) @binding(4) var<storage, read> root_weights: array<f32>;
+@group(0) @binding(5) var<storage, read> regrets: array<f32>;
+@group(0) @binding(6) var<storage, read_write> hero_reaches: array<f32>;
+@group(0) @binding(7) var<storage, read_write> villain_reaches: array<f32>;
+@group(0) @binding(8) var<uniform> params: Params;
+
+fn combo_has_card(combo: Combo, card: u32) -> bool {
+    return combo.cards[0] == card || combo.cards[1] == card;
+}
+
+fn strategy_probability(node: TreeNode, private_combo: u32, action: u32) -> f32 {
+    let private_infoset = node.public_infoset * params.combo_count * 2u
+        + node.acting_player * params.combo_count
+        + private_combo;
+    let offset = private_infoset * params.max_actions;
+    var normalizer = 0.0;
+    for (var i = 0u; i < node.child_count; i = i + 1u) {
+        normalizer = normalizer + max(regrets[offset + i], 0.0);
+    }
+    if normalizer > 0.0 {
+        return max(regrets[offset + action], 0.0) / normalizer;
+    }
+    return 1.0 / f32(max(node.child_count, 1u));
+}
+
+@compute @workgroup_size(64)
+fn tree_reach(@builtin(global_invocation_id) id: vec3<u32>) {
+    let combo = id.x;
+    if combo >= params.combo_count {
+        return;
+    }
+    for (var node_index = 0u; node_index < params.node_count; node_index = node_index + 1u) {
+        let offset = node_index * params.combo_count + combo;
+        hero_reaches[offset] = 0.0;
+        villain_reaches[offset] = 0.0;
+    }
+    if root_weights[combo] < 0.0 {
+        return;
+    }
+    hero_reaches[combo] = 1.0;
+    villain_reaches[combo] = root_weights[combo];
+    for (var node_index = 0u; node_index < params.node_count; node_index = node_index + 1u) {
+        let node = nodes[node_index];
+        let node_offset = node_index * params.combo_count + combo;
+        let hero_reach = hero_reaches[node_offset];
+        let villain_reach = villain_reaches[node_offset];
+        if node.kind == 0u {
+            for (var action = 0u; action < node.child_count; action = action + 1u) {
+                let child = children[node.first_child + action];
+                let child_offset = child * params.combo_count + combo;
+                let probability = strategy_probability(node, combo, action);
+                if node.acting_player == 0u {
+                    hero_reaches[child_offset] = hero_reach * probability;
+                    villain_reaches[child_offset] = villain_reach;
+                } else {
+                    hero_reaches[child_offset] = hero_reach;
+                    villain_reaches[child_offset] = villain_reach * probability;
+                }
+            }
+        } else if node.kind == 1u {
+            for (var action = 0u; action < node.child_count; action = action + 1u) {
+                let card = child_cards[node.first_child + action];
+                let child = children[node.first_child + action];
+                let child_offset = child * params.combo_count + combo;
+                if combo_has_card(combos[combo], card) {
+                    hero_reaches[child_offset] = 0.0;
+                    villain_reaches[child_offset] = 0.0;
+                } else {
+                    hero_reaches[child_offset] = hero_reach;
+                    villain_reaches[child_offset] = villain_reach;
+                }
+            }
+        }
+    }
+}
+"#;
+
+const PUBLIC_TREE_VALUE_SHADER: &str = r#"
+struct Combo { cards: array<u32, 2>, };
+struct FinalBoard { cards: array<u32, 5>, };
+struct TreeNode {
+    kind: u32,
+    acting_player: u32,
+    public_infoset: u32,
+    first_child: u32,
+    child_count: u32,
+    terminal_kind: u32,
+    showdown_offset: u32,
+    _pad0: u32,
+    pot: f32,
+    hero_invested: f32,
+    _pad1: f32,
+    _pad2: f32,
+};
+struct Params {
+    combo_count: u32,
+    node_count: u32,
+    max_actions: u32,
+    output_len: u32,
+    value_player: u32,
+    target_node: u32,
+    _pad2: u32,
+    _pad3: u32,
+};
+
+@group(0) @binding(0) var<storage, read> nodes: array<TreeNode>;
+@group(0) @binding(1) var<storage, read> children: array<u32>;
+@group(0) @binding(2) var<storage, read> boards: array<FinalBoard>;
+@group(0) @binding(3) var<storage, read> combos: array<Combo>;
+@group(0) @binding(4) var<storage, read> strengths: array<f32>;
+@group(0) @binding(5) var<storage, read> hero_reaches: array<f32>;
+@group(0) @binding(6) var<storage, read> villain_reaches: array<f32>;
+@group(0) @binding(7) var<storage, read_write> values: array<f32>;
+@group(0) @binding(8) var<uniform> params: Params;
+
+fn collide(left: Combo, right: Combo) -> bool {
+    return left.cards[0] == right.cards[0] || left.cards[0] == right.cards[1]
+        || left.cards[1] == right.cards[0] || left.cards[1] == right.cards[1];
+}
+
+fn combo_hits_board(combo: Combo, board: FinalBoard) -> bool {
+    return combo.cards[0] == board.cards[0]
+        || combo.cards[0] == board.cards[1]
+        || combo.cards[0] == board.cards[2]
+        || combo.cards[0] == board.cards[3]
+        || combo.cards[0] == board.cards[4]
+        || combo.cards[1] == board.cards[0]
+        || combo.cards[1] == board.cards[1]
+        || combo.cards[1] == board.cards[2]
+        || combo.cards[1] == board.cards[3]
+        || combo.cards[1] == board.cards[4];
+}
+
+fn strategy_from_reach(node_index: u32, child: u32, combo: u32, acting_player: u32) -> f32 {
+    let parent_offset = node_index * params.combo_count + combo;
+    let child_offset = child * params.combo_count + combo;
+    if acting_player == 0u {
+        let parent = hero_reaches[parent_offset];
+        if parent > 0.0 {
+            return hero_reaches[child_offset] / parent;
+        }
+    } else {
+        let parent = villain_reaches[parent_offset];
+        if parent > 0.0 {
+            return villain_reaches[child_offset] / parent;
+        }
+    }
+    return 0.0;
+}
+
+@compute @workgroup_size(64)
+fn tree_value(@builtin(global_invocation_id) id: vec3<u32>) {
+    let combo = id.x;
+    if combo >= params.combo_count {
+        return;
+    }
+    let cursor = params.target_node;
+    if cursor >= params.node_count {
+        return;
+    }
+    let node = nodes[cursor];
+    let offset = cursor * params.combo_count + combo;
+    var value = 0.0;
+    if node.kind == 0u {
+        for (var action = 0u; action < node.child_count; action = action + 1u) {
+            let child = children[node.first_child + action];
+            let child_offset = child * params.combo_count + combo;
+            let child_value = values[child_offset];
+            if node.acting_player == params.value_player {
+                let probability = strategy_from_reach(cursor, child, combo, node.acting_player);
+                value = value + probability * child_value;
+            } else {
+                value = value + child_value;
+            }
+        }
+    } else if node.kind == 1u {
+        for (var action = 0u; action < node.child_count; action = action + 1u) {
+            let child = children[node.first_child + action];
+            let child_offset = child * params.combo_count + combo;
+            value = value + values[child_offset];
+        }
+    } else {
+        if node.terminal_kind == 0u {
+            let payoff = -node.hero_invested;
+            for (var opponent = 0u; opponent < params.combo_count; opponent = opponent + 1u) {
+                if collide(combos[combo], combos[opponent]) {
+                    continue;
+                }
+                let opponent_offset = offset - combo + opponent;
+                if params.value_player == 0u {
+                    value = value + villain_reaches[opponent_offset] * payoff;
+                } else {
+                    value = value + hero_reaches[opponent_offset] * (-payoff);
+                }
+            }
+        } else if node.terminal_kind == 1u {
+            let payoff = node.pot - node.hero_invested;
+            for (var opponent = 0u; opponent < params.combo_count; opponent = opponent + 1u) {
+                if collide(combos[combo], combos[opponent]) {
+                    continue;
+                }
+                let opponent_offset = offset - combo + opponent;
+                if params.value_player == 0u {
+                    value = value + villain_reaches[opponent_offset] * payoff;
+                } else {
+                    value = value + hero_reaches[opponent_offset] * (-payoff);
+                }
+            }
+        } else {
+            let board_count = node._pad0;
+            for (var opponent = 0u; opponent < params.combo_count; opponent = opponent + 1u) {
+                if collide(combos[combo], combos[opponent]) {
+                    continue;
+                }
+                var equity_sum = 0.0;
+                var valid_boards = 0u;
+                for (var board = 0u; board < board_count; board = board + 1u) {
+                    let final_board_index = node.showdown_offset + board;
+                    let final_board = boards[final_board_index];
+                    if combo_hits_board(combos[combo], final_board) || combo_hits_board(combos[opponent], final_board) {
+                        continue;
+                    }
+                    valid_boards = valid_boards + 1u;
+                    let strength_offset = final_board_index * params.combo_count;
+                    let combo_strength = strengths[strength_offset + combo];
+                    let opponent_strength = strengths[strength_offset + opponent];
+                    if combo_strength > opponent_strength {
+                        equity_sum = equity_sum + 1.0;
+                    } else if combo_strength == opponent_strength {
+                        equity_sum = equity_sum + 0.5;
+                    }
+                }
+                let equity = select(0.5, equity_sum / f32(valid_boards), valid_boards > 0u);
+                let opponent_offset = offset - combo + opponent;
+                if params.value_player == 0u {
+                    let hero_payoff = equity * node.pot - node.hero_invested;
+                    value = value + villain_reaches[opponent_offset] * hero_payoff;
+                } else {
+                    let villain_payoff = equity * node.pot - (node.pot - node.hero_invested);
+                    value = value + hero_reaches[opponent_offset] * villain_payoff;
+                }
+            }
+        }
+        value = value * node._pad1;
+    }
+    values[offset] = value;
+}
+"#;
+
+const PUBLIC_TREE_AGGREGATE_SHADER: &str = r#"
+struct Combo { cards: array<u32, 2>, };
+struct TreeNode {
+    kind: u32,
+    acting_player: u32,
+    public_infoset: u32,
+    first_child: u32,
+    child_count: u32,
+    terminal_kind: u32,
+    showdown_offset: u32,
+    _pad0: u32,
+    pot: f32,
+    hero_invested: f32,
+    _pad1: f32,
+    _pad2: f32,
+};
+struct Params {
+    combo_count: u32,
+    node_count: u32,
+    max_actions: u32,
+    output_len: u32,
+    value_player: u32,
+    _pad1: u32,
+    _pad2: u32,
+    _pad3: u32,
+};
+
+@group(0) @binding(0) var<storage, read> nodes: array<TreeNode>;
+@group(0) @binding(1) var<storage, read> children: array<u32>;
+@group(0) @binding(2) var<storage, read> combos: array<Combo>;
+@group(0) @binding(3) var<storage, read> hero_reaches: array<f32>;
+@group(0) @binding(4) var<storage, read> villain_reaches: array<f32>;
+@group(0) @binding(5) var<storage, read> values: array<f32>;
+@group(0) @binding(6) var<storage, read_write> output: array<f32>;
+@group(0) @binding(7) var<uniform> params: Params;
+
+fn collide(left: Combo, right: Combo) -> bool {
+    return left.cards[0] == right.cards[0] || left.cards[0] == right.cards[1]
+        || left.cards[1] == right.cards[0] || left.cards[1] == right.cards[1];
+}
+
+@compute @workgroup_size(64)
+fn tree_aggregate(@builtin(global_invocation_id) id: vec3<u32>) {
+    let index = id.x;
+    if index >= params.output_len {
+        return;
+    }
+    let action_len = params.output_len;
+    let private_infoset = index / params.max_actions;
+    let action = index % params.max_actions;
+    let public_infoset = private_infoset / (params.combo_count * 2u);
+    let player_slot = (private_infoset / params.combo_count) % 2u;
+    let acting_combo = private_infoset % params.combo_count;
+
+    var node_index = 0u;
+    var found = false;
+    for (var i = 0u; i < params.node_count; i = i + 1u) {
+        let node = nodes[i];
+        if node.kind == 0u && node.public_infoset == public_infoset {
+            node_index = i;
+            found = true;
+        }
+    }
+    if !found {
+        output[index] = 0.0;
+        output[action_len + index] = 0.0;
+        return;
+    }
+    let node = nodes[node_index];
+    if action >= node.child_count || player_slot != node.acting_player || player_slot != params.value_player {
+        output[index] = 0.0;
+        output[action_len + index] = 0.0;
+        return;
+    }
+
+    let child = children[node.first_child + action];
+    var value_weight = 0.0;
+    let node_base = node_index * params.combo_count;
+    for (var opponent = 0u; opponent < params.combo_count; opponent = opponent + 1u) {
+        if collide(combos[acting_combo], combos[opponent]) {
+            continue;
+        }
+        if node.acting_player == 0u {
+            value_weight = value_weight + villain_reaches[node_base + opponent];
+        } else {
+            value_weight = value_weight + hero_reaches[node_base + opponent];
+        }
+    }
+    let value_offset = child * params.combo_count + acting_combo;
+    let action_value = values[value_offset];
+    var strategy_weight = node._pad1 * hero_reaches[node_base + acting_combo];
+    if node.acting_player == 1u {
+        strategy_weight = node._pad1 * villain_reaches[node_base + acting_combo];
+    }
+    output[index] = action_value;
+    output[action_len + index] = node._pad1 * value_weight;
+    if action == 0u {
+        let infoset_count = action_len / params.max_actions;
+        output[action_len * 2u + private_infoset] = node._pad1 * value_weight;
+        output[action_len * 2u + infoset_count + private_infoset] = strategy_weight;
+    }
+}
 "#;
 
 #[derive(Debug)]
@@ -567,7 +966,14 @@ pub struct GpuDenseCfrBackend {
     showdown_pipeline: wgpu::ComputePipeline,
     showdown_bind_group_layout: wgpu::BindGroupLayout,
     showdown_matrix_pipeline: wgpu::ComputePipeline,
+    final_board_strength_pipeline: wgpu::ComputePipeline,
     showdown_matrix_bind_group_layout: wgpu::BindGroupLayout,
+    public_tree_reach_pipeline: wgpu::ComputePipeline,
+    public_tree_reach_bind_group_layout: wgpu::BindGroupLayout,
+    public_tree_value_pipeline: wgpu::ComputePipeline,
+    public_tree_value_bind_group_layout: wgpu::BindGroupLayout,
+    public_tree_aggregate_pipeline: wgpu::ComputePipeline,
+    public_tree_aggregate_bind_group_layout: wgpu::BindGroupLayout,
 }
 
 pub struct GpuDenseCfrState {
@@ -613,6 +1019,42 @@ pub struct GpuFinalBoard {
 unsafe impl bytemuck::Zeroable for GpuFinalBoard {}
 unsafe impl bytemuck::Pod for GpuFinalBoard {}
 
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct GpuPublicTreeNode {
+    pub kind: u32,
+    pub acting_player: u32,
+    pub public_infoset: u32,
+    pub first_child: u32,
+    pub child_count: u32,
+    pub terminal_kind: u32,
+    pub showdown_offset: u32,
+    pub _pad0: u32,
+    pub pot: f32,
+    pub hero_invested: f32,
+    pub _pad1: f32,
+    pub _pad2: f32,
+}
+
+unsafe impl bytemuck::Zeroable for GpuPublicTreeNode {}
+unsafe impl bytemuck::Pod for GpuPublicTreeNode {}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct GpuPublicTreeParams {
+    combo_count: u32,
+    node_count: u32,
+    max_actions: u32,
+    output_len: u32,
+    pair_start: u32,
+    chunk_pairs: u32,
+    _pad0: u32,
+    _pad1: u32,
+}
+
+unsafe impl bytemuck::Zeroable for GpuPublicTreeParams {}
+unsafe impl bytemuck::Pod for GpuPublicTreeParams {}
+
 pub struct GpuRootTerminalValues {
     pub action_values: Vec<f32>,
     pub reach_weights: Vec<f32>,
@@ -640,11 +1082,12 @@ impl GpuDenseCfrBackend {
             .await
             .map_err(|_| GpuCfrError::NoAdapter)?;
         let adapter_info = adapter.get_info();
+        let required_limits = adapter.limits();
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("pokedr dense CFR device"),
                 required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::default(),
+                required_limits,
                 experimental_features: wgpu::ExperimentalFeatures::disabled(),
                 memory_hints: wgpu::MemoryHints::Performance,
                 trace: wgpu::Trace::Off,
@@ -736,6 +1179,117 @@ impl GpuDenseCfrBackend {
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
                 cache: None,
             });
+        let final_board_strength_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("final board strength pipeline"),
+                layout: Some(&showdown_matrix_pipeline_layout),
+                module: &showdown_matrix_shader,
+                entry_point: Some("strengths"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                cache: None,
+            });
+        let public_tree_reach_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("public tree reach shader"),
+            source: wgpu::ShaderSource::Wgsl(PUBLIC_TREE_REACH_SHADER.into()),
+        });
+        let public_tree_reach_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("public tree reach bind group layout"),
+                entries: &[
+                    storage_entry(0, true),
+                    storage_entry(1, true),
+                    storage_entry(2, true),
+                    storage_entry(3, true),
+                    storage_entry(4, true),
+                    storage_entry(5, true),
+                    storage_entry(6, false),
+                    storage_entry(7, false),
+                    uniform_entry(8),
+                ],
+            });
+        let public_tree_reach_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("public tree reach pipeline layout"),
+                bind_group_layouts: &[Some(&public_tree_reach_bind_group_layout)],
+                immediate_size: 0,
+            });
+        let public_tree_reach_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("public tree reach pipeline"),
+                layout: Some(&public_tree_reach_pipeline_layout),
+                module: &public_tree_reach_shader,
+                entry_point: Some("tree_reach"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                cache: None,
+            });
+        let public_tree_value_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("public tree value shader"),
+            source: wgpu::ShaderSource::Wgsl(PUBLIC_TREE_VALUE_SHADER.into()),
+        });
+        let public_tree_value_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("public tree value bind group layout"),
+                entries: &[
+                    storage_entry(0, true),
+                    storage_entry(1, true),
+                    storage_entry(2, true),
+                    storage_entry(3, true),
+                    storage_entry(4, true),
+                    storage_entry(5, true),
+                    storage_entry(6, true),
+                    storage_entry(7, false),
+                    uniform_entry(8),
+                ],
+            });
+        let public_tree_value_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("public tree value pipeline layout"),
+                bind_group_layouts: &[Some(&public_tree_value_bind_group_layout)],
+                immediate_size: 0,
+            });
+        let public_tree_value_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("public tree value pipeline"),
+                layout: Some(&public_tree_value_pipeline_layout),
+                module: &public_tree_value_shader,
+                entry_point: Some("tree_value"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                cache: None,
+            });
+        let public_tree_aggregate_shader =
+            device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("public tree aggregate shader"),
+                source: wgpu::ShaderSource::Wgsl(PUBLIC_TREE_AGGREGATE_SHADER.into()),
+            });
+        let public_tree_aggregate_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("public tree aggregate bind group layout"),
+                entries: &[
+                    storage_entry(0, true),
+                    storage_entry(1, true),
+                    storage_entry(2, true),
+                    storage_entry(3, true),
+                    storage_entry(4, true),
+                    storage_entry(5, true),
+                    storage_entry(6, false),
+                    uniform_entry(7),
+                ],
+            });
+        let public_tree_aggregate_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("public tree aggregate pipeline layout"),
+                bind_group_layouts: &[Some(&public_tree_aggregate_bind_group_layout)],
+                immediate_size: 0,
+            });
+        let public_tree_aggregate_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("public tree aggregate pipeline"),
+                layout: Some(&public_tree_aggregate_pipeline_layout),
+                module: &public_tree_aggregate_shader,
+                entry_point: Some("tree_aggregate"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                cache: None,
+            });
         Ok(Self {
             device,
             queue,
@@ -745,7 +1299,14 @@ impl GpuDenseCfrBackend {
             showdown_pipeline,
             showdown_bind_group_layout,
             showdown_matrix_pipeline,
+            final_board_strength_pipeline,
             showdown_matrix_bind_group_layout,
+            public_tree_reach_pipeline,
+            public_tree_reach_bind_group_layout,
+            public_tree_value_pipeline,
+            public_tree_value_bind_group_layout,
+            public_tree_aggregate_pipeline,
+            public_tree_aggregate_bind_group_layout,
         })
     }
 
@@ -896,6 +1457,16 @@ impl GpuDenseCfrBackend {
         combos: &[GpuPrivateCombo],
         final_boards: &[GpuFinalBoard],
     ) -> Result<Vec<f32>, GpuCfrError> {
+        self.showdown_matrix_range(combos, final_boards, 0, combos.len() * combos.len())
+    }
+
+    fn showdown_matrix_range(
+        &self,
+        combos: &[GpuPrivateCombo],
+        final_boards: &[GpuFinalBoard],
+        pair_start: usize,
+        output_count: usize,
+    ) -> Result<Vec<f32>, GpuCfrError> {
         if combos.is_empty() {
             return Ok(Vec::new());
         }
@@ -905,14 +1476,21 @@ impl GpuDenseCfrBackend {
         );
 
         let pair_count = combos.len() * combos.len();
+        assert!(pair_start <= pair_count);
+        assert!(output_count <= pair_count - pair_start);
         let combo_buffer = readonly_buffer(&self.device, "showdown matrix combos", combos);
         let board_buffer = readonly_buffer(&self.device, "showdown matrix boards", final_boards);
-        let output = vec![0.0f32; pair_count];
+        let output = vec![0.0f32; output_count];
         let output_buffer = storage_buffer(&self.device, "showdown matrix equities", &output);
         let params = readonly_buffer(
             &self.device,
             "showdown matrix params",
-            &[combos.len() as u32, final_boards.len() as u32],
+            &[
+                combos.len() as u32,
+                final_boards.len() as u32,
+                pair_start as u32,
+                output_count as u32,
+            ],
         );
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("showdown matrix bind group"),
@@ -936,11 +1514,11 @@ impl GpuDenseCfrBackend {
             });
             pass.set_pipeline(&self.showdown_matrix_pipeline);
             pass.set_bind_group(0, &bind_group, &[]);
-            let groups = (pair_count as u32).div_ceil(WORKGROUP_SIZE);
+            let groups = (output_count as u32).div_ceil(WORKGROUP_SIZE);
             pass.dispatch_workgroups(groups, 1, 1);
         }
-        let readback = readback_buffer(&self.device, pair_count);
-        copy_buffer(&mut encoder, &output_buffer, &readback, pair_count);
+        let readback = readback_buffer(&self.device, output_count);
+        copy_buffer(&mut encoder, &output_buffer, &readback, output_count);
         let submission = self.queue.submit(Some(encoder.finish()));
         self.device
             .poll(wgpu::PollType::Wait {
@@ -948,7 +1526,436 @@ impl GpuDenseCfrBackend {
                 timeout: None,
             })
             .map_err(|error| GpuCfrError::MapFailed(error.to_string()))?;
-        read_f32_buffer(&self.device, &readback, pair_count)
+        read_f32_buffer(&self.device, &readback, output_count)
+    }
+
+    fn final_board_strengths(
+        &self,
+        combos: &[GpuPrivateCombo],
+        final_boards: &[GpuFinalBoard],
+    ) -> Result<Vec<f32>, GpuCfrError> {
+        if combos.is_empty() || final_boards.is_empty() {
+            return Ok(Vec::new());
+        }
+        let output_count = combos.len() * final_boards.len();
+        let combo_buffer = readonly_buffer(&self.device, "strength combos", combos);
+        let board_buffer = readonly_buffer(&self.device, "strength boards", final_boards);
+        let output_buffer = storage_buffer(
+            &self.device,
+            "final board strengths",
+            &vec![0.0f32; output_count],
+        );
+        let params = readonly_buffer(
+            &self.device,
+            "strength params",
+            &[
+                combos.len() as u32,
+                final_boards.len() as u32,
+                0,
+                output_count as u32,
+            ],
+        );
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("final board strength bind group"),
+            layout: &self.showdown_matrix_bind_group_layout,
+            entries: &[
+                bind_entry(0, &combo_buffer),
+                bind_entry(1, &board_buffer),
+                bind_entry(2, &output_buffer),
+                bind_entry(3, &params),
+            ],
+        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("final board strength encoder"),
+            });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("final board strength pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.final_board_strength_pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            let groups = (output_count as u32).div_ceil(WORKGROUP_SIZE);
+            pass.dispatch_workgroups(groups.min(65_535), groups.div_ceil(65_535), 1);
+        }
+        let readback = readback_buffer(&self.device, output_count);
+        copy_buffer(&mut encoder, &output_buffer, &readback, output_count);
+        let submission = self.queue.submit(Some(encoder.finish()));
+        self.device
+            .poll(wgpu::PollType::Wait {
+                submission_index: Some(submission),
+                timeout: None,
+            })
+            .map_err(|error| GpuCfrError::MapFailed(error.to_string()))?;
+        read_f32_buffer(&self.device, &readback, output_count)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn public_tree_iteration_values(
+        &self,
+        nodes: &[GpuPublicTreeNode],
+        children: &[u32],
+        child_cards: &[u32],
+        combos: &[GpuPrivateCombo],
+        combo_legal: &[u32],
+        villain_weights: &[f32],
+        showdown_boards: &[GpuFinalBoard],
+        state: &DenseCfrState,
+    ) -> Result<GpuRootTerminalValues, GpuCfrError> {
+        assert!(!nodes.is_empty());
+        assert_eq!(combo_legal.len(), combos.len());
+        assert_eq!(villain_weights.len(), combos.len());
+        assert_eq!(
+            state.infosets,
+            nodes_public_infoset_count(nodes) * combos.len() * 2
+        );
+
+        let action_len = state.infosets * state.actions;
+        let output_len = action_len * 2 + state.infosets * 2;
+        let node_combo_len = nodes.len() * combos.len();
+
+        let node_buffer = readonly_buffer(&self.device, "public tree nodes", nodes);
+        let child_buffer = readonly_buffer(&self.device, "public tree children", children);
+        let child_card_buffer =
+            readonly_buffer(&self.device, "public tree child cards", child_cards);
+        let board_buffer =
+            readonly_buffer(&self.device, "public tree showdown boards", showdown_boards);
+        let combo_buffer = readonly_buffer(&self.device, "public tree combos", combos);
+        let root_weights: Vec<_> = combo_legal
+            .iter()
+            .zip(villain_weights)
+            .map(|(is_legal, weight)| if *is_legal != 0 { *weight } else { -1.0 })
+            .collect();
+        let root_weights_buffer =
+            readonly_buffer(&self.device, "public tree root weights", &root_weights);
+        let regrets_buffer = readonly_buffer(&self.device, "public tree regrets", &state.regrets);
+        let strength_values = self.final_board_strengths(combos, showdown_boards)?;
+        let strength_buffer = readonly_buffer(
+            &self.device,
+            "public tree final board strengths",
+            &strength_values,
+        );
+        if std::env::var_os("POKEDR_SOLVER_PROGRESS_OFF").is_none() {
+            eprintln!(
+                "pokedr: gpu public tree cfv nodes={} combos={} node_combo_values={}",
+                nodes.len(),
+                combos.len(),
+                node_combo_len
+            );
+        }
+        let hero_reaches_buffer = storage_buffer(
+            &self.device,
+            "public tree hero reaches",
+            &vec![0.0f32; node_combo_len],
+        );
+        let villain_reaches_buffer = storage_buffer(
+            &self.device,
+            "public tree villain reaches",
+            &vec![0.0f32; node_combo_len],
+        );
+        let values_buffer = storage_buffer(
+            &self.device,
+            "public tree private values",
+            &vec![0.0f32; node_combo_len],
+        );
+        let output_buffer = storage_buffer(
+            &self.device,
+            "public tree iteration output",
+            &vec![0.0f32; output_len],
+        );
+        let reach_params = uniform_buffer(
+            &self.device,
+            "public tree params",
+            &[GpuPublicTreeParams {
+                combo_count: combos.len() as u32,
+                node_count: nodes.len() as u32,
+                max_actions: state.actions as u32,
+                output_len: action_len as u32,
+                pair_start: 0,
+                chunk_pairs: 0,
+                _pad0: 0,
+                _pad1: 0,
+            }],
+        );
+        let reach_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("public tree reach bind group"),
+            layout: &self.public_tree_reach_bind_group_layout,
+            entries: &[
+                bind_entry(0, &node_buffer),
+                bind_entry(1, &child_buffer),
+                bind_entry(2, &child_card_buffer),
+                bind_entry(3, &combo_buffer),
+                bind_entry(4, &root_weights_buffer),
+                bind_entry(5, &regrets_buffer),
+                bind_entry(6, &hero_reaches_buffer),
+                bind_entry(7, &villain_reaches_buffer),
+                bind_entry(8, &reach_params),
+            ],
+        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("public tree reach encoder"),
+            });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("public tree reach pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.public_tree_reach_pipeline);
+            pass.set_bind_group(0, &reach_bind_group, &[]);
+            pass.dispatch_workgroups((combos.len() as u32).div_ceil(WORKGROUP_SIZE), 1, 1);
+        }
+        let submission = self.queue.submit(Some(encoder.finish()));
+        self.device
+            .poll(wgpu::PollType::Wait {
+                submission_index: Some(submission),
+                timeout: None,
+            })
+            .map_err(|error| GpuCfrError::MapFailed(error.to_string()))?;
+
+        let node_chunk = std::env::var("POKEDR_GPU_VALUE_NODE_CHUNK")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(64)
+            .max(1);
+        let mut end = nodes.len();
+        while end > 0 {
+            let start = end.saturating_sub(node_chunk);
+            let mut encoder = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("public tree hero value encoder"),
+                });
+            for target_node in (start..end).rev() {
+                let hero_value_params = uniform_buffer(
+                    &self.device,
+                    "public tree hero value params",
+                    &[GpuPublicTreeParams {
+                        combo_count: combos.len() as u32,
+                        node_count: nodes.len() as u32,
+                        max_actions: state.actions as u32,
+                        output_len: action_len as u32,
+                        pair_start: 0,
+                        chunk_pairs: target_node as u32,
+                        _pad0: 0,
+                        _pad1: 0,
+                    }],
+                );
+                let hero_value_bind_group =
+                    self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("public tree hero value bind group"),
+                        layout: &self.public_tree_value_bind_group_layout,
+                        entries: &[
+                            bind_entry(0, &node_buffer),
+                            bind_entry(1, &child_buffer),
+                            bind_entry(2, &board_buffer),
+                            bind_entry(3, &combo_buffer),
+                            bind_entry(4, &strength_buffer),
+                            bind_entry(5, &hero_reaches_buffer),
+                            bind_entry(6, &villain_reaches_buffer),
+                            bind_entry(7, &values_buffer),
+                            bind_entry(8, &hero_value_params),
+                        ],
+                    });
+                {
+                    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("public tree hero value pass"),
+                        timestamp_writes: None,
+                    });
+                    pass.set_pipeline(&self.public_tree_value_pipeline);
+                    pass.set_bind_group(0, &hero_value_bind_group, &[]);
+                    pass.dispatch_workgroups((combos.len() as u32).div_ceil(WORKGROUP_SIZE), 1, 1);
+                }
+            }
+            let submission = self.queue.submit(Some(encoder.finish()));
+            self.device
+                .poll(wgpu::PollType::Wait {
+                    submission_index: Some(submission),
+                    timeout: None,
+                })
+                .map_err(|error| GpuCfrError::MapFailed(error.to_string()))?;
+            end = start;
+        }
+        let hero_aggregate_params = uniform_buffer(
+            &self.device,
+            "public tree hero aggregate params",
+            &[GpuPublicTreeParams {
+                combo_count: combos.len() as u32,
+                node_count: nodes.len() as u32,
+                max_actions: state.actions as u32,
+                output_len: action_len as u32,
+                pair_start: 0,
+                chunk_pairs: 0,
+                _pad0: 0,
+                _pad1: 0,
+            }],
+        );
+        let hero_aggregate_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("public tree hero aggregate bind group"),
+            layout: &self.public_tree_aggregate_bind_group_layout,
+            entries: &[
+                bind_entry(0, &node_buffer),
+                bind_entry(1, &child_buffer),
+                bind_entry(2, &combo_buffer),
+                bind_entry(3, &hero_reaches_buffer),
+                bind_entry(4, &villain_reaches_buffer),
+                bind_entry(5, &values_buffer),
+                bind_entry(6, &output_buffer),
+                bind_entry(7, &hero_aggregate_params),
+            ],
+        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("public tree hero aggregate encoder"),
+            });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("public tree hero aggregate pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.public_tree_aggregate_pipeline);
+            pass.set_bind_group(0, &hero_aggregate_bind_group, &[]);
+            pass.dispatch_workgroups((action_len as u32).div_ceil(WORKGROUP_SIZE), 1, 1);
+        }
+        let submission = self.queue.submit(Some(encoder.finish()));
+        self.device
+            .poll(wgpu::PollType::Wait {
+                submission_index: Some(submission),
+                timeout: None,
+            })
+            .map_err(|error| GpuCfrError::MapFailed(error.to_string()))?;
+
+        let mut end = nodes.len();
+        while end > 0 {
+            let start = end.saturating_sub(node_chunk);
+            let mut encoder = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("public tree villain value encoder"),
+                });
+            for target_node in (start..end).rev() {
+                let villain_value_params = uniform_buffer(
+                    &self.device,
+                    "public tree villain value params",
+                    &[GpuPublicTreeParams {
+                        combo_count: combos.len() as u32,
+                        node_count: nodes.len() as u32,
+                        max_actions: state.actions as u32,
+                        output_len: action_len as u32,
+                        pair_start: 1,
+                        chunk_pairs: target_node as u32,
+                        _pad0: 0,
+                        _pad1: 0,
+                    }],
+                );
+                let villain_value_bind_group =
+                    self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("public tree villain value bind group"),
+                        layout: &self.public_tree_value_bind_group_layout,
+                        entries: &[
+                            bind_entry(0, &node_buffer),
+                            bind_entry(1, &child_buffer),
+                            bind_entry(2, &board_buffer),
+                            bind_entry(3, &combo_buffer),
+                            bind_entry(4, &strength_buffer),
+                            bind_entry(5, &hero_reaches_buffer),
+                            bind_entry(6, &villain_reaches_buffer),
+                            bind_entry(7, &values_buffer),
+                            bind_entry(8, &villain_value_params),
+                        ],
+                    });
+                {
+                    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("public tree villain value pass"),
+                        timestamp_writes: None,
+                    });
+                    pass.set_pipeline(&self.public_tree_value_pipeline);
+                    pass.set_bind_group(0, &villain_value_bind_group, &[]);
+                    pass.dispatch_workgroups((combos.len() as u32).div_ceil(WORKGROUP_SIZE), 1, 1);
+                }
+            }
+            let submission = self.queue.submit(Some(encoder.finish()));
+            self.device
+                .poll(wgpu::PollType::Wait {
+                    submission_index: Some(submission),
+                    timeout: None,
+                })
+                .map_err(|error| GpuCfrError::MapFailed(error.to_string()))?;
+            end = start;
+        }
+        let villain_aggregate_params = uniform_buffer(
+            &self.device,
+            "public tree villain aggregate params",
+            &[GpuPublicTreeParams {
+                combo_count: combos.len() as u32,
+                node_count: nodes.len() as u32,
+                max_actions: state.actions as u32,
+                output_len: action_len as u32,
+                pair_start: 1,
+                chunk_pairs: 0,
+                _pad0: 0,
+                _pad1: 0,
+            }],
+        );
+        let villain_aggregate_bind_group =
+            self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("public tree villain aggregate bind group"),
+                layout: &self.public_tree_aggregate_bind_group_layout,
+                entries: &[
+                    bind_entry(0, &node_buffer),
+                    bind_entry(1, &child_buffer),
+                    bind_entry(2, &combo_buffer),
+                    bind_entry(3, &hero_reaches_buffer),
+                    bind_entry(4, &villain_reaches_buffer),
+                    bind_entry(5, &values_buffer),
+                    bind_entry(6, &output_buffer),
+                    bind_entry(7, &villain_aggregate_params),
+                ],
+            });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("public tree final encoder"),
+            });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("public tree villain aggregate pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.public_tree_aggregate_pipeline);
+            pass.set_bind_group(0, &villain_aggregate_bind_group, &[]);
+            pass.dispatch_workgroups((action_len as u32).div_ceil(WORKGROUP_SIZE), 1, 1);
+        }
+        let readback = readback_buffer(&self.device, output_len);
+        copy_buffer(&mut encoder, &output_buffer, &readback, output_len);
+        let submission = self.queue.submit(Some(encoder.finish()));
+        self.device
+            .poll(wgpu::PollType::Wait {
+                submission_index: Some(submission),
+                timeout: None,
+            })
+            .map_err(|error| GpuCfrError::MapFailed(error.to_string()))?;
+        let output = read_f32_buffer(&self.device, &readback, output_len)?;
+        let mut action_values = output[..action_len].to_vec();
+        let value_weights = &output[action_len..action_len * 2];
+        for (value, weight) in action_values.iter_mut().zip(value_weights) {
+            if *weight > 0.0 {
+                *value /= *weight;
+            } else {
+                *value = 0.0;
+            }
+        }
+        let reach_start = action_len * 2;
+        let strategy_start = reach_start + state.infosets;
+        Ok(GpuRootTerminalValues {
+            action_values,
+            reach_weights: output[reach_start..strategy_start].to_vec(),
+            strategy_weights: output[strategy_start..strategy_start + state.infosets].to_vec(),
+        })
     }
 
     pub fn upload_state(&self, state: &DenseCfrState) -> GpuDenseCfrState {
@@ -1166,6 +2173,19 @@ fn storage_entry(binding: u32, read_only: bool) -> wgpu::BindGroupLayoutEntry {
     }
 }
 
+fn uniform_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Uniform,
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
+    }
+}
+
 fn bind_entry(binding: u32, buffer: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_> {
     wgpu::BindGroupEntry {
         binding,
@@ -1190,6 +2210,18 @@ fn readonly_buffer<T: bytemuck::NoUninit>(
         label: Some(label),
         contents: bytemuck::cast_slice(data),
         usage: wgpu::BufferUsages::STORAGE,
+    })
+}
+
+fn uniform_buffer<T: bytemuck::NoUninit>(
+    device: &wgpu::Device,
+    label: &str,
+    data: &[T],
+) -> wgpu::Buffer {
+    device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some(label),
+        contents: bytemuck::cast_slice(data),
+        usage: wgpu::BufferUsages::UNIFORM,
     })
 }
 
@@ -1251,6 +2283,15 @@ fn legal_actions_u32(legal_actions: &[bool]) -> Vec<u32> {
         .iter()
         .map(|is_legal| u32::from(*is_legal))
         .collect()
+}
+
+fn nodes_public_infoset_count(nodes: &[GpuPublicTreeNode]) -> usize {
+    nodes
+        .iter()
+        .filter(|node| node.kind == 0)
+        .map(|node| node.public_infoset as usize + 1)
+        .max()
+        .unwrap_or(0)
 }
 
 #[cfg(test)]

@@ -10,6 +10,9 @@ GPU-portable CFR layout:
 - observed action likelihood computed for the whole range
 - no dynamic `HashMap` node allocation in the hot solver path
 
+Detailed postflop GPU CFR math and the showdown reuse boundary are documented
+in [postflop-gpu-cfr.md](postflop-gpu-cfr.md).
+
 Research anchors:
 
 - Juho Kim, "GPU-Accelerated Counterfactual Regret Minimization", arXiv:2408.14778.

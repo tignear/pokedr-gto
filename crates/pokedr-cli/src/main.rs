@@ -15,11 +15,12 @@ fn main() {
         Some("gpu-info") => print_gpu_info(),
         Some("gpu-smoke") => run_gpu_smoke(),
         Some("postflop-smoke") => run_postflop_smoke(),
+        Some("solve-flop") => run_solve_flop(args.next().as_deref()),
         Some("rs-poker-smoke") => run_rs_poker_smoke(),
         Some("rs-poker-trace") => run_rs_poker_trace(),
         _ => {
             eprintln!(
-                "usage: {program} <gpu-info|gpu-smoke|postflop-smoke|rs-poker-smoke|rs-poker-trace>"
+                "usage: {program} <gpu-info|gpu-smoke|postflop-smoke|solve-flop|rs-poker-smoke|rs-poker-trace>"
             );
             std::process::exit(2);
         }
@@ -215,11 +216,136 @@ fn run_rs_poker_trace() {
     }
 }
 
+fn run_solve_flop(flop_arg: Option<&str>) {
+    let flop = parse_flop(flop_arg.unwrap_or("As7h2c")).unwrap_or_else(|error| {
+        eprintln!("{error}");
+        std::process::exit(2);
+    });
+    let config = fixed_flop_config();
+    println!(
+        "solving fixed flop iterations={} depth={} runouts={}",
+        config.cfr_iterations, config.max_depth, config.max_showdown_runouts
+    );
+    let summary = pokedr_agent::solve_fixed_flop_once(flop, config);
+    println!("board: {}", summary.board);
+    println!("iterations: {}", summary.iterations);
+    println!("public_decisions: {}", summary.decisions);
+    println!("chance_nodes: {}", summary.chance);
+    println!("terminals: {}", summary.terminals);
+    println!("public_infosets: {}", summary.public_infosets);
+    println!("private_infosets: {}", summary.private_infosets);
+    println!("max_actions: {}", summary.max_actions);
+    println!("elapsed: {:.2}s", summary.elapsed_secs);
+}
+
 fn smoke_hands() -> usize {
     std::env::var("POKEDR_HANDS")
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(16)
+}
+
+fn fixed_flop_config() -> pokedr_agent::PokedrAgentConfig {
+    let mut config = pokedr_agent::PokedrAgentConfig::default();
+    config.cfr_iterations = env_usize("POKEDR_CFR_ITERATIONS").unwrap_or(1);
+    config.max_depth = env_usize("POKEDR_MAX_DEPTH").unwrap_or(config.max_depth);
+    config.max_showdown_runouts =
+        env_usize("POKEDR_MAX_SHOWDOWN_RUNOUTS").unwrap_or(config.max_showdown_runouts);
+    config
+}
+
+fn env_usize(name: &str) -> Option<usize> {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse().ok())
+}
+
+fn parse_flop(input: &str) -> Result<[Card; 3], String> {
+    let normalized = input
+        .split(|character: char| character == ',' || character.is_whitespace())
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    let tokens = if normalized.len() == 3 {
+        normalized
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    } else {
+        split_compact_cards(input)?
+    };
+    if tokens.len() != 3 {
+        return Err("flop must contain exactly 3 cards, for example As7h2c".to_string());
+    }
+    let cards = [
+        parse_card(&tokens[0])?,
+        parse_card(&tokens[1])?,
+        parse_card(&tokens[2])?,
+    ];
+    let mask = cards
+        .iter()
+        .fold(0u64, |mask, card| mask | card.deck_mask());
+    if mask.count_ones() != 3 {
+        return Err("flop contains duplicate cards".to_string());
+    }
+    Ok(cards)
+}
+
+fn split_compact_cards(input: &str) -> Result<Vec<String>, String> {
+    let chars = input
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect::<Vec<_>>();
+    let mut cards = Vec::new();
+    let mut index = 0;
+    while index < chars.len() {
+        if index + 1 >= chars.len() {
+            return Err("card must include rank and suit".to_string());
+        }
+        let rank_len = if chars[index] == '1' && chars.get(index + 1) == Some(&'0') {
+            2
+        } else {
+            1
+        };
+        if index + rank_len >= chars.len() {
+            return Err("card must include rank and suit".to_string());
+        }
+        let token = chars[index..=index + rank_len].iter().collect();
+        cards.push(token);
+        index += rank_len + 1;
+    }
+    Ok(cards)
+}
+
+fn parse_card(input: &str) -> Result<Card, String> {
+    let lower = input.trim().to_ascii_lowercase();
+    if lower.len() < 2 {
+        return Err(format!("invalid card: {input}"));
+    }
+    let (rank_part, suit_part) = lower.split_at(lower.len() - 1);
+    let rank = match rank_part {
+        "2" => Rank::Two,
+        "3" => Rank::Three,
+        "4" => Rank::Four,
+        "5" => Rank::Five,
+        "6" => Rank::Six,
+        "7" => Rank::Seven,
+        "8" => Rank::Eight,
+        "9" => Rank::Nine,
+        "t" | "10" => Rank::Ten,
+        "j" => Rank::Jack,
+        "q" => Rank::Queen,
+        "k" => Rank::King,
+        "a" => Rank::Ace,
+        _ => return Err(format!("invalid rank in card: {input}")),
+    };
+    let suit = match suit_part {
+        "c" => Suit::Clubs,
+        "d" => Suit::Diamonds,
+        "h" => Suit::Hearts,
+        "s" => Suit::Spades,
+        _ => return Err(format!("invalid suit in card: {input}")),
+    };
+    Ok(Card::new(rank, suit))
 }
 
 fn smoke_postflop_tree() -> SubgameTree {
