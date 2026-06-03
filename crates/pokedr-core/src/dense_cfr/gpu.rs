@@ -854,6 +854,149 @@ fn terminal_reduce(@builtin(global_invocation_id) id: vec3<u32>) {
 }
 "#;
 
+const PUBLIC_TREE_FOLD_AGGREGATE_SHADER: &str = r#"
+struct Combo { cards: array<u32, 2>, };
+struct TreeNode {
+    kind: u32,
+    acting_player: u32,
+    public_infoset: u32,
+    first_child: u32,
+    child_count: u32,
+    terminal_kind: u32,
+    showdown_offset: u32,
+    _pad0: u32,
+    pot: f32,
+    hero_invested: f32,
+    _pad1: f32,
+    _pad2: f32,
+};
+struct Params {
+    combo_count: u32,
+    terminal_count: u32,
+    slots_per_terminal: u32,
+    output_len: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+    _pad3: u32,
+};
+
+@group(0) @binding(0) var<storage, read> terminal_nodes: array<u32>;
+@group(0) @binding(1) var<storage, read> combos: array<Combo>;
+@group(0) @binding(2) var<storage, read> hero_reaches: array<f32>;
+@group(0) @binding(3) var<storage, read> villain_reaches: array<f32>;
+@group(0) @binding(4) var<storage, read_write> hero_aggregates: array<f32>;
+@group(0) @binding(5) var<storage, read_write> villain_aggregates: array<f32>;
+@group(0) @binding(6) var<uniform> params: Params;
+
+@compute @workgroup_size(64)
+fn fold_aggregate(@builtin(global_invocation_id) id: vec3<u32>) {
+    let index = id.x + id.y * params.output_len;
+    let output_count = params.terminal_count * params.slots_per_terminal;
+    if index >= output_count {
+        return;
+    }
+    let slot = index % params.slots_per_terminal;
+    let terminal_slot = index / params.slots_per_terminal;
+    let node_index = terminal_nodes[terminal_slot];
+    let node_offset = node_index * params.combo_count;
+    var hero_sum = 0.0;
+    var villain_sum = 0.0;
+    if slot == 0u {
+        for (var combo = 0u; combo < params.combo_count; combo = combo + 1u) {
+            hero_sum = hero_sum + hero_reaches[node_offset + combo];
+            villain_sum = villain_sum + villain_reaches[node_offset + combo];
+        }
+    } else {
+        let card = slot - 1u;
+        for (var combo = 0u; combo < params.combo_count; combo = combo + 1u) {
+            let private_combo = combos[combo];
+            if private_combo.cards[0] == card || private_combo.cards[1] == card {
+                hero_sum = hero_sum + hero_reaches[node_offset + combo];
+                villain_sum = villain_sum + villain_reaches[node_offset + combo];
+            }
+        }
+    }
+    hero_aggregates[index] = hero_sum;
+    villain_aggregates[index] = villain_sum;
+}
+"#;
+
+const PUBLIC_TREE_FOLD_VALUE_SHADER: &str = r#"
+struct Combo { cards: array<u32, 2>, };
+struct TreeNode {
+    kind: u32,
+    acting_player: u32,
+    public_infoset: u32,
+    first_child: u32,
+    child_count: u32,
+    terminal_kind: u32,
+    showdown_offset: u32,
+    _pad0: u32,
+    pot: f32,
+    hero_invested: f32,
+    _pad1: f32,
+    _pad2: f32,
+};
+struct Params {
+    combo_count: u32,
+    terminal_count: u32,
+    slots_per_terminal: u32,
+    output_len: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+    _pad3: u32,
+};
+
+@group(0) @binding(0) var<storage, read> nodes: array<TreeNode>;
+@group(0) @binding(1) var<storage, read> terminal_nodes: array<u32>;
+@group(0) @binding(2) var<storage, read> combos: array<Combo>;
+@group(0) @binding(3) var<storage, read> hero_reaches: array<f32>;
+@group(0) @binding(4) var<storage, read> villain_reaches: array<f32>;
+@group(0) @binding(5) var<storage, read> hero_aggregates: array<f32>;
+@group(0) @binding(6) var<storage, read> villain_aggregates: array<f32>;
+@group(0) @binding(7) var<storage, read_write> hero_values: array<f32>;
+@group(0) @binding(8) var<storage, read_write> villain_values: array<f32>;
+@group(0) @binding(9) var<uniform> params: Params;
+
+@compute @workgroup_size(64)
+fn fold_value(@builtin(global_invocation_id) id: vec3<u32>) {
+    let index = id.x + id.y * params.output_len;
+    let output_count = params.terminal_count * params.combo_count;
+    if index >= output_count {
+        return;
+    }
+    let combo = index % params.combo_count;
+    let terminal_slot = index / params.combo_count;
+    let node_index = terminal_nodes[terminal_slot];
+    let node = nodes[node_index];
+    let private_combo = combos[combo];
+    let aggregate_base = terminal_slot * params.slots_per_terminal;
+    let node_offset = node_index * params.combo_count;
+    let hero_self = hero_reaches[node_offset + combo];
+    let villain_self = villain_reaches[node_offset + combo];
+    let hero_noncolliding = hero_aggregates[aggregate_base]
+        - hero_aggregates[aggregate_base + private_combo.cards[0] + 1u]
+        - hero_aggregates[aggregate_base + private_combo.cards[1] + 1u]
+        + hero_self;
+    let villain_noncolliding = villain_aggregates[aggregate_base]
+        - villain_aggregates[aggregate_base + private_combo.cards[0] + 1u]
+        - villain_aggregates[aggregate_base + private_combo.cards[1] + 1u]
+        + villain_self;
+
+    var hero_payoff = 0.0;
+    if node.terminal_kind == 0u {
+        hero_payoff = -node.hero_invested;
+    } else {
+        hero_payoff = node.pot - node.hero_invested;
+    }
+    let value_index = node_offset + combo;
+    hero_values[value_index] = villain_noncolliding * hero_payoff * node._pad1;
+    villain_values[value_index] = hero_noncolliding * (-hero_payoff) * node._pad1;
+}
+"#;
+
 const PUBLIC_TREE_BACKUP_SHADER: &str = r#"
 struct Combo { cards: array<u32, 2>, };
 struct TreeNode {
@@ -1076,6 +1219,10 @@ pub struct GpuDenseCfrBackend {
     public_tree_terminal_partial_bind_group_layout: wgpu::BindGroupLayout,
     public_tree_terminal_reduce_pipeline: wgpu::ComputePipeline,
     public_tree_terminal_reduce_bind_group_layout: wgpu::BindGroupLayout,
+    public_tree_fold_aggregate_pipeline: wgpu::ComputePipeline,
+    public_tree_fold_aggregate_bind_group_layout: wgpu::BindGroupLayout,
+    public_tree_fold_value_pipeline: wgpu::ComputePipeline,
+    public_tree_fold_value_bind_group_layout: wgpu::BindGroupLayout,
     public_tree_backup_pipeline: wgpu::ComputePipeline,
     public_tree_backup_bind_group_layout: wgpu::BindGroupLayout,
     public_tree_aggregate_pipeline: wgpu::ComputePipeline,
@@ -1416,6 +1563,75 @@ impl GpuDenseCfrBackend {
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
                 cache: None,
             });
+        let public_tree_fold_aggregate_shader =
+            device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("public tree fold aggregate shader"),
+                source: wgpu::ShaderSource::Wgsl(PUBLIC_TREE_FOLD_AGGREGATE_SHADER.into()),
+            });
+        let public_tree_fold_aggregate_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("public tree fold aggregate bind group layout"),
+                entries: &[
+                    storage_entry(0, true),
+                    storage_entry(1, true),
+                    storage_entry(2, true),
+                    storage_entry(3, true),
+                    storage_entry(4, false),
+                    storage_entry(5, false),
+                    uniform_entry(6),
+                ],
+            });
+        let public_tree_fold_aggregate_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("public tree fold aggregate pipeline layout"),
+                bind_group_layouts: &[Some(&public_tree_fold_aggregate_bind_group_layout)],
+                immediate_size: 0,
+            });
+        let public_tree_fold_aggregate_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("public tree fold aggregate pipeline"),
+                layout: Some(&public_tree_fold_aggregate_pipeline_layout),
+                module: &public_tree_fold_aggregate_shader,
+                entry_point: Some("fold_aggregate"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                cache: None,
+            });
+        let public_tree_fold_value_shader =
+            device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("public tree fold value shader"),
+                source: wgpu::ShaderSource::Wgsl(PUBLIC_TREE_FOLD_VALUE_SHADER.into()),
+            });
+        let public_tree_fold_value_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("public tree fold value bind group layout"),
+                entries: &[
+                    storage_entry(0, true),
+                    storage_entry(1, true),
+                    storage_entry(2, true),
+                    storage_entry(3, true),
+                    storage_entry(4, true),
+                    storage_entry(5, true),
+                    storage_entry(6, true),
+                    storage_entry(7, false),
+                    storage_entry(8, false),
+                    uniform_entry(9),
+                ],
+            });
+        let public_tree_fold_value_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("public tree fold value pipeline layout"),
+                bind_group_layouts: &[Some(&public_tree_fold_value_bind_group_layout)],
+                immediate_size: 0,
+            });
+        let public_tree_fold_value_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("public tree fold value pipeline"),
+                layout: Some(&public_tree_fold_value_pipeline_layout),
+                module: &public_tree_fold_value_shader,
+                entry_point: Some("fold_value"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                cache: None,
+            });
         let public_tree_backup_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("public tree backup shader"),
             source: wgpu::ShaderSource::Wgsl(PUBLIC_TREE_BACKUP_SHADER.into()),
@@ -1502,6 +1718,10 @@ impl GpuDenseCfrBackend {
             public_tree_terminal_partial_bind_group_layout,
             public_tree_terminal_reduce_pipeline,
             public_tree_terminal_reduce_bind_group_layout,
+            public_tree_fold_aggregate_pipeline,
+            public_tree_fold_aggregate_bind_group_layout,
+            public_tree_fold_value_pipeline,
+            public_tree_fold_value_bind_group_layout,
             public_tree_backup_pipeline,
             public_tree_backup_bind_group_layout,
             public_tree_aggregate_pipeline,
@@ -1792,6 +2012,136 @@ impl GpuDenseCfrBackend {
     }
 
     #[allow(clippy::too_many_arguments)]
+    fn fill_fold_values(
+        &self,
+        node_buffer: &wgpu::Buffer,
+        fold_terminal_nodes: &[u32],
+        combo_buffer: &wgpu::Buffer,
+        hero_reaches_buffer: &wgpu::Buffer,
+        villain_reaches_buffer: &wgpu::Buffer,
+        hero_values_buffer: &wgpu::Buffer,
+        villain_values_buffer: &wgpu::Buffer,
+        combo_count: usize,
+    ) -> Result<(), GpuCfrError> {
+        if fold_terminal_nodes.is_empty() || combo_count == 0 {
+            return Ok(());
+        }
+
+        const FOLD_AGGREGATE_SLOTS: usize = 53;
+        let fold_terminal_nodes_buffer = readonly_buffer(
+            &self.device,
+            "public tree fold terminal nodes",
+            fold_terminal_nodes,
+        );
+        let aggregate_len = fold_terminal_nodes.len() * FOLD_AGGREGATE_SLOTS;
+        let hero_aggregates_buffer = storage_buffer(
+            &self.device,
+            "public tree hero fold aggregates",
+            &vec![0.0f32; aggregate_len],
+        );
+        let villain_aggregates_buffer = storage_buffer(
+            &self.device,
+            "public tree villain fold aggregates",
+            &vec![0.0f32; aggregate_len],
+        );
+
+        let (aggregate_x_groups, aggregate_y_groups, aggregate_x_invocations) =
+            dispatch_grid(aggregate_len);
+        let aggregate_params = uniform_buffer(
+            &self.device,
+            "public tree fold aggregate params",
+            &[GpuPublicTreeParams {
+                combo_count: combo_count as u32,
+                node_count: fold_terminal_nodes.len() as u32,
+                max_actions: FOLD_AGGREGATE_SLOTS as u32,
+                output_len: aggregate_x_invocations,
+                pair_start: 0,
+                chunk_pairs: 0,
+                _pad0: 0,
+                _pad1: 0,
+            }],
+        );
+        let aggregate_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("public tree fold aggregate bind group"),
+            layout: &self.public_tree_fold_aggregate_bind_group_layout,
+            entries: &[
+                bind_entry(0, &fold_terminal_nodes_buffer),
+                bind_entry(1, combo_buffer),
+                bind_entry(2, hero_reaches_buffer),
+                bind_entry(3, villain_reaches_buffer),
+                bind_entry(4, &hero_aggregates_buffer),
+                bind_entry(5, &villain_aggregates_buffer),
+                bind_entry(6, &aggregate_params),
+            ],
+        });
+        let value_invocations = fold_terminal_nodes.len() * combo_count;
+        let (value_x_groups, value_y_groups, value_x_invocations) =
+            dispatch_grid(value_invocations);
+        let value_params = uniform_buffer(
+            &self.device,
+            "public tree fold value params",
+            &[GpuPublicTreeParams {
+                combo_count: combo_count as u32,
+                node_count: fold_terminal_nodes.len() as u32,
+                max_actions: FOLD_AGGREGATE_SLOTS as u32,
+                output_len: value_x_invocations,
+                pair_start: 0,
+                chunk_pairs: 0,
+                _pad0: 0,
+                _pad1: 0,
+            }],
+        );
+        let value_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("public tree fold value bind group"),
+            layout: &self.public_tree_fold_value_bind_group_layout,
+            entries: &[
+                bind_entry(0, node_buffer),
+                bind_entry(1, &fold_terminal_nodes_buffer),
+                bind_entry(2, combo_buffer),
+                bind_entry(3, hero_reaches_buffer),
+                bind_entry(4, villain_reaches_buffer),
+                bind_entry(5, &hero_aggregates_buffer),
+                bind_entry(6, &villain_aggregates_buffer),
+                bind_entry(7, hero_values_buffer),
+                bind_entry(8, villain_values_buffer),
+                bind_entry(9, &value_params),
+            ],
+        });
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("public tree fold value encoder"),
+            });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("public tree fold aggregate pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.public_tree_fold_aggregate_pipeline);
+            pass.set_bind_group(0, &aggregate_bind_group, &[]);
+            pass.dispatch_workgroups(aggregate_x_groups, aggregate_y_groups, 1);
+        }
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("public tree fold value pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.public_tree_fold_value_pipeline);
+            pass.set_bind_group(0, &value_bind_group, &[]);
+            pass.dispatch_workgroups(value_x_groups, value_y_groups, 1);
+        }
+        let submission = self.queue.submit(Some(encoder.finish()));
+        self.device
+            .poll(wgpu::PollType::Wait {
+                submission_index: Some(submission),
+                timeout: None,
+            })
+            .map_err(|error| GpuCfrError::MapFailed(error.to_string()))?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn fill_terminal_values(
         &self,
         node_buffer: &wgpu::Buffer,
@@ -2077,10 +2427,21 @@ impl GpuDenseCfrBackend {
             "public tree iteration output",
             &vec![0.0f32; output_len],
         );
-        let terminal_nodes: Vec<_> = nodes
+        let fold_terminal_nodes: Vec<_> = nodes
             .iter()
             .enumerate()
-            .filter_map(|(index, node)| (node.kind != 0 && node.kind != 1).then_some(index as u32))
+            .filter_map(|(index, node)| {
+                (node.kind != 0 && node.kind != 1 && node.terminal_kind != 2)
+                    .then_some(index as u32)
+            })
+            .collect();
+        let showdown_terminal_nodes: Vec<_> = nodes
+            .iter()
+            .enumerate()
+            .filter_map(|(index, node)| {
+                (node.kind != 0 && node.kind != 1 && node.terminal_kind == 2)
+                    .then_some(index as u32)
+            })
             .collect();
         let public_infoset_count = nodes_public_infoset_count(nodes);
         let mut decision_nodes = vec![u32::MAX; public_infoset_count];
@@ -2094,23 +2455,26 @@ impl GpuDenseCfrBackend {
         let terminal_tile_count = std::env::var("POKEDR_GPU_TERMINAL_TILES")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(8)
+            .unwrap_or(1)
             .max(1)
             .min(combos.len().max(1));
         let terminal_tile_size = combos.len().div_ceil(terminal_tile_count);
         let max_terminal_partial_values = 32_000_000usize;
         let terminal_chunk_size =
             (max_terminal_partial_values / (combos.len() * terminal_tile_count)).max(1);
-        let terminal_partial_len = terminal_chunk_size.min(terminal_nodes.len()).max(1)
+        let terminal_partial_len = terminal_chunk_size
+            .min(showdown_terminal_nodes.len())
+            .max(1)
             * combos.len()
             * terminal_tile_count;
         if std::env::var_os("POKEDR_SOLVER_PROGRESS_OFF").is_none() {
             eprintln!(
-                "pokedr: gpu public tree cfv nodes={} combos={} node_combo_values={} terminals={} terminal_tiles={} terminal_chunk={}",
+                "pokedr: gpu public tree cfv nodes={} combos={} node_combo_values={} folds={} showdowns={} terminal_tiles={} terminal_chunk={}",
                 nodes.len(),
                 combos.len(),
                 node_combo_len,
-                terminal_nodes.len(),
+                fold_terminal_nodes.len(),
+                showdown_terminal_nodes.len(),
                 terminal_tile_count,
                 terminal_chunk_size
             );
@@ -2234,9 +2598,20 @@ impl GpuDenseCfrBackend {
                 .map_err(|error| GpuCfrError::MapFailed(error.to_string()))?;
         }
 
+        self.fill_fold_values(
+            &node_buffer,
+            &fold_terminal_nodes,
+            &combo_buffer,
+            &hero_reaches_buffer,
+            &villain_reaches_buffer,
+            &hero_values_buffer,
+            &villain_values_buffer,
+            combos.len(),
+        )?;
+
         self.fill_terminal_values(
             &node_buffer,
-            &terminal_nodes,
+            &showdown_terminal_nodes,
             &board_buffer,
             &combo_buffer,
             &strength_buffer,
