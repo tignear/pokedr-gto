@@ -46,6 +46,10 @@ fn print_gpu_info() {
     println!("device_type: {:?}", info.device_type);
     println!("vendor: 0x{:x}", info.vendor);
     println!("device: 0x{:x}", info.device);
+    println!(
+        "shader_float32_atomic: {}",
+        backend.supports_shader_float32_atomic()
+    );
 }
 
 fn run_gpu_smoke() {

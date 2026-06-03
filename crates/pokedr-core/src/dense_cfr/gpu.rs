@@ -1458,6 +1458,7 @@ pub struct GpuDenseCfrBackend {
     device: wgpu::Device,
     queue: wgpu::Queue,
     adapter_info: wgpu::AdapterInfo,
+    adapter_features: wgpu::Features,
     pipeline: wgpu::ComputePipeline,
     bind_group_layout: wgpu::BindGroupLayout,
     public_tree_cfr_update_pipeline: wgpu::ComputePipeline,
@@ -1712,6 +1713,7 @@ impl GpuDenseCfrBackend {
             .await
             .map_err(|_| GpuCfrError::NoAdapter)?;
         let adapter_info = adapter.get_info();
+        let adapter_features = adapter.features();
         let required_limits = adapter.limits();
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
@@ -2168,6 +2170,7 @@ impl GpuDenseCfrBackend {
             device,
             queue,
             adapter_info,
+            adapter_features,
             pipeline,
             bind_group_layout,
             public_tree_cfr_update_pipeline,
@@ -2201,6 +2204,15 @@ impl GpuDenseCfrBackend {
 
     pub fn adapter_info(&self) -> &wgpu::AdapterInfo {
         &self.adapter_info
+    }
+
+    pub fn adapter_features(&self) -> wgpu::Features {
+        self.adapter_features
+    }
+
+    pub fn supports_shader_float32_atomic(&self) -> bool {
+        self.adapter_features
+            .contains(wgpu::Features::SHADER_FLOAT32_ATOMIC)
     }
 
     fn gpu_profile_enabled() -> bool {
