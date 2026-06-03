@@ -582,6 +582,9 @@ fn legal_aggressive_amount(
     amount: u32,
     all_in_threshold: f32,
 ) -> Option<u32> {
+    if request.min_aggressive_amount > request.stack {
+        return (request.stack > request.to_call).then_some(request.stack);
+    }
     if amount >= all_in_absorb_threshold(request, all_in_threshold) {
         return Some(request.stack);
     }

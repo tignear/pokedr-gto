@@ -38,6 +38,9 @@ pub struct HandBits {
     pub rank_counts: [u8; 13],
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct HandStrength(u32);
+
 impl Card {
     pub const COUNT: usize = 52;
 
@@ -185,6 +188,132 @@ impl HandBits {
     }
 }
 
+impl HandStrength {
+    pub fn category(self) -> u8 {
+        (self.0 >> 20) as u8
+    }
+
+    pub fn raw(self) -> u32 {
+        self.0
+    }
+}
+
+pub fn evaluate(cards: &[Card]) -> HandStrength {
+    assert!(
+        (5..=7).contains(&cards.len()),
+        "hand evaluation requires five to seven cards"
+    );
+    let bits = HandBits::from_cards(cards);
+    evaluate_bits(&bits)
+}
+
+fn evaluate_bits(bits: &HandBits) -> HandStrength {
+    let flush_mask = bits
+        .suit_masks
+        .iter()
+        .copied()
+        .find(|mask| mask.count_ones() >= 5);
+    if let Some(mask) = flush_mask {
+        if let Some(high) = straight_high_bit(mask) {
+            return pack(8, &[high]);
+        }
+    }
+
+    let groups = rank_groups(&bits.rank_counts);
+    if let Some(&(four, _)) = groups.iter().find(|(_, count)| *count == 4) {
+        let kicker = highest_excluding(bits.rank_mask, &[four], 1);
+        return pack(7, &[four, kicker[0]]);
+    }
+
+    let trips: Vec<u8> = groups
+        .iter()
+        .filter_map(|(rank, count)| (*count == 3).then_some(*rank))
+        .collect();
+    let pairs: Vec<u8> = groups
+        .iter()
+        .filter_map(|(rank, count)| (*count == 2).then_some(*rank))
+        .collect();
+    if !trips.is_empty() && (!pairs.is_empty() || trips.len() >= 2) {
+        let trip = trips[0];
+        let pair = pairs.first().copied().unwrap_or_else(|| trips[1]);
+        return pack(6, &[trip, pair]);
+    }
+
+    if let Some(mask) = flush_mask {
+        let kickers = highest_from_mask(mask, 5);
+        return pack(5, &kickers);
+    }
+
+    if let Some(high) = bits.straight_high_bit() {
+        return pack(4, &[high]);
+    }
+
+    if let Some(&trip) = trips.first() {
+        let kickers = highest_excluding(bits.rank_mask, &[trip], 2);
+        return pack(3, &[trip, kickers[0], kickers[1]]);
+    }
+
+    if pairs.len() >= 2 {
+        let kicker = highest_excluding(bits.rank_mask, &[pairs[0], pairs[1]], 1);
+        return pack(2, &[pairs[0], pairs[1], kicker[0]]);
+    }
+
+    if let Some(&pair) = pairs.first() {
+        let kickers = highest_excluding(bits.rank_mask, &[pair], 3);
+        return pack(1, &[pair, kickers[0], kickers[1], kickers[2]]);
+    }
+
+    pack(0, &highest_from_mask(bits.rank_mask, 5))
+}
+
+fn rank_groups(rank_counts: &[u8; 13]) -> Vec<(u8, u8)> {
+    let mut groups = Vec::new();
+    for rank in (0..13).rev() {
+        let count = rank_counts[rank];
+        if count > 0 {
+            groups.push((rank as u8 + 1, count));
+        }
+    }
+    groups
+}
+
+fn highest_from_mask(mask: u16, count: usize) -> Vec<u8> {
+    let mut ranks = Vec::with_capacity(count);
+    for rank in (1..=13).rev() {
+        if mask & (1 << rank) != 0 {
+            ranks.push(rank as u8);
+            if ranks.len() == count {
+                break;
+            }
+        }
+    }
+    ranks
+}
+
+fn highest_excluding(mask: u16, excluded: &[u8], count: usize) -> Vec<u8> {
+    let mut ranks = Vec::with_capacity(count);
+    for rank in (1..=13).rev() {
+        if excluded.contains(&(rank as u8)) {
+            continue;
+        }
+        if mask & (1 << rank) != 0 {
+            ranks.push(rank as u8);
+            if ranks.len() == count {
+                break;
+            }
+        }
+    }
+    ranks
+}
+
+fn pack(category: u8, ranks: &[u8]) -> HandStrength {
+    let mut value = (category as u32) << 20;
+    for (index, rank) in ranks.iter().take(5).enumerate() {
+        value |= (*rank as u32) << (16 - index * 4);
+    }
+    HandStrength(value)
+}
+
 pub fn straight_high_bit(rank_mask: u16) -> Option<u8> {
     for high in (4..=13).rev() {
         let window = 0b1_1111u16 << (high - 4);
@@ -238,5 +367,46 @@ mod tests {
             Card::new(Rank::Ten, Suit::Hearts),
         ];
         assert!(HandBits::from_cards(&cards).has_flush());
+    }
+
+    #[test]
+    fn evaluator_orders_major_hand_classes() {
+        let straight_flush = evaluate(&[
+            Card::new(Rank::Ace, Suit::Spades),
+            Card::new(Rank::King, Suit::Spades),
+            Card::new(Rank::Queen, Suit::Spades),
+            Card::new(Rank::Jack, Suit::Spades),
+            Card::new(Rank::Ten, Suit::Spades),
+        ]);
+        let quads = evaluate(&[
+            Card::new(Rank::Ace, Suit::Spades),
+            Card::new(Rank::Ace, Suit::Hearts),
+            Card::new(Rank::Ace, Suit::Diamonds),
+            Card::new(Rank::Ace, Suit::Clubs),
+            Card::new(Rank::King, Suit::Spades),
+        ]);
+        let full_house = evaluate(&[
+            Card::new(Rank::King, Suit::Spades),
+            Card::new(Rank::King, Suit::Hearts),
+            Card::new(Rank::King, Suit::Diamonds),
+            Card::new(Rank::Queen, Suit::Clubs),
+            Card::new(Rank::Queen, Suit::Spades),
+        ]);
+
+        assert!(straight_flush > quads);
+        assert!(quads > full_house);
+    }
+
+    #[test]
+    fn evaluator_detects_wheel_straight() {
+        let wheel = evaluate(&[
+            Card::new(Rank::Ace, Suit::Spades),
+            Card::new(Rank::Two, Suit::Clubs),
+            Card::new(Rank::Three, Suit::Diamonds),
+            Card::new(Rank::Four, Suit::Hearts),
+            Card::new(Rank::Five, Suit::Spades),
+        ]);
+
+        assert_eq!(wheel.category(), 4);
     }
 }
