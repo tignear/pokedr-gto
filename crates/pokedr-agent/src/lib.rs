@@ -1133,7 +1133,7 @@ fn linearize_gpu_public_tree(
     tree: &SubgameTree,
     layout: &PostflopDenseLayout,
     _backend: &GpuDenseCfrBackend,
-    config: &PokedrAgentConfig,
+    _config: &PokedrAgentConfig,
     _matrix_cache: &RefCell<ShowdownMatrixCache>,
 ) -> Option<GpuLinearizedPublicTree> {
     let mut nodes = Vec::with_capacity(tree.nodes().len());
@@ -1202,8 +1202,7 @@ fn linearize_gpu_public_tree(
                             *offset_count
                         } else {
                             let offset = showdown_boards.len() as u32;
-                            let final_boards =
-                                gpu_final_boards(board, config.max_showdown_runouts.max(1));
+                            let final_boards = gpu_full_final_boards(board);
                             let count = final_boards.len() as u32;
                             showdown_boards.extend(final_boards);
                             showdown_offsets.insert(key, (offset, count));
@@ -1224,7 +1223,7 @@ fn linearize_gpu_public_tree(
                     pot: *pot as f32,
                     hero_invested: *hero_invested as f32,
                     _pad1: public_chance_reach[node_index],
-                    _pad2: 0.0,
+                    _pad2: full_runout_pair_denominator(board.cards().len()) as f32,
                 });
             }
         }
@@ -1685,6 +1684,18 @@ fn gpu_private_combos() -> Vec<GpuPrivateCombo> {
 
 fn gpu_final_boards(board: &Board, limit: usize) -> Vec<GpuFinalBoard> {
     let runouts = completion_runouts(board, board.deck_mask(), limit.max(1));
+    gpu_final_boards_from_runouts(board, runouts)
+}
+
+fn gpu_full_final_boards(board: &Board) -> Vec<GpuFinalBoard> {
+    let runouts = completion_runouts(board, board.deck_mask(), usize::MAX);
+    gpu_final_boards_from_runouts(board, runouts)
+}
+
+fn gpu_final_boards_from_runouts(
+    board: &Board,
+    runouts: Vec<Vec<PokedrCard>>,
+) -> Vec<GpuFinalBoard> {
     runouts
         .into_iter()
         .filter_map(|runout| {
@@ -1701,6 +1712,17 @@ fn gpu_final_boards(board: &Board, limit: usize) -> Vec<GpuFinalBoard> {
             })
         })
         .collect()
+}
+
+fn full_runout_pair_denominator(public_cards: usize) -> usize {
+    let missing = 5usize.saturating_sub(public_cards);
+    let remaining_after_public_and_pair = PokedrCard::COUNT - public_cards - 4;
+    match missing {
+        0 => 1,
+        1 => remaining_after_public_and_pair,
+        2 => remaining_after_public_and_pair * (remaining_after_public_and_pair - 1) / 2,
+        _ => 1,
+    }
 }
 
 fn heads_up_equity(

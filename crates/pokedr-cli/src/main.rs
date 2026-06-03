@@ -230,7 +230,7 @@ fn run_solve_flop(flop_arg: Option<&str>) {
     });
     let config = fixed_flop_config();
     println!(
-        "solving fixed flop iterations={} depth={} runouts={}",
+        "solving fixed flop iterations={} depth={} equity_runout_cap={} terminal_runouts=full",
         config.cfr_iterations, config.max_depth, config.max_showdown_runouts
     );
     let summary = pokedr_agent::solve_fixed_flop_once(flop, config);
@@ -253,7 +253,7 @@ fn run_solve_flop_metrics(flop_arg: Option<&str>) {
     let config = match_config();
     let iterations = metric_iterations();
     println!(
-        "solving fixed flop metrics depth={} runouts={} iterations={:?}",
+        "solving fixed flop metrics depth={} equity_runout_cap={} terminal_runouts=full iterations={:?}",
         config.max_depth, config.max_showdown_runouts, iterations
     );
     for row in pokedr_agent::solve_fixed_flop_metrics(flop, config, &iterations) {

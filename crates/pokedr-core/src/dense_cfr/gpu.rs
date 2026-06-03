@@ -780,8 +780,6 @@ fn reach_edges(@builtin(global_invocation_id) id: vec3<u32>) {
 "#;
 
 const PUBLIC_TREE_TERMINAL_PARTIAL_SHADER: &str = r#"
-struct Combo { cards: array<u32, 2>, };
-struct FinalBoard { cards: array<u32, 5>, };
 struct TreeNode {
     kind: u32,
     acting_player: u32,
@@ -796,161 +794,112 @@ struct TreeNode {
     _pad1: f32,
     _pad2: f32,
 };
-struct Params {
-    combo_count: u32,
-    terminal_count: u32,
-    tile_count: u32,
-    tile_size: u32,
-    board_tile_count: u32,
-    x_invocations: u32,
-    board_tile_size: u32,
-    _pad3: u32,
+struct Bounds {
+    group_start: u32,
+    group_end: u32,
+    legal: u32,
+    _pad0: u32,
 };
-
-@group(0) @binding(0) var<storage, read> nodes: array<TreeNode>;
-@group(0) @binding(1) var<storage, read> terminal_nodes: array<u32>;
-@group(0) @binding(2) var<storage, read> boards: array<FinalBoard>;
-@group(0) @binding(3) var<storage, read> combos: array<Combo>;
-@group(0) @binding(4) var<storage, read> strengths: array<f32>;
-@group(0) @binding(5) var<storage, read> hero_reaches: array<f32>;
-@group(0) @binding(6) var<storage, read> villain_reaches: array<f32>;
-@group(0) @binding(7) var<storage, read_write> hero_partials: array<f32>;
-@group(0) @binding(8) var<storage, read_write> villain_partials: array<f32>;
-@group(0) @binding(9) var<uniform> params: Params;
-
-fn collide(left: Combo, right: Combo) -> bool {
-    return left.cards[0] == right.cards[0] || left.cards[0] == right.cards[1]
-        || left.cards[1] == right.cards[0] || left.cards[1] == right.cards[1];
-}
-
-fn combo_hits_board(combo: Combo, board: FinalBoard) -> bool {
-    return combo.cards[0] == board.cards[0]
-        || combo.cards[0] == board.cards[1]
-        || combo.cards[0] == board.cards[2]
-        || combo.cards[0] == board.cards[3]
-        || combo.cards[0] == board.cards[4]
-        || combo.cards[1] == board.cards[0]
-        || combo.cards[1] == board.cards[1]
-        || combo.cards[1] == board.cards[2]
-        || combo.cards[1] == board.cards[3]
-        || combo.cards[1] == board.cards[4];
-}
-
-@compute @workgroup_size(64)
-fn terminal_partial(@builtin(global_invocation_id) id: vec3<u32>) {
-    let index = id.x + id.y * params.x_invocations;
-    let tile_stride = params.tile_count * params.board_tile_count;
-    let output_count = params.terminal_count * params.combo_count * tile_stride;
-    if index >= output_count {
-        return;
-    }
-    let board_tile = index % params.board_tile_count;
-    let tile = (index / params.board_tile_count) % params.tile_count;
-    let combo = (index / tile_stride) % params.combo_count;
-    let terminal_slot = index / (tile_stride * params.combo_count);
-    let node_index = terminal_nodes[terminal_slot];
-    let node = nodes[node_index];
-    let node_offset = node_index * params.combo_count;
-    let opponent_start = tile * params.tile_size;
-    let opponent_end = min(opponent_start + params.tile_size, params.combo_count);
-    var hero_value = 0.0;
-    var villain_value = 0.0;
-
-    if node.terminal_kind == 0u {
-        let hero_payoff = -node.hero_invested;
-        let villain_payoff = node.hero_invested;
-        for (var opponent = opponent_start; opponent < opponent_end; opponent = opponent + 1u) {
-            if collide(combos[combo], combos[opponent]) {
-                continue;
-            }
-            hero_value = hero_value + villain_reaches[node_offset + opponent] * hero_payoff;
-            villain_value = villain_value + hero_reaches[node_offset + opponent] * villain_payoff;
-        }
-    } else if node.terminal_kind == 1u {
-        let hero_payoff = node.pot - node.hero_invested;
-        let villain_payoff = -hero_payoff;
-        for (var opponent = opponent_start; opponent < opponent_end; opponent = opponent + 1u) {
-            if collide(combos[combo], combos[opponent]) {
-                continue;
-            }
-            hero_value = hero_value + villain_reaches[node_offset + opponent] * hero_payoff;
-            villain_value = villain_value + hero_reaches[node_offset + opponent] * villain_payoff;
-        }
-    } else {
-        let board_count = node._pad0;
-        let board_start = board_tile * params.board_tile_size;
-        let board_end = min(board_start + params.board_tile_size, board_count);
-        for (var opponent = opponent_start; opponent < opponent_end; opponent = opponent + 1u) {
-            if collide(combos[combo], combos[opponent]) {
-                continue;
-            }
-            var equity_sum = 0.0;
-            var valid_boards_tile = 0u;
-            var valid_boards_total = 0u;
-            for (var board = board_start; board < board_end; board = board + 1u) {
-                let final_board_index = node.showdown_offset + board;
-                let final_board = boards[final_board_index];
-                if combo_hits_board(combos[combo], final_board) || combo_hits_board(combos[opponent], final_board) {
-                    continue;
-                }
-                valid_boards_tile = valid_boards_tile + 1u;
-                let strength_offset = final_board_index * params.combo_count;
-                let combo_strength = strengths[strength_offset + combo];
-                let opponent_strength = strengths[strength_offset + opponent];
-                if combo_strength > opponent_strength {
-                    equity_sum = equity_sum + 1.0;
-                } else if combo_strength == opponent_strength {
-                    equity_sum = equity_sum + 0.5;
-                }
-            }
-            if params.board_tile_count == 1u {
-                valid_boards_total = valid_boards_tile;
-            } else {
-                valid_boards_total = 0u;
-                for (var board = 0u; board < board_count; board = board + 1u) {
-                    let final_board_index = node.showdown_offset + board;
-                    let final_board = boards[final_board_index];
-                    if combo_hits_board(combos[combo], final_board) || combo_hits_board(combos[opponent], final_board) {
-                        continue;
-                    }
-                    valid_boards_total = valid_boards_total + 1u;
-                }
-            }
-            var hero_payoff = 0.0;
-            var villain_payoff = 0.0;
-            if valid_boards_total > 0u {
-                let board_weight = f32(valid_boards_tile) / f32(valid_boards_total);
-                let equity_share = equity_sum / f32(valid_boards_total);
-                hero_payoff = equity_share * node.pot - board_weight * node.hero_invested;
-                villain_payoff = equity_share * node.pot - board_weight * (node.pot - node.hero_invested);
-            }
-            hero_value = hero_value + villain_reaches[node_offset + opponent] * hero_payoff;
-            villain_value = villain_value + hero_reaches[node_offset + opponent] * villain_payoff;
-        }
-    }
-    hero_partials[index] = hero_value * node._pad1;
-    villain_partials[index] = villain_value * node._pad1;
-}
-"#;
-
-const PUBLIC_TREE_TERMINAL_REDUCE_SHADER: &str = r#"
+struct PrefixPair {
+    hero: f32,
+    villain: f32,
+};
 struct Params {
     combo_count: u32,
     terminal_count: u32,
-    tile_count: u32,
-    output_len: u32,
-    board_tile_count: u32,
+    board_count: u32,
+    prefix_stride: u32,
+    order_stride: u32,
     x_invocations: u32,
     _pad2: u32,
     _pad3: u32,
 };
 
-@group(0) @binding(0) var<storage, read> terminal_nodes: array<u32>;
-@group(0) @binding(1) var<storage, read> hero_partials: array<f32>;
-@group(0) @binding(2) var<storage, read> villain_partials: array<f32>;
-@group(0) @binding(3) var<storage, read_write> hero_values: array<f32>;
-@group(0) @binding(4) var<storage, read_write> villain_values: array<f32>;
-@group(0) @binding(5) var<uniform> params: Params;
+@group(0) @binding(0) var<storage, read> nodes: array<TreeNode>;
+@group(0) @binding(1) var<storage, read> terminal_nodes: array<u32>;
+@group(0) @binding(2) var<storage, read> combo_order: array<u32>;
+@group(0) @binding(3) var<storage, read> combo_bounds: array<Bounds>;
+@group(0) @binding(4) var<storage, read> hero_reaches: array<f32>;
+@group(0) @binding(5) var<storage, read> villain_reaches: array<f32>;
+@group(0) @binding(6) var<storage, read_write> prefix_pairs: array<PrefixPair>;
+@group(0) @binding(7) var<uniform> params: Params;
+
+@compute @workgroup_size(64)
+fn terminal_partial(@builtin(global_invocation_id) id: vec3<u32>) {
+    let index = id.x + id.y * params.x_invocations;
+    let output_count = params.terminal_count * params.board_count;
+    if index >= output_count {
+        return;
+    }
+    let board = index % params.board_count;
+    let terminal_slot = index / params.board_count;
+    let node_index = terminal_nodes[terminal_slot];
+    let node_offset = node_index * params.combo_count;
+    let order_base = board * params.order_stride;
+    let prefix_base = (terminal_slot * params.board_count + board) * params.prefix_stride;
+    var hero_sum = 0.0;
+    var villain_sum = 0.0;
+    prefix_pairs[prefix_base] = PrefixPair(0.0, 0.0);
+    for (var position = 0u; position < params.combo_count; position = position + 1u) {
+        let combo = combo_order[order_base + position];
+        if combo != 0xffffffffu {
+            let bounds = combo_bounds[board * params.combo_count + combo];
+            if bounds.legal != 0u {
+                hero_sum = hero_sum + hero_reaches[node_offset + combo];
+                villain_sum = villain_sum + villain_reaches[node_offset + combo];
+            }
+        }
+        prefix_pairs[prefix_base + position + 1u] = PrefixPair(hero_sum, villain_sum);
+    }
+}
+"#;
+
+const PUBLIC_TREE_TERMINAL_REDUCE_SHADER: &str = r#"
+struct TreeNode {
+    kind: u32,
+    acting_player: u32,
+    public_infoset: u32,
+    first_child: u32,
+    child_count: u32,
+    terminal_kind: u32,
+    showdown_offset: u32,
+    board_count: u32,
+    pot: f32,
+    hero_invested: f32,
+    chance_scale: f32,
+    showdown_denominator: f32,
+};
+struct Bounds {
+    group_start: u32,
+    group_end: u32,
+    legal: u32,
+    _pad0: u32,
+};
+struct PrefixPair {
+    hero: f32,
+    villain: f32,
+};
+struct Params {
+    combo_count: u32,
+    terminal_count: u32,
+    board_count: u32,
+    prefix_stride: u32,
+    blocker_stride: u32,
+    x_invocations: u32,
+    denominator: u32,
+    _pad3: u32,
+};
+
+@group(0) @binding(0) var<storage, read> nodes: array<TreeNode>;
+@group(0) @binding(1) var<storage, read> terminal_nodes: array<u32>;
+@group(0) @binding(2) var<storage, read> combo_bounds: array<Bounds>;
+@group(0) @binding(3) var<storage, read> blocker_neighbors: array<u32>;
+@group(0) @binding(4) var<storage, read> hero_reaches: array<f32>;
+@group(0) @binding(5) var<storage, read> villain_reaches: array<f32>;
+@group(0) @binding(6) var<storage, read> prefix_pairs: array<PrefixPair>;
+@group(0) @binding(7) var<storage, read_write> hero_values: array<f32>;
+@group(0) @binding(8) var<storage, read_write> villain_values: array<f32>;
+@group(0) @binding(9) var<uniform> params: Params;
 
 @compute @workgroup_size(64)
 fn terminal_reduce(@builtin(global_invocation_id) id: vec3<u32>) {
@@ -962,17 +911,59 @@ fn terminal_reduce(@builtin(global_invocation_id) id: vec3<u32>) {
     let combo = index % params.combo_count;
     let terminal_slot = index / params.combo_count;
     let node_index = terminal_nodes[terminal_slot];
-    let partial_count = params.tile_count * params.board_tile_count;
-    let partial_base = (terminal_slot * params.combo_count + combo) * partial_count;
+    let node = nodes[node_index];
+    let node_offset = node_index * params.combo_count;
+    let denom = max(node.showdown_denominator, 1.0);
     var hero_value = 0.0;
     var villain_value = 0.0;
-    for (var partial = 0u; partial < partial_count; partial = partial + 1u) {
-        hero_value = hero_value + hero_partials[partial_base + partial];
-        villain_value = villain_value + villain_partials[partial_base + partial];
+    for (var board = 0u; board < node.board_count; board = board + 1u) {
+        let board_index = node.showdown_offset + board;
+        let bounds = combo_bounds[board_index * params.combo_count + combo];
+        if bounds.legal == 0u {
+            continue;
+        }
+        let prefix_base = (terminal_slot * params.board_count + board_index) * params.prefix_stride;
+        let total_pair = prefix_pairs[prefix_base + params.combo_count];
+        let win_pair = prefix_pairs[prefix_base + bounds.group_start];
+        let tie_pair = prefix_pairs[prefix_base + bounds.group_end];
+        var hero_win = win_pair.villain;
+        var hero_tie = tie_pair.villain - win_pair.villain;
+        var hero_total = total_pair.villain;
+        var villain_win = win_pair.hero;
+        var villain_tie = tie_pair.hero - win_pair.hero;
+        var villain_total = total_pair.hero;
+
+        let neighbor_base = combo * params.blocker_stride;
+        for (var slot = 0u; slot < params.blocker_stride; slot = slot + 1u) {
+            let opponent = blocker_neighbors[neighbor_base + slot];
+            if opponent == 0xffffffffu {
+                continue;
+            }
+            let opponent_bounds = combo_bounds[board_index * params.combo_count + opponent];
+            if opponent_bounds.legal == 0u {
+                continue;
+            }
+            let opponent_hero_reach = hero_reaches[node_offset + opponent];
+            let opponent_villain_reach = villain_reaches[node_offset + opponent];
+            hero_total = hero_total - opponent_villain_reach;
+            villain_total = villain_total - opponent_hero_reach;
+            if opponent_bounds.group_end <= bounds.group_start {
+                hero_win = hero_win - opponent_villain_reach;
+                villain_win = villain_win - opponent_hero_reach;
+            } else if opponent_bounds.group_start == bounds.group_start {
+                hero_tie = hero_tie - opponent_villain_reach;
+                villain_tie = villain_tie - opponent_hero_reach;
+            }
+        }
+        hero_value = hero_value
+            + (node.pot * (hero_win + 0.5 * hero_tie) - node.hero_invested * hero_total) / denom;
+        let villain_invested = node.pot - node.hero_invested;
+        villain_value = villain_value
+            + (node.pot * (villain_win + 0.5 * villain_tie) - villain_invested * villain_total) / denom;
     }
     let value_index = node_index * params.combo_count + combo;
-    hero_values[value_index] = hero_value;
-    villain_values[value_index] = villain_value;
+    hero_values[value_index] = hero_value * node.chance_scale;
+    villain_values[value_index] = villain_value * node.chance_scale;
 }
 "#;
 
@@ -1555,9 +1546,22 @@ unsafe impl bytemuck::Pod for GpuPublicTreeNode {}
 #[derive(Debug, Clone)]
 pub struct GpuShowdownStrengthOrder {
     pub combo_order: Vec<u32>,
-    pub combo_group_start: Vec<u32>,
-    pub combo_group_end: Vec<u32>,
+    pub combo_bounds: Vec<GpuShowdownComboBounds>,
+    pub blocker_neighbors: Vec<u32>,
+    pub blocker_neighbor_stride: usize,
 }
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct GpuShowdownComboBounds {
+    pub group_start: u32,
+    pub group_end: u32,
+    pub legal: u32,
+    pub _pad0: u32,
+}
+
+unsafe impl bytemuck::Zeroable for GpuShowdownComboBounds {}
+unsafe impl bytemuck::Pod for GpuShowdownComboBounds {}
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -1580,13 +1584,13 @@ struct GpuPublicTreeIterationContext {
     output_len: usize,
     node_combo_len: usize,
     public_infoset_count: usize,
+    showdown_board_count: usize,
     node_buffer: wgpu::Buffer,
     child_buffer: wgpu::Buffer,
     reach_edge_buffer: wgpu::Buffer,
     reach_layer_ranges: Vec<(usize, usize)>,
     backup_nodes_buffer: wgpu::Buffer,
     backup_layer_ranges: Vec<(usize, usize)>,
-    board_buffer: wgpu::Buffer,
     combo_buffer: wgpu::Buffer,
     root_weights_buffer: wgpu::Buffer,
     hero_reaches_buffer: wgpu::Buffer,
@@ -1598,12 +1602,13 @@ struct GpuPublicTreeIterationContext {
     showdown_terminal_nodes: Vec<u32>,
     decision_nodes_buffer: wgpu::Buffer,
     terminal_tile_count: usize,
-    terminal_tile_size: usize,
     terminal_board_tile_count: usize,
-    terminal_board_tile_size: usize,
     terminal_chunk_size: usize,
-    hero_terminal_partials_buffer: wgpu::Buffer,
-    villain_terminal_partials_buffer: wgpu::Buffer,
+    terminal_combo_order_buffer: wgpu::Buffer,
+    terminal_combo_bounds_buffer: wgpu::Buffer,
+    terminal_blocker_neighbors_buffer: wgpu::Buffer,
+    terminal_blocker_neighbor_stride: usize,
+    terminal_prefix_pairs_buffer: wgpu::Buffer,
     hero_decision_aggregates_buffer: wgpu::Buffer,
     villain_decision_aggregates_buffer: wgpu::Buffer,
 }
@@ -1630,24 +1635,25 @@ pub fn showdown_strength_order(
 ) -> GpuShowdownStrengthOrder {
     let combo_count = combos.len();
     let mut combo_order = Vec::with_capacity(final_boards.len() * combo_count);
-    let mut combo_group_start = vec![0u32; final_boards.len() * combo_count];
-    let mut combo_group_end = vec![0u32; final_boards.len() * combo_count];
+    let mut combo_bounds =
+        vec![GpuShowdownComboBounds::default(); final_boards.len() * combo_count];
 
     for (board_index, board) in final_boards.iter().enumerate() {
         let mut ranked: Vec<_> = combos
             .iter()
             .enumerate()
-            .map(|(combo_index, combo)| {
-                (
+            .filter_map(|(combo_index, combo)| {
+                (!combo_hits_final_board_for_order(*combo, *board)).then_some((
                     evaluate_combo_final_board(*combo, *board),
                     combo_index as u32,
-                )
+                ))
             })
             .collect();
         ranked.sort_unstable_by_key(|(strength, combo_index)| (*strength, *combo_index));
 
         let board_order_offset = combo_order.len();
         combo_order.extend(ranked.iter().map(|(_, combo_index)| *combo_index));
+        combo_order.resize(board_order_offset + combo_count, u32::MAX);
 
         let board_combo_offset = board_index * combo_count;
         let mut group_start = 0usize;
@@ -1659,17 +1665,63 @@ pub fn showdown_strength_order(
             }
             for &(_, combo_index) in &ranked[group_start..group_end] {
                 let slot = board_combo_offset + combo_index as usize;
-                combo_group_start[slot] = (board_order_offset + group_start) as u32;
-                combo_group_end[slot] = (board_order_offset + group_end) as u32;
+                combo_bounds[slot] = GpuShowdownComboBounds {
+                    group_start: group_start as u32,
+                    group_end: group_end as u32,
+                    legal: 1,
+                    _pad0: 0,
+                };
             }
             group_start = group_end;
+        }
+    }
+    let blocker_neighbor_stride = combos
+        .iter()
+        .map(|&combo| {
+            combos
+                .iter()
+                .filter(|&&other| combos_collide_for_order(combo, other))
+                .count()
+        })
+        .max()
+        .unwrap_or(1)
+        .max(1);
+    let mut blocker_neighbors = vec![u32::MAX; combo_count * blocker_neighbor_stride];
+    for (combo_index, &combo) in combos.iter().enumerate() {
+        let mut slot = combo_index * blocker_neighbor_stride;
+        for (other_index, &other) in combos.iter().enumerate() {
+            if combos_collide_for_order(combo, other) {
+                blocker_neighbors[slot] = other_index as u32;
+                slot += 1;
+            }
         }
     }
 
     GpuShowdownStrengthOrder {
         combo_order,
-        combo_group_start,
-        combo_group_end,
+        combo_bounds,
+        blocker_neighbors,
+        blocker_neighbor_stride,
+    }
+}
+
+fn combos_collide_for_order(left: GpuPrivateCombo, right: GpuPrivateCombo) -> bool {
+    left.cards[0] == right.cards[0]
+        || left.cards[0] == right.cards[1]
+        || left.cards[1] == right.cards[0]
+        || left.cards[1] == right.cards[1]
+}
+
+fn combo_hits_final_board_for_order(combo: GpuPrivateCombo, board: GpuFinalBoard) -> bool {
+    board.cards.contains(&combo.cards[0]) || board.cards.contains(&combo.cards[1])
+}
+
+fn terminal_denominator_from_board_count(board_count: usize) -> usize {
+    match board_count {
+        1 => 1,
+        48 => 44,
+        1176 => 990,
+        _ => board_count.max(1),
     }
 }
 
@@ -1908,10 +1960,8 @@ impl GpuDenseCfrBackend {
                     storage_entry(3, true),
                     storage_entry(4, true),
                     storage_entry(5, true),
-                    storage_entry(6, true),
-                    storage_entry(7, false),
-                    storage_entry(8, false),
-                    uniform_entry(9),
+                    storage_entry(6, false),
+                    uniform_entry(7),
                 ],
             });
         let public_tree_terminal_partial_pipeline_layout =
@@ -1941,9 +1991,13 @@ impl GpuDenseCfrBackend {
                     storage_entry(0, true),
                     storage_entry(1, true),
                     storage_entry(2, true),
-                    storage_entry(3, false),
-                    storage_entry(4, false),
-                    uniform_entry(5),
+                    storage_entry(3, true),
+                    storage_entry(4, true),
+                    storage_entry(5, true),
+                    storage_entry(6, true),
+                    storage_entry(7, false),
+                    storage_entry(8, false),
+                    uniform_entry(9),
                 ],
             });
         let public_tree_terminal_reduce_pipeline_layout =
@@ -2668,31 +2722,27 @@ impl GpuDenseCfrBackend {
         encoder: &mut wgpu::CommandEncoder,
         node_buffer: &wgpu::Buffer,
         terminal_nodes: &[u32],
-        board_buffer: &wgpu::Buffer,
-        combo_buffer: &wgpu::Buffer,
-        strength_buffer: &wgpu::Buffer,
+        combo_order_buffer: &wgpu::Buffer,
+        combo_bounds_buffer: &wgpu::Buffer,
+        blocker_neighbors_buffer: &wgpu::Buffer,
         hero_reaches_buffer: &wgpu::Buffer,
         villain_reaches_buffer: &wgpu::Buffer,
         hero_values_buffer: &wgpu::Buffer,
         villain_values_buffer: &wgpu::Buffer,
-        hero_terminal_partials_buffer: &wgpu::Buffer,
-        villain_terminal_partials_buffer: &wgpu::Buffer,
+        terminal_prefix_pairs_buffer: &wgpu::Buffer,
         combo_count: usize,
-        tile_count: usize,
-        tile_size: usize,
-        board_tile_count: usize,
-        board_tile_size: usize,
+        board_count: usize,
+        blocker_neighbor_stride: usize,
         terminal_chunk_size: usize,
     ) -> Result<(), GpuCfrError> {
-        if terminal_nodes.is_empty() || combo_count == 0 || tile_count == 0 || board_tile_count == 0
-        {
+        if terminal_nodes.is_empty() || combo_count == 0 || board_count == 0 {
             return Ok(());
         }
         for terminal_chunk in terminal_nodes.chunks(terminal_chunk_size.max(1)) {
             let terminal_count = terminal_chunk.len();
             let terminal_nodes_buffer =
                 readonly_buffer(&self.device, "public tree terminal nodes", terminal_chunk);
-            let partial_invocations = terminal_count * combo_count * tile_count * board_tile_count;
+            let partial_invocations = terminal_count * board_count;
             let (partial_x_groups, partial_y_groups, partial_x_invocations) =
                 dispatch_grid(partial_invocations);
             let partial_params = uniform_buffer(
@@ -2701,11 +2751,11 @@ impl GpuDenseCfrBackend {
                 &[GpuPublicTreeParams {
                     combo_count: combo_count as u32,
                     node_count: terminal_count as u32,
-                    max_actions: tile_count as u32,
-                    output_len: tile_size as u32,
-                    pair_start: board_tile_count as u32,
+                    max_actions: board_count as u32,
+                    output_len: (combo_count + 1) as u32,
+                    pair_start: combo_count as u32,
                     chunk_pairs: partial_x_invocations,
-                    _pad0: board_tile_size as u32,
+                    _pad0: 0,
                     _pad1: 0,
                 }],
             );
@@ -2715,14 +2765,12 @@ impl GpuDenseCfrBackend {
                 entries: &[
                     bind_entry(0, node_buffer),
                     bind_entry(1, &terminal_nodes_buffer),
-                    bind_entry(2, board_buffer),
-                    bind_entry(3, combo_buffer),
-                    bind_entry(4, strength_buffer),
-                    bind_entry(5, hero_reaches_buffer),
-                    bind_entry(6, villain_reaches_buffer),
-                    bind_entry(7, hero_terminal_partials_buffer),
-                    bind_entry(8, villain_terminal_partials_buffer),
-                    bind_entry(9, &partial_params),
+                    bind_entry(2, combo_order_buffer),
+                    bind_entry(3, combo_bounds_buffer),
+                    bind_entry(4, hero_reaches_buffer),
+                    bind_entry(5, villain_reaches_buffer),
+                    bind_entry(6, terminal_prefix_pairs_buffer),
+                    bind_entry(7, &partial_params),
                 ],
             });
 
@@ -2735,11 +2783,11 @@ impl GpuDenseCfrBackend {
                 &[GpuPublicTreeParams {
                     combo_count: combo_count as u32,
                     node_count: terminal_count as u32,
-                    max_actions: tile_count as u32,
-                    output_len: 0,
-                    pair_start: board_tile_count as u32,
+                    max_actions: board_count as u32,
+                    output_len: (combo_count + 1) as u32,
+                    pair_start: blocker_neighbor_stride as u32,
                     chunk_pairs: reduce_x_invocations,
-                    _pad0: 0,
+                    _pad0: terminal_denominator_from_board_count(board_count) as u32,
                     _pad1: 0,
                 }],
             );
@@ -2747,12 +2795,16 @@ impl GpuDenseCfrBackend {
                 label: Some("public tree terminal reduce bind group"),
                 layout: &self.public_tree_terminal_reduce_bind_group_layout,
                 entries: &[
-                    bind_entry(0, &terminal_nodes_buffer),
-                    bind_entry(1, hero_terminal_partials_buffer),
-                    bind_entry(2, villain_terminal_partials_buffer),
-                    bind_entry(3, hero_values_buffer),
-                    bind_entry(4, villain_values_buffer),
-                    bind_entry(5, &reduce_params),
+                    bind_entry(0, node_buffer),
+                    bind_entry(1, &terminal_nodes_buffer),
+                    bind_entry(2, combo_bounds_buffer),
+                    bind_entry(3, blocker_neighbors_buffer),
+                    bind_entry(4, hero_reaches_buffer),
+                    bind_entry(5, villain_reaches_buffer),
+                    bind_entry(6, terminal_prefix_pairs_buffer),
+                    bind_entry(7, hero_values_buffer),
+                    bind_entry(8, villain_values_buffer),
+                    bind_entry(9, &reduce_params),
                 ],
             });
             {
@@ -2876,8 +2928,6 @@ impl GpuDenseCfrBackend {
             readonly_buffer(&self.device, "public tree reach edges", &reach_edges);
         let backup_nodes_buffer =
             readonly_buffer(&self.device, "public tree backup nodes", &backup_nodes);
-        let board_buffer =
-            readonly_buffer(&self.device, "public tree showdown boards", showdown_boards);
         let combo_buffer = readonly_buffer(&self.device, "public tree combos", combos);
         let root_weights: Vec<_> = combo_legal
             .iter()
@@ -2941,56 +2991,50 @@ impl GpuDenseCfrBackend {
         }
         let decision_nodes_buffer =
             readonly_buffer(&self.device, "public tree decision nodes", &decision_nodes);
-        let terminal_tile_count = std::env::var("POKEDR_GPU_TERMINAL_TILES")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(1)
-            .max(1)
-            .min(combos.len().max(1));
-        let terminal_tile_size = combos.len().div_ceil(terminal_tile_count);
+        let terminal_tile_count = 1;
+        let _terminal_tile_size = combos.len().max(1);
         let max_showdown_boards = showdown_terminal_nodes
             .iter()
             .map(|node_index| nodes[*node_index as usize]._pad0 as usize)
             .max()
             .unwrap_or(1)
             .max(1);
-        let terminal_board_tile_count = std::env::var("POKEDR_GPU_BOARD_TILES")
+        let terminal_board_tile_count = 1;
+        let _terminal_board_tile_size = max_showdown_boards;
+        let strength_order = showdown_strength_order(combos, showdown_boards);
+        let terminal_combo_order_buffer = readonly_buffer(
+            &self.device,
+            "public tree terminal combo strength order",
+            &strength_order.combo_order,
+        );
+        let terminal_combo_bounds_buffer = readonly_buffer(
+            &self.device,
+            "public tree terminal combo strength bounds",
+            &strength_order.combo_bounds,
+        );
+        let terminal_blocker_neighbors_buffer = readonly_buffer(
+            &self.device,
+            "public tree terminal blocker neighbors",
+            &strength_order.blocker_neighbors,
+        );
+        let default_max_terminal_prefix_pairs = 8_000_000usize;
+        let max_terminal_prefix_pairs = std::env::var("POKEDR_GPU_MAX_TERMINAL_PREFIX_PAIRS")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(1)
-            .max(1)
-            .min(max_showdown_boards);
-        let terminal_board_tile_size = max_showdown_boards.div_ceil(terminal_board_tile_count);
-        let terminal_parallel_factor = terminal_tile_count * terminal_board_tile_count;
-        let default_max_terminal_partial_values = if terminal_parallel_factor > 1 {
-            16_000_000usize
-        } else {
-            32_000_000usize
-        };
-        let max_terminal_partial_values = std::env::var("POKEDR_GPU_MAX_TERMINAL_PARTIAL_VALUES")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(default_max_terminal_partial_values)
-            .max(combos.len() * terminal_parallel_factor);
-        let terminal_chunk_size = (max_terminal_partial_values
-            / (combos.len() * terminal_tile_count * terminal_board_tile_count))
+            .unwrap_or(default_max_terminal_prefix_pairs)
+            .max(showdown_boards.len().max(1) * (combos.len() + 1));
+        let terminal_chunk_size = (max_terminal_prefix_pairs
+            / (showdown_boards.len().max(1) * (combos.len() + 1)))
             .max(1);
-        let terminal_partial_len = terminal_chunk_size
+        let terminal_prefix_pair_len = terminal_chunk_size
             .min(showdown_terminal_nodes.len())
             .max(1)
-            * combos.len()
-            * terminal_tile_count
-            * terminal_board_tile_count;
-        let hero_terminal_partials_buffer = uninit_storage_buffer(
+            * showdown_boards.len().max(1)
+            * (combos.len() + 1);
+        let terminal_prefix_pairs_buffer = uninit_storage_buffer(
             &self.device,
-            "public tree hero terminal partial values",
-            terminal_partial_len,
-            false,
-        );
-        let villain_terminal_partials_buffer = uninit_storage_buffer(
-            &self.device,
-            "public tree villain terminal partial values",
-            terminal_partial_len,
+            "public tree terminal prefix pairs",
+            terminal_prefix_pair_len * 2,
             false,
         );
         const DECISION_AGGREGATE_SLOTS: usize = 53;
@@ -3017,13 +3061,13 @@ impl GpuDenseCfrBackend {
             output_len,
             node_combo_len,
             public_infoset_count,
+            showdown_board_count: showdown_boards.len(),
             node_buffer,
             child_buffer,
             reach_edge_buffer,
             reach_layer_ranges,
             backup_nodes_buffer,
             backup_layer_ranges,
-            board_buffer,
             combo_buffer,
             root_weights_buffer,
             hero_reaches_buffer,
@@ -3035,12 +3079,13 @@ impl GpuDenseCfrBackend {
             showdown_terminal_nodes,
             decision_nodes_buffer,
             terminal_tile_count,
-            terminal_tile_size,
             terminal_board_tile_count,
-            terminal_board_tile_size,
             terminal_chunk_size,
-            hero_terminal_partials_buffer,
-            villain_terminal_partials_buffer,
+            terminal_combo_order_buffer,
+            terminal_combo_bounds_buffer,
+            terminal_blocker_neighbors_buffer,
+            terminal_blocker_neighbor_stride: strength_order.blocker_neighbor_stride,
+            terminal_prefix_pairs_buffer,
             hero_decision_aggregates_buffer,
             villain_decision_aggregates_buffer,
         }
@@ -3049,7 +3094,6 @@ impl GpuDenseCfrBackend {
     fn public_tree_iteration_output_with_context(
         &self,
         ctx: &GpuPublicTreeIterationContext,
-        strength_buffer: &wgpu::Buffer,
         regrets_buffer: &wgpu::Buffer,
     ) -> Result<(wgpu::Buffer, usize, usize), GpuCfrError> {
         if std::env::var_os("POKEDR_SOLVER_PROGRESS_OFF").is_none() {
@@ -3175,20 +3219,17 @@ impl GpuDenseCfrBackend {
             &mut encoder,
             &ctx.node_buffer,
             &ctx.showdown_terminal_nodes,
-            &ctx.board_buffer,
-            &ctx.combo_buffer,
-            strength_buffer,
+            &ctx.terminal_combo_order_buffer,
+            &ctx.terminal_combo_bounds_buffer,
+            &ctx.terminal_blocker_neighbors_buffer,
             &ctx.hero_reaches_buffer,
             &ctx.villain_reaches_buffer,
             &ctx.hero_values_buffer,
             &ctx.villain_values_buffer,
-            &ctx.hero_terminal_partials_buffer,
-            &ctx.villain_terminal_partials_buffer,
+            &ctx.terminal_prefix_pairs_buffer,
             ctx.combos_len,
-            ctx.terminal_tile_count,
-            ctx.terminal_tile_size,
-            ctx.terminal_board_tile_count,
-            ctx.terminal_board_tile_size,
+            ctx.showdown_board_count,
+            ctx.terminal_blocker_neighbor_stride,
             ctx.terminal_chunk_size,
         )?;
         encoder = self.finish_profile_phase(encoder, "cfv_terminal", phase_start)?;
@@ -3355,7 +3396,7 @@ impl GpuDenseCfrBackend {
         combo_legal: &[u32],
         villain_weights: &[f32],
         showdown_boards: &[GpuFinalBoard],
-        strength_buffer: &wgpu::Buffer,
+        _strength_buffer: &wgpu::Buffer,
         regrets_buffer: &wgpu::Buffer,
         infosets: usize,
         actions: usize,
@@ -3383,7 +3424,7 @@ impl GpuDenseCfrBackend {
             readonly_buffer(&self.device, "public tree reach edges", &reach_edges);
         let backup_nodes_buffer =
             readonly_buffer(&self.device, "public tree backup nodes", &backup_nodes);
-        let board_buffer =
+        let _board_buffer =
             readonly_buffer(&self.device, "public tree showdown boards", showdown_boards);
         let combo_buffer = readonly_buffer(&self.device, "public tree combos", combos);
         let root_weights: Vec<_> = combo_legal
@@ -3448,46 +3489,46 @@ impl GpuDenseCfrBackend {
         }
         let decision_nodes_buffer =
             readonly_buffer(&self.device, "public tree decision nodes", &decision_nodes);
-        let terminal_tile_count = std::env::var("POKEDR_GPU_TERMINAL_TILES")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(1)
-            .max(1)
-            .min(combos.len().max(1));
-        let terminal_tile_size = combos.len().div_ceil(terminal_tile_count);
+        let terminal_tile_count = 1;
+        let _terminal_tile_size = combos.len().max(1);
         let max_showdown_boards = showdown_terminal_nodes
             .iter()
             .map(|node_index| nodes[*node_index as usize]._pad0 as usize)
             .max()
             .unwrap_or(1)
             .max(1);
-        let terminal_board_tile_count = std::env::var("POKEDR_GPU_BOARD_TILES")
+        let terminal_board_tile_count = 1;
+        let _terminal_board_tile_size = max_showdown_boards;
+        let strength_order = showdown_strength_order(combos, showdown_boards);
+        let terminal_combo_order_buffer = readonly_buffer(
+            &self.device,
+            "public tree terminal combo strength order",
+            &strength_order.combo_order,
+        );
+        let terminal_combo_bounds_buffer = readonly_buffer(
+            &self.device,
+            "public tree terminal combo strength bounds",
+            &strength_order.combo_bounds,
+        );
+        let terminal_blocker_neighbors_buffer = readonly_buffer(
+            &self.device,
+            "public tree terminal blocker neighbors",
+            &strength_order.blocker_neighbors,
+        );
+        let default_max_terminal_prefix_pairs = 8_000_000usize;
+        let max_terminal_prefix_pairs = std::env::var("POKEDR_GPU_MAX_TERMINAL_PREFIX_PAIRS")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(1)
-            .max(1)
-            .min(max_showdown_boards);
-        let terminal_board_tile_size = max_showdown_boards.div_ceil(terminal_board_tile_count);
-        let terminal_parallel_factor = terminal_tile_count * terminal_board_tile_count;
-        let default_max_terminal_partial_values = if terminal_parallel_factor > 1 {
-            16_000_000usize
-        } else {
-            32_000_000usize
-        };
-        let max_terminal_partial_values = std::env::var("POKEDR_GPU_MAX_TERMINAL_PARTIAL_VALUES")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(default_max_terminal_partial_values)
-            .max(combos.len() * terminal_parallel_factor);
-        let terminal_chunk_size = (max_terminal_partial_values
-            / (combos.len() * terminal_tile_count * terminal_board_tile_count))
+            .unwrap_or(default_max_terminal_prefix_pairs)
+            .max(showdown_boards.len().max(1) * (combos.len() + 1));
+        let terminal_chunk_size = (max_terminal_prefix_pairs
+            / (showdown_boards.len().max(1) * (combos.len() + 1)))
             .max(1);
-        let terminal_partial_len = terminal_chunk_size
+        let terminal_prefix_pair_len = terminal_chunk_size
             .min(showdown_terminal_nodes.len())
             .max(1)
-            * combos.len()
-            * terminal_tile_count
-            * terminal_board_tile_count;
+            * showdown_boards.len().max(1)
+            * (combos.len() + 1);
         if std::env::var_os("POKEDR_SOLVER_PROGRESS_OFF").is_none() {
             eprintln!(
                 "pokedr: gpu public tree cfv nodes={} combos={} node_combo_values={} folds={} showdowns={} terminal_tiles={} board_tiles={} terminal_chunk={}",
@@ -3501,16 +3542,10 @@ impl GpuDenseCfrBackend {
                 terminal_chunk_size
             );
         }
-        let hero_terminal_partials_buffer = uninit_storage_buffer(
+        let terminal_prefix_pairs_buffer = uninit_storage_buffer(
             &self.device,
-            "public tree hero terminal partial values",
-            terminal_partial_len,
-            false,
-        );
-        let villain_terminal_partials_buffer = uninit_storage_buffer(
-            &self.device,
-            "public tree villain terminal partial values",
-            terminal_partial_len,
+            "public tree terminal prefix pairs",
+            terminal_prefix_pair_len * 2,
             false,
         );
         if let Some(start) = setup_start {
@@ -3628,20 +3663,17 @@ impl GpuDenseCfrBackend {
             &mut encoder,
             &node_buffer,
             &showdown_terminal_nodes,
-            &board_buffer,
-            &combo_buffer,
-            &strength_buffer,
+            &terminal_combo_order_buffer,
+            &terminal_combo_bounds_buffer,
+            &terminal_blocker_neighbors_buffer,
             &hero_reaches_buffer,
             &villain_reaches_buffer,
             &hero_values_buffer,
             &villain_values_buffer,
-            &hero_terminal_partials_buffer,
-            &villain_terminal_partials_buffer,
+            &terminal_prefix_pairs_buffer,
             combos.len(),
-            terminal_tile_count,
-            terminal_tile_size,
-            terminal_board_tile_count,
-            terminal_board_tile_size,
+            showdown_boards.len(),
+            strength_order.blocker_neighbor_stride,
             terminal_chunk_size,
         )?;
         encoder = self.finish_profile_phase(encoder, "cfv_terminal", phase_start)?;
@@ -4026,14 +4058,13 @@ impl GpuDenseCfrBackend {
     fn public_tree_update_state_with_context(
         &self,
         context: &GpuPublicTreeIterationContext,
-        strength_buffer: &wgpu::Buffer,
         state: &mut GpuDenseCfrState,
         iteration: usize,
     ) -> Result<(), GpuCfrError> {
         let profile = Self::gpu_profile_enabled();
         let cfv_start = profile.then(Instant::now);
-        let (output_buffer, _output_len, action_len) = self
-            .public_tree_iteration_output_with_context(context, strength_buffer, &state.regrets)?;
+        let (output_buffer, _output_len, action_len) =
+            self.public_tree_iteration_output_with_context(context, &state.regrets)?;
         if let Some(start) = cfv_start {
             self.profile_poll()?;
             eprintln!(
@@ -4110,15 +4141,6 @@ impl GpuDenseCfrBackend {
         iterations: usize,
     ) -> Result<(), GpuCfrError> {
         let profile = Self::gpu_profile_enabled();
-        let strength_start = profile.then(Instant::now);
-        let strength_buffer = self.final_board_strength_buffer(combos, showdown_boards)?;
-        if let Some(start) = strength_start {
-            self.profile_poll()?;
-            eprintln!(
-                "pokedr: gpu profile phase=strength_precompute elapsed_ms={:.3}",
-                start.elapsed().as_secs_f64() * 1000.0
-            );
-        }
         let setup_start = profile.then(Instant::now);
         let context = self.public_tree_iteration_context(
             nodes,
@@ -4143,12 +4165,7 @@ impl GpuDenseCfrBackend {
             .unwrap_or(4)
             .max(1);
         for iteration in 1..=iterations.max(1) {
-            self.public_tree_update_state_with_context(
-                &context,
-                &strength_buffer,
-                state,
-                iteration,
-            )?;
+            self.public_tree_update_state_with_context(&context, state, iteration)?;
             if iteration % flush_interval == 0 {
                 let flush_start = profile.then(Instant::now);
                 self.device
@@ -4633,19 +4650,22 @@ mod tests {
 
         let order = showdown_strength_order(&combos, &boards);
         assert_eq!(order.combo_order.len(), combos.len());
-        assert_eq!(order.combo_group_start.len(), combos.len());
-        assert_eq!(order.combo_group_end.len(), combos.len());
+        assert_eq!(order.combo_bounds.len(), combos.len());
+        assert_eq!(order.blocker_neighbor_stride, 1);
 
         let strengths: Vec<_> = order
             .combo_order
             .iter()
+            .filter(|&&combo_index| combo_index != u32::MAX)
             .map(|combo_index| evaluate_combo_final_board(combos[*combo_index as usize], boards[0]))
             .collect();
         assert!(strengths.windows(2).all(|pair| pair[0] <= pair[1]));
 
         for combo_index in 0..combos.len() {
-            let start = order.combo_group_start[combo_index] as usize;
-            let end = order.combo_group_end[combo_index] as usize;
+            let bounds = order.combo_bounds[combo_index];
+            let start = bounds.group_start as usize;
+            let end = bounds.group_end as usize;
+            assert_eq!(bounds.legal, 1);
             assert!(start < end);
             assert!(end <= order.combo_order.len());
             let strength = evaluate_combo_final_board(combos[combo_index], boards[0]);
