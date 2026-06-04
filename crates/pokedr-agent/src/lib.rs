@@ -2180,16 +2180,18 @@ fn assert_gpu_dense_binding_feasible(
         return;
     }
 
-    let public_infosets = config.infosets / PRIVATE_INFOS_PER_PUBLIC.max(1);
-    panic!(
-        "GPU dense CFR state exceeds current WGPU storage binding limit: public_infosets={} private_infosets={} actions={} infoset_bytes={} action_bytes={} max_binding_bytes={}. The solver needs tiled state binding before this tree can run on this backend.",
-        public_infosets,
-        config.infosets,
-        config.actions,
-        infoset_bytes,
-        action_bytes,
-        max_binding_bytes
-    );
+    if solver_progress_enabled() {
+        let public_infosets = config.infosets / PRIVATE_INFOS_PER_PUBLIC.max(1);
+        eprintln!(
+            "pokedr: gpu dense CFR state requires tiled bindings public_infosets={} private_infosets={} actions={} infoset_bytes={} action_bytes={} max_binding_bytes={}",
+            public_infosets,
+            config.infosets,
+            config.actions,
+            infoset_bytes,
+            action_bytes,
+            max_binding_bytes
+        );
+    }
 }
 
 fn fold_utility(
