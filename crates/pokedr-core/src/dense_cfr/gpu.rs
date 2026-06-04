@@ -5260,7 +5260,15 @@ mod tests {
 
         let brute = brute_force_terminal_cfv(&combos, &boards, &reaches, 17.5, 6.0);
         let board_major = board_major_terminal_cfv(&combos, &public, &boards, &reaches, 17.5, 6.0);
+        let card_aggregate =
+            card_aggregate_terminal_cfv(&combos, &public, &boards, &reaches, 17.5, 6.0);
         assert_close_vec("turn board-major cfv", &brute, &board_major, 1.0e-4);
+        assert_close_vec(
+            "turn card-aggregate cfv",
+            &board_major,
+            &card_aggregate,
+            1.0e-4,
+        );
     }
 
     #[test]
@@ -5280,7 +5288,15 @@ mod tests {
 
         let brute = brute_force_terminal_cfv(&combos, &boards, &reaches, 22.0, 8.5);
         let board_major = board_major_terminal_cfv(&combos, &public, &boards, &reaches, 22.0, 8.5);
+        let card_aggregate =
+            card_aggregate_terminal_cfv(&combos, &public, &boards, &reaches, 22.0, 8.5);
         assert_close_vec("flop board-major cfv", &brute, &board_major, 1.0e-4);
+        assert_close_vec(
+            "flop card-aggregate cfv",
+            &board_major,
+            &card_aggregate,
+            1.0e-4,
+        );
     }
 
     fn full_final_boards(public: &[u32]) -> Vec<GpuFinalBoard> {
@@ -5423,6 +5439,101 @@ mod tests {
                         block_tie += villain_reach;
                     }
                 }
+
+                let win = win_raw - block_win;
+                let tie = tie_raw - block_tie;
+                let total = total_raw - block_total;
+                values[hero_index] += (pot * (win + 0.5 * tie) - invested * total) / denominator;
+            }
+        }
+        values
+    }
+
+    fn card_aggregate_terminal_cfv(
+        combos: &[GpuPrivateCombo],
+        public: &[u32],
+        boards: &[GpuFinalBoard],
+        reaches: &[f32],
+        pot: f32,
+        invested: f32,
+    ) -> Vec<f32> {
+        let denominator = full_runout_pair_denominator(public.len()) as f32;
+        let mut values = vec![0.0; combos.len()];
+        for &board in boards {
+            let mut ordered: Vec<_> = combos
+                .iter()
+                .enumerate()
+                .filter_map(|(combo_index, &combo)| {
+                    (!combo_hits_final_board(combo, board)).then(|| {
+                        (
+                            evaluate_combo_final_board(combo, board),
+                            combo_index,
+                            reaches[combo_index],
+                        )
+                    })
+                })
+                .collect();
+            ordered.sort_unstable_by_key(|(strength, combo_index, _)| (*strength, *combo_index));
+
+            let mut group_starts = Vec::new();
+            let mut group_ends = Vec::new();
+            let mut cursor = 0usize;
+            while cursor < ordered.len() {
+                let strength = ordered[cursor].0;
+                let end = ordered.partition_point(|(candidate, _, _)| *candidate <= strength);
+                group_starts.push(cursor);
+                group_ends.push(end);
+                cursor = end;
+            }
+
+            let group_count = group_starts.len();
+            let mut combo_group = vec![usize::MAX; combos.len()];
+            let mut equal_total = vec![0.0f32; group_count];
+            let mut equal_card = vec![vec![0.0f32; group_count]; Card::COUNT];
+
+            for group in 0..group_count {
+                for &(_, combo_index, reach) in &ordered[group_starts[group]..group_ends[group]] {
+                    combo_group[combo_index] = group;
+                    equal_total[group] += reach;
+                    let combo = combos[combo_index];
+                    equal_card[combo.cards[0] as usize][group] += reach;
+                    equal_card[combo.cards[1] as usize][group] += reach;
+                }
+            }
+
+            let mut prefix_total = vec![0.0f32; group_count + 1];
+            for group in 0..group_count {
+                prefix_total[group + 1] = prefix_total[group] + equal_total[group];
+            }
+
+            let mut prefix_card = vec![vec![0.0f32; group_count + 1]; Card::COUNT];
+            for card in 0..Card::COUNT {
+                for group in 0..group_count {
+                    prefix_card[card][group + 1] =
+                        prefix_card[card][group] + equal_card[card][group];
+                }
+            }
+
+            for (hero_index, &hero) in combos.iter().enumerate() {
+                if combo_hits_final_board(hero, board) {
+                    continue;
+                }
+                let group = combo_group[hero_index];
+                assert_ne!(group, usize::MAX);
+                let hero_reach = reaches[hero_index];
+                let first_card = hero.cards[0] as usize;
+                let second_card = hero.cards[1] as usize;
+
+                let win_raw = prefix_total[group];
+                let tie_raw = equal_total[group];
+                let total_raw = prefix_total[group_count];
+
+                let block_total = prefix_card[first_card][group_count]
+                    + prefix_card[second_card][group_count]
+                    - hero_reach;
+                let block_win = prefix_card[first_card][group] + prefix_card[second_card][group];
+                let block_tie =
+                    equal_card[first_card][group] + equal_card[second_card][group] - hero_reach;
 
                 let win = win_raw - block_win;
                 let tie = tie_raw - block_tie;
