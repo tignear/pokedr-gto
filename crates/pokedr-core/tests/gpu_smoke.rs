@@ -28,6 +28,7 @@ fn main() {
     run_showdown_matrix(&backend);
     run_public_tree_terminal_values(&backend);
     run_public_tree_chance_blocks_fold_values(&backend);
+    run_public_tree_showdown_values_match_bruteforce(&backend);
     println!("GPU smoke passed");
 }
 
@@ -541,7 +542,7 @@ fn run_public_tree_chance_blocks_fold_values(backend: &GpuDenseCfrBackend) {
         52,
         52,
         Card::new(Rank::Ace, Suit::Spades).index() as u32,
-        Card::new(Rank::Two, Suit::Clubs).index() as u32,
+        Card::new(Rank::Queen, Suit::Hearts).index() as u32,
     ];
     let state = DenseCfrState::new_with_legal_actions(
         DenseCfrConfig {
@@ -558,7 +559,7 @@ fn run_public_tree_chance_blocks_fold_values(backend: &GpuDenseCfrBackend) {
             &child_cards,
             &combos,
             &vec![1; combos.len()],
-            &vec![1.0; combos.len()],
+            &vec![1.0, 0.0, 1.0],
             &[],
             &state,
         )
@@ -566,10 +567,182 @@ fn run_public_tree_chance_blocks_fold_values(backend: &GpuDenseCfrBackend) {
 
     let blocked_combo_offset = 0;
     let blocked_chance_action = values.action_values[blocked_combo_offset + 1];
-    if (blocked_chance_action - 6.0).abs() >= 1e-5 {
+    if blocked_chance_action.abs() >= 1e-5 {
         fail(&format!(
-            "chance-blocked fold value leaked invalid branch: expected 6, actual {blocked_chance_action}"
+            "chance-blocked fold value leaked invalid hero/villain branch: expected 0, actual {blocked_chance_action}"
         ));
+    }
+}
+
+fn run_public_tree_showdown_values_match_bruteforce(backend: &GpuDenseCfrBackend) {
+    let combos = vec![
+        gpu_combo([
+            Card::new(Rank::Ace, Suit::Spades),
+            Card::new(Rank::King, Suit::Spades),
+        ]),
+        gpu_combo([
+            Card::new(Rank::Ace, Suit::Clubs),
+            Card::new(Rank::Ace, Suit::Diamonds),
+        ]),
+        gpu_combo([
+            Card::new(Rank::Queen, Suit::Hearts),
+            Card::new(Rank::Jack, Suit::Hearts),
+        ]),
+    ];
+    let nodes = vec![
+        GpuPublicTreeNode {
+            kind: 0,
+            acting_player: 0,
+            public_infoset: 0,
+            first_child: 0,
+            child_count: 2,
+            terminal_kind: 0,
+            showdown_offset: 0,
+            _pad0: 0,
+            pot: 10.0,
+            hero_invested: 4.0,
+            _pad1: 1.0,
+            _pad2: 0.0,
+        },
+        GpuPublicTreeNode {
+            kind: 2,
+            acting_player: 0,
+            public_infoset: 0,
+            first_child: 0,
+            child_count: 0,
+            terminal_kind: 0,
+            showdown_offset: 0,
+            _pad0: 0,
+            pot: 10.0,
+            hero_invested: 4.0,
+            _pad1: 1.0,
+            _pad2: 0.0,
+        },
+        GpuPublicTreeNode {
+            kind: 2,
+            acting_player: 0,
+            public_infoset: 0,
+            first_child: 0,
+            child_count: 0,
+            terminal_kind: 2,
+            showdown_offset: 0,
+            _pad0: 1,
+            pot: 10.0,
+            hero_invested: 4.0,
+            _pad1: 1.0,
+            _pad2: 1.0,
+        },
+    ];
+    let children = vec![1, 2];
+    let board = GpuFinalBoard {
+        cards: [
+            Card::new(Rank::Two, Suit::Clubs).index() as u32,
+            Card::new(Rank::Three, Suit::Diamonds).index() as u32,
+            Card::new(Rank::Four, Suit::Hearts).index() as u32,
+            Card::new(Rank::Five, Suit::Spades).index() as u32,
+            Card::new(Rank::Six, Suit::Clubs).index() as u32,
+        ],
+    };
+    let villain_weights = vec![0.2, 0.7, 1.3];
+    let state = DenseCfrState::new_with_legal_actions(
+        DenseCfrConfig {
+            infosets: combos.len() * 2,
+            actions: 2,
+            variant: CfrVariant::CfrPlus,
+        },
+        vec![true; combos.len() * 2 * 2],
+    );
+    let values = backend
+        .public_tree_iteration_values(
+            &nodes,
+            &children,
+            &[52, 52],
+            &combos,
+            &vec![1; combos.len()],
+            &villain_weights,
+            &[board],
+            &state,
+        )
+        .unwrap_or_else(|error| fail(&format!("GPU public tree showdown failed: {error:?}")));
+
+    for hero in 0..combos.len() {
+        let expected = expected_showdown_action_value(&combos, &villain_weights, board, hero);
+        let actual = values.action_values[hero * 2 + 1];
+        if (expected - actual).abs() >= 1e-5 {
+            fail(&format!(
+                "public tree showdown action combo {hero} mismatch: expected {expected}, actual {actual}"
+            ));
+        }
+    }
+}
+
+fn expected_showdown_action_value(
+    combos: &[GpuPrivateCombo],
+    villain_weights: &[f32],
+    board: GpuFinalBoard,
+    hero: usize,
+) -> f32 {
+    let mut value = 0.0;
+    let mut weight = 0.0;
+    for (villain, villain_combo) in combos.iter().copied().enumerate() {
+        if private_combos_collide(combos[hero], villain_combo) {
+            continue;
+        }
+        let villain_weight = villain_weights[villain];
+        value +=
+            villain_weight * (10.0 * showdown_equity(combos[hero], villain_combo, board) - 4.0);
+        weight += villain_weight;
+    }
+    value / weight
+}
+
+fn private_combos_collide(left: GpuPrivateCombo, right: GpuPrivateCombo) -> bool {
+    left.cards[0] == right.cards[0]
+        || left.cards[0] == right.cards[1]
+        || left.cards[1] == right.cards[0]
+        || left.cards[1] == right.cards[1]
+}
+
+fn showdown_equity(hero: GpuPrivateCombo, villain: GpuPrivateCombo, board: GpuFinalBoard) -> f32 {
+    let hero_cards = [
+        Card::from_index(hero.cards[0] as u8),
+        Card::from_index(hero.cards[1] as u8),
+    ];
+    let villain_cards = [
+        Card::from_index(villain.cards[0] as u8),
+        Card::from_index(villain.cards[1] as u8),
+    ];
+    let board_cards = [
+        Card::from_index(board.cards[0] as u8),
+        Card::from_index(board.cards[1] as u8),
+        Card::from_index(board.cards[2] as u8),
+        Card::from_index(board.cards[3] as u8),
+        Card::from_index(board.cards[4] as u8),
+    ];
+    let hero_strength = evaluate(&[
+        hero_cards[0],
+        hero_cards[1],
+        board_cards[0],
+        board_cards[1],
+        board_cards[2],
+        board_cards[3],
+        board_cards[4],
+    ]);
+    let villain_strength = evaluate(&[
+        villain_cards[0],
+        villain_cards[1],
+        board_cards[0],
+        board_cards[1],
+        board_cards[2],
+        board_cards[3],
+        board_cards[4],
+    ]);
+    if hero_strength > villain_strength {
+        1.0
+    } else if hero_strength == villain_strength {
+        0.5
+    } else {
+        0.0
     }
 }
 
