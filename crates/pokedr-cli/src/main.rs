@@ -7,6 +7,7 @@ use pokedr_core::{
     postflop::{ActionSetConfig, Player, PublicState, Street, SubgameTree, SubgameTreeConfig},
     postflop_dense::PostflopDenseLayout,
 };
+use serde::Deserialize;
 
 fn main() {
     let mut args = std::env::args();
@@ -15,18 +16,57 @@ fn main() {
         Some("gpu-info") => print_gpu_info(),
         Some("gpu-smoke") => run_gpu_smoke(),
         Some("postflop-smoke") => run_postflop_smoke(),
-        Some("solve-flop") => run_solve_flop(args.next().as_deref()),
-        Some("solve-flop-metrics") => run_solve_flop_metrics(args.next().as_deref()),
-        Some("dump-flop-tree") => run_dump_flop_tree(args.next().as_deref()),
+        Some("solve-flop") => run_solve_flop(parse_flop_command_args(args)),
+        Some("solve-flop-metrics") => run_solve_flop_metrics(parse_flop_command_args(args)),
+        Some("dump-flop-tree") => run_dump_flop_tree(parse_flop_command_args(args)),
         Some("rs-poker-smoke") => run_rs_poker_smoke(),
         Some("rs-poker-trace") => run_rs_poker_trace(),
         _ => {
             eprintln!(
-                "usage: {program} <gpu-info|gpu-smoke|postflop-smoke|solve-flop|solve-flop-metrics|dump-flop-tree|rs-poker-smoke|rs-poker-trace>"
+                "usage: {program} <gpu-info|gpu-smoke|postflop-smoke|solve-flop|solve-flop-metrics|dump-flop-tree|rs-poker-smoke|rs-poker-trace> [flop] [--config path.yml]"
             );
             std::process::exit(2);
         }
     }
+}
+
+#[derive(Debug, Clone, Default)]
+struct FlopCommandArgs {
+    flop: Option<String>,
+    config_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+struct CliConfigFile {
+    cfr_iterations: Option<usize>,
+    cfr_variant: Option<String>,
+    max_depth: Option<usize>,
+    max_showdown_runouts: Option<usize>,
+    metric_iterations: Option<Vec<usize>>,
+    action_set: Option<CliActionSetConfig>,
+    dcfr_alpha: Option<f32>,
+    dcfr_gamma: Option<f32>,
+    dcfr_schedule_alpha_start: Option<f32>,
+    dcfr_schedule_alpha_end: Option<f32>,
+    dcfr_schedule_gamma_start: Option<f32>,
+    dcfr_schedule_gamma_end: Option<f32>,
+    dcfr_schedule_horizon: Option<usize>,
+    pdcfr_alpha: Option<f32>,
+    pdcfr_gamma: Option<f32>,
+    pdcfr_eta: Option<f32>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+struct CliActionSetConfig {
+    max_aggressive_actions: Option<usize>,
+    merge_log_ratio: Option<f32>,
+    all_in_threshold: Option<f32>,
+    flop_bet_fractions: Option<Vec<f32>>,
+    turn_bet_fractions: Option<Vec<f32>>,
+    river_bet_fractions: Option<Vec<f32>>,
+    raise_fractions: Option<Vec<f32>>,
 }
 
 fn print_gpu_info() {
@@ -192,16 +232,24 @@ fn run_postflop_smoke() {
 }
 
 fn run_rs_poker_smoke() {
-    let summary = pokedr_agent::run_heads_up_match_with_config(smoke_hands(), 7, match_config());
+    let cli_config = load_cli_config(None);
+    let summary = pokedr_agent::run_heads_up_match_with_config(
+        smoke_hands(),
+        7,
+        match_config(cli_config.as_ref()),
+    );
     println!("hands: {}", summary.hands);
     println!("hero_net: {:.2}", summary.hero_net);
     println!("villain_net: {:.2}", summary.villain_net);
 }
 
 fn run_rs_poker_trace() {
-    for trace in
-        pokedr_agent::run_traced_heads_up_match_with_config(smoke_hands(), 7, match_config())
-    {
+    let cli_config = load_cli_config(None);
+    for trace in pokedr_agent::run_traced_heads_up_match_with_config(
+        smoke_hands(),
+        7,
+        match_config(cli_config.as_ref()),
+    ) {
         println!(
             "hand {} hero [{}] villain [{}] board [{}] hero_net {:.2} villain_net {:.2}",
             trace.hand_index,
@@ -220,12 +268,13 @@ fn run_rs_poker_trace() {
     }
 }
 
-fn run_solve_flop(flop_arg: Option<&str>) {
-    let flop = parse_flop(flop_arg.unwrap_or("As7h2c")).unwrap_or_else(|error| {
+fn run_solve_flop(args: FlopCommandArgs) {
+    let cli_config = load_cli_config(args.config_path.as_deref());
+    let flop = parse_flop(args.flop.as_deref().unwrap_or("As7h2c")).unwrap_or_else(|error| {
         eprintln!("{error}");
         std::process::exit(2);
     });
-    let config = fixed_flop_config();
+    let config = fixed_flop_config(cli_config.as_ref());
     println!(
         "solving fixed flop iterations={} variant={:?} depth={} equity_runout_cap={} terminal_runouts=full",
         config.cfr_iterations, config.cfr_variant, config.max_depth, config.max_showdown_runouts
@@ -242,13 +291,14 @@ fn run_solve_flop(flop_arg: Option<&str>) {
     println!("elapsed: {:.2}s", summary.elapsed_secs);
 }
 
-fn run_solve_flop_metrics(flop_arg: Option<&str>) {
-    let flop = parse_flop(flop_arg.unwrap_or("As7h2c")).unwrap_or_else(|error| {
+fn run_solve_flop_metrics(args: FlopCommandArgs) {
+    let cli_config = load_cli_config(args.config_path.as_deref());
+    let flop = parse_flop(args.flop.as_deref().unwrap_or("As7h2c")).unwrap_or_else(|error| {
         eprintln!("{error}");
         std::process::exit(2);
     });
-    let config = match_config();
-    let iterations = metric_iterations();
+    let config = match_config(cli_config.as_ref());
+    let iterations = metric_iterations(cli_config.as_ref());
     println!(
         "solving fixed flop metrics variant={:?} depth={} equity_runout_cap={} terminal_runouts=full iterations={:?}",
         config.cfr_variant, config.max_depth, config.max_showdown_runouts, iterations
@@ -343,12 +393,13 @@ fn format_gap_detail(detail: &pokedr_agent::LocalGapDetail) -> String {
     )
 }
 
-fn run_dump_flop_tree(flop_arg: Option<&str>) {
-    let flop = parse_flop(flop_arg.unwrap_or("As7h2c")).unwrap_or_else(|error| {
+fn run_dump_flop_tree(args: FlopCommandArgs) {
+    let cli_config = load_cli_config(args.config_path.as_deref());
+    let flop = parse_flop(args.flop.as_deref().unwrap_or("As7h2c")).unwrap_or_else(|error| {
         eprintln!("{error}");
         std::process::exit(2);
     });
-    let config = match_config();
+    let config = match_config(cli_config.as_ref());
     for line in pokedr_agent::dump_fixed_flop_tree(flop, config) {
         println!("{line}");
     }
@@ -361,7 +412,45 @@ fn smoke_hands() -> usize {
         .unwrap_or(16)
 }
 
-fn metric_iterations() -> Vec<usize> {
+fn parse_flop_command_args(args: impl Iterator<Item = String>) -> FlopCommandArgs {
+    let mut parsed = FlopCommandArgs::default();
+    let mut args = args.peekable();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--config" | "-c" => {
+                let Some(path) = args.next() else {
+                    eprintln!("{arg} requires a YAML path");
+                    std::process::exit(2);
+                };
+                parsed.config_path = Some(path);
+            }
+            _ if arg.starts_with("--config=") => {
+                parsed.config_path = Some(arg["--config=".len()..].to_string());
+            }
+            _ if parsed.flop.is_none() => parsed.flop = Some(arg),
+            _ => {
+                eprintln!("unexpected argument: {arg}");
+                std::process::exit(2);
+            }
+        }
+    }
+    parsed
+}
+
+fn load_cli_config(path: Option<&str>) -> Option<CliConfigFile> {
+    let env_path = std::env::var("POKEDR_CONFIG").ok();
+    let path = path.map(str::to_string).or(env_path)?;
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|error| {
+        eprintln!("failed to read config {path}: {error}");
+        std::process::exit(2);
+    });
+    Some(serde_yaml::from_str(&text).unwrap_or_else(|error| {
+        eprintln!("failed to parse config {path}: {error}");
+        std::process::exit(2);
+    }))
+}
+
+fn metric_iterations(config: Option<&CliConfigFile>) -> Vec<usize> {
     std::env::var("POKEDR_METRIC_ITERATIONS")
         .ok()
         .map(|value| {
@@ -372,17 +461,37 @@ fn metric_iterations() -> Vec<usize> {
                 .collect::<Vec<_>>()
         })
         .filter(|values| !values.is_empty())
+        .or_else(|| {
+            config
+                .and_then(|config| config.metric_iterations.clone())
+                .map(|values| {
+                    values
+                        .into_iter()
+                        .filter(|value| *value > 0)
+                        .collect::<Vec<_>>()
+                })
+                .filter(|values| !values.is_empty())
+        })
         .unwrap_or_else(|| vec![1, 2, 4, 8, 16, 32])
 }
 
-fn fixed_flop_config() -> pokedr_agent::PokedrAgentConfig {
-    let mut config = match_config();
-    config.cfr_iterations = env_usize("POKEDR_CFR_ITERATIONS").unwrap_or(1);
+fn fixed_flop_config(cli_config: Option<&CliConfigFile>) -> pokedr_agent::PokedrAgentConfig {
+    let mut config = match_config(cli_config);
+    if env_usize("POKEDR_CFR_ITERATIONS").is_none()
+        && cli_config
+            .and_then(|config| config.cfr_iterations)
+            .is_none()
+    {
+        config.cfr_iterations = 1;
+    }
     config
 }
 
-fn match_config() -> pokedr_agent::PokedrAgentConfig {
+fn match_config(cli_config: Option<&CliConfigFile>) -> pokedr_agent::PokedrAgentConfig {
     let mut config = pokedr_agent::PokedrAgentConfig::default();
+    if let Some(file) = cli_config {
+        apply_cli_config(&mut config, file);
+    }
     config.cfr_iterations = env_usize("POKEDR_CFR_ITERATIONS").unwrap_or(config.cfr_iterations);
     config.cfr_variant = env_cfr_variant("POKEDR_CFR_VARIANT").unwrap_or(config.cfr_variant);
     config.max_depth = env_usize("POKEDR_MAX_DEPTH").unwrap_or(config.max_depth);
@@ -391,18 +500,81 @@ fn match_config() -> pokedr_agent::PokedrAgentConfig {
     config
 }
 
+fn apply_cli_config(config: &mut pokedr_agent::PokedrAgentConfig, file: &CliConfigFile) {
+    if let Some(value) = file.cfr_iterations {
+        config.cfr_iterations = value;
+    }
+    if let Some(value) = file
+        .cfr_variant
+        .as_deref()
+        .map(|value| parse_cfr_variant(value, file))
+    {
+        config.cfr_variant = value;
+    }
+    if let Some(value) = file.max_depth {
+        config.max_depth = value;
+    }
+    if let Some(value) = file.max_showdown_runouts {
+        config.max_showdown_runouts = value;
+    }
+    if let Some(action_set) = &file.action_set {
+        apply_action_set_config(&mut config.action_set, action_set);
+    }
+}
+
+fn apply_action_set_config(config: &mut ActionSetConfig, file: &CliActionSetConfig) {
+    if let Some(value) = file.max_aggressive_actions {
+        config.max_aggressive_actions = value;
+    }
+    if let Some(value) = file.merge_log_ratio {
+        config.merge_log_ratio = value;
+    }
+    if let Some(value) = file.all_in_threshold {
+        config.all_in_threshold = value;
+    }
+    if let Some(value) = &file.flop_bet_fractions {
+        config.flop_bet_fractions = clean_fractions("action_set.flop_bet_fractions", value);
+    }
+    if let Some(value) = &file.turn_bet_fractions {
+        config.turn_bet_fractions = clean_fractions("action_set.turn_bet_fractions", value);
+    }
+    if let Some(value) = &file.river_bet_fractions {
+        config.river_bet_fractions = clean_fractions("action_set.river_bet_fractions", value);
+    }
+    if let Some(value) = &file.raise_fractions {
+        config.raise_fractions = clean_fractions("action_set.raise_fractions", value);
+    }
+}
+
+fn clean_fractions(name: &str, values: &[f32]) -> Vec<f32> {
+    let cleaned = values
+        .iter()
+        .copied()
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .collect::<Vec<_>>();
+    if cleaned.is_empty() {
+        eprintln!("{name} must contain at least one positive finite value");
+        std::process::exit(2);
+    }
+    cleaned
+}
+
 fn env_cfr_variant(name: &str) -> Option<CfrVariant> {
     let value = std::env::var(name).ok()?;
-    match value.trim().to_ascii_lowercase().replace('_', "-").as_str() {
-        "cfr" | "cfr-plus" | "cfrplus" | "plus" => Some(CfrVariant::CfrPlus),
-        "discounted" | "dcfr" => Some(CfrVariant::Discounted),
-        "dcfr-plus" | "dcfrplus" | "dcfr+" => Some(CfrVariant::DcfrPlus {
+    Some(parse_env_cfr_variant(name, &value))
+}
+
+fn parse_env_cfr_variant(name: &str, value: &str) -> CfrVariant {
+    match normalize_variant(value).as_str() {
+        "cfr" | "cfr-plus" | "cfrplus" | "plus" => CfrVariant::CfrPlus,
+        "discounted" | "dcfr" => CfrVariant::Discounted,
+        "dcfr-plus" | "dcfrplus" | "dcfr+" => CfrVariant::DcfrPlus {
             alpha: env_f32("POKEDR_DCFR_ALPHA")
                 .unwrap_or(pokedr_core::dense_cfr::DEFAULT_DCFR_PLUS_ALPHA),
             gamma: env_f32("POKEDR_DCFR_GAMMA")
                 .unwrap_or(pokedr_core::dense_cfr::DEFAULT_DCFR_PLUS_GAMMA),
-        }),
-        "dcfr-schedule" | "dcfrschedule" | "hs-dcfr" | "hsdcfr" => Some(CfrVariant::DcfrSchedule {
+        },
+        "dcfr-schedule" | "dcfrschedule" | "hs-dcfr" | "hsdcfr" => CfrVariant::DcfrSchedule {
             alpha_start: env_f32("POKEDR_DCFR_SCHEDULE_ALPHA_START")
                 .unwrap_or(pokedr_core::dense_cfr::DEFAULT_DCFR_SCHEDULE_ALPHA_START),
             alpha_end: env_f32("POKEDR_DCFR_SCHEDULE_ALPHA_END")
@@ -413,15 +585,15 @@ fn env_cfr_variant(name: &str) -> Option<CfrVariant> {
                 .unwrap_or(pokedr_core::dense_cfr::DEFAULT_DCFR_SCHEDULE_GAMMA_END),
             horizon: env_usize("POKEDR_DCFR_SCHEDULE_HORIZON")
                 .unwrap_or(pokedr_core::dense_cfr::DEFAULT_DCFR_SCHEDULE_HORIZON),
-        }),
-        "pdcfr-plus" | "pdcfrplus" | "pdcfr+" | "pdcfr" => Some(CfrVariant::PdcfrPlus {
+        },
+        "pdcfr-plus" | "pdcfrplus" | "pdcfr+" | "pdcfr" => CfrVariant::PdcfrPlus {
             alpha: env_f32("POKEDR_PDCFR_ALPHA")
                 .unwrap_or(pokedr_core::dense_cfr::DEFAULT_PDCFR_PLUS_ALPHA),
             gamma: env_f32("POKEDR_PDCFR_GAMMA")
                 .unwrap_or(pokedr_core::dense_cfr::DEFAULT_PDCFR_PLUS_GAMMA),
             eta: env_f32("POKEDR_PDCFR_ETA")
                 .unwrap_or(pokedr_core::dense_cfr::DEFAULT_PDCFR_PLUS_ETA),
-        }),
+        },
         other => {
             eprintln!(
                 "unknown {name}={other}; expected cfr-plus, discounted, dcfr-plus, dcfr-schedule, or pdcfr-plus"
@@ -429,6 +601,59 @@ fn env_cfr_variant(name: &str) -> Option<CfrVariant> {
             std::process::exit(2);
         }
     }
+}
+
+fn parse_cfr_variant(value: &str, config: &CliConfigFile) -> CfrVariant {
+    match normalize_variant(value).as_str() {
+        "cfr" | "cfr-plus" | "cfrplus" | "plus" => CfrVariant::CfrPlus,
+        "discounted" | "dcfr" => CfrVariant::Discounted,
+        "dcfr-plus" | "dcfrplus" | "dcfr+" => CfrVariant::DcfrPlus {
+            alpha: config
+                .dcfr_alpha
+                .unwrap_or(pokedr_core::dense_cfr::DEFAULT_DCFR_PLUS_ALPHA),
+            gamma: config
+                .dcfr_gamma
+                .unwrap_or(pokedr_core::dense_cfr::DEFAULT_DCFR_PLUS_GAMMA),
+        },
+        "dcfr-schedule" | "dcfrschedule" | "hs-dcfr" | "hsdcfr" => CfrVariant::DcfrSchedule {
+            alpha_start: config
+                .dcfr_schedule_alpha_start
+                .unwrap_or(pokedr_core::dense_cfr::DEFAULT_DCFR_SCHEDULE_ALPHA_START),
+            alpha_end: config
+                .dcfr_schedule_alpha_end
+                .unwrap_or(pokedr_core::dense_cfr::DEFAULT_DCFR_SCHEDULE_ALPHA_END),
+            gamma_start: config
+                .dcfr_schedule_gamma_start
+                .unwrap_or(pokedr_core::dense_cfr::DEFAULT_DCFR_SCHEDULE_GAMMA_START),
+            gamma_end: config
+                .dcfr_schedule_gamma_end
+                .unwrap_or(pokedr_core::dense_cfr::DEFAULT_DCFR_SCHEDULE_GAMMA_END),
+            horizon: config
+                .dcfr_schedule_horizon
+                .unwrap_or(pokedr_core::dense_cfr::DEFAULT_DCFR_SCHEDULE_HORIZON),
+        },
+        "pdcfr-plus" | "pdcfrplus" | "pdcfr+" | "pdcfr" => CfrVariant::PdcfrPlus {
+            alpha: config
+                .pdcfr_alpha
+                .unwrap_or(pokedr_core::dense_cfr::DEFAULT_PDCFR_PLUS_ALPHA),
+            gamma: config
+                .pdcfr_gamma
+                .unwrap_or(pokedr_core::dense_cfr::DEFAULT_PDCFR_PLUS_GAMMA),
+            eta: config
+                .pdcfr_eta
+                .unwrap_or(pokedr_core::dense_cfr::DEFAULT_PDCFR_PLUS_ETA),
+        },
+        other => {
+            eprintln!(
+                "unknown cfr_variant={other}; expected cfr-plus, discounted, dcfr-plus, dcfr-schedule, or pdcfr-plus"
+            );
+            std::process::exit(2);
+        }
+    }
+}
+
+fn normalize_variant(value: &str) -> String {
+    value.trim().to_ascii_lowercase().replace('_', "-")
 }
 
 fn env_usize(name: &str) -> Option<usize> {

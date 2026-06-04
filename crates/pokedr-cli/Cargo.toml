@@ -8,3 +8,5 @@ repository.workspace = true
 [dependencies]
 pokedr-agent = { path = "../pokedr-agent" }
 pokedr-core = { path = "../pokedr-core" }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_yaml = "0.9.34"
