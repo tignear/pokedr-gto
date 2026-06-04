@@ -760,11 +760,11 @@ fn br_gap_metrics_from_values(
                     .sum::<f32>();
                 let gap = (best - policy_value).max(0.0);
                 let reach_weight = values.reach_weights.get(infoset).copied().unwrap_or(0.0);
-                if public_infoset == 0 && player == Player::Hero {
-                    root_gap_sum += gap;
-                    root_weight_sum += 1.0;
-                }
                 if reach_weight > 0.0 {
+                    if public_infoset == 0 && player == Player::Hero {
+                        root_gap_sum += gap * reach_weight;
+                        root_weight_sum += reach_weight;
+                    }
                     local_gap_sum += gap * reach_weight;
                     local_weight_sum += reach_weight;
                 }
@@ -824,11 +824,11 @@ fn recursive_br_gap_metrics_from_values(
                     .sum::<f32>();
                 let gap = (best - policy_value).max(0.0);
                 let reach_weight = values.reach_weights.get(infoset).copied().unwrap_or(0.0);
-                if public_infoset == 0 && player == Player::Hero {
-                    root_gap_sum += gap;
-                    root_weight_sum += 1.0;
-                }
                 if reach_weight > 0.0 {
+                    if public_infoset == 0 && player == Player::Hero {
+                        root_gap_sum += gap * reach_weight;
+                        root_weight_sum += reach_weight;
+                    }
                     local_gap_sum += gap * reach_weight;
                     local_weight_sum += reach_weight;
                 }
