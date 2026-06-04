@@ -55,11 +55,11 @@ impl Default for PokedrAgentConfig {
             cfr_iterations: 8,
             cfr_variant: CfrVariant::CfrPlus,
             action_set: ActionSetConfig {
-                max_aggressive_actions: 2,
-                flop_bet_fractions: vec![0.5],
-                turn_bet_fractions: vec![0.5],
-                river_bet_fractions: vec![0.5],
-                raise_fractions: vec![1.0],
+                max_aggressive_actions: 4,
+                flop_bet_fractions: vec![0.5, 1.0, 1.5],
+                turn_bet_fractions: vec![0.5, 1.0, 1.5],
+                river_bet_fractions: vec![0.5, 1.0, 1.5],
+                raise_fractions: vec![0.5, 1.0],
                 ..ActionSetConfig::default()
             },
             max_raises_per_street: 1,
