@@ -29,6 +29,7 @@ fn main() {
     run_public_tree_terminal_values(&backend);
     run_public_tree_chance_blocks_fold_values(&backend);
     run_public_tree_showdown_values_match_bruteforce(&backend);
+    run_public_tree_multistreet_values_match_cpu_exact(&backend);
     println!("GPU smoke passed");
 }
 
@@ -674,6 +675,471 @@ fn run_public_tree_showdown_values_match_bruteforce(backend: &GpuDenseCfrBackend
             ));
         }
     }
+}
+
+fn run_public_tree_multistreet_values_match_cpu_exact(backend: &GpuDenseCfrBackend) {
+    let combos = vec![
+        gpu_combo([
+            Card::new(Rank::Ace, Suit::Spades),
+            Card::new(Rank::King, Suit::Spades),
+        ]),
+        gpu_combo([
+            Card::new(Rank::Ace, Suit::Clubs),
+            Card::new(Rank::Ace, Suit::Diamonds),
+        ]),
+        gpu_combo([
+            Card::new(Rank::Queen, Suit::Hearts),
+            Card::new(Rank::Jack, Suit::Hearts),
+        ]),
+    ];
+    let chance_cards = vec![
+        Card::new(Rank::Ace, Suit::Spades),
+        Card::new(Rank::King, Suit::Spades),
+        Card::new(Rank::Ace, Suit::Clubs),
+        Card::new(Rank::Ace, Suit::Diamonds),
+        Card::new(Rank::Queen, Suit::Hearts),
+        Card::new(Rank::Jack, Suit::Hearts),
+        Card::new(Rank::Two, Suit::Clubs),
+        Card::new(Rank::Three, Suit::Diamonds),
+    ];
+    let chance_scale = 1.0 / (chance_cards.len() - 4) as f32;
+    let mut nodes = vec![
+        GpuPublicTreeNode {
+            kind: 0,
+            acting_player: 0,
+            public_infoset: 0,
+            first_child: 0,
+            child_count: 2,
+            terminal_kind: 0,
+            showdown_offset: 0,
+            _pad0: 0,
+            pot: 12.0,
+            hero_invested: 5.0,
+            _pad1: 1.0,
+            _pad2: 0.0,
+        },
+        GpuPublicTreeNode {
+            kind: 2,
+            acting_player: 0,
+            public_infoset: 0,
+            first_child: 0,
+            child_count: 0,
+            terminal_kind: 0,
+            showdown_offset: 0,
+            _pad0: 0,
+            pot: 12.0,
+            hero_invested: 5.0,
+            _pad1: 1.0,
+            _pad2: 0.0,
+        },
+        GpuPublicTreeNode {
+            kind: 1,
+            acting_player: 0,
+            public_infoset: 0,
+            first_child: 2,
+            child_count: chance_cards.len() as u32,
+            terminal_kind: 0,
+            showdown_offset: 0,
+            _pad0: 0,
+            pot: 0.0,
+            hero_invested: 0.0,
+            _pad1: 1.0,
+            _pad2: 0.0,
+        },
+    ];
+    let mut children = vec![1, 2];
+    let mut child_cards = vec![52, 52];
+    let chance_first_child = children.len();
+    children.resize(chance_first_child + chance_cards.len(), u32::MAX);
+    child_cards.resize(chance_first_child + chance_cards.len(), 52);
+    let mut boards = Vec::with_capacity(chance_cards.len());
+    for (chance_index, chance_card) in chance_cards.iter().copied().enumerate() {
+        let public_infoset = 1 + chance_index as u32;
+        let decision_index = nodes.len() as u32;
+        children[chance_first_child + chance_index] = decision_index;
+        child_cards[chance_first_child + chance_index] = chance_card.index() as u32;
+
+        let first_child = children.len() as u32;
+        let fold_index = decision_index + 1;
+        let showdown_index = decision_index + 2;
+        children.extend([fold_index, showdown_index]);
+        child_cards.extend([52, 52]);
+        nodes.push(GpuPublicTreeNode {
+            kind: 0,
+            acting_player: 1,
+            public_infoset,
+            first_child,
+            child_count: 2,
+            terminal_kind: 0,
+            showdown_offset: 0,
+            _pad0: 0,
+            pot: 16.0,
+            hero_invested: 6.0,
+            _pad1: chance_scale,
+            _pad2: 0.0,
+        });
+        nodes.push(GpuPublicTreeNode {
+            kind: 2,
+            acting_player: 0,
+            public_infoset: 0,
+            first_child: 0,
+            child_count: 0,
+            terminal_kind: 1,
+            showdown_offset: 0,
+            _pad0: 0,
+            pot: 16.0,
+            hero_invested: 6.0,
+            _pad1: chance_scale,
+            _pad2: 0.0,
+        });
+        nodes.push(GpuPublicTreeNode {
+            kind: 2,
+            acting_player: 0,
+            public_infoset: 0,
+            first_child: 0,
+            child_count: 0,
+            terminal_kind: 2,
+            showdown_offset: chance_index as u32,
+            _pad0: 1,
+            pot: 16.0,
+            hero_invested: 6.0,
+            _pad1: chance_scale,
+            _pad2: 1.0,
+        });
+        boards.push(final_board_with_turn(chance_card));
+    }
+
+    let public_infosets = 1 + chance_cards.len();
+    let state = DenseCfrState::new_with_legal_actions(
+        DenseCfrConfig {
+            infosets: public_infosets * combos.len() * 2,
+            actions: 2,
+            variant: CfrVariant::CfrPlus,
+        },
+        vec![true; public_infosets * combos.len() * 2 * 2],
+    );
+    let villain_weights = vec![0.35, 1.1, 0.8];
+    let values = backend
+        .public_tree_iteration_values(
+            &nodes,
+            &children,
+            &child_cards,
+            &combos,
+            &vec![1; combos.len()],
+            &villain_weights,
+            &boards,
+            &state,
+        )
+        .unwrap_or_else(|error| {
+            fail(&format!(
+                "GPU public tree multistreet values failed: {error:?}"
+            ))
+        });
+    let expected = cpu_exact_public_tree_values(
+        &nodes,
+        &children,
+        &child_cards,
+        &combos,
+        &villain_weights,
+        &boards,
+        public_infosets,
+        2,
+    );
+
+    assert_close(
+        "multistreet action value",
+        &expected.action_values,
+        &values.action_values,
+    );
+    assert_close(
+        "multistreet reach weight",
+        &expected.reach_weights,
+        &values.reach_weights,
+    );
+    assert_close(
+        "multistreet strategy weight",
+        &expected.strategy_weights,
+        &values.strategy_weights,
+    );
+}
+
+fn final_board_with_turn(turn: Card) -> GpuFinalBoard {
+    let mut cards = [
+        turn.index() as u32,
+        Card::new(Rank::Four, Suit::Hearts).index() as u32,
+        Card::new(Rank::Five, Suit::Spades).index() as u32,
+        Card::new(Rank::Six, Suit::Clubs).index() as u32,
+        Card::new(Rank::Seven, Suit::Diamonds).index() as u32,
+    ];
+    if cards[0] == cards[1] {
+        cards[1] = Card::new(Rank::Eight, Suit::Hearts).index() as u32;
+    }
+    GpuFinalBoard { cards }
+}
+
+struct ExpectedPublicTreeValues {
+    action_values: Vec<f32>,
+    reach_weights: Vec<f32>,
+    strategy_weights: Vec<f32>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cpu_exact_public_tree_values(
+    nodes: &[GpuPublicTreeNode],
+    children: &[u32],
+    child_cards: &[u32],
+    combos: &[GpuPrivateCombo],
+    villain_weights: &[f32],
+    boards: &[GpuFinalBoard],
+    public_infosets: usize,
+    actions: usize,
+) -> ExpectedPublicTreeValues {
+    let infosets = public_infosets * combos.len() * 2;
+    let mut values = ExpectedPublicTreeValues {
+        action_values: vec![0.0; infosets * actions],
+        reach_weights: vec![0.0; infosets],
+        strategy_weights: vec![0.0; infosets],
+    };
+    let mut value_weights = vec![0.0; infosets * actions];
+    for hero in 0..combos.len() {
+        for villain in 0..combos.len() {
+            if private_combos_collide(combos[hero], combos[villain]) {
+                continue;
+            }
+            traverse_cpu_public_tree(
+                nodes,
+                children,
+                child_cards,
+                combos,
+                boards,
+                hero,
+                villain,
+                0,
+                1.0,
+                villain_weights[villain],
+                1.0,
+                actions,
+                &mut values,
+                &mut value_weights,
+            );
+        }
+    }
+    for (value, weight) in values.action_values.iter_mut().zip(value_weights) {
+        if weight > 0.0 {
+            *value /= weight;
+        }
+    }
+    values.strategy_weights = cpu_exact_strategy_weights(
+        nodes,
+        children,
+        child_cards,
+        combos,
+        villain_weights,
+        public_infosets,
+    );
+    values
+}
+
+fn cpu_exact_strategy_weights(
+    nodes: &[GpuPublicTreeNode],
+    children: &[u32],
+    child_cards: &[u32],
+    combos: &[GpuPrivateCombo],
+    villain_weights: &[f32],
+    public_infosets: usize,
+) -> Vec<f32> {
+    let combo_count = combos.len();
+    let mut hero_reaches = vec![0.0f32; nodes.len() * combo_count];
+    let mut villain_reaches = vec![0.0f32; nodes.len() * combo_count];
+    for combo in 0..combo_count {
+        hero_reaches[combo] = 1.0;
+        villain_reaches[combo] = villain_weights[combo];
+    }
+    for node_index in 0..nodes.len() {
+        let node = nodes[node_index];
+        for combo in 0..combo_count {
+            let hero_reach = hero_reaches[node_index * combo_count + combo];
+            let villain_reach = villain_reaches[node_index * combo_count + combo];
+            match node.kind {
+                0 => {
+                    for action in 0..node.child_count as usize {
+                        let child = children[node.first_child as usize + action] as usize;
+                        let probability = 1.0 / node.child_count as f32;
+                        if node.acting_player == 0 {
+                            hero_reaches[child * combo_count + combo] = hero_reach * probability;
+                            villain_reaches[child * combo_count + combo] = villain_reach;
+                        } else {
+                            hero_reaches[child * combo_count + combo] = hero_reach;
+                            villain_reaches[child * combo_count + combo] =
+                                villain_reach * probability;
+                        }
+                    }
+                }
+                1 => {
+                    for action in 0..node.child_count as usize {
+                        let child = children[node.first_child as usize + action] as usize;
+                        let card = child_cards[node.first_child as usize + action];
+                        if combo_has_card(combos[combo], card) {
+                            continue;
+                        }
+                        hero_reaches[child * combo_count + combo] = hero_reach;
+                        villain_reaches[child * combo_count + combo] = villain_reach;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut weights = vec![0.0; public_infosets * combo_count * 2];
+    for (node_index, node) in nodes.iter().copied().enumerate() {
+        if node.kind != 0 {
+            continue;
+        }
+        for combo in 0..combo_count {
+            let infoset = (node.public_infoset as usize * combo_count * 2)
+                + node.acting_player as usize * combo_count
+                + combo;
+            weights[infoset] = node._pad1
+                * if node.acting_player == 0 {
+                    hero_reaches[node_index * combo_count + combo]
+                } else {
+                    villain_reaches[node_index * combo_count + combo]
+                };
+        }
+    }
+    weights
+}
+
+#[allow(clippy::too_many_arguments)]
+fn traverse_cpu_public_tree(
+    nodes: &[GpuPublicTreeNode],
+    children: &[u32],
+    child_cards: &[u32],
+    combos: &[GpuPrivateCombo],
+    boards: &[GpuFinalBoard],
+    hero: usize,
+    villain: usize,
+    node_index: usize,
+    hero_reach: f32,
+    villain_reach: f32,
+    public_reach: f32,
+    actions: usize,
+    output: &mut ExpectedPublicTreeValues,
+    value_weights: &mut [f32],
+) -> f32 {
+    let node = nodes[node_index];
+    match node.kind {
+        0 => {
+            let acting_player = node.acting_player as usize;
+            let acting_combo = if acting_player == 0 { hero } else { villain };
+            let infoset = (node.public_infoset as usize * combos.len() * 2)
+                + acting_player * combos.len()
+                + acting_combo;
+            let offset = infoset * actions;
+            let mut action_values = vec![0.0; node.child_count as usize];
+            for action in 0..node.child_count as usize {
+                let child = children[node.first_child as usize + action] as usize;
+                let probability = 1.0 / node.child_count as f32;
+                let (next_hero_reach, next_villain_reach) = if acting_player == 0 {
+                    (hero_reach * probability, villain_reach)
+                } else {
+                    (hero_reach, villain_reach * probability)
+                };
+                action_values[action] = traverse_cpu_public_tree(
+                    nodes,
+                    children,
+                    child_cards,
+                    combos,
+                    boards,
+                    hero,
+                    villain,
+                    child,
+                    next_hero_reach,
+                    next_villain_reach,
+                    public_reach,
+                    actions,
+                    output,
+                    value_weights,
+                );
+            }
+            let opponent_reach = public_reach
+                * if acting_player == 0 {
+                    villain_reach
+                } else {
+                    hero_reach
+                };
+            let own_reach = public_reach
+                * if acting_player == 0 {
+                    hero_reach
+                } else {
+                    villain_reach
+                };
+            if opponent_reach > 0.0 || own_reach > 0.0 {
+                for (action, &hero_value) in action_values.iter().enumerate() {
+                    let player_value = if acting_player == 0 {
+                        hero_value
+                    } else {
+                        -hero_value
+                    };
+                    output.action_values[offset + action] += opponent_reach * player_value;
+                    value_weights[offset + action] += opponent_reach;
+                }
+                output.reach_weights[infoset] += opponent_reach;
+                output.strategy_weights[infoset] += own_reach;
+            }
+            action_values.iter().sum::<f32>() / node.child_count as f32
+        }
+        1 => {
+            let mut valid_children = Vec::new();
+            for action in 0..node.child_count as usize {
+                let card = child_cards[node.first_child as usize + action];
+                if combo_has_card(combos[hero], card) || combo_has_card(combos[villain], card) {
+                    continue;
+                }
+                valid_children.push(children[node.first_child as usize + action] as usize);
+            }
+            if valid_children.is_empty() {
+                return 0.0;
+            }
+            let valid_count = valid_children.len();
+            let child_public_reach = public_reach / valid_children.len() as f32;
+            let mut sum = 0.0;
+            for child in valid_children {
+                sum += traverse_cpu_public_tree(
+                    nodes,
+                    children,
+                    child_cards,
+                    combos,
+                    boards,
+                    hero,
+                    villain,
+                    child,
+                    hero_reach,
+                    villain_reach,
+                    child_public_reach,
+                    actions,
+                    output,
+                    value_weights,
+                );
+            }
+            sum / valid_count as f32
+        }
+        _ => match node.terminal_kind {
+            0 => -node.hero_invested,
+            1 => node.pot - node.hero_invested,
+            2 => {
+                let board = boards[node.showdown_offset as usize];
+                node.pot * showdown_equity(combos[hero], combos[villain], board)
+                    - node.hero_invested
+            }
+            _ => 0.0,
+        },
+    }
+}
+
+fn combo_has_card(combo: GpuPrivateCombo, card: u32) -> bool {
+    combo.cards[0] == card || combo.cards[1] == card
 }
 
 fn expected_showdown_action_value(

@@ -1930,12 +1930,20 @@ fn denominator_mass(@builtin(global_invocation_id) id: vec3<u32>) {
     let aggregate_base = public_infoset * 53u;
     var value_weight = 0.0;
     if node.acting_player == 0u {
+        if hero_reaches[node_base + acting_combo] <= 0.0 {
+            output[params.output_len * params.max_actions * 2u + private_infoset] = 0.0;
+            return;
+        }
         let self_reach = villain_reaches[node_base + acting_combo];
         value_weight = villain_aggregates[aggregate_base]
             - villain_aggregates[aggregate_base + private_combo.cards[0] + 1u]
             - villain_aggregates[aggregate_base + private_combo.cards[1] + 1u]
             + self_reach;
     } else {
+        if villain_reaches[node_base + acting_combo] <= 0.0 {
+            output[params.output_len * params.max_actions * 2u + private_infoset] = 0.0;
+            return;
+        }
         let self_reach = hero_reaches[node_base + acting_combo];
         value_weight = hero_aggregates[aggregate_base]
             - hero_aggregates[aggregate_base + private_combo.cards[0] + 1u]
