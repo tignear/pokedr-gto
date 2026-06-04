@@ -18,12 +18,13 @@ fn main() {
         Some("postflop-smoke") => run_postflop_smoke(),
         Some("solve-flop") => run_solve_flop(parse_flop_command_args(args)),
         Some("solve-flop-metrics") => run_solve_flop_metrics(parse_flop_command_args(args)),
+        Some("solve-flop-sweep") => run_solve_flop_sweep(parse_flop_command_args(args)),
         Some("dump-flop-tree") => run_dump_flop_tree(parse_flop_command_args(args)),
         Some("rs-poker-smoke") => run_rs_poker_smoke(),
         Some("rs-poker-trace") => run_rs_poker_trace(),
         _ => {
             eprintln!(
-                "usage: {program} <gpu-info|gpu-smoke|postflop-smoke|solve-flop|solve-flop-metrics|dump-flop-tree|rs-poker-smoke|rs-poker-trace> [flop] [--config path.yml]"
+                "usage: {program} <gpu-info|gpu-smoke|postflop-smoke|solve-flop|solve-flop-metrics|solve-flop-sweep|dump-flop-tree|rs-poker-smoke|rs-poker-trace> [flop] [--config path.yml]"
             );
             std::process::exit(2);
         }
@@ -357,6 +358,146 @@ fn run_solve_flop_metrics(args: FlopCommandArgs) {
         }
         true
     });
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PdcfrSweepCandidate {
+    alpha: f32,
+    gamma: f32,
+    eta_start: f32,
+    eta_end: f32,
+    eta_horizon: usize,
+}
+
+#[derive(Debug, Clone)]
+struct PdcfrSweepResult {
+    candidate: PdcfrSweepCandidate,
+    row: pokedr_agent::FixedFlopMetricRow,
+}
+
+fn run_solve_flop_sweep(args: FlopCommandArgs) {
+    let cli_config = load_cli_config(args.config_path.as_deref());
+    let flop = parse_flop(args.flop.as_deref().unwrap_or("As7h2c")).unwrap_or_else(|error| {
+        eprintln!("{error}");
+        std::process::exit(2);
+    });
+    let base_config = match_config(cli_config.as_ref());
+    let iterations = env_usize("POKEDR_SWEEP_ITERATIONS")
+        .or_else(|| cli_config.and_then(|config| config.cfr_iterations))
+        .unwrap_or(128)
+        .max(1);
+    let candidates = pdcfr_sweep_candidates();
+    eprintln!(
+        "sweeping fixed flop pdcfr-plus board={} depth={} equity_runout_cap={} iterations={} candidates={}",
+        format_pokedr_cards_for_cli(&flop),
+        base_config.max_depth,
+        base_config.max_showdown_runouts,
+        iterations,
+        candidates.len()
+    );
+
+    let mut results = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
+        let mut config = base_config.clone();
+        config.cfr_iterations = iterations;
+        config.cfr_variant = CfrVariant::PdcfrPlus {
+            alpha: candidate.alpha,
+            gamma: candidate.gamma,
+            eta_start: candidate.eta_start,
+            eta_end: candidate.eta_end,
+            eta_horizon: candidate.eta_horizon,
+        };
+        eprintln!("running candidate {:?}", config.cfr_variant);
+        let rows = pokedr_agent::solve_fixed_flop_metrics(flop, config, &[iterations]);
+        let Some(row) = rows.into_iter().last() else {
+            continue;
+        };
+        results.push(PdcfrSweepResult { candidate, row });
+    }
+
+    results.sort_by(|left, right| {
+        sweep_score(&left.row)
+            .partial_cmp(&sweep_score(&right.row))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    println!(
+        "rank,alpha,gamma,eta_start,eta_end,eta_horizon,iterations,elapsed_s,root_exploitability_bb100,root_br_gap,local_br_gap,recursive_root_br_gap,recursive_local_br_gap,root_actions,finite"
+    );
+    for (rank, result) in results.iter().enumerate() {
+        print_sweep_result(rank + 1, result.candidate, &result.row);
+    }
+}
+
+fn pdcfr_sweep_candidates() -> Vec<PdcfrSweepCandidate> {
+    let alphas = env_f32_list("POKEDR_SWEEP_ALPHAS").unwrap_or_else(|| vec![2.5]);
+    let gammas = env_f32_list("POKEDR_SWEEP_GAMMAS").unwrap_or_else(|| vec![8.0, 32.0]);
+    let eta_schedules = env_eta_schedule_list("POKEDR_SWEEP_ETA_SCHEDULES").unwrap_or_else(|| {
+        vec![
+            (1.0, 1.0, 128),
+            (1.0, 0.0, 64),
+            (1.0, 0.0, 128),
+            (1.0, 0.0, 256),
+        ]
+    });
+    let mut candidates = Vec::new();
+    for alpha in alphas {
+        for gamma in &gammas {
+            for (eta_start, eta_end, eta_horizon) in &eta_schedules {
+                candidates.push(PdcfrSweepCandidate {
+                    alpha,
+                    gamma: *gamma,
+                    eta_start: *eta_start,
+                    eta_end: *eta_end,
+                    eta_horizon: *eta_horizon,
+                });
+            }
+        }
+    }
+    candidates
+}
+
+fn print_sweep_result(
+    rank: usize,
+    candidate: PdcfrSweepCandidate,
+    row: &pokedr_agent::FixedFlopMetricRow,
+) {
+    let root_actions = row
+        .root_action_probabilities
+        .iter()
+        .map(|value| format!("{value:.4}"))
+        .collect::<Vec<_>>()
+        .join("|");
+    println!(
+        "{rank},{:.3},{:.3},{:.3},{:.3},{},{},{:.2},{},{},{},{},{},{},{}",
+        candidate.alpha,
+        candidate.gamma,
+        candidate.eta_start,
+        candidate.eta_end,
+        candidate.eta_horizon,
+        row.iterations,
+        row.elapsed_secs,
+        format_optional(row.root_exploitability.map(|value| value * 100.0), 3),
+        format_optional(row.root_br_gap, 6),
+        format_optional(row.local_br_gap, 6),
+        format_optional(row.recursive_root_br_gap, 6),
+        format_optional(row.recursive_local_br_gap, 6),
+        root_actions,
+        row.finite
+    );
+}
+
+fn sweep_score(row: &pokedr_agent::FixedFlopMetricRow) -> f32 {
+    if !row.finite {
+        return f32::INFINITY;
+    }
+    row.root_exploitability.unwrap_or(f32::INFINITY)
+}
+
+fn format_optional(value: Option<f32>, decimals: usize) -> String {
+    match value {
+        Some(value) if value.is_finite() => format!("{value:.decimals$}"),
+        _ => "n/a".to_string(),
+    }
 }
 
 fn print_metric_row(row: &pokedr_agent::FixedFlopMetricRow, target_bb100: f32) {
@@ -793,6 +934,75 @@ fn env_f32(name: &str) -> Option<f32> {
     std::env::var(name)
         .ok()
         .and_then(|value| value.parse().ok())
+}
+
+fn env_f32_list(name: &str) -> Option<Vec<f32>> {
+    std::env::var(name)
+        .ok()
+        .map(|value| {
+            value
+                .split(',')
+                .filter_map(|part| part.trim().parse::<f32>().ok())
+                .filter(|value| value.is_finite())
+                .collect::<Vec<_>>()
+        })
+        .filter(|values| !values.is_empty())
+}
+
+fn env_eta_schedule_list(name: &str) -> Option<Vec<(f32, f32, usize)>> {
+    std::env::var(name)
+        .ok()
+        .map(|value| {
+            value
+                .split(',')
+                .filter_map(|part| parse_eta_schedule(part.trim()))
+                .collect::<Vec<_>>()
+        })
+        .filter(|values| !values.is_empty())
+}
+
+fn parse_eta_schedule(input: &str) -> Option<(f32, f32, usize)> {
+    let mut parts = input.split(':');
+    let start = parts.next()?.parse::<f32>().ok()?;
+    let end = parts.next()?.parse::<f32>().ok()?;
+    let horizon = parts.next()?.parse::<usize>().ok()?;
+    if parts.next().is_some() || !start.is_finite() || !end.is_finite() || horizon == 0 {
+        return None;
+    }
+    Some((start, end, horizon))
+}
+
+fn format_pokedr_cards_for_cli(cards: &[Card]) -> String {
+    cards
+        .iter()
+        .map(|card| format_pokedr_card_for_cli(*card))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn format_pokedr_card_for_cli(card: Card) -> String {
+    let rank = match card.rank() {
+        Rank::Two => "2",
+        Rank::Three => "3",
+        Rank::Four => "4",
+        Rank::Five => "5",
+        Rank::Six => "6",
+        Rank::Seven => "7",
+        Rank::Eight => "8",
+        Rank::Nine => "9",
+        Rank::Ten => "T",
+        Rank::Jack => "J",
+        Rank::Queen => "Q",
+        Rank::King => "K",
+        Rank::Ace => "A",
+    };
+    let suit = match card.suit() {
+        Suit::Clubs => "c",
+        Suit::Diamonds => "d",
+        Suit::Hearts => "h",
+        Suit::Spades => "s",
+    };
+    format!("{rank}{suit}")
 }
 
 fn parse_flop(input: &str) -> Result<[Card; 3], String> {
