@@ -2493,6 +2493,8 @@ pub struct GpuRootTerminalValues {
     pub action_values: Vec<f32>,
     pub reach_weights: Vec<f32>,
     pub strategy_weights: Vec<f32>,
+    pub root_hero_values: Vec<f32>,
+    pub root_villain_values: Vec<f32>,
 }
 
 impl GpuDenseCfrBackend {
@@ -4108,13 +4110,13 @@ impl GpuDenseCfrBackend {
                                 &self.device,
                                 "public tree layer tile hero values",
                                 value_len,
-                                false,
+                                true,
                             ),
                             villain_values_buffer: uninit_storage_buffer(
                                 &self.device,
                                 "public tree layer tile villain values",
                                 value_len,
-                                false,
+                                true,
                             ),
                         }
                     })
@@ -4894,6 +4896,8 @@ impl GpuDenseCfrBackend {
         let action_weights_readback = readback_buffer(&self.device, action_len);
         let reach_weights_readback = readback_buffer(&self.device, state.infosets);
         let strategy_weights_readback = readback_buffer(&self.device, state.infosets);
+        let root_hero_values_readback = readback_buffer(&self.device, combos.len());
+        let root_villain_values_readback = readback_buffer(&self.device, combos.len());
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -4923,6 +4927,19 @@ impl GpuDenseCfrBackend {
             &strategy_weights_readback,
             state.infosets,
         );
+        let root_tile = &context.layer_tiles[0][0];
+        copy_buffer(
+            &mut encoder,
+            &root_tile.hero_values_buffer,
+            &root_hero_values_readback,
+            combos.len(),
+        );
+        copy_buffer(
+            &mut encoder,
+            &root_tile.villain_values_buffer,
+            &root_villain_values_readback,
+            combos.len(),
+        );
         let submission = self.queue.submit(Some(encoder.finish()));
         self.device
             .poll(wgpu::PollType::Wait {
@@ -4946,6 +4963,16 @@ impl GpuDenseCfrBackend {
                 &self.device,
                 &strategy_weights_readback,
                 state.infosets,
+            )?,
+            root_hero_values: read_f32_buffer(
+                &self.device,
+                &root_hero_values_readback,
+                combos.len(),
+            )?,
+            root_villain_values: read_f32_buffer(
+                &self.device,
+                &root_villain_values_readback,
+                combos.len(),
             )?,
         })
     }

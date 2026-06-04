@@ -292,6 +292,8 @@ fn run_solve_flop(args: FlopCommandArgs) {
 }
 
 fn run_solve_flop_metrics(args: FlopCommandArgs) {
+    const PIO_STYLE_TARGET_BB100: f32 = 1.0;
+
     let cli_config = load_cli_config(args.config_path.as_deref());
     let flop = parse_flop(args.flop.as_deref().unwrap_or("As7h2c")).unwrap_or_else(|error| {
         eprintln!("{error}");
@@ -314,8 +316,12 @@ fn run_solve_flop_metrics(args: FlopCommandArgs) {
             .map(|value| format!("{value:.4}"))
             .collect::<Vec<_>>()
             .join(",");
+        let root_exploitability_bb100 = row.root_exploitability.map(|value| value * 100.0);
+        let root_converged = root_exploitability_bb100
+            .map(|value| value <= PIO_STYLE_TARGET_BB100)
+            .unwrap_or(false);
         println!(
-            "board={} iterations={} elapsed={:.2}s root_l1_delta={} root_actions=[{}] root_exploitability={} hero_root_br_value={} villain_response_root_value={} root_br_gap={} local_br_gap={} recursive_root_br_gap={} recursive_local_br_gap={} regret_mass={:.3} illegal_mass={:.6} current_norm_err={:.6} avg_norm_err={:.6} finite={}",
+            "board={} iterations={} elapsed={:.2}s root_l1_delta={} root_actions=[{}] root_exploitability={} root_exploitability_bb100={} pio_style_target_bb100={:.2} pio_style_converged={} hero_root_br_value={} villain_root_br_value={} root_br_gap={} local_br_gap={} recursive_root_br_gap={} recursive_local_br_gap={} regret_mass={:.3} illegal_mass={:.6} current_norm_err={:.6} avg_norm_err={:.6} finite={}",
             row.board,
             row.iterations,
             row.elapsed_secs,
@@ -324,10 +330,15 @@ fn run_solve_flop_metrics(args: FlopCommandArgs) {
             row.root_exploitability
                 .map(|value| format!("{value:.6}"))
                 .unwrap_or_else(|| "n/a".to_string()),
+            root_exploitability_bb100
+                .map(|value| format!("{value:.3}"))
+                .unwrap_or_else(|| "n/a".to_string()),
+            PIO_STYLE_TARGET_BB100,
+            root_converged,
             row.hero_root_br_value
                 .map(|value| format!("{value:.6}"))
                 .unwrap_or_else(|| "n/a".to_string()),
-            row.villain_response_root_value
+            row.villain_root_br_value
                 .map(|value| format!("{value:.6}"))
                 .unwrap_or_else(|| "n/a".to_string()),
             row.root_br_gap

@@ -116,7 +116,7 @@ pub struct FixedFlopMetricRow {
     pub root_action_probabilities: Vec<f32>,
     pub root_exploitability: Option<f32>,
     pub hero_root_br_value: Option<f32>,
-    pub villain_response_root_value: Option<f32>,
+    pub villain_root_br_value: Option<f32>,
     pub root_br_gap: Option<f32>,
     pub local_br_gap: Option<f32>,
     pub recursive_root_br_gap: Option<f32>,
@@ -507,7 +507,7 @@ pub fn solve_fixed_flop_metrics(
             root_action_probabilities,
             root_exploitability: None,
             hero_root_br_value: None,
-            villain_response_root_value: None,
+            villain_root_br_value: None,
             root_br_gap: None,
             local_br_gap: None,
             recursive_root_br_gap: None,
@@ -656,9 +656,9 @@ fn try_solve_fixed_flop_metrics_gpu(
             hero_root_br_value: recursive_br_gap
                 .as_ref()
                 .map(|metrics| metrics.hero_root_br_value),
-            villain_response_root_value: recursive_br_gap
+            villain_root_br_value: recursive_br_gap
                 .as_ref()
-                .map(|metrics| metrics.villain_response_root_value),
+                .map(|metrics| metrics.villain_root_br_value),
             root_br_gap: br_gap.as_ref().map(|metrics| metrics.root_br_gap),
             local_br_gap: br_gap.as_ref().map(|metrics| metrics.local_br_gap),
             recursive_root_br_gap: recursive_br_gap.as_ref().map(|metrics| metrics.root_br_gap),
@@ -730,7 +730,7 @@ struct BrGapMetrics {
     local_br_gap: f32,
     root_exploitability: f32,
     hero_root_br_value: f32,
-    villain_response_root_value: f32,
+    villain_root_br_value: f32,
     local_gap_detail: Option<LocalGapDetail>,
 }
 
@@ -804,6 +804,9 @@ fn recursive_br_gap_metrics_gpu(
         layout,
         state,
         &profile,
+        combos,
+        combo_legal,
+        villain_weights,
         &hero_values,
         &villain_values,
     ))
@@ -887,7 +890,7 @@ fn br_gap_metrics_from_values(
         },
         root_exploitability: 0.0,
         hero_root_br_value: 0.0,
-        villain_response_root_value: 0.0,
+        villain_root_br_value: 0.0,
         local_gap_detail,
     }
 }
@@ -897,6 +900,9 @@ fn recursive_br_gap_metrics_from_values(
     layout: &PostflopDenseLayout,
     state: &DenseCfrState,
     _profile: &DenseCfrState,
+    combos: &[GpuPrivateCombo],
+    combo_legal: &[u32],
+    villain_weights: &[f32],
     hero_values: &GpuRootTerminalValues,
     villain_values: &GpuRootTerminalValues,
 ) -> BrGapMetrics {
@@ -962,8 +968,13 @@ fn recursive_br_gap_metrics_from_values(
         }
     }
 
-    let root_exploitability =
-        root_exploitability_from_recursive_values(layout, state, hero_values, villain_values);
+    let root_exploitability = root_exploitability_from_recursive_values(
+        combos,
+        combo_legal,
+        villain_weights,
+        hero_values,
+        villain_values,
+    );
 
     BrGapMetrics {
         root_br_gap: if root_weight_sum > 0.0 {
@@ -978,7 +989,7 @@ fn recursive_br_gap_metrics_from_values(
         },
         root_exploitability: root_exploitability.exploitability,
         hero_root_br_value: root_exploitability.hero_br_value,
-        villain_response_root_value: root_exploitability.villain_response_value,
+        villain_root_br_value: root_exploitability.villain_br_value,
         local_gap_detail,
     }
 }
@@ -987,71 +998,85 @@ fn recursive_br_gap_metrics_from_values(
 struct RootExploitability {
     exploitability: f32,
     hero_br_value: f32,
-    villain_response_value: f32,
+    villain_br_value: f32,
 }
 
 fn root_exploitability_from_recursive_values(
-    layout: &PostflopDenseLayout,
-    state: &DenseCfrState,
+    combos: &[GpuPrivateCombo],
+    combo_legal: &[u32],
+    villain_weights: &[f32],
     hero_values: &GpuRootTerminalValues,
     villain_values: &GpuRootTerminalValues,
 ) -> RootExploitability {
-    let root_action_count = layout.action_count(0);
-    let mut strategy = vec![0.0; layout.max_actions()];
     let mut hero_br_sum = 0.0;
-    let mut villain_response_sum = 0.0;
-    let mut weight_sum = 0.0;
+    let mut hero_weight_sum = 0.0;
+    let mut villain_br_sum = 0.0;
+    let mut villain_weight_sum = 0.0;
 
-    for combo_index in 0..COMBO_COUNT {
-        let infoset = private_infoset(0, Player::Hero, combo_index);
-        let offset = infoset * layout.max_actions();
-        let weight = hero_values
-            .reach_weights
-            .get(infoset)
-            .copied()
-            .unwrap_or(0.0);
-        if weight <= 0.0 {
+    for (combo_index, combo) in combos.iter().enumerate() {
+        if combo_legal.get(combo_index).copied().unwrap_or(0) == 0 {
             continue;
         }
 
-        let hero_action_values = &hero_values.action_values[offset..offset + root_action_count];
-        let villain_response_action_values =
-            &villain_values.action_values[offset..offset + root_action_count];
-        let hero_br = hero_action_values
-            .iter()
-            .copied()
-            .fold(f32::NEG_INFINITY, f32::max);
-        if !hero_br.is_finite() {
-            continue;
+        let mut villain_nonblocking_weight = 0.0;
+        let mut hero_nonblocking_weight = 0.0;
+        for (opponent_index, opponent) in combos.iter().enumerate() {
+            if opponent_index == combo_index
+                || combo_legal.get(opponent_index).copied().unwrap_or(0) == 0
+                || combo.cards[0] == opponent.cards[0]
+                || combo.cards[0] == opponent.cards[1]
+                || combo.cards[1] == opponent.cards[0]
+                || combo.cards[1] == opponent.cards[1]
+            {
+                continue;
+            }
+            villain_nonblocking_weight +=
+                villain_weights.get(opponent_index).copied().unwrap_or(0.0);
+            hero_nonblocking_weight += 1.0;
         }
 
-        state.average_strategy_for(infoset, &mut strategy);
-        let villain_response_value = villain_response_action_values
-            .iter()
-            .zip(&strategy)
-            .take(root_action_count)
-            .map(|(value, probability)| value * probability)
-            .sum::<f32>();
+        if villain_nonblocking_weight > 0.0 {
+            let hero_value = hero_values
+                .root_hero_values
+                .get(combo_index)
+                .copied()
+                .unwrap_or(0.0)
+                / villain_nonblocking_weight;
+            if hero_value.is_finite() {
+                hero_br_sum += hero_value;
+                hero_weight_sum += 1.0;
+            }
+        }
 
-        hero_br_sum += hero_br * weight;
-        villain_response_sum += villain_response_value * weight;
-        weight_sum += weight;
+        let villain_weight = villain_weights.get(combo_index).copied().unwrap_or(0.0);
+        if villain_weight > 0.0 && hero_nonblocking_weight > 0.0 {
+            let villain_value = villain_values
+                .root_villain_values
+                .get(combo_index)
+                .copied()
+                .unwrap_or(0.0)
+                / hero_nonblocking_weight;
+            if villain_value.is_finite() {
+                villain_br_sum += villain_value * villain_weight;
+                villain_weight_sum += villain_weight;
+            }
+        }
     }
 
-    if weight_sum <= 0.0 {
+    if hero_weight_sum <= 0.0 || villain_weight_sum <= 0.0 {
         return RootExploitability {
             exploitability: 0.0,
             hero_br_value: 0.0,
-            villain_response_value: 0.0,
+            villain_br_value: 0.0,
         };
     }
 
-    let hero_br_value = hero_br_sum / weight_sum;
-    let villain_response_value = villain_response_sum / weight_sum;
+    let hero_br_value = hero_br_sum / hero_weight_sum;
+    let villain_br_value = villain_br_sum / villain_weight_sum;
     RootExploitability {
-        exploitability: (hero_br_value - villain_response_value).max(0.0),
+        exploitability: (hero_br_value + villain_br_value).max(0.0),
         hero_br_value,
-        villain_response_value,
+        villain_br_value,
     }
 }
 
