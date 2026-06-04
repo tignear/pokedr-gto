@@ -790,6 +790,7 @@ struct Params {
 @group(0) @binding(6) var<storage, read_write> villain_reaches: array<f32>;
 @group(0) @binding(7) var<uniform> params: Params;
 @group(0) @binding(8) var<storage, read> prediction: array<f32>;
+@group(0) @binding(9) var<storage, read_write> combo_live: array<f32>;
 
 fn combo_has_card(combo: Combo, card: u32) -> bool {
     return combo.cards[0] == card || combo.cards[1] == card;
@@ -827,11 +828,13 @@ fn reach_init(@builtin(global_invocation_id) id: vec3<u32>) {
     let combo = index % params.combo_count;
     hero_reaches[index] = 0.0;
     villain_reaches[index] = 0.0;
+    combo_live[index] = 0.0;
     if index >= params.combo_count || root_weights[combo] < 0.0 {
         return;
     }
     hero_reaches[combo] = 1.0;
     villain_reaches[combo] = root_weights[combo];
+    combo_live[combo] = 1.0;
 }
 
 @compute @workgroup_size(64)
@@ -850,6 +853,7 @@ fn reach_edges(@builtin(global_invocation_id) id: vec3<u32>) {
     let child_offset = edge.child * params.combo_count + combo;
     let hero_reach = hero_reaches[node_offset];
     let villain_reach = villain_reaches[node_offset];
+    let live = combo_live[node_offset];
     if node.kind == 0u {
         let probability = strategy_probability(node, combo, edge.action);
         if node.acting_player == 0u {
@@ -859,13 +863,16 @@ fn reach_edges(@builtin(global_invocation_id) id: vec3<u32>) {
             hero_reaches[child_offset] = hero_reach;
             villain_reaches[child_offset] = villain_reach * probability;
         }
+        combo_live[child_offset] = live;
     } else if node.kind == 1u {
         if combo_has_card(combos[combo], edge.card) {
             hero_reaches[child_offset] = 0.0;
             villain_reaches[child_offset] = 0.0;
+            combo_live[child_offset] = 0.0;
         } else {
             hero_reaches[child_offset] = hero_reach;
             villain_reaches[child_offset] = villain_reach;
+            combo_live[child_offset] = live;
         }
     }
 }
@@ -1567,7 +1574,8 @@ struct Params {
 @group(0) @binding(6) var<storage, read> villain_aggregates: array<f32>;
 @group(0) @binding(7) var<storage, read_write> hero_values: array<f32>;
 @group(0) @binding(8) var<storage, read_write> villain_values: array<f32>;
-@group(0) @binding(9) var<uniform> params: Params;
+@group(0) @binding(9) var<storage, read> combo_live: array<f32>;
+@group(0) @binding(10) var<uniform> params: Params;
 
 @compute @workgroup_size(64)
 fn fold_value(@builtin(global_invocation_id) id: vec3<u32>) {
@@ -1601,8 +1609,9 @@ fn fold_value(@builtin(global_invocation_id) id: vec3<u32>) {
         hero_payoff = node.pot - node.hero_invested;
     }
     let value_index = node_offset + combo;
-    hero_values[value_index] = select(0.0, villain_noncolliding * hero_payoff * node._pad1, hero_self > 0.0);
-    villain_values[value_index] = select(0.0, hero_noncolliding * (-hero_payoff) * node._pad1, villain_self > 0.0);
+    let structurally_live = combo_live[value_index] > 0.0;
+    hero_values[value_index] = select(0.0, villain_noncolliding * hero_payoff * node._pad1, structurally_live);
+    villain_values[value_index] = select(0.0, hero_noncolliding * (-hero_payoff) * node._pad1, structurally_live);
 }
 "#;
 
@@ -1899,7 +1908,8 @@ struct Params {
 @group(0) @binding(5) var<storage, read> hero_aggregates: array<f32>;
 @group(0) @binding(6) var<storage, read> villain_aggregates: array<f32>;
 @group(0) @binding(7) var<storage, read_write> output: array<f32>;
-@group(0) @binding(8) var<uniform> params: Params;
+@group(0) @binding(8) var<storage, read> combo_live: array<f32>;
+@group(0) @binding(9) var<uniform> params: Params;
 
 @compute @workgroup_size(64)
 fn denominator_mass(@builtin(global_invocation_id) id: vec3<u32>) {
@@ -1928,22 +1938,18 @@ fn denominator_mass(@builtin(global_invocation_id) id: vec3<u32>) {
     let node_base = node_index * params.combo_count;
     let private_combo = combos[acting_combo];
     let aggregate_base = public_infoset * 53u;
+    if combo_live[node_base + acting_combo] <= 0.0 {
+        output[params.output_len * params.max_actions * 2u + private_infoset] = 0.0;
+        return;
+    }
     var value_weight = 0.0;
     if node.acting_player == 0u {
-        if hero_reaches[node_base + acting_combo] <= 0.0 {
-            output[params.output_len * params.max_actions * 2u + private_infoset] = 0.0;
-            return;
-        }
         let self_reach = villain_reaches[node_base + acting_combo];
         value_weight = villain_aggregates[aggregate_base]
             - villain_aggregates[aggregate_base + private_combo.cards[0] + 1u]
             - villain_aggregates[aggregate_base + private_combo.cards[1] + 1u]
             + self_reach;
     } else {
-        if villain_reaches[node_base + acting_combo] <= 0.0 {
-            output[params.output_len * params.max_actions * 2u + private_infoset] = 0.0;
-            return;
-        }
         let self_reach = hero_reaches[node_base + acting_combo];
         value_weight = hero_aggregates[aggregate_base]
             - hero_aggregates[aggregate_base + private_combo.cards[0] + 1u]
@@ -2115,6 +2121,7 @@ struct GpuPublicTreeIterationContext {
     root_weights_buffer: wgpu::Buffer,
     hero_reaches_buffer: wgpu::Buffer,
     villain_reaches_buffer: wgpu::Buffer,
+    combo_live_buffer: wgpu::Buffer,
     hero_values_buffer: wgpu::Buffer,
     villain_values_buffer: wgpu::Buffer,
     output_buffer: wgpu::Buffer,
@@ -2639,6 +2646,7 @@ impl GpuDenseCfrBackend {
                     storage_entry(6, false),
                     uniform_entry(7),
                     storage_entry(8, true),
+                    storage_entry(9, false),
                 ],
             });
         let public_tree_reach_pipeline_layout =
@@ -2894,7 +2902,8 @@ impl GpuDenseCfrBackend {
                     storage_entry(6, true),
                     storage_entry(7, false),
                     storage_entry(8, false),
-                    uniform_entry(9),
+                    storage_entry(9, true),
+                    uniform_entry(10),
                 ],
             });
         let public_tree_fold_value_pipeline_layout =
@@ -2995,7 +3004,8 @@ impl GpuDenseCfrBackend {
                     storage_entry(5, true),
                     storage_entry(6, true),
                     storage_entry(7, false),
-                    uniform_entry(8),
+                    storage_entry(8, true),
+                    uniform_entry(9),
                 ],
             });
         let public_tree_denominator_pipeline_layout =
@@ -3462,6 +3472,7 @@ impl GpuDenseCfrBackend {
         combo_buffer: &wgpu::Buffer,
         hero_reaches_buffer: &wgpu::Buffer,
         villain_reaches_buffer: &wgpu::Buffer,
+        combo_live_buffer: &wgpu::Buffer,
         hero_values_buffer: &wgpu::Buffer,
         villain_values_buffer: &wgpu::Buffer,
         combo_count: usize,
@@ -3549,7 +3560,8 @@ impl GpuDenseCfrBackend {
                 bind_entry(6, &villain_aggregates_buffer),
                 bind_entry(7, hero_values_buffer),
                 bind_entry(8, villain_values_buffer),
-                bind_entry(9, &value_params),
+                bind_entry(9, combo_live_buffer),
+                bind_entry(10, &value_params),
             ],
         });
 
@@ -4128,6 +4140,12 @@ impl GpuDenseCfrBackend {
             node_combo_len,
             false,
         );
+        let combo_live_buffer = uninit_storage_buffer(
+            &self.device,
+            "public tree combo live mask",
+            node_combo_len,
+            false,
+        );
         let hero_values_buffer = uninit_storage_buffer(
             &self.device,
             "public tree hero private values",
@@ -4255,6 +4273,7 @@ impl GpuDenseCfrBackend {
             root_weights_buffer,
             hero_reaches_buffer,
             villain_reaches_buffer,
+            combo_live_buffer,
             hero_values_buffer,
             villain_values_buffer,
             output_buffer,
@@ -4333,6 +4352,7 @@ impl GpuDenseCfrBackend {
                 bind_entry(6, &ctx.villain_reaches_buffer),
                 bind_entry(7, &reach_init_params),
                 bind_entry(8, prediction_buffer),
+                bind_entry(9, &ctx.combo_live_buffer),
             ],
         });
         {
@@ -4379,6 +4399,7 @@ impl GpuDenseCfrBackend {
                     bind_entry(6, &ctx.villain_reaches_buffer),
                     bind_entry(7, &reach_edge_params),
                     bind_entry(8, prediction_buffer),
+                    bind_entry(9, &ctx.combo_live_buffer),
                 ],
             });
             {
@@ -4401,6 +4422,7 @@ impl GpuDenseCfrBackend {
             &ctx.combo_buffer,
             &ctx.hero_reaches_buffer,
             &ctx.villain_reaches_buffer,
+            &ctx.combo_live_buffer,
             &ctx.hero_values_buffer,
             &ctx.villain_values_buffer,
             ctx.combos_len,
@@ -4524,7 +4546,8 @@ impl GpuDenseCfrBackend {
                         bind_entry(5, &ctx.hero_decision_aggregates_buffer),
                         bind_entry(6, &ctx.villain_decision_aggregates_buffer),
                         bind_entry(7, &ctx.output_buffer),
-                        bind_entry(8, &denominator_params),
+                        bind_entry(8, &ctx.combo_live_buffer),
+                        bind_entry(9, &denominator_params),
                     ],
                 });
             {
@@ -4647,6 +4670,12 @@ impl GpuDenseCfrBackend {
         let villain_reaches_buffer = uninit_storage_buffer(
             &self.device,
             "public tree villain reaches",
+            node_combo_len,
+            false,
+        );
+        let combo_live_buffer = uninit_storage_buffer(
+            &self.device,
+            "public tree combo live mask",
             node_combo_len,
             false,
         );
@@ -4792,6 +4821,7 @@ impl GpuDenseCfrBackend {
                 bind_entry(6, &villain_reaches_buffer),
                 bind_entry(7, &reach_init_params),
                 bind_entry(8, prediction_buffer),
+                bind_entry(9, &combo_live_buffer),
             ],
         });
         {
@@ -4838,6 +4868,7 @@ impl GpuDenseCfrBackend {
                     bind_entry(6, &villain_reaches_buffer),
                     bind_entry(7, &reach_edge_params),
                     bind_entry(8, prediction_buffer),
+                    bind_entry(9, &combo_live_buffer),
                 ],
             });
             {
@@ -4860,6 +4891,7 @@ impl GpuDenseCfrBackend {
             &combo_buffer,
             &hero_reaches_buffer,
             &villain_reaches_buffer,
+            &combo_live_buffer,
             &hero_values_buffer,
             &villain_values_buffer,
             combos.len(),
@@ -4998,7 +5030,8 @@ impl GpuDenseCfrBackend {
                         bind_entry(5, &hero_decision_aggregates_buffer),
                         bind_entry(6, &villain_decision_aggregates_buffer),
                         bind_entry(7, &output_buffer),
-                        bind_entry(8, &denominator_params),
+                        bind_entry(8, &combo_live_buffer),
+                        bind_entry(9, &denominator_params),
                     ],
                 });
             {

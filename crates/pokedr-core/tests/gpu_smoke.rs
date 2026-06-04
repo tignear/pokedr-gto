@@ -810,13 +810,22 @@ fn run_public_tree_multistreet_values_match_cpu_exact(backend: &GpuDenseCfrBacke
     }
 
     let public_infosets = 1 + chance_cards.len();
-    let state = DenseCfrState::new_with_legal_actions(
+    let mut state = DenseCfrState::new_with_legal_actions(
         DenseCfrConfig {
             infosets: public_infosets * combos.len() * 2,
             actions: 2,
             variant: CfrVariant::CfrPlus,
         },
         vec![true; public_infosets * combos.len() * 2 * 2],
+    );
+    let seed_action_values: Vec<_> = (0..state.infosets() * state.actions())
+        .map(|index| ((index as f32 + 0.5) * 0.37).sin())
+        .collect();
+    state.update_all_infosets(
+        &seed_action_values,
+        &vec![1.0; state.infosets()],
+        &vec![1.0; state.infosets()],
+        1,
     );
     let villain_weights = vec![0.35, 1.1, 0.8];
     let values = backend
@@ -842,6 +851,7 @@ fn run_public_tree_multistreet_values_match_cpu_exact(backend: &GpuDenseCfrBacke
         &combos,
         &villain_weights,
         &boards,
+        &state,
         public_infosets,
         2,
     );
@@ -891,6 +901,7 @@ fn cpu_exact_public_tree_values(
     combos: &[GpuPrivateCombo],
     villain_weights: &[f32],
     boards: &[GpuFinalBoard],
+    state: &DenseCfrState,
     public_infosets: usize,
     actions: usize,
 ) -> ExpectedPublicTreeValues {
@@ -918,6 +929,7 @@ fn cpu_exact_public_tree_values(
                 1.0,
                 villain_weights[villain],
                 1.0,
+                state,
                 actions,
                 &mut values,
                 &mut value_weights,
@@ -935,6 +947,7 @@ fn cpu_exact_public_tree_values(
         child_cards,
         combos,
         villain_weights,
+        state,
         public_infosets,
     );
     values
@@ -946,6 +959,7 @@ fn cpu_exact_strategy_weights(
     child_cards: &[u32],
     combos: &[GpuPrivateCombo],
     villain_weights: &[f32],
+    state: &DenseCfrState,
     public_infosets: usize,
 ) -> Vec<f32> {
     let combo_count = combos.len();
@@ -962,9 +976,14 @@ fn cpu_exact_strategy_weights(
             let villain_reach = villain_reaches[node_index * combo_count + combo];
             match node.kind {
                 0 => {
+                    let private_infoset = (node.public_infoset as usize * combo_count * 2)
+                        + node.acting_player as usize * combo_count
+                        + combo;
+                    let mut strategy = vec![0.0; state.actions()];
+                    state.strategy_for(private_infoset, &mut strategy);
                     for action in 0..node.child_count as usize {
                         let child = children[node.first_child as usize + action] as usize;
-                        let probability = 1.0 / node.child_count as f32;
+                        let probability = strategy[action];
                         if node.acting_player == 0 {
                             hero_reaches[child * combo_count + combo] = hero_reach * probability;
                             villain_reaches[child * combo_count + combo] = villain_reach;
@@ -1024,6 +1043,7 @@ fn traverse_cpu_public_tree(
     hero_reach: f32,
     villain_reach: f32,
     public_reach: f32,
+    state: &DenseCfrState,
     actions: usize,
     output: &mut ExpectedPublicTreeValues,
     value_weights: &mut [f32],
@@ -1037,10 +1057,12 @@ fn traverse_cpu_public_tree(
                 + acting_player * combos.len()
                 + acting_combo;
             let offset = infoset * actions;
+            let mut strategy = vec![0.0; state.actions()];
+            state.strategy_for(infoset, &mut strategy);
             let mut action_values = vec![0.0; node.child_count as usize];
             for action in 0..node.child_count as usize {
                 let child = children[node.first_child as usize + action] as usize;
-                let probability = 1.0 / node.child_count as f32;
+                let probability = strategy[action];
                 let (next_hero_reach, next_villain_reach) = if acting_player == 0 {
                     (hero_reach * probability, villain_reach)
                 } else {
@@ -1058,6 +1080,7 @@ fn traverse_cpu_public_tree(
                     next_hero_reach,
                     next_villain_reach,
                     public_reach,
+                    state,
                     actions,
                     output,
                     value_weights,
@@ -1088,7 +1111,11 @@ fn traverse_cpu_public_tree(
                 output.reach_weights[infoset] += opponent_reach;
                 output.strategy_weights[infoset] += own_reach;
             }
-            action_values.iter().sum::<f32>() / node.child_count as f32
+            action_values
+                .iter()
+                .zip(strategy)
+                .map(|(value, probability)| value * probability)
+                .sum()
         }
         1 => {
             let mut valid_children = Vec::new();
@@ -1118,6 +1145,7 @@ fn traverse_cpu_public_tree(
                     hero_reach,
                     villain_reach,
                     child_public_reach,
+                    state,
                     actions,
                     output,
                     value_weights,
