@@ -931,7 +931,7 @@ struct Params {
     prefix_stride: u32,
     order_stride: u32,
     x_invocations: u32,
-    board_base: u32,
+    _pad0: u32,
     terminal_start: u32,
 };
 struct ChunkParams {
@@ -990,9 +990,11 @@ fn terminal_partial(
     let is_live = index < output_count && params.combo_count + 1u <= TERMINAL_PREFIX_CAPACITY;
     let board = select(0u, index % params.board_count, is_live);
     let terminal_slot = select(0u, index / params.board_count, is_live);
-    let node_index = terminal_nodes[chunk.terminal_start + terminal_slot];
+    let group_terminal_slot = chunk.terminal_start + terminal_slot;
+    let node_index = terminal_nodes[group_terminal_slot];
     let node_offset = node_index * params.combo_count;
-    let order_base = board * params.order_stride;
+    let table_board = group_terminal_slot * params.board_count + board;
+    let order_base = table_board * params.order_stride;
     let prefix_base = (terminal_slot * params.board_count + board) * params.prefix_stride;
 
     for (var position = local_id.x; position < TERMINAL_PREFIX_CAPACITY; position = position + 256u) {
@@ -1000,7 +1002,7 @@ fn terminal_partial(
         if is_live && position < params.combo_count {
             let combo = combo_order[order_base + position];
             if combo != 0xffffffffu {
-                let bounds = combo_bounds[board * params.combo_count + combo];
+                let bounds = combo_bounds[table_board * params.combo_count + combo];
                 if bounds.legal != 0u {
                     pair = PrefixPair(
                         hero_reaches[node_offset + combo],
@@ -1102,7 +1104,7 @@ struct Params {
     prefix_stride: u32,
     order_stride: u32,
     x_invocations: u32,
-    board_base: u32,
+    _pad0: u32,
     terminal_start: u32,
 };
 struct ChunkParams {
@@ -1131,9 +1133,11 @@ fn terminal_partial(@builtin(global_invocation_id) id: vec3<u32>) {
     }
     let board = index % params.board_count;
     let terminal_slot = index / params.board_count;
-    let node_index = terminal_nodes[chunk.terminal_start + terminal_slot];
+    let group_terminal_slot = chunk.terminal_start + terminal_slot;
+    let node_index = terminal_nodes[group_terminal_slot];
     let node_offset = node_index * params.combo_count;
-    let order_base = board * params.order_stride;
+    let table_board = group_terminal_slot * params.board_count + board;
+    let order_base = table_board * params.order_stride;
     let prefix_base = (terminal_slot * params.board_count + board) * params.prefix_stride;
     var hero_sum = 0.0;
     var villain_sum = 0.0;
@@ -1141,7 +1145,7 @@ fn terminal_partial(@builtin(global_invocation_id) id: vec3<u32>) {
     for (var position = 0u; position < params.combo_count; position = position + 1u) {
         let combo = combo_order[order_base + position];
         if combo != 0xffffffffu {
-            let bounds = combo_bounds[board * params.combo_count + combo];
+            let bounds = combo_bounds[table_board * params.combo_count + combo];
             if bounds.legal != 0u {
                 hero_sum = hero_sum + hero_reaches[node_offset + combo];
                 villain_sum = villain_sum + villain_reaches[node_offset + combo];
@@ -1184,7 +1188,7 @@ struct Params {
     prefix_stride: u32,
     blocker_stride: u32,
     x_invocations: u32,
-    board_base: u32,
+    _pad0: u32,
     terminal_start: u32,
 };
 struct ChunkParams {
@@ -1215,16 +1219,16 @@ fn terminal_reduce(@builtin(global_invocation_id) id: vec3<u32>) {
     }
     let combo = index % params.combo_count;
     let terminal_slot = index / params.combo_count;
-    let node_index = terminal_nodes[chunk.terminal_start + terminal_slot];
+    let group_terminal_slot = chunk.terminal_start + terminal_slot;
+    let node_index = terminal_nodes[group_terminal_slot];
     let node = nodes[node_index];
     let node_offset = node_index * params.combo_count;
     let denom = max(node.showdown_denominator, 1.0);
     var hero_value = 0.0;
     var villain_value = 0.0;
-    for (var board = 0u; board < node.board_count; board = board + 1u) {
-        let board_index = node.showdown_offset + board;
-        let local_board = board_index - params.board_base;
-        let bounds = combo_bounds[local_board * params.combo_count + combo];
+    for (var local_board = 0u; local_board < node.board_count; local_board = local_board + 1u) {
+        let table_board = group_terminal_slot * params.board_count + local_board;
+        let bounds = combo_bounds[table_board * params.combo_count + combo];
         if bounds.legal == 0u {
             continue;
         }
@@ -1245,7 +1249,7 @@ fn terminal_reduce(@builtin(global_invocation_id) id: vec3<u32>) {
             if opponent == 0xffffffffu {
                 continue;
             }
-            let opponent_bounds = combo_bounds[local_board * params.combo_count + opponent];
+            let opponent_bounds = combo_bounds[table_board * params.combo_count + opponent];
             if opponent_bounds.legal == 0u {
                 continue;
             }
@@ -1306,7 +1310,7 @@ struct Params {
     prefix_stride: u32,
     card_stride: u32,
     x_invocations: u32,
-    board_base: u32,
+    _pad0: u32,
     terminal_start: u32,
 };
 
@@ -1336,9 +1340,11 @@ fn terminal_card_prefix(
     }
     let board = index % params.board_count;
     let terminal_slot = index / params.board_count;
-    let node_index = terminal_nodes[params.terminal_start + terminal_slot];
+    let group_terminal_slot = params.terminal_start + terminal_slot;
+    let node_index = terminal_nodes[group_terminal_slot];
     let node_offset = node_index * params.combo_count;
-    let order_base = board * params.combo_count;
+    let table_board = group_terminal_slot * params.board_count + board;
+    let order_base = table_board * params.combo_count;
     let output_base =
         (terminal_slot * params.board_count * 52u + board * 52u + card) * params.card_stride;
     var hero_sum = 0.0;
@@ -1347,7 +1353,7 @@ fn terminal_card_prefix(
     for (var position = 0u; position < params.combo_count; position = position + 1u) {
         let combo_index = combo_order[order_base + position];
         if combo_index != 0xffffffffu {
-            let bounds = combo_bounds[board * params.combo_count + combo_index];
+            let bounds = combo_bounds[table_board * params.combo_count + combo_index];
             let combo = combos[combo_index];
             if bounds.legal != 0u {
                 if bounds.group_start == position {
@@ -1402,7 +1408,7 @@ struct Params {
     prefix_stride: u32,
     card_stride: u32,
     x_invocations: u32,
-    board_base: u32,
+    _pad0: u32,
     terminal_start: u32,
 };
 
@@ -1431,17 +1437,17 @@ fn terminal_reduce(@builtin(global_invocation_id) id: vec3<u32>) {
     }
     let combo = index % params.combo_count;
     let terminal_slot = index / params.combo_count;
-    let node_index = terminal_nodes[params.terminal_start + terminal_slot];
+    let group_terminal_slot = params.terminal_start + terminal_slot;
+    let node_index = terminal_nodes[group_terminal_slot];
     let node = nodes[node_index];
     let node_offset = node_index * params.combo_count;
     let private_combo = combos[combo];
     let denom = max(node.showdown_denominator, 1.0);
     var hero_value = 0.0;
     var villain_value = 0.0;
-    for (var board = 0u; board < node.board_count; board = board + 1u) {
-        let board_index = node.showdown_offset + board;
-        let local_board = board_index - params.board_base;
-        let bounds = combo_bounds[local_board * params.combo_count + combo];
+    for (var local_board = 0u; local_board < node.board_count; local_board = local_board + 1u) {
+        let table_board = group_terminal_slot * params.board_count + local_board;
+        let bounds = combo_bounds[table_board * params.combo_count + combo];
         if bounds.legal == 0u {
             continue;
         }
@@ -2193,7 +2199,6 @@ struct GpuPublicTreeLayered {
 }
 
 struct GpuTerminalGroupCache {
-    board_base: usize,
     board_count: usize,
     terminal_nodes: Vec<u32>,
     combo_order: Vec<u32>,
@@ -2201,7 +2206,6 @@ struct GpuTerminalGroupCache {
 }
 
 struct GpuTerminalGroupBufferCache {
-    board_base: usize,
     board_count: usize,
     terminal_nodes_len: usize,
     terminal_nodes_buffer: wgpu::Buffer,
@@ -2333,31 +2337,53 @@ fn terminal_group_caches(
     combos: &[GpuPrivateCombo],
     showdown_boards: &[GpuFinalBoard],
 ) -> Vec<GpuTerminalGroupCache> {
-    let mut groups: BTreeMap<(usize, usize), Vec<u32>> = BTreeMap::new();
+    const MAX_TERMINAL_GROUP_TABLE_BYTES: usize = 124 * 1024 * 1024;
+
+    let mut groups: BTreeMap<usize, Vec<u32>> = BTreeMap::new();
     for &node_index in terminal_nodes {
         let node = nodes[node_index as usize];
         groups
-            .entry((node.showdown_offset as usize, node._pad0 as usize))
+            .entry(node._pad0 as usize)
             .or_default()
             .push(node_index);
     }
-    groups
-        .into_iter()
-        .filter_map(|((board_base, board_count), terminal_nodes)| {
-            if board_count == 0 {
-                return None;
+
+    let mut caches = Vec::new();
+    for (board_count, terminal_nodes) in groups {
+        if board_count == 0 {
+            continue;
+        }
+
+        let table_bytes_per_terminal = board_count.saturating_mul(combos.len()).saturating_mul(
+            std::mem::size_of::<u32>() + std::mem::size_of::<GpuShowdownComboBounds>(),
+        );
+        let terminals_per_group = (MAX_TERMINAL_GROUP_TABLE_BYTES / table_bytes_per_terminal)
+            .max(1)
+            .min(terminal_nodes.len());
+
+        for terminal_chunk in terminal_nodes.chunks(terminals_per_group) {
+            let mut combo_order =
+                Vec::with_capacity(terminal_chunk.len() * board_count * combos.len());
+            let mut combo_bounds =
+                Vec::with_capacity(terminal_chunk.len() * board_count * combos.len());
+            for &node_index in terminal_chunk {
+                let node = nodes[node_index as usize];
+                let board_base = node.showdown_offset as usize;
+                let boards = &showdown_boards[board_base..board_base + board_count];
+                let (node_combo_order, node_combo_bounds) =
+                    showdown_strength_order_data(combos, boards);
+                combo_order.extend(node_combo_order);
+                combo_bounds.extend(node_combo_bounds);
             }
-            let boards = &showdown_boards[board_base..board_base + board_count];
-            let (combo_order, combo_bounds) = showdown_strength_order_data(combos, boards);
-            Some(GpuTerminalGroupCache {
-                board_base,
+            caches.push(GpuTerminalGroupCache {
                 board_count,
-                terminal_nodes,
+                terminal_nodes: terminal_chunk.to_vec(),
                 combo_order,
                 combo_bounds,
-            })
-        })
-        .collect()
+            });
+        }
+    }
+    caches
 }
 
 fn requested_wgpu_backends() -> Option<wgpu::Backends> {
@@ -3598,7 +3624,6 @@ impl GpuDenseCfrBackend {
         terminal_groups
             .iter()
             .map(|group| GpuTerminalGroupBufferCache {
-                board_base: group.board_base,
                 board_count: group.board_count,
                 terminal_nodes_len: group.terminal_nodes.len(),
                 terminal_nodes_buffer: readonly_buffer(
@@ -3673,7 +3698,7 @@ impl GpuDenseCfrBackend {
                     output_len: (combo_count + 1) as u32,
                     pair_start: combo_count as u32,
                     chunk_pairs: 0,
-                    _pad0: group.board_base as u32,
+                    _pad0: 0,
                     _pad1: 0,
                 }],
             );
@@ -3701,7 +3726,7 @@ impl GpuDenseCfrBackend {
                     output_len: (combo_count + 1) as u32,
                     pair_start: blocker_neighbor_stride as u32,
                     chunk_pairs: 0,
-                    _pad0: group.board_base as u32,
+                    _pad0: 0,
                     _pad1: 0,
                 }],
             );
@@ -3771,7 +3796,7 @@ impl GpuDenseCfrBackend {
                             output_len: (combo_count + 1) as u32,
                             pair_start: (combo_count + 1) as u32,
                             chunk_pairs: card_prefix_x_groups,
-                            _pad0: group.board_base as u32,
+                            _pad0: 0,
                             _pad1: terminal_start as u32,
                         }],
                     )
@@ -3787,7 +3812,7 @@ impl GpuDenseCfrBackend {
                             output_len: (combo_count + 1) as u32,
                             pair_start: (combo_count + 1) as u32,
                             chunk_pairs: reduce_x_invocations,
-                            _pad0: group.board_base as u32,
+                            _pad0: 0,
                             _pad1: terminal_start as u32,
                         }],
                     )
