@@ -485,7 +485,7 @@ impl SubgameTree {
             child_state.min_aggressive_amount = child_state.pot.max(1);
             child_state.raises_this_street = 0;
             child_state.checks_this_street = 0;
-            self.expand_state(Some(chance), child_state, depth + 1, config, builder);
+            self.expand_state(Some(chance), child_state, depth, config, builder);
         }
     }
 }
@@ -964,5 +964,23 @@ mod tests {
             panic!("river check-check should finish the public tree");
         };
         assert_eq!(kind, TerminalKind::Showdown);
+    }
+
+    #[test]
+    fn flop_tree_depth_budget_preserves_river_decisions() {
+        let tree = SubgameTree::build(root_state(Street::Flop), compact_tree_config(5));
+
+        let river_decisions = tree
+            .nodes()
+            .iter()
+            .filter(|node| {
+                matches!(
+                    &node.kind,
+                    PublicNodeKind::Decision { state, .. } if state.street == Street::River
+                )
+            })
+            .count();
+
+        assert!(river_decisions > 0);
     }
 }
