@@ -644,17 +644,14 @@ fn run_dump_flop_tree(args: FlopCommandArgs) {
         std::process::exit(2);
     });
     let config = match_config(cli_config.as_ref());
-    let lines = pokedr_agent::dump_fixed_flop_tree(flop, config);
     if let Some(node) = env_usize("POKEDR_DUMP_NODE") {
-        let Some(line) = lines.get(node) else {
-            eprintln!(
-                "POKEDR_DUMP_NODE={node} is outside dumped tree size {}",
-                lines.len()
-            );
+        let Some(line) = pokedr_agent::dump_fixed_flop_tree_node(flop, config, node) else {
+            eprintln!("POKEDR_DUMP_NODE={node} is outside dumped tree");
             std::process::exit(2);
         };
         println!("{line}");
     } else {
+        let lines = pokedr_agent::dump_fixed_flop_tree(flop, config);
         for line in lines {
             println!("{line}");
         }

@@ -542,11 +542,12 @@ where
 }
 
 pub fn dump_fixed_flop_tree(flop: [PokedrCard; 3], config: PokedrAgentConfig) -> Vec<String> {
-    let (tree, layout) = fixed_flop_tree_and_layout(flop, config);
+    let (tree, layout) = fixed_flop_tree_and_layout(flop, config.clone());
+    let solver_dump = DumpSolverContext::build(&tree, &layout, &config);
     tree.nodes()
         .iter()
         .enumerate()
-        .map(|(index, node)| dump_tree_node_json(&tree, &layout, index, node))
+        .map(|(index, node)| dump_tree_node_json(&tree, &layout, solver_dump.as_ref(), index, node))
         .collect()
 }
 
@@ -555,9 +556,16 @@ pub fn dump_fixed_flop_tree_node(
     config: PokedrAgentConfig,
     node_index: usize,
 ) -> Option<String> {
-    let (tree, layout) = fixed_flop_tree_and_layout(flop, config);
+    let (tree, layout) = fixed_flop_tree_and_layout(flop, config.clone());
+    let solver_dump = DumpSolverContext::build(&tree, &layout, &config);
     let node = tree.nodes().get(node_index)?;
-    Some(dump_tree_node_json(&tree, &layout, node_index, node))
+    Some(dump_tree_node_json(
+        &tree,
+        &layout,
+        solver_dump.as_ref(),
+        node_index,
+        node,
+    ))
 }
 
 fn fixed_flop_tree_and_layout(
@@ -2549,9 +2557,94 @@ fn format_action_candidate(candidate: &ActionCandidate) -> String {
     )
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DumpSolverMode {
+    Summary,
+    Full,
+}
+
+struct DumpSolverContext {
+    state: DenseCfrState,
+    values: Option<GpuRootTerminalValues>,
+    indexer: ComboIndexer,
+    root_dead: u64,
+    iterations: usize,
+    mode: DumpSolverMode,
+    combo_limit: usize,
+}
+
+impl DumpSolverContext {
+    fn build(
+        tree: &SubgameTree,
+        layout: &PostflopDenseLayout,
+        config: &PokedrAgentConfig,
+    ) -> Option<Self> {
+        let mode = dump_solver_mode()?;
+        let indexer = ComboIndexer::new();
+        let root_dead = root_board(tree).deck_mask();
+        let villain_weights = vec![1.0; COMBO_COUNT];
+        let state = solve_public_tree_cfr(tree, layout, config, &villain_weights);
+        let values = cfr_gpu_backend().and_then(|backend| {
+            let matrix_cache =
+                RefCell::new(ShowdownMatrixCache::new(showdown_matrix_cache_capacity()));
+            let linearized =
+                linearize_gpu_public_tree(tree, layout, &backend, config, &matrix_cache)?;
+            let combos = gpu_private_combos();
+            let combo_legal = indexer
+                .combos()
+                .iter()
+                .map(|combo| (!combo.collides_with(root_dead)) as u32)
+                .collect::<Vec<_>>();
+            let profile = state.average_strategy_profile_state();
+            backend
+                .public_tree_iteration_values(
+                    &linearized.nodes,
+                    &linearized.children,
+                    &linearized.child_cards,
+                    &combos,
+                    &combo_legal,
+                    &villain_weights,
+                    &linearized.showdown_boards,
+                    &profile,
+                )
+                .ok()
+        });
+        Some(Self {
+            state,
+            values,
+            indexer,
+            root_dead,
+            iterations: config.cfr_iterations.max(1),
+            mode,
+            combo_limit: dump_solver_combo_limit(mode),
+        })
+    }
+}
+
+fn dump_solver_mode() -> Option<DumpSolverMode> {
+    let value = std::env::var("POKEDR_DUMP_SOLVER_STATE").ok()?;
+    match value.to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "summary" => Some(DumpSolverMode::Summary),
+        "full" | "all" | "combos" => Some(DumpSolverMode::Full),
+        "0" | "false" | "no" | "off" => None,
+        _ => Some(DumpSolverMode::Summary),
+    }
+}
+
+fn dump_solver_combo_limit(mode: DumpSolverMode) -> usize {
+    std::env::var("POKEDR_DUMP_COMBO_LIMIT")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(match mode {
+            DumpSolverMode::Summary => 8,
+            DumpSolverMode::Full => usize::MAX,
+        })
+}
+
 fn dump_tree_node_json(
     tree: &SubgameTree,
     layout: &PostflopDenseLayout,
+    solver_dump: Option<&DumpSolverContext>,
     index: usize,
     node: &pokedr_core::postflop::PublicNode,
 ) -> String {
@@ -2614,9 +2707,213 @@ fn dump_tree_node_json(
             villain_invested
         ),
     };
+    let solver = solver_dump
+        .and_then(|context| dump_solver_node_json(tree, layout, context, index))
+        .map(|json| format!(r#","solver":{json}"#))
+        .unwrap_or_default();
     format!(
-        r#"{{"index":{index},"parent":{parent},"children":{children},"path":[{path}],"infoset":{infoset},"kind":{kind}}}"#
+        r#"{{"index":{index},"parent":{parent},"children":{children},"path":[{path}],"infoset":{infoset},"kind":{kind}{solver}}}"#
     )
+}
+
+fn dump_solver_node_json(
+    tree: &SubgameTree,
+    layout: &PostflopDenseLayout,
+    context: &DumpSolverContext,
+    node_index: usize,
+) -> Option<String> {
+    let public_infoset = layout.node_infoset(node_index)?;
+    let PublicNodeKind::Decision { state, actions } = &tree.nodes()[node_index].kind else {
+        return None;
+    };
+    let action_count = actions.len();
+    let mut current_strategy = vec![0.0; layout.max_actions()];
+    let mut average_strategy = vec![0.0; layout.max_actions()];
+    let mut average_sum = vec![0.0; action_count];
+    let mut current_sum = vec![0.0; action_count];
+    let mut legal_combo_count = 0usize;
+    let mut gap_rows = Vec::new();
+
+    for (combo_index, combo) in context.indexer.combos().iter().enumerate() {
+        if combo.collides_with(context.root_dead) {
+            continue;
+        }
+        legal_combo_count += 1;
+        let infoset = private_infoset(public_infoset, state.acting_player, combo_index);
+        let offset = infoset * layout.max_actions();
+        context.state.strategy_for(infoset, &mut current_strategy);
+        context
+            .state
+            .average_strategy_for(infoset, &mut average_strategy);
+        for action in 0..action_count {
+            average_sum[action] += average_strategy[action];
+            current_sum[action] += current_strategy[action];
+        }
+        gap_rows.push(dump_solver_combo_row(
+            context,
+            combo_index,
+            offset,
+            action_count,
+            &average_strategy,
+            &current_strategy,
+        ));
+    }
+
+    if legal_combo_count > 0 {
+        for action in 0..action_count {
+            average_sum[action] /= legal_combo_count as f32;
+            current_sum[action] /= legal_combo_count as f32;
+        }
+    }
+
+    gap_rows.sort_by(|left, right| {
+        right
+            .weighted_gap
+            .partial_cmp(&left.weighted_gap)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let max_gap = gap_rows.first().map(DumpSolverComboRow::to_json);
+    let include_combos = matches!(context.mode, DumpSolverMode::Full) || context.combo_limit > 0;
+    let combos = if include_combos {
+        let rows = gap_rows
+            .iter()
+            .take(context.combo_limit)
+            .map(DumpSolverComboRow::to_json)
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(r#","combos":[{rows}]"#)
+    } else {
+        String::new()
+    };
+    Some(format!(
+        r#"{{"mode":"{:?}","iterations":{},"public_infoset":{},"acting_player":"{:?}","action_count":{},"legal_combo_count":{},"actions":[{}],"avg_strategy":{},"current_strategy":{},"max_gap":{}{}}}"#,
+        context.mode,
+        context.iterations,
+        public_infoset,
+        state.acting_player,
+        action_count,
+        legal_combo_count,
+        actions
+            .iter()
+            .enumerate()
+            .map(|(action_index, action)| {
+                format!(
+                    r#"{{"index":{},"action":"{}","source":"{:?}"}}"#,
+                    action_index,
+                    json_escape(&format_player_action(action.action)),
+                    action.source
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(","),
+        json_f32_array(&average_sum),
+        json_f32_array(&current_sum),
+        max_gap.unwrap_or_else(|| "null".to_string()),
+        combos
+    ))
+}
+
+struct DumpSolverComboRow {
+    combo_index: usize,
+    combo: String,
+    reach_weight: f32,
+    gap: f32,
+    weighted_gap: f32,
+    best_action: Option<usize>,
+    policy_value: Option<f32>,
+    action_values: Option<Vec<f32>>,
+    average_strategy: Vec<f32>,
+    current_strategy: Vec<f32>,
+    regrets: Vec<f32>,
+    strategy_sum: Vec<f32>,
+}
+
+impl DumpSolverComboRow {
+    fn to_json(&self) -> String {
+        format!(
+            r#"{{"combo_index":{},"combo":"{}","reach":{},"gap":{},"weighted_gap":{},"best_action":{},"policy_value":{},"action_values":{},"avg_strategy":{},"current_strategy":{},"regrets":{},"strategy_sum":{}}}"#,
+            self.combo_index,
+            json_escape(&self.combo),
+            json_f32(self.reach_weight),
+            json_f32(self.gap),
+            json_f32(self.weighted_gap),
+            self.best_action
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "null".to_string()),
+            self.policy_value
+                .map(json_f32)
+                .unwrap_or_else(|| "null".to_string()),
+            self.action_values
+                .as_ref()
+                .map(|values| json_f32_array(values))
+                .unwrap_or_else(|| "null".to_string()),
+            json_f32_array(&self.average_strategy),
+            json_f32_array(&self.current_strategy),
+            json_f32_array(&self.regrets),
+            json_f32_array(&self.strategy_sum)
+        )
+    }
+}
+
+fn dump_solver_combo_row(
+    context: &DumpSolverContext,
+    combo_index: usize,
+    offset: usize,
+    action_count: usize,
+    average_strategy: &[f32],
+    current_strategy: &[f32],
+) -> DumpSolverComboRow {
+    let combo = context.indexer.combo(combo_index);
+    let regrets = context.state.regrets()[offset..offset + action_count].to_vec();
+    let strategy_sum = context.state.strategy_sum()[offset..offset + action_count].to_vec();
+    let action_values = context
+        .values
+        .as_ref()
+        .map(|values| values.action_values[offset..offset + action_count].to_vec());
+    let reach_weight = context
+        .values
+        .as_ref()
+        .and_then(|values| values.reach_weights.get(offset / context.state.actions()))
+        .copied()
+        .unwrap_or(0.0);
+    let (best_action, gap, policy_value) = action_values
+        .as_ref()
+        .map(|values| {
+            let (best_action, best_value) = values
+                .iter()
+                .copied()
+                .enumerate()
+                .max_by(|(_, left), (_, right)| {
+                    left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .unwrap_or((0, 0.0));
+            let policy_value = values
+                .iter()
+                .zip(average_strategy)
+                .take(action_count)
+                .map(|(value, probability)| value * probability)
+                .sum::<f32>();
+            (
+                Some(best_action),
+                (best_value - policy_value).max(0.0),
+                Some(policy_value),
+            )
+        })
+        .unwrap_or((None, 0.0, None));
+    DumpSolverComboRow {
+        combo_index,
+        combo: format_pokedr_cards(&[combo.first, combo.second]),
+        reach_weight,
+        gap,
+        weighted_gap: gap * reach_weight,
+        best_action,
+        policy_value,
+        action_values,
+        average_strategy: average_strategy[..action_count].to_vec(),
+        current_strategy: current_strategy[..action_count].to_vec(),
+        regrets,
+        strategy_sum,
+    }
 }
 
 fn dump_tree_path_json(tree: &SubgameTree, index: usize) -> String {
@@ -2695,6 +2992,25 @@ fn json_usize_array(values: &[usize]) -> String {
         values
             .iter()
             .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(",")
+    )
+}
+
+fn json_f32(value: f32) -> String {
+    if value.is_finite() {
+        format!("{value:.6}")
+    } else {
+        "null".to_string()
+    }
+}
+
+fn json_f32_array(values: &[f32]) -> String {
+    format!(
+        "[{}]",
+        values
+            .iter()
+            .map(|value| json_f32(*value))
             .collect::<Vec<_>>()
             .join(",")
     )
