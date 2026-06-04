@@ -30,6 +30,7 @@ fn main() {
     run_public_tree_chance_blocks_fold_values(&backend);
     run_public_tree_showdown_values_match_bruteforce(&backend);
     run_public_tree_multistreet_values_match_cpu_exact(&backend);
+    run_public_tree_average_strategy_br_matches_cpu_exact(&backend);
     println!("GPU smoke passed");
 }
 
@@ -873,6 +874,234 @@ fn run_public_tree_multistreet_values_match_cpu_exact(backend: &GpuDenseCfrBacke
     );
 }
 
+fn run_public_tree_average_strategy_br_matches_cpu_exact(backend: &GpuDenseCfrBackend) {
+    let fixture = multistreet_public_tree_fixture();
+    let mut state = DenseCfrState::new_with_legal_actions(
+        DenseCfrConfig {
+            infosets: fixture.public_infosets * fixture.combos.len() * 2,
+            actions: 2,
+            variant: CfrVariant::DcfrPlus {
+                alpha: 1.5,
+                gamma: 4.0,
+            },
+        },
+        vec![true; fixture.public_infosets * fixture.combos.len() * 2 * 2],
+    );
+    for iteration in 1..=4 {
+        let action_values: Vec<_> = (0..state.infosets() * state.actions())
+            .map(|index| ((index as f32 + iteration as f32 * 0.41) * 0.29).cos())
+            .collect();
+        let reach_weights: Vec<_> = (0..state.infosets())
+            .map(|index| 0.25 + ((index + iteration) % 5) as f32 * 0.2)
+            .collect();
+        let strategy_weights: Vec<_> = (0..state.infosets())
+            .map(|index| 0.5 + ((index * 3 + iteration) % 7) as f32 * 0.15)
+            .collect();
+        state.update_all_infosets(&action_values, &reach_weights, &strategy_weights, iteration);
+    }
+    let average_state = state.average_strategy_profile_state();
+
+    for br_player in [0u32, 1u32] {
+        let gpu = backend
+            .public_tree_best_response_values(
+                &fixture.nodes,
+                &fixture.children,
+                &fixture.child_cards,
+                &fixture.combos,
+                &vec![1; fixture.combos.len()],
+                &fixture.villain_weights,
+                &fixture.boards,
+                &average_state,
+                br_player,
+            )
+            .unwrap_or_else(|error| {
+                fail(&format!(
+                    "GPU public tree average strategy BR failed: {error:?}"
+                ))
+            });
+        let expected = cpu_exact_public_tree_values_with_br(
+            &fixture.nodes,
+            &fixture.children,
+            &fixture.child_cards,
+            &fixture.combos,
+            &fixture.villain_weights,
+            &fixture.boards,
+            &average_state,
+            fixture.public_infosets,
+            2,
+            Some(br_player as usize),
+        );
+        assert_close_player_actions(
+            &format!("average strategy BR {br_player} action value"),
+            &expected.action_values,
+            &gpu.action_values,
+            fixture.combos.len(),
+            2,
+            br_player as usize,
+        );
+        assert_close_player_infosets(
+            &format!("average strategy BR {br_player} reach weight"),
+            &expected.reach_weights,
+            &gpu.reach_weights,
+            fixture.combos.len(),
+            br_player as usize,
+        );
+    }
+}
+
+struct PublicTreeFixture {
+    nodes: Vec<GpuPublicTreeNode>,
+    children: Vec<u32>,
+    child_cards: Vec<u32>,
+    combos: Vec<GpuPrivateCombo>,
+    villain_weights: Vec<f32>,
+    boards: Vec<GpuFinalBoard>,
+    public_infosets: usize,
+}
+
+fn multistreet_public_tree_fixture() -> PublicTreeFixture {
+    let combos = vec![
+        gpu_combo([
+            Card::new(Rank::Ace, Suit::Spades),
+            Card::new(Rank::King, Suit::Spades),
+        ]),
+        gpu_combo([
+            Card::new(Rank::Ace, Suit::Clubs),
+            Card::new(Rank::Ace, Suit::Diamonds),
+        ]),
+        gpu_combo([
+            Card::new(Rank::Queen, Suit::Hearts),
+            Card::new(Rank::Jack, Suit::Hearts),
+        ]),
+    ];
+    let chance_cards = vec![
+        Card::new(Rank::Ace, Suit::Spades),
+        Card::new(Rank::King, Suit::Spades),
+        Card::new(Rank::Ace, Suit::Clubs),
+        Card::new(Rank::Ace, Suit::Diamonds),
+        Card::new(Rank::Queen, Suit::Hearts),
+        Card::new(Rank::Jack, Suit::Hearts),
+        Card::new(Rank::Two, Suit::Clubs),
+        Card::new(Rank::Three, Suit::Diamonds),
+    ];
+    let chance_scale = 1.0 / (chance_cards.len() - 4) as f32;
+    let mut nodes = vec![
+        GpuPublicTreeNode {
+            kind: 0,
+            acting_player: 0,
+            public_infoset: 0,
+            first_child: 0,
+            child_count: 2,
+            terminal_kind: 0,
+            showdown_offset: 0,
+            _pad0: 0,
+            pot: 12.0,
+            hero_invested: 5.0,
+            _pad1: 1.0,
+            _pad2: 0.0,
+        },
+        GpuPublicTreeNode {
+            kind: 2,
+            acting_player: 0,
+            public_infoset: 0,
+            first_child: 0,
+            child_count: 0,
+            terminal_kind: 0,
+            showdown_offset: 0,
+            _pad0: 0,
+            pot: 12.0,
+            hero_invested: 5.0,
+            _pad1: 1.0,
+            _pad2: 0.0,
+        },
+        GpuPublicTreeNode {
+            kind: 1,
+            acting_player: 0,
+            public_infoset: 0,
+            first_child: 2,
+            child_count: chance_cards.len() as u32,
+            terminal_kind: 0,
+            showdown_offset: 0,
+            _pad0: 0,
+            pot: 0.0,
+            hero_invested: 0.0,
+            _pad1: 1.0,
+            _pad2: 0.0,
+        },
+    ];
+    let mut children = vec![1, 2];
+    let mut child_cards = vec![52, 52];
+    let chance_first_child = children.len();
+    children.resize(chance_first_child + chance_cards.len(), u32::MAX);
+    child_cards.resize(chance_first_child + chance_cards.len(), 52);
+    let mut boards = Vec::with_capacity(chance_cards.len());
+    for (chance_index, chance_card) in chance_cards.iter().copied().enumerate() {
+        let public_infoset = 1 + chance_index as u32;
+        let decision_index = nodes.len() as u32;
+        children[chance_first_child + chance_index] = decision_index;
+        child_cards[chance_first_child + chance_index] = chance_card.index() as u32;
+
+        let first_child = children.len() as u32;
+        let fold_index = decision_index + 1;
+        let showdown_index = decision_index + 2;
+        children.extend([fold_index, showdown_index]);
+        child_cards.extend([52, 52]);
+        nodes.push(GpuPublicTreeNode {
+            kind: 0,
+            acting_player: 1,
+            public_infoset,
+            first_child,
+            child_count: 2,
+            terminal_kind: 0,
+            showdown_offset: 0,
+            _pad0: 0,
+            pot: 16.0,
+            hero_invested: 6.0,
+            _pad1: chance_scale,
+            _pad2: 0.0,
+        });
+        nodes.push(GpuPublicTreeNode {
+            kind: 2,
+            acting_player: 0,
+            public_infoset: 0,
+            first_child: 0,
+            child_count: 0,
+            terminal_kind: 1,
+            showdown_offset: 0,
+            _pad0: 0,
+            pot: 16.0,
+            hero_invested: 6.0,
+            _pad1: chance_scale,
+            _pad2: 0.0,
+        });
+        nodes.push(GpuPublicTreeNode {
+            kind: 2,
+            acting_player: 0,
+            public_infoset: 0,
+            first_child: 0,
+            child_count: 0,
+            terminal_kind: 2,
+            showdown_offset: chance_index as u32,
+            _pad0: 1,
+            pot: 16.0,
+            hero_invested: 6.0,
+            _pad1: chance_scale,
+            _pad2: 1.0,
+        });
+        boards.push(final_board_with_turn(chance_card));
+    }
+
+    PublicTreeFixture {
+        nodes,
+        children,
+        child_cards,
+        combos,
+        villain_weights: vec![0.35, 1.1, 0.8],
+        boards,
+        public_infosets: 1 + chance_cards.len(),
+    }
+}
+
 fn final_board_with_turn(turn: Card) -> GpuFinalBoard {
     let mut cards = [
         turn.index() as u32,
@@ -905,6 +1134,33 @@ fn cpu_exact_public_tree_values(
     public_infosets: usize,
     actions: usize,
 ) -> ExpectedPublicTreeValues {
+    cpu_exact_public_tree_values_with_br(
+        nodes,
+        children,
+        child_cards,
+        combos,
+        villain_weights,
+        boards,
+        state,
+        public_infosets,
+        actions,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cpu_exact_public_tree_values_with_br(
+    nodes: &[GpuPublicTreeNode],
+    children: &[u32],
+    child_cards: &[u32],
+    combos: &[GpuPrivateCombo],
+    villain_weights: &[f32],
+    boards: &[GpuFinalBoard],
+    state: &DenseCfrState,
+    public_infosets: usize,
+    actions: usize,
+    br_player: Option<usize>,
+) -> ExpectedPublicTreeValues {
     let infosets = public_infosets * combos.len() * 2;
     let mut values = ExpectedPublicTreeValues {
         action_values: vec![0.0; infosets * actions],
@@ -931,6 +1187,7 @@ fn cpu_exact_public_tree_values(
                 1.0,
                 state,
                 actions,
+                br_player,
                 &mut values,
                 &mut value_weights,
             );
@@ -1045,6 +1302,7 @@ fn traverse_cpu_public_tree(
     public_reach: f32,
     state: &DenseCfrState,
     actions: usize,
+    br_player: Option<usize>,
     output: &mut ExpectedPublicTreeValues,
     value_weights: &mut [f32],
 ) -> f32 {
@@ -1082,6 +1340,7 @@ fn traverse_cpu_public_tree(
                     public_reach,
                     state,
                     actions,
+                    br_player,
                     output,
                     value_weights,
                 );
@@ -1111,11 +1370,27 @@ fn traverse_cpu_public_tree(
                 output.reach_weights[infoset] += opponent_reach;
                 output.strategy_weights[infoset] += own_reach;
             }
-            action_values
-                .iter()
-                .zip(strategy)
-                .map(|(value, probability)| value * probability)
-                .sum()
+            if br_player == Some(acting_player) {
+                if acting_player == 0 {
+                    action_values
+                        .iter()
+                        .copied()
+                        .reduce(f32::max)
+                        .unwrap_or(0.0)
+                } else {
+                    action_values
+                        .iter()
+                        .copied()
+                        .reduce(f32::min)
+                        .unwrap_or(0.0)
+                }
+            } else {
+                action_values
+                    .iter()
+                    .zip(strategy)
+                    .map(|(value, probability)| value * probability)
+                    .sum()
+            }
         }
         1 => {
             let mut valid_children = Vec::new();
@@ -1147,6 +1422,7 @@ fn traverse_cpu_public_tree(
                     child_public_reach,
                     state,
                     actions,
+                    br_player,
                     output,
                     value_weights,
                 );
@@ -1249,6 +1525,42 @@ fn gpu_combo(cards: [Card; 2]) -> GpuPrivateCombo {
 fn assert_close(label: &str, expected: &[f32], actual: &[f32]) {
     for (index, (expected, actual)) in expected.iter().zip(actual).enumerate() {
         if (expected - actual).abs() >= 1e-5 {
+            fail(&format!(
+                "{label}[{index}] mismatch: expected {expected}, actual {actual}"
+            ));
+        }
+    }
+}
+
+fn assert_close_player_actions(
+    label: &str,
+    expected: &[f32],
+    actual: &[f32],
+    combo_count: usize,
+    actions: usize,
+    player: usize,
+) {
+    for (index, (expected, actual)) in expected.iter().zip(actual).enumerate() {
+        let private_infoset = index / actions;
+        let player_slot = (private_infoset / combo_count) % 2;
+        if player_slot == player && (expected - actual).abs() >= 1e-5 {
+            fail(&format!(
+                "{label}[{index}] mismatch: expected {expected}, actual {actual}"
+            ));
+        }
+    }
+}
+
+fn assert_close_player_infosets(
+    label: &str,
+    expected: &[f32],
+    actual: &[f32],
+    combo_count: usize,
+    player: usize,
+) {
+    for (index, (expected, actual)) in expected.iter().zip(actual).enumerate() {
+        let player_slot = (index / combo_count) % 2;
+        if player_slot == player && (expected - actual).abs() >= 1e-5 {
             fail(&format!(
                 "{label}[{index}] mismatch: expected {expected}, actual {actual}"
             ));
