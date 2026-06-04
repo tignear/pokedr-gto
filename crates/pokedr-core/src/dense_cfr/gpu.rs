@@ -995,6 +995,81 @@ fn terminal_partial(
 }
 "#;
 
+const PUBLIC_TREE_TERMINAL_PARTIAL_SERIAL_SHADER: &str = r#"
+struct TreeNode {
+    kind: u32,
+    acting_player: u32,
+    public_infoset: u32,
+    first_child: u32,
+    child_count: u32,
+    terminal_kind: u32,
+    showdown_offset: u32,
+    _pad0: u32,
+    pot: f32,
+    hero_invested: f32,
+    _pad1: f32,
+    _pad2: f32,
+};
+struct Bounds {
+    group_start: u32,
+    group_end: u32,
+    legal: u32,
+    _pad0: u32,
+};
+struct PrefixPair {
+    hero: f32,
+    villain: f32,
+};
+struct Params {
+    combo_count: u32,
+    terminal_count: u32,
+    board_count: u32,
+    prefix_stride: u32,
+    order_stride: u32,
+    x_invocations: u32,
+    board_base: u32,
+    _pad3: u32,
+};
+
+@group(0) @binding(0) var<storage, read> nodes: array<TreeNode>;
+@group(0) @binding(1) var<storage, read> terminal_nodes: array<u32>;
+@group(0) @binding(2) var<storage, read> combo_order: array<u32>;
+@group(0) @binding(3) var<storage, read> combo_bounds: array<Bounds>;
+@group(0) @binding(4) var<storage, read> hero_reaches: array<f32>;
+@group(0) @binding(5) var<storage, read> villain_reaches: array<f32>;
+@group(0) @binding(6) var<storage, read_write> prefix_pairs: array<PrefixPair>;
+@group(0) @binding(7) var<uniform> params: Params;
+
+@compute @workgroup_size(64)
+fn terminal_partial(@builtin(global_invocation_id) id: vec3<u32>) {
+    let index = id.x + id.y * params.x_invocations;
+    let output_count = params.terminal_count * params.board_count;
+    if index >= output_count {
+        return;
+    }
+    let board = index % params.board_count;
+    let terminal_slot = index / params.board_count;
+    let node_index = terminal_nodes[terminal_slot];
+    let node_offset = node_index * params.combo_count;
+    let order_base = board * params.order_stride;
+    let prefix_base = (terminal_slot * params.board_count + board) * params.prefix_stride;
+    var hero_sum = 0.0;
+    var villain_sum = 0.0;
+    prefix_pairs[prefix_base] = PrefixPair(0.0, 0.0);
+    for (var position = 0u; position < params.combo_count; position = position + 1u) {
+        let combo = combo_order[order_base + position];
+        if combo != 0xffffffffu {
+            let bounds = combo_bounds[board * params.combo_count + combo];
+            if bounds.legal != 0u {
+                hero_sum = hero_sum + hero_reaches[node_offset + combo];
+                villain_sum = villain_sum + villain_reaches[node_offset + combo];
+            }
+        }
+        prefix_pairs[prefix_base + position + 1u] = PrefixPair(hero_sum, villain_sum);
+    }
+}
+"#;
+
 const PUBLIC_TREE_TERMINAL_REDUCE_SHADER: &str = r#"
 struct TreeNode {
     kind: u32,
@@ -1925,6 +2000,35 @@ fn requested_wgpu_backends() -> Option<wgpu::Backends> {
     (!backends.is_empty()).then_some(backends)
 }
 
+fn public_tree_terminal_partial_shader_source(
+    backend: wgpu::Backend,
+) -> (&'static str, &'static str) {
+    let force_parallel = std::env::var("POKEDR_GPU_TERMINAL_PARALLEL_PREFIX")
+        .ok()
+        .map(|value| {
+            matches!(
+                value.to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "parallel"
+            )
+        })
+        .unwrap_or(false);
+    let allow_unsafe_dx12_parallel =
+        std::env::var_os("POKEDR_GPU_UNSAFE_DX12_PARALLEL_PREFIX").is_some();
+    if force_parallel && (!matches!(backend, wgpu::Backend::Dx12) || allow_unsafe_dx12_parallel) {
+        return (PUBLIC_TREE_TERMINAL_PARTIAL_SHADER, "parallel-forced");
+    }
+    if matches!(backend, wgpu::Backend::Dx12) {
+        return (PUBLIC_TREE_TERMINAL_PARTIAL_SERIAL_SHADER, "serial");
+    }
+    (PUBLIC_TREE_TERMINAL_PARTIAL_SHADER, "parallel")
+}
+
+fn trace_pipeline_step(step: &str) {
+    if std::env::var_os("POKEDR_GPU_PIPELINE_TRACE").is_some() {
+        eprintln!("pokedr: gpu pipeline {step}");
+    }
+}
+
 async fn request_gpu_adapter() -> Result<wgpu::Adapter, GpuCfrError> {
     let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle_from_env();
     if let Some(backends) = requested_wgpu_backends() {
@@ -2039,6 +2143,7 @@ impl GpuDenseCfrBackend {
         if std::env::var_os("POKEDR_GPU_INIT_TRACE").is_some() {
             eprintln!("pokedr: gpu init creating pipelines");
         }
+        trace_pipeline_step("dense_cfr_update:start");
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("dense CFR update shader"),
             source: wgpu::ShaderSource::Wgsl(CFR_UPDATE_SHADER.into()),
@@ -2068,6 +2173,7 @@ impl GpuDenseCfrBackend {
             compilation_options: wgpu::PipelineCompilationOptions::default(),
             cache: None,
         });
+        trace_pipeline_step("dense_cfr_update:done");
         let public_tree_cfr_update_shader =
             device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("public tree CFR update shader"),
@@ -2206,10 +2312,23 @@ impl GpuDenseCfrBackend {
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
                 cache: None,
             });
+        trace_pipeline_step("public_tree_terminal_partial:start");
+        let (partial_shader_source, partial_shader_mode) =
+            public_tree_terminal_partial_shader_source(adapter_info.backend);
+        if std::env::var_os("POKEDR_GPU_PIPELINE_TRACE").is_some() {
+            eprintln!(
+                "pokedr: gpu pipeline public_tree_terminal_partial backend={:?} mode={} forced_parallel_env={}",
+                adapter_info.backend,
+                partial_shader_mode,
+                std::env::var("POKEDR_GPU_TERMINAL_PARALLEL_PREFIX")
+                    .ok()
+                    .unwrap_or_default(),
+            );
+        }
         let public_tree_terminal_partial_shader =
             device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("public tree terminal partial shader"),
-                source: wgpu::ShaderSource::Wgsl(PUBLIC_TREE_TERMINAL_PARTIAL_SHADER.into()),
+                source: wgpu::ShaderSource::Wgsl(partial_shader_source.into()),
             });
         let public_tree_terminal_partial_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -2240,6 +2359,8 @@ impl GpuDenseCfrBackend {
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
                 cache: None,
             });
+        trace_pipeline_step("public_tree_terminal_partial:done");
+        trace_pipeline_step("public_tree_terminal_reduce:start");
         let public_tree_terminal_reduce_shader =
             device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("public tree terminal reduce shader"),
@@ -2276,6 +2397,7 @@ impl GpuDenseCfrBackend {
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
                 cache: None,
             });
+        trace_pipeline_step("public_tree_terminal_reduce:done");
         let public_tree_fold_aggregate_shader =
             device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("public tree fold aggregate shader"),

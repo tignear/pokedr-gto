@@ -677,6 +677,77 @@ The high-value kernel work is therefore parallel scan / segmented scan over
 Replacing CPU precomputed `order` with GPU sort should not change this operator
 interface.
 
+### Blocker Card Aggregate Feasibility
+
+For a fixed terminal `z`, final board `b`, and hero combo `h = (a,b)`, the
+current reduce kernel subtracts all opponent combos that intersect `h`.
+For opponent reach vector `r[v]`, board-legal combos only, and hero strength
+group `g_h`, the exact correction can be written with card aggregates:
+
+```text
+block_total(h) =
+  total_card[a] + total_card[b] - r[h]
+
+block_win(h) =
+  prefix_card[a, g_h] + prefix_card[b, g_h]
+
+block_tie(h) =
+  equal_card[a, g_h] + equal_card[b, g_h] - r[h]
+```
+
+The `- r[h]` term appears for total and tie because combo `h` contains both
+hero cards and is counted in both card lanes. It does not appear in
+`block_win`, because `h` is in the equal group, not in a lower-strength group.
+The same equations apply symmetrically with hero reach when computing villain
+values.
+
+This is mathematically equivalent to the current neighbor-combo loop:
+
+```text
+for v in C:
+  if v intersects h and legal(v,b):
+    subtract r[v] from total
+    subtract r[v] from win if S[v] < S[h]
+    subtract r[v] from tie if S[v] = S[h]
+```
+
+The hard part is not the formula; it is building the aggregate cheaply on GPU.
+A naive table
+
+```text
+prefix_card[z,b,card,position]
+```
+
+has `52 * (combo_count + 1)` entries per `(z,b)` row, which is usually too much
+memory traffic. A strength-group table is smaller:
+
+```text
+prefix_card[z,b,card,group]
+equal_card[z,b,card,group]
+```
+
+but it requires a way to accumulate reach into `(card, group)` buckets. Without
+portable `fp32` atomics, that accumulation cannot be a simple scatter-add.
+Reasonable implementations are:
+
+```text
+1. group/card gather:
+   one invocation per (z,b,card,group) scans the combos in that group
+
+2. sorted-order fused scan:
+   while scanning strength order for total prefix, also emit card-lane group
+   masses for the two cards of each combo
+
+3. two-stage deterministic reduce:
+   produce per-tile card/group partials, then reduce tiles
+```
+
+The expected speedup is bounded by the measured blocker cost. On `As7h2c`,
+depth 5, WSL/DZN profiling showed reduce dropping from about `381ms` to
+`244ms` when blocker correction was disabled, so blocker work is roughly
+`135ms` of the stage-profile run. Card aggregate can target that cost, but it
+does not remove prefix construction or board iteration by itself.
+
 ## Next Mathematical Cut
 
 The current implementation is still too close to "run a public tree program on
