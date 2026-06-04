@@ -756,7 +756,7 @@ struct Params {
     output_len: u32,
     variant: u32,
     edge_count: u32,
-    tile_node_start: u32,
+    aux0: u32,
     eta_bits: u32,
 };
 
@@ -778,7 +778,7 @@ fn reach_init_tile(@builtin(global_invocation_id) id: vec3<u32>) {
     hero_reaches[index] = 0.0;
     villain_reaches[index] = 0.0;
     combo_live[index] = 0.0;
-    if params.tile_node_start == 0u && local_node == 0u && root_weights[combo] >= 0.0 {
+    if params.aux0 == 0u && local_node == 0u && root_weights[combo] >= 0.0 {
         hero_reaches[index] = 1.0;
         villain_reaches[index] = root_weights[combo];
         combo_live[index] = 1.0;
@@ -815,7 +815,7 @@ struct Params {
     output_len: u32,
     variant: u32,
     edge_count: u32,
-    tile_node_start: u32,
+    aux0: u32,
     eta_bits: u32,
 };
 
@@ -877,12 +877,15 @@ fn reach_edge_tile(@builtin(global_invocation_id) id: vec3<u32>) {
     let live = parent_combo_live[parent_offset];
     if node.kind == 0u {
         let probability = strategy_probability(node, combo, edge.action);
+        let is_br_player = params.aux0 < 2u && node.acting_player == params.aux0;
         if node.acting_player == 0u {
-            child_hero_reaches[child_offset] = hero_reach * probability;
+            child_hero_reaches[child_offset] =
+                hero_reach * select(probability, 1.0, is_br_player);
             child_villain_reaches[child_offset] = villain_reach;
         } else {
             child_hero_reaches[child_offset] = hero_reach;
-            child_villain_reaches[child_offset] = villain_reach * probability;
+            child_villain_reaches[child_offset] =
+                villain_reach * select(probability, 1.0, is_br_player);
         }
         child_combo_live[child_offset] = live;
     } else if node.kind == 1u {
@@ -4162,6 +4165,7 @@ impl GpuDenseCfrBackend {
         regrets_buffer: &wgpu::Buffer,
         prediction_buffer: &wgpu::Buffer,
         variant: super::CfrVariant,
+        br_player: u32,
     ) {
         for layer_tiles in &ctx.layer_tiles {
             for tile in layer_tiles {
@@ -4227,7 +4231,7 @@ impl GpuDenseCfrBackend {
                     output_len: x_invocations,
                     pair_start: variant_code(variant),
                     chunk_pairs: edge_tile.edges.len() as u32,
-                    _pad0: 0,
+                    _pad0: br_player,
                     _pad1: variant_prediction_eta(variant).to_bits(),
                 }],
             );
@@ -4753,6 +4757,7 @@ impl GpuDenseCfrBackend {
             regrets_buffer,
             prediction_buffer,
             variant,
+            br_player,
         );
         encoder = self.finish_profile_phase(encoder, "cfv_reach", phase_start)?;
         phase_start = profile.then(Instant::now);
