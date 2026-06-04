@@ -15,8 +15,8 @@ use pokedr_core::{
     },
     dense_cfr::{CfrVariant, DenseCfrIteration, DenseCfrState},
     postflop::{
-        ActionSetConfig, Player, PlayerAction, PublicNodeKind, PublicState, Street, SubgameTree,
-        SubgameTreeConfig, TerminalKind,
+        ActionCandidate, ActionSetConfig, Player, PlayerAction, PublicNodeKind, PublicState,
+        Street, SubgameTree, SubgameTreeConfig, TerminalKind,
     },
     postflop_dense::PostflopDenseLayout,
     range::{COMBO_COUNT, Combo, ComboIndexer},
@@ -118,11 +118,28 @@ pub struct FixedFlopMetricRow {
     pub local_br_gap: Option<f32>,
     pub recursive_root_br_gap: Option<f32>,
     pub recursive_local_br_gap: Option<f32>,
+    pub local_gap_detail: Option<LocalGapDetail>,
+    pub recursive_local_gap_detail: Option<LocalGapDetail>,
     pub positive_regret_mass: f32,
     pub illegal_strategy_mass: f32,
     pub current_strategy_norm_error: f32,
     pub average_strategy_norm_error: f32,
     pub finite: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct LocalGapDetail {
+    pub gap: f32,
+    pub weighted_gap: f32,
+    pub reach_weight: f32,
+    pub public_infoset: usize,
+    pub node_index: usize,
+    pub player: Player,
+    pub combo_index: usize,
+    pub combo: String,
+    pub action_values: Vec<f32>,
+    pub average_strategy: Vec<f32>,
+    pub actions: Vec<String>,
 }
 
 impl Default for PokedrAgent {
@@ -486,6 +503,8 @@ pub fn solve_fixed_flop_metrics(
             local_br_gap: None,
             recursive_root_br_gap: None,
             recursive_local_br_gap: None,
+            local_gap_detail: None,
+            recursive_local_gap_detail: None,
             positive_regret_mass: diagnostics.positive_regret_mass,
             illegal_strategy_mass: diagnostics.illegal_strategy_mass,
             current_strategy_norm_error: diagnostics.current_strategy_norm_error,
@@ -495,6 +514,36 @@ pub fn solve_fixed_flop_metrics(
         previous_root_strategy = Some(root_strategy);
     }
     rows
+}
+
+pub fn dump_fixed_flop_tree(flop: [PokedrCard; 3], config: PokedrAgentConfig) -> Vec<String> {
+    let public_state = PublicState {
+        street: Street::Flop,
+        board: Board::new(flop.to_vec()),
+        pot: 4,
+        hero_invested: 2,
+        villain_invested: 2,
+        effective_stack: 100,
+        to_call: 0,
+        min_aggressive_amount: 2,
+        acting_player: Player::Hero,
+        raises_this_street: 0,
+        checks_this_street: 0,
+    };
+    let tree = SubgameTree::build(
+        public_state,
+        SubgameTreeConfig {
+            action_set: config.action_set,
+            max_raises_per_street: config.max_raises_per_street,
+            max_depth: config.max_depth,
+        },
+    );
+    let layout = PostflopDenseLayout::from_tree(&tree);
+    tree.nodes()
+        .iter()
+        .enumerate()
+        .map(|(index, node)| dump_tree_node_json(&tree, &layout, index, node))
+        .collect()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -567,6 +616,7 @@ fn try_solve_fixed_flop_metrics_gpu(
         let root_action_probabilities = root_action_probabilities(layout, &root_strategy);
         let br_gap = br_gap_metrics_gpu(
             &backend,
+            tree,
             &linearized,
             &combos,
             &combo_legal,
@@ -576,6 +626,7 @@ fn try_solve_fixed_flop_metrics_gpu(
         );
         let recursive_br_gap = recursive_br_gap_metrics_gpu(
             &backend,
+            tree,
             &linearized,
             &combos,
             &combo_legal,
@@ -596,6 +647,9 @@ fn try_solve_fixed_flop_metrics_gpu(
             recursive_local_br_gap: recursive_br_gap
                 .as_ref()
                 .map(|metrics| metrics.local_br_gap),
+            local_gap_detail: br_gap.and_then(|metrics| metrics.local_gap_detail),
+            recursive_local_gap_detail: recursive_br_gap
+                .and_then(|metrics| metrics.local_gap_detail),
             positive_regret_mass: diagnostics.positive_regret_mass,
             illegal_strategy_mass: diagnostics.illegal_strategy_mass,
             current_strategy_norm_error: diagnostics.current_strategy_norm_error,
@@ -656,10 +710,12 @@ fn cfr_state_diagnostics(state: &DenseCfrState) -> CfrDiagnostics {
 struct BrGapMetrics {
     root_br_gap: f32,
     local_br_gap: f32,
+    local_gap_detail: Option<LocalGapDetail>,
 }
 
 fn br_gap_metrics_gpu(
     backend: &GpuDenseCfrBackend,
+    tree: &SubgameTree,
     linearized: &GpuLinearizedPublicTree,
     combos: &[GpuPrivateCombo],
     combo_legal: &[u32],
@@ -680,11 +736,12 @@ fn br_gap_metrics_gpu(
             &profile,
         )
         .ok()?;
-    Some(br_gap_metrics_from_values(layout, &profile, &values))
+    Some(br_gap_metrics_from_values(tree, layout, &profile, &values))
 }
 
 fn recursive_br_gap_metrics_gpu(
     backend: &GpuDenseCfrBackend,
+    tree: &SubgameTree,
     linearized: &GpuLinearizedPublicTree,
     combos: &[GpuPrivateCombo],
     combo_legal: &[u32],
@@ -720,6 +777,7 @@ fn recursive_br_gap_metrics_gpu(
         )
         .ok()?;
     Some(recursive_br_gap_metrics_from_values(
+        tree,
         layout,
         &profile,
         &hero_values,
@@ -728,6 +786,7 @@ fn recursive_br_gap_metrics_gpu(
 }
 
 fn br_gap_metrics_from_values(
+    tree: &SubgameTree,
     layout: &PostflopDenseLayout,
     profile: &DenseCfrState,
     values: &GpuRootTerminalValues,
@@ -737,6 +796,7 @@ fn br_gap_metrics_from_values(
     let mut root_weight_sum = 0.0;
     let mut local_gap_sum = 0.0;
     let mut local_weight_sum = 0.0;
+    let mut local_gap_detail = None;
 
     for public_infoset in 0..layout.infoset_count() {
         let action_count = layout.action_count(public_infoset);
@@ -765,8 +825,22 @@ fn br_gap_metrics_from_values(
                         root_gap_sum += gap * reach_weight;
                         root_weight_sum += reach_weight;
                     }
-                    local_gap_sum += gap * reach_weight;
+                    let weighted_gap = gap * reach_weight;
+                    local_gap_sum += weighted_gap;
                     local_weight_sum += reach_weight;
+                    update_local_gap_detail(
+                        &mut local_gap_detail,
+                        tree,
+                        layout,
+                        public_infoset,
+                        player,
+                        combo_index,
+                        gap,
+                        weighted_gap,
+                        reach_weight,
+                        action_values,
+                        &strategy[..action_count],
+                    );
                 }
             }
         }
@@ -783,10 +857,12 @@ fn br_gap_metrics_from_values(
         } else {
             0.0
         },
+        local_gap_detail,
     }
 }
 
 fn recursive_br_gap_metrics_from_values(
+    tree: &SubgameTree,
     layout: &PostflopDenseLayout,
     profile: &DenseCfrState,
     hero_values: &GpuRootTerminalValues,
@@ -797,6 +873,7 @@ fn recursive_br_gap_metrics_from_values(
     let mut root_weight_sum = 0.0;
     let mut local_gap_sum = 0.0;
     let mut local_weight_sum = 0.0;
+    let mut local_gap_detail = None;
 
     for public_infoset in 0..layout.infoset_count() {
         let action_count = layout.action_count(public_infoset);
@@ -829,8 +906,22 @@ fn recursive_br_gap_metrics_from_values(
                         root_gap_sum += gap * reach_weight;
                         root_weight_sum += reach_weight;
                     }
-                    local_gap_sum += gap * reach_weight;
+                    let weighted_gap = gap * reach_weight;
+                    local_gap_sum += weighted_gap;
                     local_weight_sum += reach_weight;
+                    update_local_gap_detail(
+                        &mut local_gap_detail,
+                        tree,
+                        layout,
+                        public_infoset,
+                        player,
+                        combo_index,
+                        gap,
+                        weighted_gap,
+                        reach_weight,
+                        action_values,
+                        &strategy[..action_count],
+                    );
                 }
             }
         }
@@ -847,7 +938,50 @@ fn recursive_br_gap_metrics_from_values(
         } else {
             0.0
         },
+        local_gap_detail,
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn update_local_gap_detail(
+    current: &mut Option<LocalGapDetail>,
+    tree: &SubgameTree,
+    layout: &PostflopDenseLayout,
+    public_infoset: usize,
+    player: Player,
+    combo_index: usize,
+    gap: f32,
+    weighted_gap: f32,
+    reach_weight: f32,
+    action_values: &[f32],
+    average_strategy: &[f32],
+) {
+    if current
+        .as_ref()
+        .is_some_and(|detail| detail.weighted_gap >= weighted_gap)
+    {
+        return;
+    }
+    let indexer = ComboIndexer::new();
+    let combo = indexer.combo(combo_index);
+    let node_index = layout.infoset_node(public_infoset);
+    let actions = (0..layout.action_count(public_infoset))
+        .filter_map(|action| layout.action(tree, public_infoset, action))
+        .map(format_action_candidate)
+        .collect();
+    *current = Some(LocalGapDetail {
+        gap,
+        weighted_gap,
+        reach_weight,
+        public_infoset,
+        node_index,
+        player,
+        combo_index,
+        combo: format_pokedr_cards(&[combo.first, combo.second]),
+        action_values: action_values.to_vec(),
+        average_strategy: average_strategy.to_vec(),
+        actions,
+    });
 }
 
 fn root_average_strategy(
@@ -2160,6 +2294,126 @@ fn format_pokedr_cards(cards: &[PokedrCard]) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+fn format_action_candidate(candidate: &ActionCandidate) -> String {
+    format!(
+        "{}:{:?}",
+        format_player_action(candidate.action),
+        candidate.source
+    )
+}
+
+fn dump_tree_node_json(
+    tree: &SubgameTree,
+    layout: &PostflopDenseLayout,
+    index: usize,
+    node: &pokedr_core::postflop::PublicNode,
+) -> String {
+    let parent = node
+        .parent
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "null".to_string());
+    let children = json_usize_array(&node.children);
+    let infoset = layout
+        .node_infoset(index)
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "null".to_string());
+    let kind = match &node.kind {
+        PublicNodeKind::Decision { state, actions } => format!(
+            r#""decision","state":{},"actions":[{}]"#,
+            dump_public_state_json(state),
+            actions
+                .iter()
+                .enumerate()
+                .map(|(action_index, action)| {
+                    let child = tree.nodes()[index].children[action_index];
+                    format!(
+                        r#"{{"index":{},"child":{},"action":"{}","source":"{:?}"}}"#,
+                        action_index,
+                        child,
+                        json_escape(&format_player_action(action.action)),
+                        action.source
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+        PublicNodeKind::Chance {
+            street,
+            board,
+            cards,
+        } => format!(
+            r#""chance","street":"{:?}","board":"{}","cards":[{}]"#,
+            street,
+            json_escape(&format_pokedr_cards(board.cards())),
+            cards
+                .iter()
+                .map(|card| format!(r#""{}""#, json_escape(&format_pokedr_cards(&[*card]))))
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+        PublicNodeKind::Terminal {
+            kind,
+            board,
+            pot,
+            hero_invested,
+            villain_invested,
+        } => format!(
+            r#""terminal","terminal_kind":"{:?}","board":"{}","pot":{},"hero_invested":{},"villain_invested":{}"#,
+            kind,
+            json_escape(&format_pokedr_cards(board.cards())),
+            pot,
+            hero_invested,
+            villain_invested
+        ),
+    };
+    format!(
+        r#"{{"index":{index},"parent":{parent},"children":{children},"infoset":{infoset},"kind":{kind}}}"#
+    )
+}
+
+fn dump_public_state_json(state: &PublicState) -> String {
+    format!(
+        r#"{{"street":"{:?}","board":"{}","pot":{},"hero_invested":{},"villain_invested":{},"effective_stack":{},"to_call":{},"min_aggressive_amount":{},"acting_player":"{:?}","raises_this_street":{},"checks_this_street":{}}}"#,
+        state.street,
+        json_escape(&format_pokedr_cards(state.board.cards())),
+        state.pot,
+        state.hero_invested,
+        state.villain_invested,
+        state.effective_stack,
+        state.to_call,
+        state.min_aggressive_amount,
+        state.acting_player,
+        state.raises_this_street,
+        state.checks_this_street
+    )
+}
+
+fn format_player_action(action: PlayerAction) -> String {
+    match action {
+        PlayerAction::Fold => "fold".to_string(),
+        PlayerAction::Check => "check".to_string(),
+        PlayerAction::Call { amount } => format!("call:{amount}"),
+        PlayerAction::Bet { amount } => format!("bet:{amount}"),
+        PlayerAction::Raise { amount } => format!("raise:{amount}"),
+        PlayerAction::AllIn { amount } => format!("allin:{amount}"),
+    }
+}
+
+fn json_usize_array(values: &[usize]) -> String {
+    format!(
+        "[{}]",
+        values
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(",")
+    )
+}
+
+fn json_escape(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 fn format_trace_action(action: &Action) -> Option<String> {

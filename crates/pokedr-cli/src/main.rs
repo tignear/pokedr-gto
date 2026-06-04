@@ -17,11 +17,12 @@ fn main() {
         Some("postflop-smoke") => run_postflop_smoke(),
         Some("solve-flop") => run_solve_flop(args.next().as_deref()),
         Some("solve-flop-metrics") => run_solve_flop_metrics(args.next().as_deref()),
+        Some("dump-flop-tree") => run_dump_flop_tree(args.next().as_deref()),
         Some("rs-poker-smoke") => run_rs_poker_smoke(),
         Some("rs-poker-trace") => run_rs_poker_trace(),
         _ => {
             eprintln!(
-                "usage: {program} <gpu-info|gpu-smoke|postflop-smoke|solve-flop|solve-flop-metrics|rs-poker-smoke|rs-poker-trace>"
+                "usage: {program} <gpu-info|gpu-smoke|postflop-smoke|solve-flop|solve-flop-metrics|dump-flop-tree|rs-poker-smoke|rs-poker-trace>"
             );
             std::process::exit(2);
         }
@@ -288,6 +289,50 @@ fn run_solve_flop_metrics(flop_arg: Option<&str>) {
             row.average_strategy_norm_error,
             row.finite
         );
+        if let Some(detail) = &row.local_gap_detail {
+            println!("  local_gap_detail {}", format_gap_detail(detail));
+        }
+        if let Some(detail) = &row.recursive_local_gap_detail {
+            println!("  recursive_local_gap_detail {}", format_gap_detail(detail));
+        }
+    }
+}
+
+fn format_gap_detail(detail: &pokedr_agent::LocalGapDetail) -> String {
+    format!(
+        "gap={:.6} weighted_gap={:.6} reach={:.6} public_infoset={} node={} player={:?} combo_index={} combo=[{}] actions=[{}] avg_strategy=[{}] action_values=[{}]",
+        detail.gap,
+        detail.weighted_gap,
+        detail.reach_weight,
+        detail.public_infoset,
+        detail.node_index,
+        detail.player,
+        detail.combo_index,
+        detail.combo,
+        detail.actions.join(","),
+        detail
+            .average_strategy
+            .iter()
+            .map(|value| format!("{value:.4}"))
+            .collect::<Vec<_>>()
+            .join(","),
+        detail
+            .action_values
+            .iter()
+            .map(|value| format!("{value:.4}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    )
+}
+
+fn run_dump_flop_tree(flop_arg: Option<&str>) {
+    let flop = parse_flop(flop_arg.unwrap_or("As7h2c")).unwrap_or_else(|error| {
+        eprintln!("{error}");
+        std::process::exit(2);
+    });
+    let config = match_config();
+    for line in pokedr_agent::dump_fixed_flop_tree(flop, config) {
+        println!("{line}");
     }
 }
 
