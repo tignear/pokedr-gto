@@ -3279,7 +3279,7 @@ impl GpuDenseCfrBackend {
             iteration as u32,
             variant_dcfr_alpha(state.variant, iteration).to_bits(),
             variant_dcfr_gamma(state.variant, iteration).to_bits(),
-            variant_prediction_eta(state.variant).to_bits(),
+            variant_prediction_eta(state.variant, iteration).to_bits(),
         ];
         let regrets = storage_buffer(&self.device, "regrets", &state.regrets);
         let prediction = storage_buffer(&self.device, "prediction", &state.prediction);
@@ -4166,6 +4166,7 @@ impl GpuDenseCfrBackend {
         prediction_buffer: &wgpu::Buffer,
         variant: super::CfrVariant,
         br_player: u32,
+        iteration: usize,
     ) {
         for layer_tiles in &ctx.layer_tiles {
             for tile in layer_tiles {
@@ -4185,7 +4186,7 @@ impl GpuDenseCfrBackend {
                         pair_start: variant_code(variant),
                         chunk_pairs: 0,
                         _pad0: tile.node_start as u32,
-                        _pad1: variant_prediction_eta(variant).to_bits(),
+                        _pad1: variant_prediction_eta(variant, iteration).to_bits(),
                     }],
                 );
                 let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -4232,7 +4233,7 @@ impl GpuDenseCfrBackend {
                     pair_start: variant_code(variant),
                     chunk_pairs: edge_tile.edges.len() as u32,
                     _pad0: br_player,
-                    _pad1: variant_prediction_eta(variant).to_bits(),
+                    _pad1: variant_prediction_eta(variant, iteration).to_bits(),
                 }],
             );
             let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -4729,6 +4730,7 @@ impl GpuDenseCfrBackend {
         prediction_buffer: &wgpu::Buffer,
         variant: super::CfrVariant,
         br_player: u32,
+        iteration: usize,
     ) -> Result<(GpuPublicTreeOutputBuffers, usize, usize), GpuCfrError> {
         if std::env::var_os("POKEDR_SOLVER_PROGRESS_OFF").is_none() {
             eprintln!(
@@ -4758,6 +4760,7 @@ impl GpuDenseCfrBackend {
             prediction_buffer,
             variant,
             br_player,
+            iteration,
         );
         encoder = self.finish_profile_phase(encoder, "cfv_reach", phase_start)?;
         phase_start = profile.then(Instant::now);
@@ -4926,6 +4929,7 @@ impl GpuDenseCfrBackend {
                 &prediction_buffer,
                 state.variant,
                 br_player,
+                usize::MAX,
             )?;
         let action_values_readback = readback_buffer(&self.device, action_len);
         let action_weights_readback = readback_buffer(&self.device, action_len);
@@ -5062,6 +5066,7 @@ impl GpuDenseCfrBackend {
                 &state.prediction,
                 state.variant,
                 2,
+                iteration,
             )?;
         if let Some(start) = cfv_start {
             self.profile_poll()?;
@@ -5081,7 +5086,7 @@ impl GpuDenseCfrBackend {
                 iteration as u32,
                 variant_dcfr_alpha(state.variant, iteration).to_bits(),
                 variant_dcfr_gamma(state.variant, iteration).to_bits(),
-                variant_prediction_eta(state.variant).to_bits(),
+                variant_prediction_eta(state.variant, iteration).to_bits(),
             ],
         );
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -5374,7 +5379,7 @@ impl GpuDenseCfrState {
             iteration as u32,
             variant_dcfr_alpha(self.variant, iteration).to_bits(),
             variant_dcfr_gamma(self.variant, iteration).to_bits(),
-            variant_prediction_eta(self.variant).to_bits(),
+            variant_prediction_eta(self.variant, iteration).to_bits(),
         ];
         let action_values =
             readonly_buffer(&backend.device, "resident action values", action_values);
@@ -5676,9 +5681,14 @@ fn variant_dcfr_gamma(variant: super::CfrVariant, iteration: usize) -> f32 {
     }
 }
 
-fn variant_prediction_eta(variant: super::CfrVariant) -> f32 {
+fn variant_prediction_eta(variant: super::CfrVariant, iteration: usize) -> f32 {
     match variant {
-        super::CfrVariant::PdcfrPlus { eta, .. } => eta,
+        super::CfrVariant::PdcfrPlus {
+            eta_start,
+            eta_end,
+            eta_horizon,
+            ..
+        } => scheduled_value(eta_start, eta_end, iteration, eta_horizon),
         _ => 0.0,
     }
 }

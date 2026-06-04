@@ -7,7 +7,9 @@ pub const DEFAULT_DCFR_SCHEDULE_GAMMA_END: f32 = 8.0;
 pub const DEFAULT_DCFR_SCHEDULE_HORIZON: usize = 128;
 pub const DEFAULT_PDCFR_PLUS_ALPHA: f32 = 2.5;
 pub const DEFAULT_PDCFR_PLUS_GAMMA: f32 = 8.0;
-pub const DEFAULT_PDCFR_PLUS_ETA: f32 = 1.0;
+pub const DEFAULT_PDCFR_PLUS_ETA_START: f32 = 1.0;
+pub const DEFAULT_PDCFR_PLUS_ETA: f32 = 0.0;
+pub const DEFAULT_PDCFR_PLUS_ETA_HORIZON: usize = 128;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum CfrVariant {
@@ -27,7 +29,9 @@ pub enum CfrVariant {
     PdcfrPlus {
         alpha: f32,
         gamma: f32,
-        eta: f32,
+        eta_start: f32,
+        eta_end: f32,
+        eta_horizon: usize,
     },
 }
 
@@ -43,7 +47,9 @@ impl CfrVariant {
         Self::PdcfrPlus {
             alpha: DEFAULT_PDCFR_PLUS_ALPHA,
             gamma: DEFAULT_PDCFR_PLUS_GAMMA,
-            eta: DEFAULT_PDCFR_PLUS_ETA,
+            eta_start: DEFAULT_PDCFR_PLUS_ETA_START,
+            eta_end: DEFAULT_PDCFR_PLUS_ETA,
+            eta_horizon: DEFAULT_PDCFR_PLUS_ETA_HORIZON,
         }
     }
 
@@ -173,6 +179,10 @@ impl DenseCfrState {
     }
 
     pub fn strategy_for(&self, infoset: usize, out: &mut [f32]) {
+        self.strategy_for_at(infoset, out, usize::MAX);
+    }
+
+    fn strategy_for_at(&self, infoset: usize, out: &mut [f32], iteration: usize) {
         assert!(infoset < self.infosets);
         assert!(out.len() >= self.actions);
         let offset = self.offset(infoset);
@@ -185,13 +195,19 @@ impl DenseCfrState {
             .zip(legal)
             .filter(|(_, is_legal)| **is_legal)
             .map(|((value, predicted), _)| {
-                effective_regret(self.variant, *value, *predicted).max(0.0)
+                effective_regret_at(self.variant, *value, *predicted, iteration).max(0.0)
             })
             .sum();
         if normalizer > f32::EPSILON {
             for action in 0..self.actions {
                 out[action] = if legal[action] {
-                    effective_regret(self.variant, regrets[action], prediction[action]).max(0.0)
+                    effective_regret_at(
+                        self.variant,
+                        regrets[action],
+                        prediction[action],
+                        iteration,
+                    )
+                    .max(0.0)
                         / normalizer
                 } else {
                     0.0
@@ -245,7 +261,7 @@ impl DenseCfrState {
 
         let offset = self.offset(infoset);
         let mut strategy = vec![0.0; self.actions];
-        self.strategy_for(infoset, &mut strategy);
+        self.strategy_for_at(infoset, &mut strategy, iteration);
         let node_value: f32 = strategy
             .iter()
             .zip(action_values.iter())
@@ -466,9 +482,21 @@ fn scheduled_value(start: f32, end: f32, iteration: usize, horizon: usize) -> f3
     start + (end - start) * progress
 }
 
-fn effective_regret(variant: CfrVariant, regret: f32, prediction: f32) -> f32 {
+fn pdcfr_eta(variant: CfrVariant, iteration: usize) -> f32 {
     match variant {
-        CfrVariant::PdcfrPlus { eta, .. } => regret + eta * prediction,
+        CfrVariant::PdcfrPlus {
+            eta_start,
+            eta_end,
+            eta_horizon,
+            ..
+        } => scheduled_value(eta_start, eta_end, iteration, eta_horizon),
+        _ => 0.0,
+    }
+}
+
+fn effective_regret_at(variant: CfrVariant, regret: f32, prediction: f32, iteration: usize) -> f32 {
+    match variant {
+        CfrVariant::PdcfrPlus { .. } => regret + pdcfr_eta(variant, iteration) * prediction,
         _ => regret,
     }
 }
@@ -576,7 +604,9 @@ mod tests {
             variant: CfrVariant::PdcfrPlus {
                 alpha: 2.5,
                 gamma: 8.0,
-                eta: 1.0,
+                eta_start: 1.0,
+                eta_end: 1.0,
+                eta_horizon: 2,
             },
         });
         state.regrets.copy_from_slice(&[0.0, 1.0]);
@@ -589,6 +619,32 @@ mod tests {
     }
 
     #[test]
+    fn pdcfr_plus_eta_can_be_scheduled_by_iteration() {
+        let mut state = DenseCfrState::new(DenseCfrConfig {
+            infosets: 1,
+            actions: 2,
+            variant: CfrVariant::PdcfrPlus {
+                alpha: 2.5,
+                gamma: 8.0,
+                eta_start: 0.0,
+                eta_end: 1.0,
+                eta_horizon: 3,
+            },
+        });
+        state.regrets.copy_from_slice(&[0.0, 1.0]);
+        state.prediction.copy_from_slice(&[1.0, 0.0]);
+
+        let mut strategy = [0.0; 2];
+        state.strategy_for_at(0, &mut strategy, 1);
+        assert_eq!(strategy, [0.0, 1.0]);
+        state.strategy_for_at(0, &mut strategy, 2);
+        assert!((strategy[0] - 1.0 / 3.0).abs() < 1e-6);
+        assert!((strategy[1] - 2.0 / 3.0).abs() < 1e-6);
+        state.strategy_for_at(0, &mut strategy, 3);
+        assert_eq!(strategy, [0.5, 0.5]);
+    }
+
+    #[test]
     fn pdcfr_plus_records_current_instant_regret_as_prediction() {
         let mut state = DenseCfrState::new(DenseCfrConfig {
             infosets: 1,
@@ -596,7 +652,9 @@ mod tests {
             variant: CfrVariant::PdcfrPlus {
                 alpha: 2.5,
                 gamma: 8.0,
-                eta: 1.0,
+                eta_start: 1.0,
+                eta_end: 1.0,
+                eta_horizon: 2,
             },
         });
 

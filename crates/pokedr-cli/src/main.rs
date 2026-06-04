@@ -55,6 +55,9 @@ struct CliConfigFile {
     pdcfr_alpha: Option<f32>,
     pdcfr_gamma: Option<f32>,
     pdcfr_eta: Option<f32>,
+    pdcfr_eta_start: Option<f32>,
+    pdcfr_eta_end: Option<f32>,
+    pdcfr_eta_horizon: Option<usize>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -701,8 +704,14 @@ fn parse_env_cfr_variant(name: &str, value: &str) -> CfrVariant {
                 .unwrap_or(pokedr_core::dense_cfr::DEFAULT_PDCFR_PLUS_ALPHA),
             gamma: env_f32("POKEDR_PDCFR_GAMMA")
                 .unwrap_or(pokedr_core::dense_cfr::DEFAULT_PDCFR_PLUS_GAMMA),
-            eta: env_f32("POKEDR_PDCFR_ETA")
+            eta_start: env_f32("POKEDR_PDCFR_ETA_START")
+                .or_else(|| env_f32("POKEDR_PDCFR_ETA"))
+                .unwrap_or(pokedr_core::dense_cfr::DEFAULT_PDCFR_PLUS_ETA_START),
+            eta_end: env_f32("POKEDR_PDCFR_ETA_END")
+                .or_else(|| env_f32("POKEDR_PDCFR_ETA"))
                 .unwrap_or(pokedr_core::dense_cfr::DEFAULT_PDCFR_PLUS_ETA),
+            eta_horizon: env_usize("POKEDR_PDCFR_ETA_HORIZON")
+                .unwrap_or(pokedr_core::dense_cfr::DEFAULT_PDCFR_PLUS_ETA_HORIZON),
         },
         other => {
             eprintln!(
@@ -749,9 +758,17 @@ fn parse_cfr_variant(value: &str, config: &CliConfigFile) -> CfrVariant {
             gamma: config
                 .pdcfr_gamma
                 .unwrap_or(pokedr_core::dense_cfr::DEFAULT_PDCFR_PLUS_GAMMA),
-            eta: config
-                .pdcfr_eta
+            eta_start: config
+                .pdcfr_eta_start
+                .or(config.pdcfr_eta)
+                .unwrap_or(pokedr_core::dense_cfr::DEFAULT_PDCFR_PLUS_ETA_START),
+            eta_end: config
+                .pdcfr_eta_end
+                .or(config.pdcfr_eta)
                 .unwrap_or(pokedr_core::dense_cfr::DEFAULT_PDCFR_PLUS_ETA),
+            eta_horizon: config
+                .pdcfr_eta_horizon
+                .unwrap_or(pokedr_core::dense_cfr::DEFAULT_PDCFR_PLUS_ETA_HORIZON),
         },
         other => {
             eprintln!(
