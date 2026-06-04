@@ -7,9 +7,9 @@ use pokedr_core::{
     postflop::{ActionSetConfig, Player, PublicState, Street, SubgameTree, SubgameTreeConfig},
     postflop_dense::PostflopDenseLayout,
 };
+use rusqlite::{Connection, params};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
 
 fn main() {
     let mut args = std::env::args();
@@ -21,13 +21,12 @@ fn main() {
         Some("solve-flop") => run_solve_flop(parse_flop_command_args(args)),
         Some("solve-flop-metrics") => run_solve_flop_metrics(parse_flop_command_args(args)),
         Some("solve-flop-sweep") => run_solve_flop_sweep(parse_flop_command_args(args)),
-        Some("dump-flop-tree") => run_dump_flop_tree(parse_flop_command_args(args)),
-        Some("analyze-tree-dump") => run_analyze_tree_dump(args),
+        Some("tree-db") => run_tree_db(args),
         Some("rs-poker-smoke") => run_rs_poker_smoke(),
         Some("rs-poker-trace") => run_rs_poker_trace(),
         _ => {
             eprintln!(
-                "usage: {program} <gpu-info|gpu-smoke|postflop-smoke|solve-flop|solve-flop-metrics|solve-flop-sweep|dump-flop-tree|analyze-tree-dump|rs-poker-smoke|rs-poker-trace> [flop] [--config path.yml]"
+                "usage: {program} <gpu-info|gpu-smoke|postflop-smoke|solve-flop|solve-flop-metrics|solve-flop-sweep|tree-db|rs-poker-smoke|rs-poker-trace> ..."
             );
             std::process::exit(2);
         }
@@ -38,6 +37,14 @@ fn main() {
 struct FlopCommandArgs {
     flop: Option<String>,
     config_path: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct TreeDbBuildArgs {
+    db_path: String,
+    flop: Option<String>,
+    config_path: Option<String>,
+    combo_limit: usize,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -637,368 +644,357 @@ fn format_gap_detail(detail: &pokedr_agent::LocalGapDetail) -> String {
     )
 }
 
-fn run_dump_flop_tree(args: FlopCommandArgs) {
-    let cli_config = load_cli_config(args.config_path.as_deref());
-    let flop = parse_flop(args.flop.as_deref().unwrap_or("As7h2c")).unwrap_or_else(|error| {
-        eprintln!("{error}");
-        std::process::exit(2);
-    });
-    let config = match_config(cli_config.as_ref());
-    if let Some(node) = env_usize("POKEDR_DUMP_NODE") {
-        let Some(line) = pokedr_agent::dump_fixed_flop_tree_node(flop, config, node) else {
-            eprintln!("POKEDR_DUMP_NODE={node} is outside dumped tree");
+fn run_tree_db(mut args: impl Iterator<Item = String>) {
+    match args.next().as_deref() {
+        Some("build") => run_tree_db_build(args),
+        Some("analyze") => run_tree_db_analyze(args),
+        _ => {
+            eprintln!(
+                "usage: pokedr-cli tree-db <build|analyze>\n  pokedr-cli tree-db build <tree.sqlite> [flop] [--config path.yml]\n  pokedr-cli tree-db analyze <tree.sqlite>"
+            );
             std::process::exit(2);
-        };
-        println!("{line}");
-    } else {
-        let lines = pokedr_agent::dump_fixed_flop_tree(flop, config);
-        for line in lines {
-            println!("{line}");
         }
     }
 }
 
-fn run_analyze_tree_dump(mut args: impl Iterator<Item = String>) {
-    let Some(path) = args.next() else {
-        eprintln!("usage: pokedr-cli analyze-tree-dump <tree.jsonl>");
+fn run_tree_db_build(mut args: impl Iterator<Item = String>) {
+    let build_args = parse_tree_db_build_args(&mut args);
+    let cli_config = load_cli_config(build_args.config_path.as_deref());
+    let flop = parse_flop(build_args.flop.as_deref().unwrap_or("As7h2c")).unwrap_or_else(|error| {
+        eprintln!("{error}");
+        std::process::exit(2);
+    });
+    let config = match_config(cli_config.as_ref());
+    let dump = pokedr_agent::build_fixed_flop_tree_dump_with_combo_limit(
+        flop,
+        config,
+        build_args.combo_limit,
+    );
+    write_tree_db(&build_args.db_path, &dump);
+    println!(
+        "wrote {} nodes, {} actions, {} solver nodes, {} combo rows to {}",
+        dump.nodes.len(),
+        dump.actions.len(),
+        dump.solver_nodes.len(),
+        dump.solver_combos.len(),
+        build_args.db_path
+    );
+}
+
+fn run_tree_db_analyze(mut args: impl Iterator<Item = String>) {
+    let Some(db_path) = args.next() else {
+        eprintln!("usage: pokedr-cli tree-db analyze <tree.sqlite>");
         std::process::exit(2);
     };
     if let Some(extra) = args.next() {
         eprintln!("unexpected argument: {extra}");
         std::process::exit(2);
     }
-    let text = std::fs::read_to_string(&path).unwrap_or_else(|error| {
-        eprintln!("failed to read tree dump {path}: {error}");
+    let conn = Connection::open(&db_path).unwrap_or_else(|error| {
+        eprintln!("failed to open tree DB {db_path}: {error}");
         std::process::exit(2);
     });
-    let nodes = parse_tree_dump_jsonl(&path, &text);
-    let analysis = analyze_tree_nodes(&nodes);
+    let analysis = analyze_tree_db(&conn);
     println!(
         "{}",
         serde_json::to_string_pretty(&analysis).expect("analysis JSON must serialize")
     );
 }
 
-fn parse_tree_dump_jsonl(path: &str, text: &str) -> Vec<Value> {
-    let nodes = text
-        .lines()
-        .enumerate()
-        .filter_map(|(line_index, line)| {
-            let line = line.trim();
-            if line.is_empty() {
-                return None;
-            }
-            Some(serde_json::from_str::<Value>(line).unwrap_or_else(|error| {
-                eprintln!(
-                    "failed to parse {path}:{} as JSON tree node: {error}",
-                    line_index + 1
-                );
-                std::process::exit(2);
+fn write_tree_db(path: &str, dump: &pokedr_agent::FixedFlopTreeDump) {
+    let _ = std::fs::remove_file(path);
+    let mut conn = Connection::open(path).unwrap_or_else(|error| {
+        eprintln!("failed to create tree DB {path}: {error}");
+        std::process::exit(1);
+    });
+    conn.execute_batch(
+        r#"
+        PRAGMA journal_mode = WAL;
+        CREATE TABLE nodes (
+            node_id INTEGER PRIMARY KEY,
+            parent_id INTEGER,
+            kind TEXT NOT NULL,
+            infoset INTEGER,
+            path TEXT NOT NULL,
+            street TEXT,
+            board TEXT,
+            acting_player TEXT,
+            pot INTEGER,
+            to_call INTEGER,
+            hero_invested INTEGER,
+            villain_invested INTEGER,
+            terminal_kind TEXT
+        );
+        CREATE TABLE actions (
+            node_id INTEGER NOT NULL,
+            action_index INTEGER NOT NULL,
+            child_id INTEGER NOT NULL,
+            action TEXT NOT NULL,
+            source TEXT NOT NULL,
+            PRIMARY KEY (node_id, action_index)
+        );
+        CREATE TABLE solver_nodes (
+            node_id INTEGER PRIMARY KEY,
+            infoset INTEGER NOT NULL,
+            iterations INTEGER NOT NULL,
+            acting_player TEXT NOT NULL,
+            action_count INTEGER NOT NULL,
+            legal_combo_count INTEGER NOT NULL,
+            avg_strategy TEXT NOT NULL,
+            current_strategy TEXT NOT NULL,
+            avg_action_ev TEXT,
+            current_action_ev TEXT,
+            avg_policy_ev REAL,
+            current_policy_ev REAL,
+            avg_gap REAL,
+            current_gap REAL
+        );
+        CREATE TABLE solver_combos (
+            node_id INTEGER NOT NULL,
+            combo_index INTEGER NOT NULL,
+            combo TEXT NOT NULL,
+            reach REAL NOT NULL,
+            weighted_gap REAL NOT NULL,
+            avg_action_values TEXT,
+            current_action_values TEXT,
+            avg_strategy TEXT NOT NULL,
+            current_strategy TEXT NOT NULL,
+            regrets TEXT NOT NULL,
+            strategy_sum TEXT NOT NULL,
+            PRIMARY KEY (node_id, combo_index)
+        );
+        CREATE INDEX nodes_parent_idx ON nodes(parent_id);
+        CREATE INDEX solver_nodes_avg_gap_idx ON solver_nodes(avg_gap DESC);
+        CREATE INDEX solver_nodes_current_gap_idx ON solver_nodes(current_gap DESC);
+        "#,
+    )
+    .unwrap_or_else(|error| {
+        eprintln!("failed to initialize tree DB schema: {error}");
+        std::process::exit(1);
+    });
+
+    let tx = conn.transaction().unwrap();
+    {
+        let mut statement = tx
+            .prepare(
+                "INSERT INTO nodes VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            )
+            .unwrap();
+        for node in &dump.nodes {
+            statement
+                .execute(params![
+                    db_usize(node.node_id),
+                    db_opt_usize(node.parent_id),
+                    node.kind,
+                    db_opt_usize(node.infoset),
+                    node.path,
+                    node.street,
+                    node.board,
+                    node.acting_player,
+                    db_opt_u32(node.pot),
+                    db_opt_u32(node.to_call),
+                    db_opt_u32(node.hero_invested),
+                    db_opt_u32(node.villain_invested),
+                    node.terminal_kind,
+                ])
+                .unwrap();
+        }
+    }
+    {
+        let mut statement = tx
+            .prepare("INSERT INTO actions VALUES (?1, ?2, ?3, ?4, ?5)")
+            .unwrap();
+        for action in &dump.actions {
+            statement
+                .execute(params![
+                    db_usize(action.node_id),
+                    db_usize(action.action_index),
+                    db_usize(action.child_id),
+                    action.action,
+                    action.source,
+                ])
+                .unwrap();
+        }
+    }
+    {
+        let mut statement = tx.prepare(
+            "INSERT INTO solver_nodes VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+        ).unwrap();
+        for node in &dump.solver_nodes {
+            statement
+                .execute(params![
+                    db_usize(node.node_id),
+                    db_usize(node.infoset),
+                    db_usize(node.iterations),
+                    node.acting_player,
+                    db_usize(node.action_count),
+                    db_usize(node.legal_combo_count),
+                    vec_json(&node.avg_strategy),
+                    vec_json(&node.current_strategy),
+                    opt_vec_json(&node.avg_action_ev),
+                    opt_vec_json(&node.current_action_ev),
+                    node.avg_policy_ev,
+                    node.current_policy_ev,
+                    node.avg_gap,
+                    node.current_gap,
+                ])
+                .unwrap();
+        }
+    }
+    {
+        let mut statement = tx
+            .prepare(
+                "INSERT INTO solver_combos VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            )
+            .unwrap();
+        for combo in &dump.solver_combos {
+            statement
+                .execute(params![
+                    db_usize(combo.node_id),
+                    db_usize(combo.combo_index),
+                    combo.combo,
+                    combo.reach,
+                    combo.weighted_gap,
+                    opt_vec_json(&combo.avg_action_values),
+                    opt_vec_json(&combo.current_action_values),
+                    vec_json(&combo.avg_strategy),
+                    vec_json(&combo.current_strategy),
+                    vec_json(&combo.regrets),
+                    vec_json(&combo.strategy_sum),
+                ])
+                .unwrap();
+        }
+    }
+    tx.commit().unwrap();
+}
+
+fn analyze_tree_db(conn: &Connection) -> Value {
+    json!({
+        "counts": db_counts(conn),
+        "top_avg_gaps": db_top_gaps(conn, "avg_gap", "avg_action_ev", "avg_policy_ev"),
+        "top_current_gaps": db_top_gaps(conn, "current_gap", "current_action_ev", "current_policy_ev"),
+        "root_action_subtrees": db_root_action_subtrees(conn),
+    })
+}
+
+fn db_counts(conn: &Connection) -> Value {
+    let count = |table: &str| -> i64 {
+        conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+            row.get(0)
+        })
+        .unwrap()
+    };
+    json!({
+        "nodes": count("nodes"),
+        "actions": count("actions"),
+        "solver_nodes": count("solver_nodes"),
+        "solver_combos": count("solver_combos"),
+    })
+}
+
+fn db_top_gaps(
+    conn: &Connection,
+    gap_column: &str,
+    action_ev_column: &str,
+    policy_column: &str,
+) -> Value {
+    let sql = format!(
+        "SELECT n.node_id, n.street, n.acting_player, n.pot, n.to_call, n.path, s.{gap_column}, s.{action_ev_column}, s.{policy_column}, s.avg_strategy, s.current_strategy
+         FROM solver_nodes s JOIN nodes n ON n.node_id = s.node_id
+         WHERE s.{gap_column} IS NOT NULL
+         ORDER BY s.{gap_column} DESC
+         LIMIT 20"
+    );
+    let mut statement = conn.prepare(&sql).unwrap();
+    let rows = statement
+        .query_map([], |row| {
+            Ok(json!({
+                "node": row.get::<_, i64>(0)?,
+                "street": row.get::<_, Option<String>>(1)?,
+                "acting_player": row.get::<_, Option<String>>(2)?,
+                "pot": row.get::<_, Option<i64>>(3)?,
+                "to_call": row.get::<_, Option<i64>>(4)?,
+                "path": json_text_value(row.get::<_, String>(5)?),
+                "gap": row.get::<_, f64>(6)?,
+                "action_ev": row.get::<_, Option<String>>(7)?.map(json_text_value),
+                "policy_ev": row.get::<_, Option<f64>>(8)?,
+                "avg_strategy": json_text_value(row.get::<_, String>(9)?),
+                "current_strategy": json_text_value(row.get::<_, String>(10)?),
             }))
         })
-        .collect::<Vec<_>>();
-    if nodes.is_empty() {
-        eprintln!("tree dump {path} did not contain any JSON nodes");
-        std::process::exit(2);
-    }
-    nodes
+        .unwrap();
+    Value::Array(rows.map(Result::unwrap).collect())
 }
 
-fn analyze_tree_nodes(nodes: &[Value]) -> Value {
-    let mut by_index = BTreeMap::new();
-    let mut parents = BTreeMap::new();
-    for node in nodes {
-        let index = json_usize_field(node, "index");
-        by_index.insert(index, node);
-        parents.insert(index, json_optional_usize_field(node, "parent"));
-    }
-
-    let root = by_index.get(&0).copied().unwrap_or_else(|| {
-        eprintln!("tree dump must contain root node index 0");
-        std::process::exit(2);
-    });
-    let total = summarize_tree_subset(nodes.iter());
-    let root_actions = root
-        .get("actions")
-        .and_then(Value::as_array)
-        .map(|actions| {
-            actions
-                .iter()
-                .map(|action| {
-                    let child = json_usize_field(action, "child");
-                    let subtree_nodes = nodes
-                        .iter()
-                        .filter(|node| node_belongs_to_subtree(node, child, &parents))
-                        .collect::<Vec<_>>();
-                    json!({
-                        "action_index": json_usize_field(action, "index"),
-                        "action": json_string_field(action, "action"),
-                        "source": json_string_field(action, "source"),
-                        "child": child,
-                        "summary": summarize_tree_subset(subtree_nodes.iter().copied()),
-                        "solver_summary": summarize_solver_subset(subtree_nodes.iter().copied()),
-                    })
-                })
-                .collect::<Vec<_>>()
+fn db_root_action_subtrees(conn: &Connection) -> Value {
+    let mut statement = conn
+        .prepare("SELECT action_index, action, child_id FROM actions WHERE node_id = 0 ORDER BY action_index")
+        .unwrap();
+    let rows = statement
+        .query_map([], |row| {
+            let action_index: i64 = row.get(0)?;
+            let action: String = row.get(1)?;
+            let child_id: i64 = row.get(2)?;
+            Ok(json!({
+                "action_index": action_index,
+                "action": action,
+                "child": child_id,
+                "solver_summary": db_subtree_solver_summary(conn, child_id),
+            }))
         })
-        .unwrap_or_default();
-
-    json!({
-        "root": root,
-        "total": total,
-        "solver_summary": summarize_solver_subset(nodes.iter()),
-        "root_action_subtrees": root_actions,
-    })
+        .unwrap();
+    Value::Array(rows.map(Result::unwrap).collect())
 }
 
-fn summarize_tree_subset<'a>(nodes: impl Iterator<Item = &'a Value>) -> Value {
-    let mut node_count = 0usize;
-    let mut decisions = 0usize;
-    let mut chances = 0usize;
-    let mut terminals = 0usize;
-    let mut fold_terminals = 0usize;
-    let mut showdown_terminals = 0usize;
-    let mut max_depth = 0usize;
-    let mut max_branching = 0usize;
-    let mut depth_counts = BTreeMap::<usize, usize>::new();
-    let mut street_decisions = BTreeMap::<String, usize>::new();
-    let mut player_decisions = BTreeMap::<String, usize>::new();
-    let mut action_counts = BTreeMap::<String, usize>::new();
-    let mut action_source_counts = BTreeMap::<String, usize>::new();
-    let mut terminal_pot_counts = BTreeMap::<u64, usize>::new();
-    let mut decision_pot_counts = BTreeMap::<u64, usize>::new();
-    let mut to_call_counts = BTreeMap::<u64, usize>::new();
-
-    for node in nodes {
-        node_count += 1;
-        let depth = node
-            .get("path")
-            .and_then(Value::as_array)
-            .map_or(0, Vec::len);
-        max_depth = max_depth.max(depth);
-        *depth_counts.entry(depth).or_default() += 1;
-        let branching = node
-            .get("children")
-            .and_then(Value::as_array)
-            .map_or(0, Vec::len);
-        max_branching = max_branching.max(branching);
-
-        match node
-            .get("kind")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown")
-        {
-            "decision" => {
-                decisions += 1;
-                if let Some(state) = node.get("state") {
-                    increment_string_field(&mut street_decisions, state, "street");
-                    increment_string_field(&mut player_decisions, state, "acting_player");
-                    increment_u64_field(&mut decision_pot_counts, state, "pot");
-                    increment_u64_field(&mut to_call_counts, state, "to_call");
-                }
-                if let Some(actions) = node.get("actions").and_then(Value::as_array) {
-                    for action in actions {
-                        increment_string_field(&mut action_counts, action, "action");
-                        increment_string_field(&mut action_source_counts, action, "source");
-                    }
-                }
-            }
-            "chance" => chances += 1,
-            "terminal" => {
-                terminals += 1;
-                match node
-                    .get("terminal_kind")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                {
-                    "Fold" => fold_terminals += 1,
-                    "Showdown" => showdown_terminals += 1,
-                    _ => {}
-                }
-                increment_u64_field(&mut terminal_pot_counts, node, "pot");
-            }
-            _ => {}
-        }
-    }
-
-    json!({
-        "nodes": node_count,
-        "decisions": decisions,
-        "chances": chances,
-        "terminals": terminals,
-        "fold_terminals": fold_terminals,
-        "showdown_terminals": showdown_terminals,
-        "max_depth": max_depth,
-        "max_branching": max_branching,
-        "depth_counts": depth_counts,
-        "street_decisions": street_decisions,
-        "player_decisions": player_decisions,
-        "action_counts": action_counts,
-        "action_source_counts": action_source_counts,
-        "decision_pot_counts": decision_pot_counts,
-        "to_call_counts": to_call_counts,
-        "terminal_pot_counts": terminal_pot_counts,
-    })
+fn db_subtree_solver_summary(conn: &Connection, root: i64) -> Value {
+    conn.query_row(
+        "WITH RECURSIVE subtree(node_id) AS (
+            SELECT ?1
+            UNION ALL
+            SELECT n.node_id FROM nodes n JOIN subtree s ON n.parent_id = s.node_id
+         )
+         SELECT COUNT(solver_nodes.node_id),
+                AVG(avg_gap),
+                AVG(current_gap),
+                MAX(avg_gap),
+                MAX(current_gap)
+         FROM subtree LEFT JOIN solver_nodes ON solver_nodes.node_id = subtree.node_id",
+        [root],
+        |row| {
+            Ok(json!({
+                "solver_nodes": row.get::<_, i64>(0)?,
+                "mean_avg_gap": row.get::<_, Option<f64>>(1)?.unwrap_or(0.0),
+                "mean_current_gap": row.get::<_, Option<f64>>(2)?.unwrap_or(0.0),
+                "max_avg_gap": row.get::<_, Option<f64>>(3)?.unwrap_or(0.0),
+                "max_current_gap": row.get::<_, Option<f64>>(4)?.unwrap_or(0.0),
+            }))
+        },
+    )
+    .unwrap()
 }
 
-fn summarize_solver_subset<'a>(nodes: impl Iterator<Item = &'a Value>) -> Value {
-    let mut solver_nodes = 0usize;
-    let mut avg_gap_sum = 0.0f64;
-    let mut current_gap_sum = 0.0f64;
-    let mut max_avg_gap = 0.0f64;
-    let mut max_current_gap = 0.0f64;
-    let mut top_avg_gaps = Vec::<Value>::new();
-    let mut top_current_gaps = Vec::<Value>::new();
-
-    for node in nodes {
-        let Some(solver) = node.get("solver") else {
-            continue;
-        };
-        let avg_gap = solver_gap(solver, "avg_action_ev", "avg_policy_ev");
-        let current_gap = solver_gap(solver, "current_action_ev", "current_policy_ev");
-        if avg_gap.is_none() && current_gap.is_none() {
-            continue;
-        }
-        solver_nodes += 1;
-        if let Some(gap) = avg_gap {
-            avg_gap_sum += gap;
-            max_avg_gap = max_avg_gap.max(gap);
-            push_top_solver_gap(&mut top_avg_gaps, node, solver, gap, "avg_action_ev");
-        }
-        if let Some(gap) = current_gap {
-            current_gap_sum += gap;
-            max_current_gap = max_current_gap.max(gap);
-            push_top_solver_gap(
-                &mut top_current_gaps,
-                node,
-                solver,
-                gap,
-                "current_action_ev",
-            );
-        }
-    }
-
-    json!({
-        "solver_nodes": solver_nodes,
-        "mean_avg_gap": if solver_nodes > 0 { avg_gap_sum / solver_nodes as f64 } else { 0.0 },
-        "mean_current_gap": if solver_nodes > 0 { current_gap_sum / solver_nodes as f64 } else { 0.0 },
-        "max_avg_gap": max_avg_gap,
-        "max_current_gap": max_current_gap,
-        "top_avg_gaps": top_avg_gaps,
-        "top_current_gaps": top_current_gaps,
-    })
+fn vec_json(values: &[f32]) -> String {
+    serde_json::to_string(values).expect("float array must serialize")
 }
 
-fn solver_gap(solver: &Value, action_ev_key: &str, policy_ev_key: &str) -> Option<f64> {
-    let action_values = solver.get(action_ev_key)?.as_array()?;
-    let policy_ev = solver.get(policy_ev_key)?.as_f64()?;
-    let best = action_values
-        .iter()
-        .filter_map(Value::as_f64)
-        .fold(f64::NEG_INFINITY, f64::max);
-    best.is_finite().then_some((best - policy_ev).max(0.0))
+fn opt_vec_json(values: &Option<Vec<f32>>) -> Option<String> {
+    values.as_ref().map(|values| vec_json(values))
 }
 
-fn push_top_solver_gap(
-    top: &mut Vec<Value>,
-    node: &Value,
-    solver: &Value,
-    gap: f64,
-    action_ev_key: &str,
-) {
-    let action_values = solver
-        .get(action_ev_key)
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    let best_action = action_values
-        .iter()
-        .enumerate()
-        .filter_map(|(index, value)| value.as_f64().map(|value| (index, value)))
-        .max_by(|(_, left), (_, right)| {
-            left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal)
-        })
-        .map(|(index, _)| index);
-    let path = node
-        .get("path")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    top.push(json!({
-        "gap": gap,
-        "node": json_usize_field(node, "index"),
-        "infoset": node.get("infoset").cloned().unwrap_or(Value::Null),
-        "best_action": best_action,
-        "action_values": action_values,
-        "policy_ev": solver.get(if action_ev_key == "avg_action_ev" { "avg_policy_ev" } else { "current_policy_ev" }).cloned().unwrap_or(Value::Null),
-        "avg_strategy": solver.get("avg_strategy").cloned().unwrap_or(Value::Null),
-        "current_strategy": solver.get("current_strategy").cloned().unwrap_or(Value::Null),
-        "state": node.get("state").cloned().unwrap_or(Value::Null),
-        "path": path,
-    }));
-    top.sort_by(|left, right| {
-        let left_gap = left.get("gap").and_then(Value::as_f64).unwrap_or(0.0);
-        let right_gap = right.get("gap").and_then(Value::as_f64).unwrap_or(0.0);
-        right_gap
-            .partial_cmp(&left_gap)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    top.truncate(10);
+fn json_text_value(text: String) -> Value {
+    serde_json::from_str(&text).unwrap_or(Value::String(text))
 }
 
-fn node_belongs_to_subtree(
-    node: &Value,
-    subtree_root: usize,
-    parents: &BTreeMap<usize, Option<usize>>,
-) -> bool {
-    let mut current = Some(json_usize_field(node, "index"));
-    while let Some(index) = current {
-        if index == subtree_root {
-            return true;
-        }
-        current = parents.get(&index).copied().flatten();
-    }
-    false
+fn db_usize(value: usize) -> i64 {
+    value as i64
 }
 
-fn increment_string_field(counts: &mut BTreeMap<String, usize>, value: &Value, key: &str) {
-    if let Some(text) = value.get(key).and_then(Value::as_str) {
-        *counts.entry(text.to_string()).or_default() += 1;
-    }
+fn db_opt_usize(value: Option<usize>) -> Option<i64> {
+    value.map(db_usize)
 }
 
-fn increment_u64_field(counts: &mut BTreeMap<u64, usize>, value: &Value, key: &str) {
-    if let Some(number) = value.get(key).and_then(Value::as_u64) {
-        *counts.entry(number).or_default() += 1;
-    }
-}
-
-fn json_usize_field(value: &Value, key: &str) -> usize {
-    value.get(key).and_then(Value::as_u64).unwrap_or_else(|| {
-        eprintln!("tree node JSON missing numeric field `{key}`: {value}");
-        std::process::exit(2);
-    }) as usize
-}
-
-fn json_optional_usize_field(value: &Value, key: &str) -> Option<usize> {
-    match value.get(key) {
-        Some(Value::Null) | None => None,
-        Some(value) => Some(value.as_u64().unwrap_or_else(|| {
-            eprintln!("tree node JSON field `{key}` must be a number or null: {value}");
-            std::process::exit(2);
-        }) as usize),
-    }
-}
-
-fn json_string_field(value: &Value, key: &str) -> String {
-    value
-        .get(key)
-        .and_then(Value::as_str)
-        .unwrap_or_else(|| {
-            eprintln!("tree node JSON missing string field `{key}`: {value}");
-            std::process::exit(2);
-        })
-        .to_string()
+fn db_opt_u32(value: Option<u32>) -> Option<i64> {
+    value.map(i64::from)
 }
 
 fn smoke_hands() -> usize {
@@ -1006,6 +1002,56 @@ fn smoke_hands() -> usize {
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(16)
+}
+
+fn parse_tree_db_build_args(args: &mut impl Iterator<Item = String>) -> TreeDbBuildArgs {
+    let Some(db_path) = args.next() else {
+        eprintln!(
+            "usage: pokedr-cli tree-db build <tree.sqlite> [flop] [--config path.yml] [--combo-limit n|--full-combos]"
+        );
+        std::process::exit(2);
+    };
+    let mut parsed = TreeDbBuildArgs {
+        db_path,
+        flop: None,
+        config_path: None,
+        combo_limit: 32,
+    };
+    let mut args = args.peekable();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--config" => {
+                parsed.config_path = Some(args.next().unwrap_or_else(|| {
+                    eprintln!("--config requires a path");
+                    std::process::exit(2);
+                }));
+            }
+            "--combo-limit" => {
+                let value = args.next().unwrap_or_else(|| {
+                    eprintln!("--combo-limit requires a number");
+                    std::process::exit(2);
+                });
+                parsed.combo_limit = value.parse().unwrap_or_else(|_| {
+                    eprintln!("--combo-limit must be a number: {value}");
+                    std::process::exit(2);
+                });
+            }
+            "--full-combos" => {
+                parsed.combo_limit = usize::MAX;
+            }
+            value if value.starts_with("--") => {
+                eprintln!("unknown tree-db build option: {value}");
+                std::process::exit(2);
+            }
+            value => {
+                if parsed.flop.replace(value.to_string()).is_some() {
+                    eprintln!("multiple flop arguments are not supported");
+                    std::process::exit(2);
+                }
+            }
+        }
+    }
+    parsed
 }
 
 fn parse_flop_command_args(args: impl Iterator<Item = String>) -> FlopCommandArgs {

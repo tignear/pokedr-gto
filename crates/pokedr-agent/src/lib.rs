@@ -148,6 +148,73 @@ pub struct LocalGapDetail {
     pub actions: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct FixedFlopTreeDump {
+    pub nodes: Vec<TreeNodeRecord>,
+    pub actions: Vec<TreeActionRecord>,
+    pub solver_nodes: Vec<SolverNodeRecord>,
+    pub solver_combos: Vec<SolverComboRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TreeNodeRecord {
+    pub node_id: usize,
+    pub parent_id: Option<usize>,
+    pub kind: String,
+    pub infoset: Option<usize>,
+    pub path: String,
+    pub street: Option<String>,
+    pub board: Option<String>,
+    pub acting_player: Option<String>,
+    pub pot: Option<u32>,
+    pub to_call: Option<u32>,
+    pub hero_invested: Option<u32>,
+    pub villain_invested: Option<u32>,
+    pub terminal_kind: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TreeActionRecord {
+    pub node_id: usize,
+    pub action_index: usize,
+    pub child_id: usize,
+    pub action: String,
+    pub source: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SolverNodeRecord {
+    pub node_id: usize,
+    pub infoset: usize,
+    pub iterations: usize,
+    pub acting_player: String,
+    pub action_count: usize,
+    pub legal_combo_count: usize,
+    pub avg_strategy: Vec<f32>,
+    pub current_strategy: Vec<f32>,
+    pub avg_action_ev: Option<Vec<f32>>,
+    pub current_action_ev: Option<Vec<f32>>,
+    pub avg_policy_ev: Option<f32>,
+    pub current_policy_ev: Option<f32>,
+    pub avg_gap: Option<f32>,
+    pub current_gap: Option<f32>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SolverComboRecord {
+    pub node_id: usize,
+    pub combo_index: usize,
+    pub combo: String,
+    pub reach: f32,
+    pub weighted_gap: f32,
+    pub avg_action_values: Option<Vec<f32>>,
+    pub current_action_values: Option<Vec<f32>>,
+    pub avg_strategy: Vec<f32>,
+    pub current_strategy: Vec<f32>,
+    pub regrets: Vec<f32>,
+    pub strategy_sum: Vec<f32>,
+}
+
 impl Default for PokedrAgent {
     fn default() -> Self {
         Self::new(PokedrAgentConfig::default())
@@ -566,6 +633,66 @@ pub fn dump_fixed_flop_tree_node(
         node_index,
         node,
     ))
+}
+
+pub fn build_fixed_flop_tree_dump(
+    flop: [PokedrCard; 3],
+    config: PokedrAgentConfig,
+) -> FixedFlopTreeDump {
+    build_fixed_flop_tree_dump_with_combo_limit(flop, config, dump_solver_db_combo_limit())
+}
+
+pub fn build_fixed_flop_tree_dump_with_combo_limit(
+    flop: [PokedrCard; 3],
+    config: PokedrAgentConfig,
+    combo_limit: usize,
+) -> FixedFlopTreeDump {
+    let (tree, layout) = fixed_flop_tree_and_layout(flop, config.clone());
+    let solver_dump = Some(DumpSolverContext::build_for_mode(
+        &tree,
+        &layout,
+        &config,
+        DumpSolverMode::Summary,
+        combo_limit,
+    ));
+    let mut nodes = Vec::with_capacity(tree.nodes().len());
+    let mut actions = Vec::new();
+    let mut solver_nodes = Vec::new();
+    let mut solver_combos = Vec::new();
+
+    for (node_id, node) in tree.nodes().iter().enumerate() {
+        nodes.push(tree_node_record(&tree, &layout, node_id, node));
+        if let PublicNodeKind::Decision {
+            actions: candidates,
+            ..
+        } = &node.kind
+        {
+            for (action_index, candidate) in candidates.iter().enumerate() {
+                actions.push(TreeActionRecord {
+                    node_id,
+                    action_index,
+                    child_id: node.children[action_index],
+                    action: format_player_action(candidate.action),
+                    source: format!("{:?}", candidate.source),
+                });
+            }
+        }
+        if let Some(context) = solver_dump.as_ref() {
+            if let Some((record, combo_records)) =
+                solver_node_records(&tree, &layout, context, node_id)
+            {
+                solver_nodes.push(record);
+                solver_combos.extend(combo_records);
+            }
+        }
+    }
+
+    FixedFlopTreeDump {
+        nodes,
+        actions,
+        solver_nodes,
+        solver_combos,
+    }
 }
 
 fn fixed_flop_tree_and_layout(
@@ -2581,6 +2708,22 @@ impl DumpSolverContext {
         config: &PokedrAgentConfig,
     ) -> Option<Self> {
         let mode = dump_solver_mode()?;
+        Some(Self::build_for_mode(
+            tree,
+            layout,
+            config,
+            mode,
+            dump_solver_combo_limit(mode),
+        ))
+    }
+
+    fn build_for_mode(
+        tree: &SubgameTree,
+        layout: &PostflopDenseLayout,
+        config: &PokedrAgentConfig,
+        mode: DumpSolverMode,
+        combo_limit: usize,
+    ) -> Self {
         let indexer = ComboIndexer::new();
         let root_dead = root_board(tree).deck_mask();
         let villain_weights = vec![1.0; COMBO_COUNT];
@@ -2626,7 +2769,7 @@ impl DumpSolverContext {
                 Some((Some(average_values), Some(current_values)))
             })
             .unwrap_or((None, None));
-        Some(Self {
+        Self {
             state,
             average_values,
             current_values,
@@ -2634,8 +2777,8 @@ impl DumpSolverContext {
             root_dead,
             iterations: config.cfr_iterations.max(1),
             mode,
-            combo_limit: dump_solver_combo_limit(mode),
-        })
+            combo_limit,
+        }
     }
 }
 
@@ -2657,6 +2800,13 @@ fn dump_solver_combo_limit(mode: DumpSolverMode) -> usize {
             DumpSolverMode::Summary => 8,
             DumpSolverMode::Full => usize::MAX,
         })
+}
+
+fn dump_solver_db_combo_limit() -> usize {
+    std::env::var("POKEDR_DUMP_COMBO_LIMIT")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(32)
 }
 
 fn dump_tree_node_json(
@@ -2978,6 +3128,210 @@ fn dump_solver_combo_row(
         regrets,
         strategy_sum,
     }
+}
+
+fn tree_node_record(
+    tree: &SubgameTree,
+    layout: &PostflopDenseLayout,
+    node_id: usize,
+    node: &pokedr_core::postflop::PublicNode,
+) -> TreeNodeRecord {
+    let path = format!("[{}]", dump_tree_path_json(tree, node_id));
+    match &node.kind {
+        PublicNodeKind::Decision { state, .. } => TreeNodeRecord {
+            node_id,
+            parent_id: node.parent,
+            kind: "decision".to_string(),
+            infoset: layout.node_infoset(node_id),
+            path,
+            street: Some(format!("{:?}", state.street)),
+            board: Some(format_pokedr_cards(state.board.cards())),
+            acting_player: Some(format!("{:?}", state.acting_player)),
+            pot: Some(state.pot),
+            to_call: Some(state.to_call),
+            hero_invested: Some(state.hero_invested),
+            villain_invested: Some(state.villain_invested),
+            terminal_kind: None,
+        },
+        PublicNodeKind::Chance { street, board, .. } => TreeNodeRecord {
+            node_id,
+            parent_id: node.parent,
+            kind: "chance".to_string(),
+            infoset: None,
+            path,
+            street: Some(format!("{:?}", street)),
+            board: Some(format_pokedr_cards(board.cards())),
+            acting_player: None,
+            pot: None,
+            to_call: None,
+            hero_invested: None,
+            villain_invested: None,
+            terminal_kind: None,
+        },
+        PublicNodeKind::Terminal {
+            kind,
+            board,
+            pot,
+            hero_invested,
+            villain_invested,
+        } => TreeNodeRecord {
+            node_id,
+            parent_id: node.parent,
+            kind: "terminal".to_string(),
+            infoset: None,
+            path,
+            street: None,
+            board: Some(format_pokedr_cards(board.cards())),
+            acting_player: None,
+            pot: Some(*pot),
+            to_call: None,
+            hero_invested: Some(*hero_invested),
+            villain_invested: Some(*villain_invested),
+            terminal_kind: Some(format!("{:?}", kind)),
+        },
+    }
+}
+
+fn solver_node_records(
+    tree: &SubgameTree,
+    layout: &PostflopDenseLayout,
+    context: &DumpSolverContext,
+    node_id: usize,
+) -> Option<(SolverNodeRecord, Vec<SolverComboRecord>)> {
+    let public_infoset = layout.node_infoset(node_id)?;
+    let PublicNodeKind::Decision { state, actions } = &tree.nodes()[node_id].kind else {
+        return None;
+    };
+    let action_count = actions.len();
+    let mut current_strategy = vec![0.0; layout.max_actions()];
+    let mut average_strategy = vec![0.0; layout.max_actions()];
+    let mut average_sum = vec![0.0; action_count];
+    let mut current_sum = vec![0.0; action_count];
+    let mut avg_action_value_sum = vec![0.0; action_count];
+    let mut current_action_value_sum = vec![0.0; action_count];
+    let mut avg_policy_value_sum = 0.0;
+    let mut current_policy_value_sum = 0.0;
+    let mut action_value_weight_sum = 0.0;
+    let mut legal_combo_count = 0usize;
+    let mut combo_rows = Vec::new();
+
+    for (combo_index, combo) in context.indexer.combos().iter().enumerate() {
+        if combo.collides_with(context.root_dead) {
+            continue;
+        }
+        legal_combo_count += 1;
+        let infoset = private_infoset(public_infoset, state.acting_player, combo_index);
+        let offset = infoset * layout.max_actions();
+        context.state.strategy_for(infoset, &mut current_strategy);
+        context
+            .state
+            .average_strategy_for(infoset, &mut average_strategy);
+        for action in 0..action_count {
+            average_sum[action] += average_strategy[action];
+            current_sum[action] += current_strategy[action];
+        }
+        let row = dump_solver_combo_row(
+            context,
+            combo_index,
+            offset,
+            action_count,
+            &average_strategy,
+            &current_strategy,
+        );
+        if row.reach_weight > 0.0 {
+            let value_weight = row.reach_weight;
+            if let Some(values) = &row.avg_action_values {
+                for action in 0..action_count {
+                    avg_action_value_sum[action] += values[action] * value_weight;
+                    avg_policy_value_sum +=
+                        values[action] * average_strategy[action] * value_weight;
+                }
+            }
+            if let Some(values) = &row.current_action_values {
+                for action in 0..action_count {
+                    current_action_value_sum[action] += values[action] * value_weight;
+                    current_policy_value_sum +=
+                        values[action] * current_strategy[action] * value_weight;
+                }
+            }
+            action_value_weight_sum += value_weight;
+        }
+        combo_rows.push(row);
+    }
+
+    if legal_combo_count > 0 {
+        for action in 0..action_count {
+            average_sum[action] /= legal_combo_count as f32;
+            current_sum[action] /= legal_combo_count as f32;
+        }
+    }
+    let has_ev = action_value_weight_sum > 0.0;
+    if has_ev {
+        for action in 0..action_count {
+            avg_action_value_sum[action] /= action_value_weight_sum;
+            current_action_value_sum[action] /= action_value_weight_sum;
+        }
+        avg_policy_value_sum /= action_value_weight_sum;
+        current_policy_value_sum /= action_value_weight_sum;
+    }
+
+    let avg_gap = has_ev.then(|| {
+        avg_action_value_sum
+            .iter()
+            .copied()
+            .fold(f32::NEG_INFINITY, f32::max)
+            - avg_policy_value_sum
+    });
+    let current_gap = has_ev.then(|| {
+        current_action_value_sum
+            .iter()
+            .copied()
+            .fold(f32::NEG_INFINITY, f32::max)
+            - current_policy_value_sum
+    });
+    combo_rows.sort_by(|left, right| {
+        right
+            .weighted_gap
+            .partial_cmp(&left.weighted_gap)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let combo_records = combo_rows
+        .iter()
+        .take(context.combo_limit)
+        .map(|row| SolverComboRecord {
+            node_id,
+            combo_index: row.combo_index,
+            combo: row.combo.clone(),
+            reach: row.reach_weight,
+            weighted_gap: row.weighted_gap,
+            avg_action_values: row.avg_action_values.clone(),
+            current_action_values: row.current_action_values.clone(),
+            avg_strategy: row.average_strategy.clone(),
+            current_strategy: row.current_strategy.clone(),
+            regrets: row.regrets.clone(),
+            strategy_sum: row.strategy_sum.clone(),
+        })
+        .collect();
+
+    Some((
+        SolverNodeRecord {
+            node_id,
+            infoset: public_infoset,
+            iterations: context.iterations,
+            acting_player: format!("{:?}", state.acting_player),
+            action_count,
+            legal_combo_count,
+            avg_strategy: average_sum,
+            current_strategy: current_sum,
+            avg_action_ev: has_ev.then_some(avg_action_value_sum),
+            current_action_ev: has_ev.then_some(current_action_value_sum),
+            avg_policy_ev: has_ev.then_some(avg_policy_value_sum),
+            current_policy_ev: has_ev.then_some(current_policy_value_sum),
+            avg_gap: avg_gap.map(|value| value.max(0.0)),
+            current_gap: current_gap.map(|value| value.max(0.0)),
+        },
+        combo_records,
+    ))
 }
 
 fn dump_tree_path_json(tree: &SubgameTree, index: usize) -> String {
