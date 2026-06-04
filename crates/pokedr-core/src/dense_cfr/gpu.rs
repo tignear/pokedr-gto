@@ -2205,6 +2205,9 @@ struct GpuPublicTreeLayerTileBuffers {
     child_buffer: wgpu::Buffer,
     fold_terminal_nodes: Vec<u32>,
     showdown_terminal_groups: Vec<GpuTerminalGroupCache>,
+    terminal_refs_buffer: wgpu::Buffer,
+    terminal_combo_order_buffer: wgpu::Buffer,
+    terminal_combo_bounds_buffer: wgpu::Buffer,
     hero_reaches_buffer: wgpu::Buffer,
     villain_reaches_buffer: wgpu::Buffer,
     combo_live_buffer: wgpu::Buffer,
@@ -3289,16 +3292,15 @@ impl GpuDenseCfrBackend {
         phase: &str,
         start: Option<Instant>,
     ) -> Result<wgpu::CommandEncoder, GpuCfrError> {
-        let Some(start) = start else {
-            return Ok(encoder);
-        };
         self.queue.submit(Some(encoder.finish()));
         self.profile_poll()?;
-        eprintln!(
-            "pokedr: gpu profile phase={} elapsed_ms={:.3}",
-            phase,
-            start.elapsed().as_secs_f64() * 1000.0
-        );
+        if let Some(start) = start {
+            eprintln!(
+                "pokedr: gpu profile phase={} elapsed_ms={:.3}",
+                phase,
+                start.elapsed().as_secs_f64() * 1000.0
+            );
+        }
         Ok(self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -3313,8 +3315,8 @@ impl GpuDenseCfrBackend {
         start: Option<Instant>,
     ) -> Result<(), GpuCfrError> {
         self.queue.submit(Some(encoder.finish()));
+        self.profile_poll()?;
         if let Some(start) = start {
-            self.profile_poll()?;
             eprintln!(
                 "pokedr: gpu profile phase={} elapsed_ms={:.3}",
                 phase,
@@ -3689,6 +3691,9 @@ impl GpuDenseCfrBackend {
         &self,
         node_buffer: &wgpu::Buffer,
         terminal_groups: &[GpuTerminalGroupCache],
+        terminal_refs_buffer: &wgpu::Buffer,
+        combo_order_buffer: &wgpu::Buffer,
+        combo_bounds_buffer: &wgpu::Buffer,
         combo_buffer: &wgpu::Buffer,
         blocker_neighbors_buffer: &wgpu::Buffer,
         hero_reaches_buffer: &wgpu::Buffer,
@@ -3720,45 +3725,6 @@ impl GpuDenseCfrBackend {
         let mut card_prefix_elapsed = Duration::ZERO;
         let mut reduce_elapsed = Duration::ZERO;
         let mut profiled_chunks = 0usize;
-        let max_terminal_refs_len = terminal_groups
-            .iter()
-            .map(|group| group.terminal_refs.len())
-            .max()
-            .unwrap_or(1)
-            .max(1);
-        let max_combo_order_len = terminal_groups
-            .iter()
-            .map(|group| group.combo_order.len())
-            .max()
-            .unwrap_or(1)
-            .max(1);
-        let max_combo_bounds_len = terminal_groups
-            .iter()
-            .map(|group| group.combo_bounds.len())
-            .max()
-            .unwrap_or(1)
-            .max(1);
-        let terminal_refs_buffer = uninit_storage_buffer_typed::<GpuTerminalRef>(
-            &self.device,
-            "public tree streamed terminal refs scratch",
-            max_terminal_refs_len,
-            false,
-            true,
-        );
-        let combo_order_buffer = uninit_storage_buffer_typed::<u32>(
-            &self.device,
-            "public tree streamed terminal combo strength order scratch",
-            max_combo_order_len,
-            false,
-            true,
-        );
-        let combo_bounds_buffer = uninit_storage_buffer_typed::<GpuShowdownComboBounds>(
-            &self.device,
-            "public tree streamed terminal combo strength bounds scratch",
-            max_combo_bounds_len,
-            false,
-            true,
-        );
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -3767,17 +3733,17 @@ impl GpuDenseCfrBackend {
         let mut pending_chunks = 0usize;
         for group in terminal_groups {
             self.queue.write_buffer(
-                &terminal_refs_buffer,
+                terminal_refs_buffer,
                 0,
                 bytemuck::cast_slice(&group.terminal_refs),
             );
             self.queue.write_buffer(
-                &combo_order_buffer,
+                combo_order_buffer,
                 0,
                 bytemuck::cast_slice(&group.combo_order),
             );
             self.queue.write_buffer(
-                &combo_bounds_buffer,
+                combo_bounds_buffer,
                 0,
                 bytemuck::cast_slice(&group.combo_bounds),
             );
@@ -3800,9 +3766,9 @@ impl GpuDenseCfrBackend {
                 layout: &self.public_tree_terminal_partial_bind_group_layout,
                 entries: &[
                     bind_entry(0, node_buffer),
-                    bind_entry(1, &terminal_refs_buffer),
-                    bind_entry(2, &combo_order_buffer),
-                    bind_entry(3, &combo_bounds_buffer),
+                    bind_entry(1, terminal_refs_buffer),
+                    bind_entry(2, combo_order_buffer),
+                    bind_entry(3, combo_bounds_buffer),
                     bind_entry(4, hero_reaches_buffer),
                     bind_entry(5, villain_reaches_buffer),
                     bind_entry(6, terminal_prefix_pairs_buffer),
@@ -3828,8 +3794,8 @@ impl GpuDenseCfrBackend {
                 layout: &self.public_tree_terminal_reduce_bind_group_layout,
                 entries: &[
                     bind_entry(0, node_buffer),
-                    bind_entry(1, &terminal_refs_buffer),
-                    bind_entry(2, &combo_bounds_buffer),
+                    bind_entry(1, terminal_refs_buffer),
+                    bind_entry(2, combo_bounds_buffer),
                     bind_entry(3, blocker_neighbors_buffer),
                     bind_entry(4, hero_reaches_buffer),
                     bind_entry(5, villain_reaches_buffer),
@@ -3922,9 +3888,9 @@ impl GpuDenseCfrBackend {
                                 ),
                             entries: &[
                                 bind_entry(0, node_buffer),
-                                bind_entry(1, &terminal_refs_buffer),
-                                bind_entry(2, &combo_order_buffer),
-                                bind_entry(3, &combo_bounds_buffer),
+                                bind_entry(1, terminal_refs_buffer),
+                                bind_entry(2, combo_order_buffer),
+                                bind_entry(3, combo_bounds_buffer),
                                 bind_entry(4, combo_buffer),
                                 bind_entry(5, hero_reaches_buffer),
                                 bind_entry(6, villain_reaches_buffer),
@@ -3944,8 +3910,8 @@ impl GpuDenseCfrBackend {
                             ),
                         entries: &[
                             bind_entry(0, node_buffer),
-                            bind_entry(1, &terminal_refs_buffer),
-                            bind_entry(2, &combo_bounds_buffer),
+                            bind_entry(1, terminal_refs_buffer),
+                            bind_entry(2, combo_bounds_buffer),
                             bind_entry(3, combo_buffer),
                             bind_entry(4, hero_reaches_buffer),
                             bind_entry(5, villain_reaches_buffer),
@@ -4204,6 +4170,24 @@ impl GpuDenseCfrBackend {
                             combos,
                             showdown_boards,
                         );
+                        let max_terminal_refs_len = showdown_terminal_groups
+                            .iter()
+                            .map(|group| group.terminal_refs.len())
+                            .max()
+                            .unwrap_or(1)
+                            .max(1);
+                        let max_combo_order_len = showdown_terminal_groups
+                            .iter()
+                            .map(|group| group.combo_order.len())
+                            .max()
+                            .unwrap_or(1)
+                            .max(1);
+                        let max_combo_bounds_len = showdown_terminal_groups
+                            .iter()
+                            .map(|group| group.combo_bounds.len())
+                            .max()
+                            .unwrap_or(1)
+                            .max(1);
 
                         GpuPublicTreeLayerTileBuffers {
                             node_start,
@@ -4220,6 +4204,29 @@ impl GpuDenseCfrBackend {
                             ),
                             fold_terminal_nodes,
                             showdown_terminal_groups,
+                            terminal_refs_buffer: uninit_storage_buffer_typed::<GpuTerminalRef>(
+                                &self.device,
+                                "public tree streamed terminal refs scratch",
+                                max_terminal_refs_len,
+                                false,
+                                true,
+                            ),
+                            terminal_combo_order_buffer: uninit_storage_buffer_typed::<u32>(
+                                &self.device,
+                                "public tree streamed terminal combo strength order scratch",
+                                max_combo_order_len,
+                                false,
+                                true,
+                            ),
+                            terminal_combo_bounds_buffer: uninit_storage_buffer_typed::<
+                                GpuShowdownComboBounds,
+                            >(
+                                &self.device,
+                                "public tree streamed terminal combo strength bounds scratch",
+                                max_combo_bounds_len,
+                                false,
+                                true,
+                            ),
                             hero_reaches_buffer: uninit_storage_buffer(
                                 &self.device,
                                 "public tree layer tile hero reaches",
@@ -4947,11 +4954,15 @@ impl GpuDenseCfrBackend {
             }
         }
         self.queue.submit(Some(encoder.finish()));
+        self.profile_poll()?;
         for layer_tiles in &ctx.layer_tiles {
             for tile in layer_tiles {
                 self.fill_terminal_values_streaming(
                     &tile.node_buffer,
                     &tile.showdown_terminal_groups,
+                    &tile.terminal_refs_buffer,
+                    &tile.terminal_combo_order_buffer,
+                    &tile.terminal_combo_bounds_buffer,
                     &ctx.combo_buffer,
                     &ctx.terminal_blocker_neighbors_buffer,
                     &tile.hero_reaches_buffer,

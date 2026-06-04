@@ -651,6 +651,7 @@ fn try_solve_fixed_flop_metrics_gpu(
                 delta,
             )
             .ok()?;
+        backend.wait_idle().ok()?;
         completed_iterations = iterations;
 
         let state = gpu_state.download(&backend).ok()?;
@@ -802,6 +803,7 @@ fn br_gap_metrics_gpu(
             &profile,
         )
         .ok()?;
+    backend.wait_idle().ok()?;
     Some(br_gap_metrics_from_values(
         tree, layout, state, &profile, &values,
     ))
@@ -832,6 +834,7 @@ fn recursive_br_gap_metrics_gpu(
             0,
         )
         .ok()?;
+    backend.wait_idle().ok()?;
     let villain_values = backend
         .public_tree_best_response_values(
             &linearized.nodes,
@@ -845,6 +848,7 @@ fn recursive_br_gap_metrics_gpu(
             1,
         )
         .ok()?;
+    backend.wait_idle().ok()?;
     Some(recursive_br_gap_metrics_from_values(
         tree,
         layout,
@@ -876,7 +880,8 @@ fn br_gap_metrics_from_values(
 
     for public_infoset in 0..layout.infoset_count() {
         let action_count = layout.action_count(public_infoset);
-        for player in [Player::Hero, Player::Villain] {
+        let player = infoset_acting_player(tree, layout, public_infoset);
+        {
             for combo_index in 0..COMBO_COUNT {
                 let infoset = private_infoset(public_infoset, player, combo_index);
                 let offset = infoset * layout.max_actions();
@@ -969,7 +974,8 @@ fn recursive_br_gap_metrics_from_values(
     };
     for public_infoset in 0..public_infoset_count {
         let action_count = layout.action_count(public_infoset);
-        for player in [Player::Hero, Player::Villain] {
+        let player = infoset_acting_player(tree, layout, public_infoset);
+        {
             if !include_local_gaps && !(public_infoset == 0 && player == Player::Hero) {
                 continue;
             }
@@ -1136,6 +1142,18 @@ fn root_exploitability_from_recursive_values(
         hero_br_value,
         villain_br_value,
     }
+}
+
+fn infoset_acting_player(
+    tree: &SubgameTree,
+    layout: &PostflopDenseLayout,
+    public_infoset: usize,
+) -> Player {
+    let node_index = layout.infoset_node(public_infoset);
+    let PublicNodeKind::Decision { state, .. } = &tree.nodes()[node_index].kind else {
+        unreachable!("infoset nodes are decisions");
+    };
+    state.acting_player
 }
 
 #[allow(clippy::too_many_arguments)]
