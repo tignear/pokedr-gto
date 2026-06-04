@@ -421,11 +421,11 @@ fn run_public_tree_terminal_values(backend: &GpuDenseCfrBackend) {
     }];
     let state = DenseCfrState::new_with_legal_actions(
         DenseCfrConfig {
-            infosets: combos.len() * 2,
+            infosets: combos.len(),
             actions: 2,
             variant: CfrVariant::CfrPlus,
         },
-        vec![true; combos.len() * 2 * 2],
+        vec![true; combos.len() * 2],
     );
     let values = backend
         .public_tree_iteration_values(
@@ -549,11 +549,11 @@ fn run_public_tree_chance_blocks_fold_values(backend: &GpuDenseCfrBackend) {
     ];
     let state = DenseCfrState::new_with_legal_actions(
         DenseCfrConfig {
-            infosets: combos.len() * 2,
+            infosets: combos.len(),
             actions: 2,
             variant: CfrVariant::CfrPlus,
         },
-        vec![true; combos.len() * 2 * 2],
+        vec![true; combos.len() * 2],
     );
     let values = backend
         .public_tree_iteration_values(
@@ -649,11 +649,11 @@ fn run_public_tree_showdown_values_match_bruteforce(backend: &GpuDenseCfrBackend
     let villain_weights = vec![0.2, 0.7, 1.3];
     let state = DenseCfrState::new_with_legal_actions(
         DenseCfrConfig {
-            infosets: combos.len() * 2,
+            infosets: combos.len(),
             actions: 2,
             variant: CfrVariant::CfrPlus,
         },
-        vec![true; combos.len() * 2 * 2],
+        vec![true; combos.len() * 2],
     );
     let values = backend
         .public_tree_iteration_values(
@@ -814,11 +814,11 @@ fn run_public_tree_multistreet_values_match_cpu_exact(backend: &GpuDenseCfrBacke
     let public_infosets = 1 + chance_cards.len();
     let mut state = DenseCfrState::new_with_legal_actions(
         DenseCfrConfig {
-            infosets: public_infosets * combos.len() * 2,
+            infosets: public_infosets * combos.len(),
             actions: 2,
             variant: CfrVariant::CfrPlus,
         },
-        vec![true; public_infosets * combos.len() * 2 * 2],
+        vec![true; public_infosets * combos.len() * 2],
     );
     let seed_action_values: Vec<_> = (0..state.infosets() * state.actions())
         .map(|index| ((index as f32 + 0.5) * 0.37).sin())
@@ -879,14 +879,14 @@ fn run_public_tree_average_strategy_br_matches_cpu_exact(backend: &GpuDenseCfrBa
     let fixture = multistreet_public_tree_fixture();
     let mut state = DenseCfrState::new_with_legal_actions(
         DenseCfrConfig {
-            infosets: fixture.public_infosets * fixture.combos.len() * 2,
+            infosets: fixture.public_infosets * fixture.combos.len(),
             actions: 2,
             variant: CfrVariant::DcfrPlus {
                 alpha: 1.5,
                 gamma: 4.0,
             },
         },
-        vec![true; fixture.public_infosets * fixture.combos.len() * 2 * 2],
+        vec![true; fixture.public_infosets * fixture.combos.len() * 2],
     );
     for iteration in 1..=4 {
         let action_values: Vec<_> = (0..state.infosets() * state.actions())
@@ -936,6 +936,7 @@ fn run_public_tree_average_strategy_br_matches_cpu_exact(backend: &GpuDenseCfrBa
             &format!("average strategy BR {br_player} action value"),
             &expected.action_values,
             &gpu.action_values,
+            &fixture.nodes,
             fixture.combos.len(),
             2,
             br_player as usize,
@@ -944,6 +945,7 @@ fn run_public_tree_average_strategy_br_matches_cpu_exact(backend: &GpuDenseCfrBa
             &format!("average strategy BR {br_player} reach weight"),
             &expected.reach_weights,
             &gpu.reach_weights,
+            &fixture.nodes,
             fixture.combos.len(),
             br_player as usize,
         );
@@ -953,7 +955,7 @@ fn run_public_tree_average_strategy_br_matches_cpu_exact(backend: &GpuDenseCfrBa
 fn run_public_tree_iterations_match_cpu_exact(backend: &GpuDenseCfrBackend) {
     let fixture = multistreet_public_tree_fixture();
     let config = DenseCfrConfig {
-        infosets: fixture.public_infosets * fixture.combos.len() * 2,
+        infosets: fixture.public_infosets * fixture.combos.len(),
         actions: 2,
         variant: CfrVariant::DcfrPlus {
             alpha: 1.5,
@@ -1230,7 +1232,7 @@ fn cpu_exact_public_tree_values_with_br(
     actions: usize,
     br_player: Option<usize>,
 ) -> ExpectedPublicTreeValues {
-    let infosets = public_infosets * combos.len() * 2;
+    let infosets = public_infosets * combos.len();
     let mut values = ExpectedPublicTreeValues {
         action_values: vec![0.0; infosets * actions],
         reach_weights: vec![0.0; infosets],
@@ -1302,9 +1304,7 @@ fn cpu_exact_strategy_weights(
             let villain_reach = villain_reaches[node_index * combo_count + combo];
             match node.kind {
                 0 => {
-                    let private_infoset = (node.public_infoset as usize * combo_count * 2)
-                        + node.acting_player as usize * combo_count
-                        + combo;
+                    let private_infoset = node.public_infoset as usize * combo_count + combo;
                     let mut strategy = vec![0.0; state.actions()];
                     state.strategy_for(private_infoset, &mut strategy);
                     for action in 0..node.child_count as usize {
@@ -1336,15 +1336,13 @@ fn cpu_exact_strategy_weights(
         }
     }
 
-    let mut weights = vec![0.0; public_infosets * combo_count * 2];
+    let mut weights = vec![0.0; public_infosets * combo_count];
     for (node_index, node) in nodes.iter().copied().enumerate() {
         if node.kind != 0 {
             continue;
         }
         for combo in 0..combo_count {
-            let infoset = (node.public_infoset as usize * combo_count * 2)
-                + node.acting_player as usize * combo_count
-                + combo;
+            let infoset = node.public_infoset as usize * combo_count + combo;
             weights[infoset] = node._pad1
                 * if node.acting_player == 0 {
                     hero_reaches[node_index * combo_count + combo]
@@ -1380,9 +1378,7 @@ fn traverse_cpu_public_tree(
         0 => {
             let acting_player = node.acting_player as usize;
             let acting_combo = if acting_player == 0 { hero } else { villain };
-            let infoset = (node.public_infoset as usize * combos.len() * 2)
-                + acting_player * combos.len()
-                + acting_combo;
+            let infoset = node.public_infoset as usize * combos.len() + acting_combo;
             let offset = infoset * actions;
             let mut strategy = vec![0.0; state.actions()];
             state.strategy_for(infoset, &mut strategy);
@@ -1605,14 +1601,16 @@ fn assert_close_player_actions(
     label: &str,
     expected: &[f32],
     actual: &[f32],
+    nodes: &[GpuPublicTreeNode],
     combo_count: usize,
     actions: usize,
     player: usize,
 ) {
+    let actors = public_infoset_actors(nodes);
     for (index, (expected, actual)) in expected.iter().zip(actual).enumerate() {
         let private_infoset = index / actions;
-        let player_slot = (private_infoset / combo_count) % 2;
-        if player_slot == player && (expected - actual).abs() >= 1e-5 {
+        let public_infoset = private_infoset / combo_count;
+        if actors.get(public_infoset) == Some(&player) && (expected - actual).abs() >= 1e-5 {
             fail(&format!(
                 "{label}[{index}] mismatch: expected {expected}, actual {actual}"
             ));
@@ -1624,17 +1622,35 @@ fn assert_close_player_infosets(
     label: &str,
     expected: &[f32],
     actual: &[f32],
+    nodes: &[GpuPublicTreeNode],
     combo_count: usize,
     player: usize,
 ) {
+    let actors = public_infoset_actors(nodes);
     for (index, (expected, actual)) in expected.iter().zip(actual).enumerate() {
-        let player_slot = (index / combo_count) % 2;
-        if player_slot == player && (expected - actual).abs() >= 1e-5 {
+        let public_infoset = index / combo_count;
+        if actors.get(public_infoset) == Some(&player) && (expected - actual).abs() >= 1e-5 {
             fail(&format!(
                 "{label}[{index}] mismatch: expected {expected}, actual {actual}"
             ));
         }
     }
+}
+
+fn public_infoset_actors(nodes: &[GpuPublicTreeNode]) -> Vec<usize> {
+    let count = nodes
+        .iter()
+        .filter(|node| node.kind == 0)
+        .map(|node| node.public_infoset as usize + 1)
+        .max()
+        .unwrap_or(0);
+    let mut actors = vec![usize::MAX; count];
+    for node in nodes {
+        if node.kind == 0 {
+            actors[node.public_infoset as usize] = node.acting_player as usize;
+        }
+    }
+    actors
 }
 
 fn fail(message: &str) -> ! {

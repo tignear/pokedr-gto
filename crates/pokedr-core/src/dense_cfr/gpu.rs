@@ -845,9 +845,7 @@ fn effective_regret(index: u32) -> f32 {
 }
 
 fn strategy_probability(node: TreeNode, private_combo: u32, action: u32) -> f32 {
-    let private_infoset = node.public_infoset * params.combo_count * 2u
-        + node.acting_player * params.combo_count
-        + private_combo;
+    let private_infoset = node.public_infoset * params.combo_count + private_combo;
     let offset = private_infoset * params.max_actions;
     var normalizer = 0.0;
     for (var i = 0u; i < node.child_count; i = i + 1u) {
@@ -1911,9 +1909,7 @@ fn denominator_tile(@builtin(global_invocation_id) id: vec3<u32>) {
         return;
     }
     if combo_live[index] <= 0.0 {
-        let private_infoset = node.public_infoset * params.combo_count * 2u
-            + params.value_player * params.combo_count
-            + combo;
+        let private_infoset = node.public_infoset * params.combo_count + combo;
         reach_weights[private_infoset] = 0.0;
         return;
     }
@@ -1933,9 +1929,7 @@ fn denominator_tile(@builtin(global_invocation_id) id: vec3<u32>) {
             - hero_aggregates[aggregate_base + private_combo.cards[1] + 1u]
             + self_reach;
     }
-    let private_infoset = node.public_infoset * params.combo_count * 2u
-        + params.value_player * params.combo_count
-        + combo;
+    let private_infoset = node.public_infoset * params.combo_count + combo;
     reach_weights[private_infoset] = node._pad1 * value_weight;
 }
 
@@ -1954,9 +1948,7 @@ fn action_edge_tile(@builtin(global_invocation_id) id: vec3<u32>) {
     if node.kind != 0u || node.acting_player != params.value_player {
         return;
     }
-    let private_infoset = node.public_infoset * params.combo_count * 2u
-        + params.value_player * params.combo_count
-        + combo;
+    let private_infoset = node.public_infoset * params.combo_count + combo;
     let action_index = private_infoset * params.max_actions + edge.action;
     let action_len = params.output_len;
     let child_offset = edge.child * params.combo_count + combo;
@@ -3190,6 +3182,10 @@ impl GpuDenseCfrBackend {
 
     pub fn adapter_info(&self) -> &wgpu::AdapterInfo {
         &self.adapter_info
+    }
+
+    pub fn max_storage_buffer_binding_size(&self) -> u64 {
+        self.device.limits().max_storage_buffer_binding_size
     }
 
     pub fn adapter_features(&self) -> wgpu::Features {
@@ -4554,10 +4550,7 @@ impl GpuDenseCfrBackend {
         assert!(!nodes.is_empty());
         assert_eq!(combo_legal.len(), combos.len());
         assert_eq!(villain_weights.len(), combos.len());
-        assert_eq!(
-            infosets,
-            nodes_public_infoset_count(nodes) * combos.len() * 2
-        );
+        assert_eq!(infosets, nodes_public_infoset_count(nodes) * combos.len());
 
         let action_len = infosets * actions;
         let output_len = action_len * 2 + infosets * 2;

@@ -606,6 +606,7 @@ fn try_solve_fixed_flop_metrics_gpu(
     let linearized = linearize_gpu_public_tree(tree, layout, &backend, base_config, &matrix_cache)?;
     let mut dense_config = layout.dense_config(base_config.cfr_variant);
     dense_config.infosets *= PRIVATE_INFOS_PER_PUBLIC;
+    assert_gpu_dense_binding_feasible(&backend, &dense_config);
     let combos = gpu_private_combos();
     let combo_legal: Vec<u32> = indexer
         .combos()
@@ -1478,9 +1479,6 @@ fn solve_public_tree_cfr(
 ) -> DenseCfrState {
     let mut dense_config = layout.dense_config(config.cfr_variant);
     dense_config.infosets *= PRIVATE_INFOS_PER_PUBLIC;
-    let mut state =
-        DenseCfrState::new_with_legal_actions(dense_config.clone(), private_legal_actions(layout));
-    let mut batch = DenseCfrIteration::new(&dense_config);
     let indexer = ComboIndexer::new();
     let gpu_backend = cfr_gpu_backend();
     let matrix_cache = RefCell::new(ShowdownMatrixCache::new(showdown_matrix_cache_capacity()));
@@ -1499,6 +1497,9 @@ fn solve_public_tree_cfr(
         return gpu_state;
     }
 
+    let mut state =
+        DenseCfrState::new_with_legal_actions(dense_config.clone(), private_legal_actions(layout));
+    let mut batch = DenseCfrIteration::new(&dense_config);
     for iteration in 1..=config.cfr_iterations.max(1) {
         let iteration_started = Instant::now();
         if solver_progress_enabled() && should_report_iteration(iteration, config.cfr_iterations) {
@@ -1603,6 +1604,7 @@ fn try_solve_gpu_public_tree_resident(
     matrix_cache: &RefCell<ShowdownMatrixCache>,
 ) -> Option<DenseCfrState> {
     let linearized = linearize_gpu_public_tree(tree, layout, backend, config, matrix_cache)?;
+    assert_gpu_dense_binding_feasible(backend, dense_config);
     if solver_progress_enabled() {
         eprintln!(
             "pokedr: gpu resident public tree nodes={} showdown_boards={} iterations={}",
@@ -2143,12 +2145,8 @@ fn observed_villain_range_weights(
         .collect()
 }
 
-fn private_infoset(public_infoset: usize, player: Player, private_combo: usize) -> usize {
-    let player_offset = match player {
-        Player::Hero => 0,
-        Player::Villain => PRIVATE_HANDS,
-    };
-    public_infoset * PRIVATE_INFOS_PER_PUBLIC + player_offset + private_combo
+fn private_infoset(public_infoset: usize, _player: Player, private_combo: usize) -> usize {
+    public_infoset * PRIVATE_INFOS_PER_PUBLIC + private_combo
 }
 
 fn hero_combo_index(indexer: &ComboIndexer, hero_cards: [PokedrCard; 2]) -> usize {
@@ -2168,6 +2166,30 @@ fn private_legal_actions(layout: &PostflopDenseLayout) -> Vec<bool> {
         }
     }
     legal
+}
+
+fn assert_gpu_dense_binding_feasible(
+    backend: &GpuDenseCfrBackend,
+    config: &pokedr_core::dense_cfr::DenseCfrConfig,
+) {
+    let max_binding_bytes = backend.max_storage_buffer_binding_size() as usize;
+    let infoset_bytes = config.infosets.saturating_mul(std::mem::size_of::<f32>());
+    let action_slots = config.infosets.saturating_mul(config.actions);
+    let action_bytes = action_slots.saturating_mul(std::mem::size_of::<f32>());
+    if infoset_bytes <= max_binding_bytes && action_bytes <= max_binding_bytes {
+        return;
+    }
+
+    let public_infosets = config.infosets / PRIVATE_INFOS_PER_PUBLIC.max(1);
+    panic!(
+        "GPU dense CFR state exceeds current WGPU storage binding limit: public_infosets={} private_infosets={} actions={} infoset_bytes={} action_bytes={} max_binding_bytes={}. The solver needs tiled state binding before this tree can run on this backend.",
+        public_infosets,
+        config.infosets,
+        config.actions,
+        infoset_bytes,
+        action_bytes,
+        max_binding_bytes
+    );
 }
 
 fn fold_utility(
@@ -2794,8 +2816,7 @@ enum PreflopClass {
     Premium = 4,
 }
 
-const PRIVATE_HANDS: usize = COMBO_COUNT;
-const PRIVATE_INFOS_PER_PUBLIC: usize = PRIVATE_HANDS * 2;
+const PRIVATE_INFOS_PER_PUBLIC: usize = COMBO_COUNT;
 
 impl PreflopClass {
     fn open_raises(self) -> bool {
