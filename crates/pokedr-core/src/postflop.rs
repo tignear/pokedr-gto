@@ -212,15 +212,17 @@ impl ActionSetBuilder {
             }
         }
 
-        let all_in = request.stack;
-        insert_or_replace_near(
-            &mut sizings,
-            AggressiveSizing {
-                amount: all_in,
-                source: SizingSource::Forced,
-            },
-            self.config.merge_log_ratio,
-        );
+        if !request.can_check() {
+            let all_in = request.stack;
+            insert_or_replace_near(
+                &mut sizings,
+                AggressiveSizing {
+                    amount: all_in,
+                    source: SizingSource::Forced,
+                },
+                self.config.merge_log_ratio,
+            );
+        }
 
         sizings.sort_by_key(|sizing| sizing.amount);
         sizings.dedup_by_key(|sizing| sizing.amount);
@@ -699,7 +701,7 @@ mod tests {
     }
 
     #[test]
-    fn check_spot_includes_standard_bets_and_all_in() {
+    fn check_spot_includes_standard_bets_without_forced_all_in() {
         let actions = builder().build(&ActionSetRequest {
             street: Street::Flop,
             pot: 100,
@@ -721,9 +723,9 @@ mod tests {
                 .any(|candidate| candidate.action == PlayerAction::Bet { amount: 75 })
         );
         assert!(
-            actions
+            !actions
                 .iter()
-                .any(|candidate| candidate.action == PlayerAction::AllIn { amount: 500 })
+                .any(|candidate| matches!(candidate.action, PlayerAction::AllIn { .. }))
         );
     }
 
@@ -780,7 +782,7 @@ mod tests {
     }
 
     #[test]
-    fn aggressive_action_cap_preserves_observed_and_all_in() {
+    fn aggressive_action_cap_preserves_observed_without_forced_check_spot_all_in() {
         let config = ActionSetConfig {
             max_aggressive_actions: 2,
             ..ActionSetConfig::default()
@@ -805,9 +807,14 @@ mod tests {
                 .any(|candidate| candidate.action == PlayerAction::Bet { amount: 220 })
         );
         assert!(
+            !aggressive
+                .iter()
+                .any(|candidate| matches!(candidate.action, PlayerAction::AllIn { .. }))
+        );
+        assert!(
             aggressive
                 .iter()
-                .any(|candidate| candidate.action == PlayerAction::AllIn { amount: 1000 })
+                .any(|candidate| candidate.source == SizingSource::Standard)
         );
     }
 
