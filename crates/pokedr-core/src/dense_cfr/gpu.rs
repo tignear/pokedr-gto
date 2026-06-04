@@ -930,6 +930,10 @@ struct TreeNode {
     _pad1: f32,
     _pad2: f32,
 };
+struct TerminalRef {
+    node: u32,
+    table: u32,
+};
 struct Bounds {
     group_start: u32,
     group_end: u32,
@@ -958,7 +962,7 @@ struct ChunkParams {
 };
 
 @group(0) @binding(0) var<storage, read> nodes: array<TreeNode>;
-@group(0) @binding(1) var<storage, read> terminal_nodes: array<u32>;
+@group(0) @binding(1) var<storage, read> terminal_refs: array<TerminalRef>;
 @group(0) @binding(2) var<storage, read> combo_order: array<u32>;
 @group(0) @binding(3) var<storage, read> combo_bounds: array<Bounds>;
 @group(0) @binding(4) var<storage, read> hero_reaches: array<f32>;
@@ -1007,9 +1011,10 @@ fn terminal_partial(
     let board = select(0u, index % params.board_count, is_live);
     let terminal_slot = select(0u, index / params.board_count, is_live);
     let group_terminal_slot = chunk.terminal_start + terminal_slot;
-    let node_index = terminal_nodes[group_terminal_slot];
+    let terminal_ref = terminal_refs[group_terminal_slot];
+    let node_index = terminal_ref.node;
     let node_offset = node_index * params.combo_count;
-    let table_board = group_terminal_slot * params.board_count + board;
+    let table_board = terminal_ref.table * params.board_count + board;
     let order_base = table_board * params.order_stride;
     let prefix_base = (terminal_slot * params.board_count + board) * params.prefix_stride;
 
@@ -1103,6 +1108,10 @@ struct TreeNode {
     _pad1: f32,
     _pad2: f32,
 };
+struct TerminalRef {
+    node: u32,
+    table: u32,
+};
 struct Bounds {
     group_start: u32,
     group_end: u32,
@@ -1131,7 +1140,7 @@ struct ChunkParams {
 };
 
 @group(0) @binding(0) var<storage, read> nodes: array<TreeNode>;
-@group(0) @binding(1) var<storage, read> terminal_nodes: array<u32>;
+@group(0) @binding(1) var<storage, read> terminal_refs: array<TerminalRef>;
 @group(0) @binding(2) var<storage, read> combo_order: array<u32>;
 @group(0) @binding(3) var<storage, read> combo_bounds: array<Bounds>;
 @group(0) @binding(4) var<storage, read> hero_reaches: array<f32>;
@@ -1150,9 +1159,10 @@ fn terminal_partial(@builtin(global_invocation_id) id: vec3<u32>) {
     let board = index % params.board_count;
     let terminal_slot = index / params.board_count;
     let group_terminal_slot = chunk.terminal_start + terminal_slot;
-    let node_index = terminal_nodes[group_terminal_slot];
+    let terminal_ref = terminal_refs[group_terminal_slot];
+    let node_index = terminal_ref.node;
     let node_offset = node_index * params.combo_count;
-    let table_board = group_terminal_slot * params.board_count + board;
+    let table_board = terminal_ref.table * params.board_count + board;
     let order_base = table_board * params.order_stride;
     let prefix_base = (terminal_slot * params.board_count + board) * params.prefix_stride;
     var hero_sum = 0.0;
@@ -1187,6 +1197,10 @@ struct TreeNode {
     chance_scale: f32,
     showdown_denominator: f32,
 };
+struct TerminalRef {
+    node: u32,
+    table: u32,
+};
 struct Bounds {
     group_start: u32,
     group_end: u32,
@@ -1215,7 +1229,7 @@ struct ChunkParams {
 };
 
 @group(0) @binding(0) var<storage, read> nodes: array<TreeNode>;
-@group(0) @binding(1) var<storage, read> terminal_nodes: array<u32>;
+@group(0) @binding(1) var<storage, read> terminal_refs: array<TerminalRef>;
 @group(0) @binding(2) var<storage, read> combo_bounds: array<Bounds>;
 @group(0) @binding(3) var<storage, read> blocker_neighbors: array<u32>;
 @group(0) @binding(4) var<storage, read> hero_reaches: array<f32>;
@@ -1236,14 +1250,15 @@ fn terminal_reduce(@builtin(global_invocation_id) id: vec3<u32>) {
     let combo = index % params.combo_count;
     let terminal_slot = index / params.combo_count;
     let group_terminal_slot = chunk.terminal_start + terminal_slot;
-    let node_index = terminal_nodes[group_terminal_slot];
+    let terminal_ref = terminal_refs[group_terminal_slot];
+    let node_index = terminal_ref.node;
     let node = nodes[node_index];
     let node_offset = node_index * params.combo_count;
     let denom = max(node.showdown_denominator, 1.0);
     var hero_value = 0.0;
     var villain_value = 0.0;
     for (var local_board = 0u; local_board < node.board_count; local_board = local_board + 1u) {
-        let table_board = group_terminal_slot * params.board_count + local_board;
+        let table_board = terminal_ref.table * params.board_count + local_board;
         let bounds = combo_bounds[table_board * params.combo_count + combo];
         if bounds.legal == 0u {
             continue;
@@ -1309,6 +1324,10 @@ struct TreeNode {
     chance_scale: f32,
     showdown_denominator: f32,
 };
+struct TerminalRef {
+    node: u32,
+    table: u32,
+};
 struct Bounds {
     group_start: u32,
     group_end: u32,
@@ -1331,7 +1350,7 @@ struct Params {
 };
 
 @group(0) @binding(0) var<storage, read> nodes: array<TreeNode>;
-@group(0) @binding(1) var<storage, read> terminal_nodes: array<u32>;
+@group(0) @binding(1) var<storage, read> terminal_refs: array<TerminalRef>;
 @group(0) @binding(2) var<storage, read> combo_order: array<u32>;
 @group(0) @binding(3) var<storage, read> combo_bounds: array<Bounds>;
 @group(0) @binding(4) var<storage, read> combos: array<Combo>;
@@ -1357,9 +1376,10 @@ fn terminal_card_prefix(
     let board = index % params.board_count;
     let terminal_slot = index / params.board_count;
     let group_terminal_slot = params.terminal_start + terminal_slot;
-    let node_index = terminal_nodes[group_terminal_slot];
+    let terminal_ref = terminal_refs[group_terminal_slot];
+    let node_index = terminal_ref.node;
     let node_offset = node_index * params.combo_count;
-    let table_board = group_terminal_slot * params.board_count + board;
+    let table_board = terminal_ref.table * params.board_count + board;
     let order_base = table_board * params.combo_count;
     let output_base =
         (terminal_slot * params.board_count * 52u + board * 52u + card) * params.card_stride;
@@ -1407,6 +1427,10 @@ struct TreeNode {
     chance_scale: f32,
     showdown_denominator: f32,
 };
+struct TerminalRef {
+    node: u32,
+    table: u32,
+};
 struct Bounds {
     group_start: u32,
     group_end: u32,
@@ -1429,7 +1453,7 @@ struct Params {
 };
 
 @group(0) @binding(0) var<storage, read> nodes: array<TreeNode>;
-@group(0) @binding(1) var<storage, read> terminal_nodes: array<u32>;
+@group(0) @binding(1) var<storage, read> terminal_refs: array<TerminalRef>;
 @group(0) @binding(2) var<storage, read> combo_bounds: array<Bounds>;
 @group(0) @binding(3) var<storage, read> combos: array<Combo>;
 @group(0) @binding(4) var<storage, read> hero_reaches: array<f32>;
@@ -1454,7 +1478,8 @@ fn terminal_reduce(@builtin(global_invocation_id) id: vec3<u32>) {
     let combo = index % params.combo_count;
     let terminal_slot = index / params.combo_count;
     let group_terminal_slot = params.terminal_start + terminal_slot;
-    let node_index = terminal_nodes[group_terminal_slot];
+    let terminal_ref = terminal_refs[group_terminal_slot];
+    let node_index = terminal_ref.node;
     let node = nodes[node_index];
     let node_offset = node_index * params.combo_count;
     let private_combo = combos[combo];
@@ -1462,7 +1487,7 @@ fn terminal_reduce(@builtin(global_invocation_id) id: vec3<u32>) {
     var hero_value = 0.0;
     var villain_value = 0.0;
     for (var local_board = 0u; local_board < node.board_count; local_board = local_board + 1u) {
-        let table_board = group_terminal_slot * params.board_count + local_board;
+        let table_board = terminal_ref.table * params.board_count + local_board;
         let bounds = combo_bounds[table_board * params.combo_count + combo];
         if bounds.legal == 0u {
             continue;
@@ -2133,6 +2158,16 @@ struct GpuPublicTreeEdge {
 unsafe impl bytemuck::Zeroable for GpuPublicTreeEdge {}
 unsafe impl bytemuck::Pod for GpuPublicTreeEdge {}
 
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct GpuTerminalRef {
+    node: u32,
+    table: u32,
+}
+
+unsafe impl bytemuck::Zeroable for GpuTerminalRef {}
+unsafe impl bytemuck::Pod for GpuTerminalRef {}
+
 struct GpuPublicTreeIterationContext {
     nodes_len: usize,
     combos_len: usize,
@@ -2215,16 +2250,9 @@ struct GpuPublicTreeLayered {
 
 struct GpuTerminalGroupCache {
     board_count: usize,
-    terminal_nodes: Vec<u32>,
+    terminal_refs: Vec<GpuTerminalRef>,
     combo_order: Vec<u32>,
     combo_bounds: Vec<GpuShowdownComboBounds>,
-}
-
-struct GpuTerminalGroupBufferCache {
-    terminal_nodes_len: usize,
-    terminal_nodes_buffer: wgpu::Buffer,
-    combo_order_buffer: wgpu::Buffer,
-    combo_bounds_buffer: wgpu::Buffer,
 }
 
 #[repr(C)]
@@ -2368,30 +2396,51 @@ fn terminal_group_caches(
             continue;
         }
 
-        let table_bytes_per_terminal = board_count.saturating_mul(combos.len()).saturating_mul(
+        let table_bytes_per_unique_board = board_count.saturating_mul(combos.len()).saturating_mul(
             std::mem::size_of::<u32>() + std::mem::size_of::<GpuShowdownComboBounds>(),
         );
-        let terminals_per_group = (MAX_TERMINAL_GROUP_TABLE_BYTES / table_bytes_per_terminal)
-            .max(1)
-            .min(terminal_nodes.len());
+        let max_unique_tables_per_group =
+            (MAX_TERMINAL_GROUP_TABLE_BYTES / table_bytes_per_unique_board).max(1);
 
-        for terminal_chunk in terminal_nodes.chunks(terminals_per_group) {
-            let mut combo_order =
-                Vec::with_capacity(terminal_chunk.len() * board_count * combos.len());
-            let mut combo_bounds =
-                Vec::with_capacity(terminal_chunk.len() * board_count * combos.len());
-            for &node_index in terminal_chunk {
+        let mut index = 0usize;
+        while index < terminal_nodes.len() {
+            let mut table_slots = BTreeMap::<usize, u32>::new();
+            let mut terminal_refs = Vec::new();
+            let mut combo_order = Vec::new();
+            let mut combo_bounds = Vec::new();
+            while index < terminal_nodes.len() {
+                let node_index = terminal_nodes[index];
                 let node = nodes[node_index as usize];
                 let board_base = node.showdown_offset as usize;
-                let boards = &showdown_boards[board_base..board_base + board_count];
-                let (node_combo_order, node_combo_bounds) =
-                    showdown_strength_order_data(combos, boards);
-                combo_order.extend(node_combo_order);
-                combo_bounds.extend(node_combo_bounds);
+                let existing_slot = table_slots.get(&board_base).copied();
+                if existing_slot.is_none()
+                    && table_slots.len() >= max_unique_tables_per_group
+                    && !terminal_refs.is_empty()
+                {
+                    break;
+                }
+                let table = match existing_slot {
+                    Some(table) => table,
+                    None => {
+                        let table = table_slots.len() as u32;
+                        let boards = &showdown_boards[board_base..board_base + board_count];
+                        let (node_combo_order, node_combo_bounds) =
+                            showdown_strength_order_data(combos, boards);
+                        combo_order.extend(node_combo_order);
+                        combo_bounds.extend(node_combo_bounds);
+                        table_slots.insert(board_base, table);
+                        table
+                    }
+                };
+                terminal_refs.push(GpuTerminalRef {
+                    node: node_index,
+                    table,
+                });
+                index += 1;
             }
             caches.push(GpuTerminalGroupCache {
                 board_count,
-                terminal_nodes: terminal_chunk.to_vec(),
+                terminal_refs,
                 combo_order,
                 combo_bounds,
             });
@@ -3671,6 +3720,45 @@ impl GpuDenseCfrBackend {
         let mut card_prefix_elapsed = Duration::ZERO;
         let mut reduce_elapsed = Duration::ZERO;
         let mut profiled_chunks = 0usize;
+        let max_terminal_refs_len = terminal_groups
+            .iter()
+            .map(|group| group.terminal_refs.len())
+            .max()
+            .unwrap_or(1)
+            .max(1);
+        let max_combo_order_len = terminal_groups
+            .iter()
+            .map(|group| group.combo_order.len())
+            .max()
+            .unwrap_or(1)
+            .max(1);
+        let max_combo_bounds_len = terminal_groups
+            .iter()
+            .map(|group| group.combo_bounds.len())
+            .max()
+            .unwrap_or(1)
+            .max(1);
+        let terminal_refs_buffer = uninit_storage_buffer_typed::<GpuTerminalRef>(
+            &self.device,
+            "public tree streamed terminal refs scratch",
+            max_terminal_refs_len,
+            false,
+            true,
+        );
+        let combo_order_buffer = uninit_storage_buffer_typed::<u32>(
+            &self.device,
+            "public tree streamed terminal combo strength order scratch",
+            max_combo_order_len,
+            false,
+            true,
+        );
+        let combo_bounds_buffer = uninit_storage_buffer_typed::<GpuShowdownComboBounds>(
+            &self.device,
+            "public tree streamed terminal combo strength bounds scratch",
+            max_combo_bounds_len,
+            false,
+            true,
+        );
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -3678,30 +3766,27 @@ impl GpuDenseCfrBackend {
             });
         let mut pending_chunks = 0usize;
         for group in terminal_groups {
-            let group_buffers = GpuTerminalGroupBufferCache {
-                terminal_nodes_len: group.terminal_nodes.len(),
-                terminal_nodes_buffer: readonly_buffer(
-                    &self.device,
-                    "public tree streamed terminal nodes",
-                    &group.terminal_nodes,
-                ),
-                combo_order_buffer: readonly_buffer(
-                    &self.device,
-                    "public tree streamed terminal combo strength order",
-                    &group.combo_order,
-                ),
-                combo_bounds_buffer: readonly_buffer(
-                    &self.device,
-                    "public tree streamed terminal combo strength bounds",
-                    &group.combo_bounds,
-                ),
-            };
+            self.queue.write_buffer(
+                &terminal_refs_buffer,
+                0,
+                bytemuck::cast_slice(&group.terminal_refs),
+            );
+            self.queue.write_buffer(
+                &combo_order_buffer,
+                0,
+                bytemuck::cast_slice(&group.combo_order),
+            );
+            self.queue.write_buffer(
+                &combo_bounds_buffer,
+                0,
+                bytemuck::cast_slice(&group.combo_bounds),
+            );
             let partial_params = uniform_buffer(
                 &self.device,
                 "public tree streamed terminal partial params",
                 &[GpuPublicTreeParams {
                     combo_count: combo_count as u32,
-                    node_count: group_buffers.terminal_nodes_len as u32,
+                    node_count: group.terminal_refs.len() as u32,
                     max_actions: group.board_count as u32,
                     output_len: (combo_count + 1) as u32,
                     pair_start: combo_count as u32,
@@ -3715,9 +3800,9 @@ impl GpuDenseCfrBackend {
                 layout: &self.public_tree_terminal_partial_bind_group_layout,
                 entries: &[
                     bind_entry(0, node_buffer),
-                    bind_entry(1, &group_buffers.terminal_nodes_buffer),
-                    bind_entry(2, &group_buffers.combo_order_buffer),
-                    bind_entry(3, &group_buffers.combo_bounds_buffer),
+                    bind_entry(1, &terminal_refs_buffer),
+                    bind_entry(2, &combo_order_buffer),
+                    bind_entry(3, &combo_bounds_buffer),
                     bind_entry(4, hero_reaches_buffer),
                     bind_entry(5, villain_reaches_buffer),
                     bind_entry(6, terminal_prefix_pairs_buffer),
@@ -3729,7 +3814,7 @@ impl GpuDenseCfrBackend {
                 "public tree streamed terminal reduce params",
                 &[GpuPublicTreeParams {
                     combo_count: combo_count as u32,
-                    node_count: group_buffers.terminal_nodes_len as u32,
+                    node_count: group.terminal_refs.len() as u32,
                     max_actions: group.board_count as u32,
                     output_len: (combo_count + 1) as u32,
                     pair_start: blocker_neighbor_stride as u32,
@@ -3743,8 +3828,8 @@ impl GpuDenseCfrBackend {
                 layout: &self.public_tree_terminal_reduce_bind_group_layout,
                 entries: &[
                     bind_entry(0, node_buffer),
-                    bind_entry(1, &group_buffers.terminal_nodes_buffer),
-                    bind_entry(2, &group_buffers.combo_bounds_buffer),
+                    bind_entry(1, &terminal_refs_buffer),
+                    bind_entry(2, &combo_bounds_buffer),
                     bind_entry(3, blocker_neighbors_buffer),
                     bind_entry(4, hero_reaches_buffer),
                     bind_entry(5, villain_reaches_buffer),
@@ -3765,13 +3850,12 @@ impl GpuDenseCfrBackend {
             let terminal_chunk_size = prefix_chunk_size
                 .min(card_prefix_chunk_size)
                 .max(1)
-                .min(group_buffers.terminal_nodes_len.max(1));
+                .min(group.terminal_refs.len().max(1));
             let chunk_use_card_prefix =
                 use_card_prefix && card_prefix_pairs_per_terminal <= max_terminal_card_prefix_pairs;
-            for terminal_start in (0..group_buffers.terminal_nodes_len).step_by(terminal_chunk_size)
-            {
+            for terminal_start in (0..group.terminal_refs.len()).step_by(terminal_chunk_size) {
                 let terminal_count =
-                    terminal_chunk_size.min(group_buffers.terminal_nodes_len - terminal_start);
+                    terminal_chunk_size.min(group.terminal_refs.len() - terminal_start);
                 let partial_workgroups = (terminal_count * group.board_count) as u32;
                 let partial_x_groups = partial_workgroups.min(65_535).max(1);
                 let partial_y_groups = partial_workgroups.div_ceil(partial_x_groups);
@@ -3838,9 +3922,9 @@ impl GpuDenseCfrBackend {
                                 ),
                             entries: &[
                                 bind_entry(0, node_buffer),
-                                bind_entry(1, &group_buffers.terminal_nodes_buffer),
-                                bind_entry(2, &group_buffers.combo_order_buffer),
-                                bind_entry(3, &group_buffers.combo_bounds_buffer),
+                                bind_entry(1, &terminal_refs_buffer),
+                                bind_entry(2, &combo_order_buffer),
+                                bind_entry(3, &combo_bounds_buffer),
                                 bind_entry(4, combo_buffer),
                                 bind_entry(5, hero_reaches_buffer),
                                 bind_entry(6, villain_reaches_buffer),
@@ -3860,8 +3944,8 @@ impl GpuDenseCfrBackend {
                             ),
                         entries: &[
                             bind_entry(0, node_buffer),
-                            bind_entry(1, &group_buffers.terminal_nodes_buffer),
-                            bind_entry(2, &group_buffers.combo_bounds_buffer),
+                            bind_entry(1, &terminal_refs_buffer),
+                            bind_entry(2, &combo_bounds_buffer),
                             bind_entry(3, combo_buffer),
                             bind_entry(4, hero_reaches_buffer),
                             bind_entry(5, villain_reaches_buffer),
@@ -5688,13 +5772,26 @@ fn uninit_storage_buffer(
     len: usize,
     copy_src: bool,
 ) -> wgpu::Buffer {
+    uninit_storage_buffer_typed::<f32>(device, label, len, copy_src, false)
+}
+
+fn uninit_storage_buffer_typed<T>(
+    device: &wgpu::Device,
+    label: &str,
+    len: usize,
+    copy_src: bool,
+    copy_dst: bool,
+) -> wgpu::Buffer {
     let mut usage = wgpu::BufferUsages::STORAGE;
     if copy_src {
         usage |= wgpu::BufferUsages::COPY_SRC;
     }
+    if copy_dst {
+        usage |= wgpu::BufferUsages::COPY_DST;
+    }
     device.create_buffer(&wgpu::BufferDescriptor {
         label: Some(label),
-        size: byte_len::<f32>(len),
+        size: byte_len::<T>(len),
         usage,
         mapped_at_creation: false,
     })
