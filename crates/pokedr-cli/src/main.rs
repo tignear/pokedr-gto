@@ -8,6 +8,8 @@ use pokedr_core::{
     postflop_dense::PostflopDenseLayout,
 };
 use serde::Deserialize;
+use serde_json::{Value, json};
+use std::collections::BTreeMap;
 
 fn main() {
     let mut args = std::env::args();
@@ -20,11 +22,12 @@ fn main() {
         Some("solve-flop-metrics") => run_solve_flop_metrics(parse_flop_command_args(args)),
         Some("solve-flop-sweep") => run_solve_flop_sweep(parse_flop_command_args(args)),
         Some("dump-flop-tree") => run_dump_flop_tree(parse_flop_command_args(args)),
+        Some("analyze-tree-dump") => run_analyze_tree_dump(args),
         Some("rs-poker-smoke") => run_rs_poker_smoke(),
         Some("rs-poker-trace") => run_rs_poker_trace(),
         _ => {
             eprintln!(
-                "usage: {program} <gpu-info|gpu-smoke|postflop-smoke|solve-flop|solve-flop-metrics|solve-flop-sweep|dump-flop-tree|rs-poker-smoke|rs-poker-trace> [flop] [--config path.yml]"
+                "usage: {program} <gpu-info|gpu-smoke|postflop-smoke|solve-flop|solve-flop-metrics|solve-flop-sweep|dump-flop-tree|analyze-tree-dump|rs-poker-smoke|rs-poker-trace> [flop] [--config path.yml]"
             );
             std::process::exit(2);
         }
@@ -656,6 +659,242 @@ fn run_dump_flop_tree(args: FlopCommandArgs) {
             println!("{line}");
         }
     }
+}
+
+fn run_analyze_tree_dump(mut args: impl Iterator<Item = String>) {
+    let Some(path) = args.next() else {
+        eprintln!("usage: pokedr-cli analyze-tree-dump <tree.jsonl>");
+        std::process::exit(2);
+    };
+    if let Some(extra) = args.next() {
+        eprintln!("unexpected argument: {extra}");
+        std::process::exit(2);
+    }
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|error| {
+        eprintln!("failed to read tree dump {path}: {error}");
+        std::process::exit(2);
+    });
+    let nodes = parse_tree_dump_jsonl(&path, &text);
+    let analysis = analyze_tree_nodes(&nodes);
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&analysis).expect("analysis JSON must serialize")
+    );
+}
+
+fn parse_tree_dump_jsonl(path: &str, text: &str) -> Vec<Value> {
+    let nodes = text
+        .lines()
+        .enumerate()
+        .filter_map(|(line_index, line)| {
+            let line = line.trim();
+            if line.is_empty() {
+                return None;
+            }
+            Some(serde_json::from_str::<Value>(line).unwrap_or_else(|error| {
+                eprintln!(
+                    "failed to parse {path}:{} as JSON tree node: {error}",
+                    line_index + 1
+                );
+                std::process::exit(2);
+            }))
+        })
+        .collect::<Vec<_>>();
+    if nodes.is_empty() {
+        eprintln!("tree dump {path} did not contain any JSON nodes");
+        std::process::exit(2);
+    }
+    nodes
+}
+
+fn analyze_tree_nodes(nodes: &[Value]) -> Value {
+    let mut by_index = BTreeMap::new();
+    let mut parents = BTreeMap::new();
+    for node in nodes {
+        let index = json_usize_field(node, "index");
+        by_index.insert(index, node);
+        parents.insert(index, json_optional_usize_field(node, "parent"));
+    }
+
+    let root = by_index.get(&0).copied().unwrap_or_else(|| {
+        eprintln!("tree dump must contain root node index 0");
+        std::process::exit(2);
+    });
+    let total = summarize_tree_subset(nodes.iter());
+    let root_actions = root
+        .get("actions")
+        .and_then(Value::as_array)
+        .map(|actions| {
+            actions
+                .iter()
+                .map(|action| {
+                    let child = json_usize_field(action, "child");
+                    let subtree_nodes = nodes
+                        .iter()
+                        .filter(|node| node_belongs_to_subtree(node, child, &parents))
+                        .collect::<Vec<_>>();
+                    json!({
+                        "action_index": json_usize_field(action, "index"),
+                        "action": json_string_field(action, "action"),
+                        "source": json_string_field(action, "source"),
+                        "child": child,
+                        "summary": summarize_tree_subset(subtree_nodes.into_iter()),
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    json!({
+        "root": root,
+        "total": total,
+        "root_action_subtrees": root_actions,
+    })
+}
+
+fn summarize_tree_subset<'a>(nodes: impl Iterator<Item = &'a Value>) -> Value {
+    let mut node_count = 0usize;
+    let mut decisions = 0usize;
+    let mut chances = 0usize;
+    let mut terminals = 0usize;
+    let mut fold_terminals = 0usize;
+    let mut showdown_terminals = 0usize;
+    let mut max_depth = 0usize;
+    let mut max_branching = 0usize;
+    let mut depth_counts = BTreeMap::<usize, usize>::new();
+    let mut street_decisions = BTreeMap::<String, usize>::new();
+    let mut player_decisions = BTreeMap::<String, usize>::new();
+    let mut action_counts = BTreeMap::<String, usize>::new();
+    let mut action_source_counts = BTreeMap::<String, usize>::new();
+    let mut terminal_pot_counts = BTreeMap::<u64, usize>::new();
+    let mut decision_pot_counts = BTreeMap::<u64, usize>::new();
+    let mut to_call_counts = BTreeMap::<u64, usize>::new();
+
+    for node in nodes {
+        node_count += 1;
+        let depth = node
+            .get("path")
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len);
+        max_depth = max_depth.max(depth);
+        *depth_counts.entry(depth).or_default() += 1;
+        let branching = node
+            .get("children")
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len);
+        max_branching = max_branching.max(branching);
+
+        match node
+            .get("kind")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+        {
+            "decision" => {
+                decisions += 1;
+                if let Some(state) = node.get("state") {
+                    increment_string_field(&mut street_decisions, state, "street");
+                    increment_string_field(&mut player_decisions, state, "acting_player");
+                    increment_u64_field(&mut decision_pot_counts, state, "pot");
+                    increment_u64_field(&mut to_call_counts, state, "to_call");
+                }
+                if let Some(actions) = node.get("actions").and_then(Value::as_array) {
+                    for action in actions {
+                        increment_string_field(&mut action_counts, action, "action");
+                        increment_string_field(&mut action_source_counts, action, "source");
+                    }
+                }
+            }
+            "chance" => chances += 1,
+            "terminal" => {
+                terminals += 1;
+                match node
+                    .get("terminal_kind")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                {
+                    "Fold" => fold_terminals += 1,
+                    "Showdown" => showdown_terminals += 1,
+                    _ => {}
+                }
+                increment_u64_field(&mut terminal_pot_counts, node, "pot");
+            }
+            _ => {}
+        }
+    }
+
+    json!({
+        "nodes": node_count,
+        "decisions": decisions,
+        "chances": chances,
+        "terminals": terminals,
+        "fold_terminals": fold_terminals,
+        "showdown_terminals": showdown_terminals,
+        "max_depth": max_depth,
+        "max_branching": max_branching,
+        "depth_counts": depth_counts,
+        "street_decisions": street_decisions,
+        "player_decisions": player_decisions,
+        "action_counts": action_counts,
+        "action_source_counts": action_source_counts,
+        "decision_pot_counts": decision_pot_counts,
+        "to_call_counts": to_call_counts,
+        "terminal_pot_counts": terminal_pot_counts,
+    })
+}
+
+fn node_belongs_to_subtree(
+    node: &Value,
+    subtree_root: usize,
+    parents: &BTreeMap<usize, Option<usize>>,
+) -> bool {
+    let mut current = Some(json_usize_field(node, "index"));
+    while let Some(index) = current {
+        if index == subtree_root {
+            return true;
+        }
+        current = parents.get(&index).copied().flatten();
+    }
+    false
+}
+
+fn increment_string_field(counts: &mut BTreeMap<String, usize>, value: &Value, key: &str) {
+    if let Some(text) = value.get(key).and_then(Value::as_str) {
+        *counts.entry(text.to_string()).or_default() += 1;
+    }
+}
+
+fn increment_u64_field(counts: &mut BTreeMap<u64, usize>, value: &Value, key: &str) {
+    if let Some(number) = value.get(key).and_then(Value::as_u64) {
+        *counts.entry(number).or_default() += 1;
+    }
+}
+
+fn json_usize_field(value: &Value, key: &str) -> usize {
+    value.get(key).and_then(Value::as_u64).unwrap_or_else(|| {
+        eprintln!("tree node JSON missing numeric field `{key}`: {value}");
+        std::process::exit(2);
+    }) as usize
+}
+
+fn json_optional_usize_field(value: &Value, key: &str) -> Option<usize> {
+    match value.get(key) {
+        Some(Value::Null) | None => None,
+        Some(value) => Some(value.as_u64().unwrap_or_else(|| {
+            eprintln!("tree node JSON field `{key}` must be a number or null: {value}");
+            std::process::exit(2);
+        }) as usize),
+    }
+}
+
+fn json_string_field(value: &Value, key: &str) -> String {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| {
+            eprintln!("tree node JSON missing string field `{key}`: {value}");
+            std::process::exit(2);
+        })
+        .to_string()
 }
 
 fn smoke_hands() -> usize {
