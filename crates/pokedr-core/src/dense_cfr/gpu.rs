@@ -872,32 +872,121 @@ struct Params {
 @group(0) @binding(6) var<storage, read_write> prefix_pairs: array<PrefixPair>;
 @group(0) @binding(7) var<uniform> params: Params;
 
-@compute @workgroup_size(64)
-fn terminal_partial(@builtin(global_invocation_id) id: vec3<u32>) {
-    let index = id.x + id.y * params.x_invocations;
-    let output_count = params.terminal_count * params.board_count;
-    if index >= output_count {
-        return;
+const TERMINAL_PREFIX_CAPACITY: u32 = 2048u;
+var<workgroup> scan_pairs: array<PrefixPair, 2048>;
+
+fn terminal_scan_upsweep(stride: u32, local_index: u32) {
+    let step = stride * 2u;
+    for (var slot = local_index; slot < TERMINAL_PREFIX_CAPACITY / step; slot = slot + 256u) {
+        let scan_target = (slot + 1u) * step - 1u;
+        let source = scan_target - stride;
+        scan_pairs[scan_target] = PrefixPair(
+            scan_pairs[scan_target].hero + scan_pairs[source].hero,
+            scan_pairs[scan_target].villain + scan_pairs[source].villain,
+        );
     }
-    let board = index % params.board_count;
-    let terminal_slot = index / params.board_count;
+}
+
+fn terminal_scan_downsweep(stride: u32, local_index: u32) {
+    let step = stride * 2u;
+    for (var slot = local_index; slot < TERMINAL_PREFIX_CAPACITY / step; slot = slot + 256u) {
+        let scan_target = (slot + 1u) * step - 1u;
+        let source = scan_target - stride;
+        let left = scan_pairs[source];
+        scan_pairs[source] = scan_pairs[scan_target];
+        scan_pairs[scan_target] = PrefixPair(
+            scan_pairs[scan_target].hero + left.hero,
+            scan_pairs[scan_target].villain + left.villain,
+        );
+    }
+}
+
+@compute @workgroup_size(256)
+fn terminal_partial(
+    @builtin(workgroup_id) workgroup_id: vec3<u32>,
+    @builtin(local_invocation_id) local_id: vec3<u32>,
+) {
+    let index = workgroup_id.x + workgroup_id.y * params.x_invocations;
+    let output_count = params.terminal_count * params.board_count;
+    let is_live = index < output_count && params.combo_count + 1u <= TERMINAL_PREFIX_CAPACITY;
+    let board = select(0u, index % params.board_count, is_live);
+    let terminal_slot = select(0u, index / params.board_count, is_live);
     let node_index = terminal_nodes[terminal_slot];
     let node_offset = node_index * params.combo_count;
     let order_base = board * params.order_stride;
     let prefix_base = (terminal_slot * params.board_count + board) * params.prefix_stride;
-    var hero_sum = 0.0;
-    var villain_sum = 0.0;
-    prefix_pairs[prefix_base] = PrefixPair(0.0, 0.0);
-    for (var position = 0u; position < params.combo_count; position = position + 1u) {
-        let combo = combo_order[order_base + position];
-        if combo != 0xffffffffu {
-            let bounds = combo_bounds[board * params.combo_count + combo];
-            if bounds.legal != 0u {
-                hero_sum = hero_sum + hero_reaches[node_offset + combo];
-                villain_sum = villain_sum + villain_reaches[node_offset + combo];
+
+    for (var position = local_id.x; position < TERMINAL_PREFIX_CAPACITY; position = position + 256u) {
+        var pair = PrefixPair(0.0, 0.0);
+        if is_live && position < params.combo_count {
+            let combo = combo_order[order_base + position];
+            if combo != 0xffffffffu {
+                let bounds = combo_bounds[board * params.combo_count + combo];
+                if bounds.legal != 0u {
+                    pair = PrefixPair(
+                        hero_reaches[node_offset + combo],
+                        villain_reaches[node_offset + combo],
+                    );
+                }
             }
         }
-        prefix_pairs[prefix_base + position + 1u] = PrefixPair(hero_sum, villain_sum);
+        scan_pairs[position] = pair;
+    }
+    workgroupBarrier();
+
+    terminal_scan_upsweep(1u, local_id.x);
+    workgroupBarrier();
+    terminal_scan_upsweep(2u, local_id.x);
+    workgroupBarrier();
+    terminal_scan_upsweep(4u, local_id.x);
+    workgroupBarrier();
+    terminal_scan_upsweep(8u, local_id.x);
+    workgroupBarrier();
+    terminal_scan_upsweep(16u, local_id.x);
+    workgroupBarrier();
+    terminal_scan_upsweep(32u, local_id.x);
+    workgroupBarrier();
+    terminal_scan_upsweep(64u, local_id.x);
+    workgroupBarrier();
+    terminal_scan_upsweep(128u, local_id.x);
+    workgroupBarrier();
+    terminal_scan_upsweep(256u, local_id.x);
+    workgroupBarrier();
+    terminal_scan_upsweep(512u, local_id.x);
+    workgroupBarrier();
+    terminal_scan_upsweep(1024u, local_id.x);
+    workgroupBarrier();
+
+    if local_id.x == 0u {
+        scan_pairs[TERMINAL_PREFIX_CAPACITY - 1u] = PrefixPair(0.0, 0.0);
+    }
+    workgroupBarrier();
+
+    terminal_scan_downsweep(1024u, local_id.x);
+    workgroupBarrier();
+    terminal_scan_downsweep(512u, local_id.x);
+    workgroupBarrier();
+    terminal_scan_downsweep(256u, local_id.x);
+    workgroupBarrier();
+    terminal_scan_downsweep(128u, local_id.x);
+    workgroupBarrier();
+    terminal_scan_downsweep(64u, local_id.x);
+    workgroupBarrier();
+    terminal_scan_downsweep(32u, local_id.x);
+    workgroupBarrier();
+    terminal_scan_downsweep(16u, local_id.x);
+    workgroupBarrier();
+    terminal_scan_downsweep(8u, local_id.x);
+    workgroupBarrier();
+    terminal_scan_downsweep(4u, local_id.x);
+    workgroupBarrier();
+    terminal_scan_downsweep(2u, local_id.x);
+    workgroupBarrier();
+    terminal_scan_downsweep(1u, local_id.x);
+    workgroupBarrier();
+
+    for (var position = local_id.x; is_live && position <= params.combo_count; position = position + 256u) {
+        prefix_pairs[prefix_base + position] = scan_pairs[position];
     }
 }
 "#;
@@ -1808,6 +1897,30 @@ fn terminal_group_caches(
         .collect()
 }
 
+fn requested_wgpu_backends() -> Option<wgpu::Backends> {
+    let value = std::env::var("POKEDR_WGPU_BACKENDS")
+        .ok()
+        .or_else(|| std::env::var("WGPU_BACKENDS").ok())?;
+    let mut backends = wgpu::Backends::empty();
+    for token in value
+        .split(|character: char| character == ',' || character == ';' || character == '|')
+        .flat_map(str::split_whitespace)
+    {
+        match token.to_ascii_lowercase().as_str() {
+            "dx12" | "d3d12" | "directx12" => backends |= wgpu::Backends::DX12,
+            "vulkan" | "vk" => backends |= wgpu::Backends::VULKAN,
+            "gl" | "opengl" | "gles" => backends |= wgpu::Backends::GL,
+            "metal" => backends |= wgpu::Backends::METAL,
+            "webgpu" | "browser_webgpu" | "browser-webgpu" => {
+                backends |= wgpu::Backends::BROWSER_WEBGPU;
+            }
+            "noop" => backends |= wgpu::Backends::NOOP,
+            _ => {}
+        }
+    }
+    (!backends.is_empty()).then_some(backends)
+}
+
 fn combos_collide_for_order(left: GpuPrivateCombo, right: GpuPrivateCombo) -> bool {
     left.cards[0] == right.cards[0]
         || left.cards[0] == right.cards[1]
@@ -1845,11 +1958,31 @@ impl GpuDenseCfrBackend {
 
     pub async fn new_async() -> Result<Self, GpuCfrError> {
         let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle_from_env();
-        descriptor.backends = wgpu::Backends::VULKAN;
+        if let Some(backends) = requested_wgpu_backends() {
+            descriptor.backends = backends;
+        } else {
+            #[cfg(windows)]
+            {
+                descriptor.backends = wgpu::Backends::DX12;
+            }
+            #[cfg(not(windows))]
+            {
+                descriptor.backends = wgpu::Backends::VULKAN;
+            }
+        }
         descriptor
             .flags
             .insert(wgpu::InstanceFlags::ALLOW_UNDERLYING_NONCOMPLIANT_ADAPTER);
+        if std::env::var_os("POKEDR_GPU_INIT_TRACE").is_some() {
+            eprintln!(
+                "pokedr: gpu init creating instance backends={:?}",
+                descriptor.backends
+            );
+        }
         let instance = wgpu::Instance::new(descriptor);
+        if std::env::var_os("POKEDR_GPU_INIT_TRACE").is_some() {
+            eprintln!("pokedr: gpu init requesting high-performance adapter");
+        }
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::HighPerformance,
@@ -1859,8 +1992,17 @@ impl GpuDenseCfrBackend {
             .await
             .map_err(|_| GpuCfrError::NoAdapter)?;
         let adapter_info = adapter.get_info();
+        if std::env::var_os("POKEDR_GPU_INIT_TRACE").is_some() {
+            eprintln!(
+                "pokedr: gpu init adapter name={} backend={:?}",
+                adapter_info.name, adapter_info.backend
+            );
+        }
         let adapter_features = adapter.features();
         let required_limits = adapter.limits();
+        if std::env::var_os("POKEDR_GPU_INIT_TRACE").is_some() {
+            eprintln!("pokedr: gpu init requesting device");
+        }
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("pokedr dense CFR device"),
@@ -1872,6 +2014,9 @@ impl GpuDenseCfrBackend {
             })
             .await
             .map_err(|error| GpuCfrError::RequestDevice(error.to_string()))?;
+        if std::env::var_os("POKEDR_GPU_INIT_TRACE").is_some() {
+            eprintln!("pokedr: gpu init creating pipelines");
+        }
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("dense CFR update shader"),
             source: wgpu::ShaderSource::Wgsl(CFR_UPDATE_SHADER.into()),
@@ -2830,12 +2975,17 @@ impl GpuDenseCfrBackend {
         if terminal_groups.is_empty() || combo_count == 0 {
             return Ok(());
         }
-        let poll_interval = std::env::var("POKEDR_GPU_TERMINAL_STREAM_POLL")
+        let submit_batch = std::env::var("POKEDR_GPU_TERMINAL_SUBMIT_BATCH")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(16)
+            .unwrap_or(1)
             .max(1);
-        let mut submitted_chunks = 0usize;
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("public tree streamed terminal encoder"),
+            });
+        let mut pending_chunks = 0usize;
         for group in terminal_groups {
             let combo_order_buffer = readonly_buffer(
                 &self.device,
@@ -2858,9 +3008,9 @@ impl GpuDenseCfrBackend {
                     "public tree streamed terminal nodes",
                     terminal_chunk,
                 );
-                let partial_invocations = terminal_count * group.board_count;
-                let (partial_x_groups, partial_y_groups, partial_x_invocations) =
-                    dispatch_grid(partial_invocations);
+                let partial_workgroups = (terminal_count * group.board_count) as u32;
+                let partial_x_groups = partial_workgroups.min(65_535).max(1);
+                let partial_y_groups = partial_workgroups.div_ceil(partial_x_groups);
                 let partial_params = uniform_buffer(
                     &self.device,
                     "public tree streamed terminal partial params",
@@ -2870,7 +3020,7 @@ impl GpuDenseCfrBackend {
                         max_actions: group.board_count as u32,
                         output_len: (combo_count + 1) as u32,
                         pair_start: combo_count as u32,
-                        chunk_pairs: partial_x_invocations,
+                        chunk_pairs: partial_x_groups,
                         _pad0: group.board_base as u32,
                         _pad1: 0,
                     }],
@@ -2924,11 +3074,6 @@ impl GpuDenseCfrBackend {
                         bind_entry(9, &reduce_params),
                     ],
                 });
-                let mut encoder =
-                    self.device
-                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                            label: Some("public tree streamed terminal encoder"),
-                        });
                 {
                     let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                         label: Some("public tree streamed terminal partial pass"),
@@ -2948,12 +3093,20 @@ impl GpuDenseCfrBackend {
                     pass.set_bind_group(0, &reduce_bind_group, &[]);
                     pass.dispatch_workgroups(reduce_x_groups, reduce_y_groups, 1);
                 }
-                self.queue.submit(Some(encoder.finish()));
-                submitted_chunks += 1;
-                if submitted_chunks % poll_interval == 0 {
-                    self.profile_poll()?;
+                pending_chunks += 1;
+                if pending_chunks >= submit_batch {
+                    self.queue.submit(Some(encoder.finish()));
+                    encoder = self
+                        .device
+                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                            label: Some("public tree streamed terminal encoder"),
+                        });
+                    pending_chunks = 0;
                 }
             }
+        }
+        if pending_chunks > 0 {
+            self.queue.submit(Some(encoder.finish()));
         }
         self.profile_poll()?;
         Ok(())
