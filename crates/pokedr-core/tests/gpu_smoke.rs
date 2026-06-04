@@ -41,6 +41,7 @@ fn run_one_shot_update(backend: &GpuDenseCfrBackend) {
         CfrVariant::CfrPlus,
         CfrVariant::Discounted,
         CfrVariant::dcfr_plus_default(),
+        CfrVariant::dcfr_schedule_default(),
         CfrVariant::pdcfr_plus_default(),
     ] {
         let config = DenseCfrConfig {
@@ -114,6 +115,7 @@ fn run_resident_updates(backend: &GpuDenseCfrBackend) {
         CfrVariant::CfrPlus,
         CfrVariant::Discounted,
         CfrVariant::dcfr_plus_default(),
+        CfrVariant::dcfr_schedule_default(),
         CfrVariant::pdcfr_plus_default(),
     ] {
         let config = DenseCfrConfig {

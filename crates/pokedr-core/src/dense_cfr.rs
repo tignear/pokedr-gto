@@ -1,5 +1,10 @@
 pub const DEFAULT_DCFR_PLUS_ALPHA: f32 = 1.5;
 pub const DEFAULT_DCFR_PLUS_GAMMA: f32 = 4.0;
+pub const DEFAULT_DCFR_SCHEDULE_ALPHA_START: f32 = 1.5;
+pub const DEFAULT_DCFR_SCHEDULE_ALPHA_END: f32 = 2.5;
+pub const DEFAULT_DCFR_SCHEDULE_GAMMA_START: f32 = 4.0;
+pub const DEFAULT_DCFR_SCHEDULE_GAMMA_END: f32 = 8.0;
+pub const DEFAULT_DCFR_SCHEDULE_HORIZON: usize = 128;
 pub const DEFAULT_PDCFR_PLUS_ALPHA: f32 = 2.5;
 pub const DEFAULT_PDCFR_PLUS_GAMMA: f32 = 8.0;
 pub const DEFAULT_PDCFR_PLUS_ETA: f32 = 1.0;
@@ -8,8 +13,22 @@ pub const DEFAULT_PDCFR_PLUS_ETA: f32 = 1.0;
 pub enum CfrVariant {
     CfrPlus,
     Discounted,
-    DcfrPlus { alpha: f32, gamma: f32 },
-    PdcfrPlus { alpha: f32, gamma: f32, eta: f32 },
+    DcfrPlus {
+        alpha: f32,
+        gamma: f32,
+    },
+    DcfrSchedule {
+        alpha_start: f32,
+        alpha_end: f32,
+        gamma_start: f32,
+        gamma_end: f32,
+        horizon: usize,
+    },
+    PdcfrPlus {
+        alpha: f32,
+        gamma: f32,
+        eta: f32,
+    },
 }
 
 impl CfrVariant {
@@ -28,8 +47,21 @@ impl CfrVariant {
         }
     }
 
+    pub const fn dcfr_schedule_default() -> Self {
+        Self::DcfrSchedule {
+            alpha_start: DEFAULT_DCFR_SCHEDULE_ALPHA_START,
+            alpha_end: DEFAULT_DCFR_SCHEDULE_ALPHA_END,
+            gamma_start: DEFAULT_DCFR_SCHEDULE_GAMMA_START,
+            gamma_end: DEFAULT_DCFR_SCHEDULE_GAMMA_END,
+            horizon: DEFAULT_DCFR_SCHEDULE_HORIZON,
+        }
+    }
+
     pub fn is_dcfr_plus(self) -> bool {
-        matches!(self, Self::DcfrPlus { .. })
+        matches!(
+            self,
+            Self::DcfrPlus { .. } | Self::DcfrSchedule { .. } | Self::PdcfrPlus { .. }
+        )
     }
 
     pub fn uses_prediction(self) -> bool {
@@ -239,7 +271,10 @@ impl DenseCfrState {
             *slot += regret;
             if matches!(
                 self.variant,
-                CfrVariant::CfrPlus | CfrVariant::DcfrPlus { .. } | CfrVariant::PdcfrPlus { .. }
+                CfrVariant::CfrPlus
+                    | CfrVariant::DcfrPlus { .. }
+                    | CfrVariant::DcfrSchedule { .. }
+                    | CfrVariant::PdcfrPlus { .. }
             ) {
                 *slot = slot.max(0.0);
             }
@@ -374,18 +409,13 @@ fn regret_discount(variant: CfrVariant, iteration: usize) -> f32 {
             let t = iteration.max(1) as f32;
             t / (t + 1.0)
         }
-        CfrVariant::DcfrPlus { alpha, .. } => {
+        CfrVariant::DcfrPlus { .. }
+        | CfrVariant::DcfrSchedule { .. }
+        | CfrVariant::PdcfrPlus { .. } => {
             if iteration <= 1 {
                 0.0
             } else {
-                let weighted = ((iteration - 1) as f32).powf(alpha);
-                weighted / (weighted + 1.5)
-            }
-        }
-        CfrVariant::PdcfrPlus { alpha, .. } => {
-            if iteration <= 1 {
-                0.0
-            } else {
+                let alpha = dcfr_alpha(variant, iteration);
                 let weighted = ((iteration - 1) as f32).powf(alpha);
                 weighted / (weighted + 1.5)
             }
@@ -395,13 +425,48 @@ fn regret_discount(variant: CfrVariant, iteration: usize) -> f32 {
 
 fn average_strategy_discount(variant: CfrVariant, iteration: usize) -> f32 {
     match variant {
-        CfrVariant::DcfrPlus { gamma, .. } | CfrVariant::PdcfrPlus { gamma, .. }
+        CfrVariant::DcfrPlus { .. }
+        | CfrVariant::DcfrSchedule { .. }
+        | CfrVariant::PdcfrPlus { .. }
             if iteration > 1 =>
         {
+            let gamma = dcfr_gamma(variant, iteration);
             (((iteration - 1) as f32) / iteration as f32).powf(gamma)
         }
         _ => 1.0,
     }
+}
+
+fn dcfr_alpha(variant: CfrVariant, iteration: usize) -> f32 {
+    match variant {
+        CfrVariant::DcfrPlus { alpha, .. } | CfrVariant::PdcfrPlus { alpha, .. } => alpha,
+        CfrVariant::DcfrSchedule {
+            alpha_start,
+            alpha_end,
+            horizon,
+            ..
+        } => scheduled_value(alpha_start, alpha_end, iteration, horizon),
+        _ => DEFAULT_DCFR_PLUS_ALPHA,
+    }
+}
+
+fn dcfr_gamma(variant: CfrVariant, iteration: usize) -> f32 {
+    match variant {
+        CfrVariant::DcfrPlus { gamma, .. } | CfrVariant::PdcfrPlus { gamma, .. } => gamma,
+        CfrVariant::DcfrSchedule {
+            gamma_start,
+            gamma_end,
+            horizon,
+            ..
+        } => scheduled_value(gamma_start, gamma_end, iteration, horizon),
+        _ => DEFAULT_DCFR_PLUS_GAMMA,
+    }
+}
+
+fn scheduled_value(start: f32, end: f32, iteration: usize, horizon: usize) -> f32 {
+    let horizon = horizon.max(2);
+    let progress = (iteration.saturating_sub(1) as f32 / (horizon - 1) as f32).clamp(0.0, 1.0);
+    start + (end - start) * progress
 }
 
 fn effective_regret(variant: CfrVariant, regret: f32, prediction: f32) -> f32 {
@@ -486,6 +551,24 @@ mod tests {
         assert!((state.strategy_sum()[0] - (0.5 * discount + 1.0)).abs() < 1e-6);
         assert!((state.strategy_sum()[1] - (0.5 * discount)).abs() < 1e-6);
         assert!(state.regrets().iter().all(|value| *value >= 0.0));
+    }
+
+    #[test]
+    fn dcfr_schedule_interpolates_discount_parameters() {
+        let variant = CfrVariant::DcfrSchedule {
+            alpha_start: 0.5,
+            alpha_end: 2.5,
+            gamma_start: 16.0,
+            gamma_end: 8.0,
+            horizon: 5,
+        };
+
+        assert!((dcfr_alpha(variant, 1) - 0.5).abs() < 1e-6);
+        assert!((dcfr_alpha(variant, 3) - 1.5).abs() < 1e-6);
+        assert!((dcfr_alpha(variant, 9) - 2.5).abs() < 1e-6);
+        assert!((dcfr_gamma(variant, 1) - 16.0).abs() < 1e-6);
+        assert!((dcfr_gamma(variant, 3) - 12.0).abs() < 1e-6);
+        assert!((dcfr_gamma(variant, 9) - 8.0).abs() < 1e-6);
     }
 
     #[test]

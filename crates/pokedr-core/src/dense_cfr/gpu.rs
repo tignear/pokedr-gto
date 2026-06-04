@@ -51,7 +51,7 @@ fn regret_discount(variant: u32, iteration: u32, alpha: f32) -> f32 {
         let t = f32(max(iteration, 1u));
         return t / (t + 1.0);
     }
-    if variant == 2u || variant == 3u {
+    if variant == 2u || variant == 3u || variant == 4u {
         if iteration <= 1u {
             return 0.0;
         }
@@ -62,7 +62,7 @@ fn regret_discount(variant: u32, iteration: u32, alpha: f32) -> f32 {
 }
 
 fn average_strategy_discount(variant: u32, iteration: u32, gamma: f32) -> f32 {
-    if (variant == 2u || variant == 3u) && iteration > 1u {
+    if (variant == 2u || variant == 3u || variant == 4u) && iteration > 1u {
         let t = f32(iteration);
         return pow((t - 1.0) / t, gamma);
     }
@@ -124,7 +124,7 @@ fn update(@builtin(global_invocation_id) id: vec3<u32>) {
         );
         let regret = (action_values[offset + action] - node_value) * reach_weights[infoset];
         var updated = regrets[offset + action] * discount + regret;
-        if variant == 0u || variant == 2u || variant == 3u {
+        if variant == 0u || variant == 2u || variant == 3u || variant == 4u {
             updated = max(updated, 0.0);
         }
         regrets[offset + action] = updated;
@@ -180,7 +180,7 @@ fn regret_discount(variant: u32, iteration: u32, alpha: f32) -> f32 {
         let t = f32(max(iteration, 1u));
         return t / (t + 1.0);
     }
-    if variant == 2u || variant == 3u {
+    if variant == 2u || variant == 3u || variant == 4u {
         if iteration <= 1u {
             return 0.0;
         }
@@ -191,7 +191,7 @@ fn regret_discount(variant: u32, iteration: u32, alpha: f32) -> f32 {
 }
 
 fn average_strategy_discount(variant: u32, iteration: u32, gamma: f32) -> f32 {
-    if (variant == 2u || variant == 3u) && iteration > 1u {
+    if (variant == 2u || variant == 3u || variant == 4u) && iteration > 1u {
         let t = f32(iteration);
         return pow((t - 1.0) / t, gamma);
     }
@@ -243,7 +243,7 @@ fn update(@builtin(global_invocation_id) id: vec3<u32>) {
     let reach_weight = output[reach_start + infoset];
     let raw_strategy_weight = output[strategy_start + infoset];
     var strategy_weight = raw_strategy_weight * f32(iteration);
-    if variant == 2u || variant == 3u {
+    if variant == 2u || variant == 3u || variant == 4u {
         strategy_weight = raw_strategy_weight;
     }
     for (var action = 0u; action < actions; action = action + 1u) {
@@ -262,7 +262,7 @@ fn update(@builtin(global_invocation_id) id: vec3<u32>) {
         );
         let regret = (action_value(offset + action, action_len) - node_value) * reach_weight;
         var updated = regrets[offset + action] * discount + regret;
-        if variant == 0u || variant == 2u || variant == 3u {
+        if variant == 0u || variant == 2u || variant == 3u || variant == 4u {
             updated = max(updated, 0.0);
         }
         regrets[offset + action] = updated;
@@ -3112,8 +3112,8 @@ impl GpuDenseCfrBackend {
             state.actions as u32,
             variant_code(state.variant),
             iteration as u32,
-            variant_dcfr_alpha(state.variant).to_bits(),
-            variant_dcfr_gamma(state.variant).to_bits(),
+            variant_dcfr_alpha(state.variant, iteration).to_bits(),
+            variant_dcfr_gamma(state.variant, iteration).to_bits(),
             variant_prediction_eta(state.variant).to_bits(),
         ];
         let regrets = storage_buffer(&self.device, "regrets", &state.regrets);
@@ -5183,8 +5183,8 @@ impl GpuDenseCfrBackend {
                 state.actions as u32,
                 variant_code(state.variant),
                 iteration as u32,
-                variant_dcfr_alpha(state.variant).to_bits(),
-                variant_dcfr_gamma(state.variant).to_bits(),
+                variant_dcfr_alpha(state.variant, iteration).to_bits(),
+                variant_dcfr_gamma(state.variant, iteration).to_bits(),
                 action_len as u32,
                 reach_start as u32,
                 strategy_start as u32,
@@ -5265,8 +5265,8 @@ impl GpuDenseCfrBackend {
                 state.actions as u32,
                 variant_code(state.variant),
                 iteration as u32,
-                variant_dcfr_alpha(state.variant).to_bits(),
-                variant_dcfr_gamma(state.variant).to_bits(),
+                variant_dcfr_alpha(state.variant, iteration).to_bits(),
+                variant_dcfr_gamma(state.variant, iteration).to_bits(),
                 action_len as u32,
                 reach_start as u32,
                 strategy_start as u32,
@@ -5526,8 +5526,8 @@ impl GpuDenseCfrState {
             self.actions as u32,
             variant_code(self.variant),
             iteration as u32,
-            variant_dcfr_alpha(self.variant).to_bits(),
-            variant_dcfr_gamma(self.variant).to_bits(),
+            variant_dcfr_alpha(self.variant, iteration).to_bits(),
+            variant_dcfr_gamma(self.variant, iteration).to_bits(),
             variant_prediction_eta(self.variant).to_bits(),
         ];
         let action_values =
@@ -5796,23 +5796,36 @@ fn variant_code(variant: super::CfrVariant) -> u32 {
         super::CfrVariant::Discounted => 1,
         super::CfrVariant::DcfrPlus { .. } => 2,
         super::CfrVariant::PdcfrPlus { .. } => 3,
+        super::CfrVariant::DcfrSchedule { .. } => 4,
     }
 }
 
-fn variant_dcfr_alpha(variant: super::CfrVariant) -> f32 {
+fn variant_dcfr_alpha(variant: super::CfrVariant, iteration: usize) -> f32 {
     match variant {
         super::CfrVariant::DcfrPlus { alpha, .. } | super::CfrVariant::PdcfrPlus { alpha, .. } => {
             alpha
         }
+        super::CfrVariant::DcfrSchedule {
+            alpha_start,
+            alpha_end,
+            horizon,
+            ..
+        } => scheduled_value(alpha_start, alpha_end, iteration, horizon),
         _ => super::DEFAULT_DCFR_PLUS_ALPHA,
     }
 }
 
-fn variant_dcfr_gamma(variant: super::CfrVariant) -> f32 {
+fn variant_dcfr_gamma(variant: super::CfrVariant, iteration: usize) -> f32 {
     match variant {
         super::CfrVariant::DcfrPlus { gamma, .. } | super::CfrVariant::PdcfrPlus { gamma, .. } => {
             gamma
         }
+        super::CfrVariant::DcfrSchedule {
+            gamma_start,
+            gamma_end,
+            horizon,
+            ..
+        } => scheduled_value(gamma_start, gamma_end, iteration, horizon),
         _ => super::DEFAULT_DCFR_PLUS_GAMMA,
     }
 }
@@ -5822,6 +5835,12 @@ fn variant_prediction_eta(variant: super::CfrVariant) -> f32 {
         super::CfrVariant::PdcfrPlus { eta, .. } => eta,
         _ => 0.0,
     }
+}
+
+fn scheduled_value(start: f32, end: f32, iteration: usize, horizon: usize) -> f32 {
+    let horizon = horizon.max(2);
+    let progress = (iteration.saturating_sub(1) as f32 / (horizon - 1) as f32).clamp(0.0, 1.0);
+    start + (end - start) * progress
 }
 
 fn legal_actions_u32(legal_actions: &[bool]) -> Vec<u32> {

@@ -339,6 +339,18 @@ fn env_cfr_variant(name: &str) -> Option<CfrVariant> {
             gamma: env_f32("POKEDR_DCFR_GAMMA")
                 .unwrap_or(pokedr_core::dense_cfr::DEFAULT_DCFR_PLUS_GAMMA),
         }),
+        "dcfr-schedule" | "dcfrschedule" | "hs-dcfr" | "hsdcfr" => Some(CfrVariant::DcfrSchedule {
+            alpha_start: env_f32("POKEDR_DCFR_SCHEDULE_ALPHA_START")
+                .unwrap_or(pokedr_core::dense_cfr::DEFAULT_DCFR_SCHEDULE_ALPHA_START),
+            alpha_end: env_f32("POKEDR_DCFR_SCHEDULE_ALPHA_END")
+                .unwrap_or(pokedr_core::dense_cfr::DEFAULT_DCFR_SCHEDULE_ALPHA_END),
+            gamma_start: env_f32("POKEDR_DCFR_SCHEDULE_GAMMA_START")
+                .unwrap_or(pokedr_core::dense_cfr::DEFAULT_DCFR_SCHEDULE_GAMMA_START),
+            gamma_end: env_f32("POKEDR_DCFR_SCHEDULE_GAMMA_END")
+                .unwrap_or(pokedr_core::dense_cfr::DEFAULT_DCFR_SCHEDULE_GAMMA_END),
+            horizon: env_usize("POKEDR_DCFR_SCHEDULE_HORIZON")
+                .unwrap_or(pokedr_core::dense_cfr::DEFAULT_DCFR_SCHEDULE_HORIZON),
+        }),
         "pdcfr-plus" | "pdcfrplus" | "pdcfr+" | "pdcfr" => Some(CfrVariant::PdcfrPlus {
             alpha: env_f32("POKEDR_PDCFR_ALPHA")
                 .unwrap_or(pokedr_core::dense_cfr::DEFAULT_PDCFR_PLUS_ALPHA),
@@ -349,7 +361,7 @@ fn env_cfr_variant(name: &str) -> Option<CfrVariant> {
         }),
         other => {
             eprintln!(
-                "unknown {name}={other}; expected cfr-plus, discounted, dcfr-plus, or pdcfr-plus"
+                "unknown {name}={other}; expected cfr-plus, discounted, dcfr-plus, dcfr-schedule, or pdcfr-plus"
             );
             std::process::exit(2);
         }

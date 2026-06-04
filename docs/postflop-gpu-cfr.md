@@ -1128,6 +1128,33 @@ Current interpretation:
 - The old literature-style starting point `alpha=1.5, gamma=4.0` was on the
   edge of the first grid; expanding `gamma` improved the BR gap.
 
+## DCFR Schedule Notes
+
+`CfrVariant::DcfrSchedule` keeps the DCFR+ update rule but makes the discount
+hyperparameters iteration-dependent:
+
+```text
+progress(t) = clamp((t - 1) / (horizon - 1), 0, 1)
+alpha(t)   = lerp(alpha_start, alpha_end, progress(t))
+gamma(t)   = lerp(gamma_start, gamma_end, progress(t))
+```
+
+Runtime selection:
+
+```text
+POKEDR_CFR_VARIANT=dcfr-schedule
+POKEDR_DCFR_SCHEDULE_ALPHA_START=1.5
+POKEDR_DCFR_SCHEDULE_ALPHA_END=2.5
+POKEDR_DCFR_SCHEDULE_GAMMA_START=4.0
+POKEDR_DCFR_SCHEDULE_GAMMA_END=8.0
+POKEDR_DCFR_SCHEDULE_HORIZON=128
+```
+
+The default schedule is intentionally experimental. The point is to expose the
+schedule in the same metrics path as fixed DCFR+ so it can be tuned against
+`recursive_root_br_gap` and `recursive_local_br_gap` across flop textures. Do
+not treat it as a new default until that sweep is run.
+
 ## PDCFR+ Notes
 
 `CfrVariant::PdcfrPlus { alpha, gamma, eta }` adds one extra dense vector:
