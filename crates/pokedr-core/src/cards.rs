@@ -249,18 +249,22 @@ fn evaluate_bits(bits: &HandBits) -> HandStrength {
     }
 
     if let Some(&trip) = trips.first() {
-        let kickers = highest_excluding(bits.rank_mask, &[trip], 2);
-        return pack(3, &[trip, kickers[0], kickers[1]]);
+        let mut ranks = vec![trip];
+        ranks.extend(highest_excluding(bits.rank_mask, &[trip], 2));
+        return pack(3, &ranks);
     }
 
     if pairs.len() >= 2 {
         let kicker = highest_excluding(bits.rank_mask, &[pairs[0], pairs[1]], 1);
-        return pack(2, &[pairs[0], pairs[1], kicker[0]]);
+        let mut ranks = vec![pairs[0], pairs[1]];
+        ranks.extend(kicker);
+        return pack(2, &ranks);
     }
 
     if let Some(&pair) = pairs.first() {
-        let kickers = highest_excluding(bits.rank_mask, &[pair], 3);
-        return pack(1, &[pair, kickers[0], kickers[1], kickers[2]]);
+        let mut ranks = vec![pair];
+        ranks.extend(highest_excluding(bits.rank_mask, &[pair], 3));
+        return pack(1, &ranks);
     }
 
     pack(0, &highest_from_mask(bits.rank_mask, 5))

@@ -761,7 +761,7 @@ struct Params {
     eta_bits: u32,
 };
 
-@group(0) @binding(0) var<storage, read> root_weights: array<f32>;
+@group(0) @binding(0) var<storage, read> root_reach_weights: array<f32>;
 @group(0) @binding(1) var<storage, read_write> hero_reaches: array<f32>;
 @group(0) @binding(2) var<storage, read_write> villain_reaches: array<f32>;
 @group(0) @binding(3) var<storage, read_write> combo_live: array<atomic<u32>>;
@@ -781,9 +781,9 @@ fn reach_init_tile(@builtin(global_invocation_id) id: vec3<u32>) {
     let live_word = index >> 5u;
     let live_mask = 1u << (index & 31u);
     atomicAnd(&combo_live[live_word], 0xffffffffu ^ live_mask);
-    if params.aux0 == 0u && local_node == 0u && root_weights[combo] >= 0.0 {
-        hero_reaches[index] = 1.0;
-        villain_reaches[index] = root_weights[combo];
+    if params.aux0 == 0u && local_node == 0u && root_reach_weights[combo] >= 0.0 {
+        hero_reaches[index] = root_reach_weights[combo];
+        villain_reaches[index] = root_reach_weights[params.combo_count + combo];
         atomicOr(&combo_live[live_word], live_mask);
     }
 }
@@ -825,7 +825,7 @@ struct Params {
 @group(0) @binding(0) var<storage, read> parent_nodes: array<TreeNode>;
 @group(0) @binding(1) var<storage, read> edges: array<Edge>;
 @group(0) @binding(2) var<storage, read> combos: array<Combo>;
-@group(0) @binding(3) var<storage, read> root_weights: array<f32>;
+@group(0) @binding(3) var<storage, read> root_reach_weights: array<f32>;
 @group(0) @binding(4) var<storage, read> regrets: array<f32>;
 @group(0) @binding(5) var<storage, read> parent_hero_reaches: array<f32>;
 @group(0) @binding(6) var<storage, read> parent_villain_reaches: array<f32>;
@@ -4726,6 +4726,7 @@ impl GpuDenseCfrBackend {
         child_cards: &[u32],
         combos: &[GpuPrivateCombo],
         combo_legal: &[u32],
+        hero_weights: &[f32],
         villain_weights: &[f32],
         showdown_boards: &[GpuFinalBoard],
         infosets: usize,
@@ -4733,6 +4734,7 @@ impl GpuDenseCfrBackend {
     ) -> GpuPublicTreeIterationContext {
         assert!(!nodes.is_empty());
         assert_eq!(combo_legal.len(), combos.len());
+        assert_eq!(hero_weights.len(), combos.len());
         assert_eq!(villain_weights.len(), combos.len());
         assert_eq!(infosets, nodes_public_infoset_count(nodes) * combos.len());
 
@@ -4760,13 +4762,24 @@ impl GpuDenseCfrBackend {
         }
 
         let combo_buffer = readonly_buffer(&self.device, "public tree combos", combos);
-        let root_weights: Vec<_> = combo_legal
-            .iter()
-            .zip(villain_weights)
-            .map(|(is_legal, weight)| if *is_legal != 0 { *weight } else { -1.0 })
-            .collect();
-        let root_weights_buffer =
-            readonly_buffer(&self.device, "public tree root weights", &root_weights);
+        let mut root_weights = Vec::with_capacity(combos.len() * 2);
+        root_weights.extend(
+            combo_legal
+                .iter()
+                .zip(hero_weights)
+                .map(|(is_legal, weight)| if *is_legal != 0 { *weight } else { -1.0 }),
+        );
+        root_weights.extend(
+            combo_legal
+                .iter()
+                .zip(villain_weights)
+                .map(|(is_legal, weight)| if *is_legal != 0 { *weight } else { -1.0 }),
+        );
+        let root_weights_buffer = readonly_buffer(
+            &self.device,
+            "public tree root reach weights",
+            &root_weights,
+        );
         let action_values_buffer = uninit_storage_buffer(
             &self.device,
             "public tree action values output",
@@ -5018,6 +5031,7 @@ impl GpuDenseCfrBackend {
         child_cards: &[u32],
         combos: &[GpuPrivateCombo],
         combo_legal: &[u32],
+        hero_weights: &[f32],
         villain_weights: &[f32],
         showdown_boards: &[GpuFinalBoard],
         state: &DenseCfrState,
@@ -5028,6 +5042,7 @@ impl GpuDenseCfrBackend {
             child_cards,
             combos,
             combo_legal,
+            hero_weights,
             villain_weights,
             showdown_boards,
             state,
@@ -5043,6 +5058,7 @@ impl GpuDenseCfrBackend {
         child_cards: &[u32],
         combos: &[GpuPrivateCombo],
         combo_legal: &[u32],
+        hero_weights: &[f32],
         villain_weights: &[f32],
         showdown_boards: &[GpuFinalBoard],
         state: &DenseCfrState,
@@ -5055,6 +5071,7 @@ impl GpuDenseCfrBackend {
             child_cards,
             combos,
             combo_legal,
+            hero_weights,
             villain_weights,
             showdown_boards,
             state,
@@ -5070,6 +5087,7 @@ impl GpuDenseCfrBackend {
         child_cards: &[u32],
         combos: &[GpuPrivateCombo],
         combo_legal: &[u32],
+        hero_weights: &[f32],
         villain_weights: &[f32],
         showdown_boards: &[GpuFinalBoard],
         state: &DenseCfrState,
@@ -5086,6 +5104,7 @@ impl GpuDenseCfrBackend {
             child_cards,
             combos,
             combo_legal,
+            hero_weights,
             villain_weights,
             showdown_boards,
             state.infosets,
@@ -5194,6 +5213,7 @@ impl GpuDenseCfrBackend {
         child_cards: &[u32],
         combos: &[GpuPrivateCombo],
         combo_legal: &[u32],
+        hero_weights: &[f32],
         villain_weights: &[f32],
         showdown_boards: &[GpuFinalBoard],
         state: &mut GpuDenseCfrState,
@@ -5207,6 +5227,7 @@ impl GpuDenseCfrBackend {
             child_cards,
             combos,
             combo_legal,
+            hero_weights,
             villain_weights,
             showdown_boards,
             state.infosets,
@@ -5356,6 +5377,7 @@ impl GpuDenseCfrBackend {
         child_cards: &[u32],
         combos: &[GpuPrivateCombo],
         combo_legal: &[u32],
+        hero_weights: &[f32],
         villain_weights: &[f32],
         showdown_boards: &[GpuFinalBoard],
         state: &mut GpuDenseCfrState,
@@ -5367,6 +5389,7 @@ impl GpuDenseCfrBackend {
             child_cards,
             combos,
             combo_legal,
+            hero_weights,
             villain_weights,
             showdown_boards,
             state,
@@ -5383,6 +5406,7 @@ impl GpuDenseCfrBackend {
         child_cards: &[u32],
         combos: &[GpuPrivateCombo],
         combo_legal: &[u32],
+        hero_weights: &[f32],
         villain_weights: &[f32],
         showdown_boards: &[GpuFinalBoard],
         state: &mut GpuDenseCfrState,
@@ -5400,6 +5424,7 @@ impl GpuDenseCfrBackend {
             child_cards,
             combos,
             combo_legal,
+            hero_weights,
             villain_weights,
             showdown_boards,
             state.infosets,
@@ -5447,6 +5472,7 @@ impl GpuDenseCfrBackend {
         child_cards: &[u32],
         combos: &[GpuPrivateCombo],
         combo_legal: &[u32],
+        hero_weights: &[f32],
         villain_weights: &[f32],
         showdown_boards: &[GpuFinalBoard],
         state: &mut GpuDenseCfrState,
@@ -5471,6 +5497,7 @@ impl GpuDenseCfrBackend {
             child_cards,
             combos,
             combo_legal,
+            hero_weights,
             villain_weights,
             showdown_boards,
             state.infosets,

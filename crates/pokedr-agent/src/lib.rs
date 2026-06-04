@@ -503,8 +503,9 @@ pub fn solve_fixed_flop_once(
         },
     );
     let layout = PostflopDenseLayout::from_tree(&tree);
+    let hero_weights = vec![1.0; COMBO_COUNT];
     let villain_weights = vec![1.0; COMBO_COUNT];
-    let state = solve_public_tree_cfr(&tree, &layout, &config, &villain_weights);
+    let state = solve_public_tree_cfr(&tree, &layout, &config, &hero_weights, &villain_weights);
     FixedFlopSolveSummary {
         board: format_pokedr_cards(&flop),
         iterations: config.cfr_iterations.max(1),
@@ -557,6 +558,7 @@ where
         },
     );
     let layout = PostflopDenseLayout::from_tree(&tree);
+    let hero_weights = vec![1.0; COMBO_COUNT];
     let villain_weights = vec![1.0; COMBO_COUNT];
     let indexer = ComboIndexer::new();
     let root_dead = root_board(&tree).deck_mask();
@@ -564,6 +566,7 @@ where
         &tree,
         &layout,
         &base_config,
+        &hero_weights,
         &villain_weights,
         &indexer,
         root_dead,
@@ -579,13 +582,19 @@ where
         let started = Instant::now();
         let mut config = base_config.clone();
         config.cfr_iterations = iterations.max(1);
-        let state = solve_public_tree_cfr(&tree, &layout, &config, &villain_weights);
+        let state = solve_public_tree_cfr(&tree, &layout, &config, &hero_weights, &villain_weights);
         let elapsed_secs = started.elapsed().as_secs_f32();
         let root_strategy = root_average_strategy(&layout, &state, &indexer, root_dead);
         let root_strategy_l1_delta = previous_root_strategy
             .as_ref()
             .map(|previous| mean_l1_delta(previous, &root_strategy));
-        let root_action_probabilities = root_action_probabilities(&layout, &root_strategy);
+        let root_action_probabilities = weighted_root_action_probabilities(
+            &layout,
+            &root_strategy,
+            &hero_weights,
+            &indexer,
+            root_dead,
+        );
         let diagnostics = cfr_state_diagnostics(&state);
         rows.push(FixedFlopMetricRow {
             board: format_pokedr_cards(&flop),
@@ -740,6 +749,7 @@ fn try_solve_fixed_flop_metrics_gpu(
     tree: &SubgameTree,
     layout: &PostflopDenseLayout,
     base_config: &PokedrAgentConfig,
+    hero_weights: &[f32],
     villain_weights: &[f32],
     indexer: &ComboIndexer,
     root_dead: u64,
@@ -790,6 +800,7 @@ fn try_solve_fixed_flop_metrics_gpu(
                 &linearized.child_cards,
                 &combos,
                 &combo_legal,
+                hero_weights,
                 villain_weights,
                 &linearized.showdown_boards,
                 &mut gpu_state,
@@ -806,7 +817,13 @@ fn try_solve_fixed_flop_metrics_gpu(
         let root_strategy_l1_delta = previous_root_strategy
             .as_ref()
             .map(|previous| mean_l1_delta(previous, &root_strategy));
-        let root_action_probabilities = root_action_probabilities(layout, &root_strategy);
+        let root_action_probabilities = weighted_root_action_probabilities(
+            layout,
+            &root_strategy,
+            hero_weights,
+            indexer,
+            root_dead,
+        );
         let br_gap = include_local_gaps
             .then(|| {
                 br_gap_metrics_gpu(
@@ -815,6 +832,7 @@ fn try_solve_fixed_flop_metrics_gpu(
                     &linearized,
                     &combos,
                     &combo_legal,
+                    hero_weights,
                     villain_weights,
                     layout,
                     &state,
@@ -827,6 +845,7 @@ fn try_solve_fixed_flop_metrics_gpu(
             &linearized,
             &combos,
             &combo_legal,
+            hero_weights,
             villain_weights,
             layout,
             &state,
@@ -838,6 +857,7 @@ fn try_solve_fixed_flop_metrics_gpu(
             &linearized,
             &combos,
             &combo_legal,
+            hero_weights,
             villain_weights,
             layout,
             &state,
@@ -952,6 +972,7 @@ fn br_gap_metrics_gpu(
     linearized: &GpuLinearizedPublicTree,
     combos: &[GpuPrivateCombo],
     combo_legal: &[u32],
+    hero_weights: &[f32],
     villain_weights: &[f32],
     layout: &PostflopDenseLayout,
     state: &DenseCfrState,
@@ -964,6 +985,7 @@ fn br_gap_metrics_gpu(
             &linearized.child_cards,
             combos,
             combo_legal,
+            hero_weights,
             villain_weights,
             &linearized.showdown_boards,
             &profile,
@@ -981,6 +1003,7 @@ fn recursive_br_gap_metrics_gpu(
     linearized: &GpuLinearizedPublicTree,
     combos: &[GpuPrivateCombo],
     combo_legal: &[u32],
+    hero_weights: &[f32],
     villain_weights: &[f32],
     layout: &PostflopDenseLayout,
     state: &DenseCfrState,
@@ -993,6 +1016,7 @@ fn recursive_br_gap_metrics_gpu(
         linearized,
         combos,
         combo_legal,
+        hero_weights,
         villain_weights,
         layout,
         state,
@@ -1007,6 +1031,7 @@ fn recursive_br_gap_metrics_gpu_with_profile(
     linearized: &GpuLinearizedPublicTree,
     combos: &[GpuPrivateCombo],
     combo_legal: &[u32],
+    hero_weights: &[f32],
     villain_weights: &[f32],
     layout: &PostflopDenseLayout,
     state: &DenseCfrState,
@@ -1018,6 +1043,7 @@ fn recursive_br_gap_metrics_gpu_with_profile(
         linearized,
         combos,
         combo_legal,
+        hero_weights,
         villain_weights,
         layout,
         state,
@@ -1033,6 +1059,7 @@ fn recursive_br_gap_metrics_gpu_for_profile(
     linearized: &GpuLinearizedPublicTree,
     combos: &[GpuPrivateCombo],
     combo_legal: &[u32],
+    hero_weights: &[f32],
     villain_weights: &[f32],
     layout: &PostflopDenseLayout,
     state: &DenseCfrState,
@@ -1046,6 +1073,7 @@ fn recursive_br_gap_metrics_gpu_for_profile(
             &linearized.child_cards,
             combos,
             combo_legal,
+            hero_weights,
             villain_weights,
             &linearized.showdown_boards,
             profile,
@@ -1060,6 +1088,7 @@ fn recursive_br_gap_metrics_gpu_for_profile(
             &linearized.child_cards,
             combos,
             combo_legal,
+            hero_weights,
             villain_weights,
             &linearized.showdown_boards,
             profile,
@@ -1074,6 +1103,7 @@ fn recursive_br_gap_metrics_gpu_for_profile(
         profile,
         combos,
         combo_legal,
+        hero_weights,
         villain_weights,
         &hero_values,
         &villain_values,
@@ -1172,6 +1202,7 @@ fn recursive_br_gap_metrics_from_values(
     _profile: &DenseCfrState,
     combos: &[GpuPrivateCombo],
     combo_legal: &[u32],
+    hero_weights: &[f32],
     villain_weights: &[f32],
     hero_values: &GpuRootTerminalValues,
     villain_values: &GpuRootTerminalValues,
@@ -1253,6 +1284,7 @@ fn recursive_br_gap_metrics_from_values(
     let root_exploitability = root_exploitability_from_recursive_values(
         combos,
         combo_legal,
+        hero_weights,
         villain_weights,
         hero_values,
         villain_values,
@@ -1286,6 +1318,7 @@ struct RootExploitability {
 fn root_exploitability_from_recursive_values(
     combos: &[GpuPrivateCombo],
     combo_legal: &[u32],
+    hero_weights: &[f32],
     villain_weights: &[f32],
     hero_values: &GpuRootTerminalValues,
     villain_values: &GpuRootTerminalValues,
@@ -1314,10 +1347,11 @@ fn root_exploitability_from_recursive_values(
             }
             villain_nonblocking_weight +=
                 villain_weights.get(opponent_index).copied().unwrap_or(0.0);
-            hero_nonblocking_weight += 1.0;
+            hero_nonblocking_weight += hero_weights.get(opponent_index).copied().unwrap_or(0.0);
         }
 
-        if villain_nonblocking_weight > 0.0 {
+        let hero_weight = hero_weights.get(combo_index).copied().unwrap_or(0.0);
+        if hero_weight > 0.0 && villain_nonblocking_weight > 0.0 {
             let hero_value = hero_values
                 .root_hero_values
                 .get(combo_index)
@@ -1325,8 +1359,8 @@ fn root_exploitability_from_recursive_values(
                 .unwrap_or(0.0)
                 / villain_nonblocking_weight;
             if hero_value.is_finite() {
-                hero_br_sum += hero_value;
-                hero_weight_sum += 1.0;
+                hero_br_sum += hero_value * hero_weight;
+                hero_weight_sum += hero_weight;
             }
         }
 
@@ -1443,22 +1477,35 @@ fn root_average_strategy(
     result
 }
 
-fn root_action_probabilities(layout: &PostflopDenseLayout, root_strategy: &[f32]) -> Vec<f32> {
+fn weighted_root_action_probabilities(
+    layout: &PostflopDenseLayout,
+    root_strategy: &[f32],
+    hero_weights: &[f32],
+    indexer: &ComboIndexer,
+    root_dead: u64,
+) -> Vec<f32> {
     let mut probabilities = vec![0.0; layout.max_actions()];
-    let mut legal_combo_count = 0usize;
-    for strategy in root_strategy.chunks(layout.max_actions()) {
+    let mut weight_sum = 0.0f32;
+    for ((strategy, combo), weight) in root_strategy
+        .chunks(layout.max_actions())
+        .zip(indexer.combos())
+        .zip(hero_weights)
+    {
+        if *weight <= 0.0 || combo.collides_with(root_dead) {
+            continue;
+        }
         let mass: f32 = strategy.iter().sum();
         if mass <= 0.0 {
             continue;
         }
-        legal_combo_count += 1;
         for (target, value) in probabilities.iter_mut().zip(strategy) {
-            *target += *value;
+            *target += *value * *weight;
         }
+        weight_sum += *weight;
     }
-    if legal_combo_count > 0 {
+    if weight_sum > 0.0 {
         for probability in &mut probabilities {
-            *probability /= legal_combo_count as f32;
+            *probability /= weight_sum;
         }
     }
     probabilities
@@ -1693,8 +1740,9 @@ fn build_postflop_plan(
     );
     let layout = PostflopDenseLayout::from_tree(&tree);
     let indexer = ComboIndexer::new();
+    let hero_weights = observed_hero_range_weights(game_state, &indexer);
     let villain_weights = observed_villain_range_weights(records, game_state, &indexer);
-    let state = solve_public_tree_cfr(&tree, &layout, config, &villain_weights);
+    let state = solve_public_tree_cfr(&tree, &layout, config, &hero_weights, &villain_weights);
     if solver_progress_enabled() {
         eprintln!(
             "pokedr: plan ready decisions={} chance={} terminals={} elapsed={:.2}s",
@@ -1711,6 +1759,7 @@ fn solve_public_tree_cfr(
     tree: &SubgameTree,
     layout: &PostflopDenseLayout,
     config: &PokedrAgentConfig,
+    hero_weights: &[f32],
     villain_weights: &[f32],
 ) -> DenseCfrState {
     let mut dense_config = layout.dense_config(config.cfr_variant);
@@ -1726,6 +1775,7 @@ fn solve_public_tree_cfr(
             backend,
             &dense_config,
             config,
+            hero_weights,
             villain_weights,
             &matrix_cache,
         )
@@ -1752,6 +1802,7 @@ fn solve_public_tree_cfr(
             gpu_backend.as_deref(),
             &state,
             config,
+            hero_weights,
             villain_weights,
             &matrix_cache,
             &mut batch,
@@ -1836,6 +1887,7 @@ fn try_solve_gpu_public_tree_resident(
     backend: &GpuDenseCfrBackend,
     dense_config: &pokedr_core::dense_cfr::DenseCfrConfig,
     config: &PokedrAgentConfig,
+    hero_weights: &[f32],
     villain_weights: &[f32],
     matrix_cache: &RefCell<ShowdownMatrixCache>,
 ) -> Option<DenseCfrState> {
@@ -1866,6 +1918,7 @@ fn try_solve_gpu_public_tree_resident(
             &linearized.child_cards,
             &combos,
             &combo_legal,
+            hero_weights,
             villain_weights,
             &linearized.showdown_boards,
             &mut gpu_state,
@@ -1889,6 +1942,7 @@ fn fill_public_tree_iteration(
     gpu_backend: Option<&GpuDenseCfrBackend>,
     cfr_state: &DenseCfrState,
     config: &PokedrAgentConfig,
+    hero_weights: &[f32],
     villain_weights: &[f32],
     matrix_cache: &RefCell<ShowdownMatrixCache>,
     batch: &mut DenseCfrIteration,
@@ -1905,6 +1959,7 @@ fn fill_public_tree_iteration(
         gpu_backend,
         cfr_state,
         config,
+        hero_weights,
         villain_weights,
         matrix_cache,
         batch,
@@ -1923,6 +1978,10 @@ fn fill_public_tree_iteration(
         })
         .collect();
     for (hero_offset, (hero_combo, hero_cards, hero_dead)) in legal_combos.iter().enumerate() {
+        let hero_weight = hero_weights[*hero_combo];
+        if hero_weight <= 0.0 {
+            continue;
+        }
         if solver_progress_enabled() && hero_offset % 64 == 0 {
             eprintln!(
                 "pokedr: cfr combo block {}/{}",
@@ -1931,6 +1990,10 @@ fn fill_public_tree_iteration(
             );
         }
         for (villain_combo, villain_cards, villain_dead) in &legal_combos {
+            let villain_weight = villain_weights[*villain_combo];
+            if villain_weight <= 0.0 {
+                continue;
+            }
             if hero_dead & villain_dead != 0 {
                 continue;
             }
@@ -1952,8 +2015,8 @@ fn fill_public_tree_iteration(
                 None,
                 *hero_combo,
                 *villain_combo,
-                1.0,
-                villain_weights[*villain_combo],
+                hero_weight,
+                villain_weight,
                 1.0,
                 cfr_state,
                 &mut ctx,
@@ -1978,6 +2041,7 @@ fn try_fill_gpu_public_tree_iteration(
     gpu_backend: Option<&GpuDenseCfrBackend>,
     cfr_state: &DenseCfrState,
     config: &PokedrAgentConfig,
+    hero_weights: &[f32],
     villain_weights: &[f32],
     matrix_cache: &RefCell<ShowdownMatrixCache>,
     batch: &mut DenseCfrIteration,
@@ -2009,6 +2073,7 @@ fn try_fill_gpu_public_tree_iteration(
         &linearized.child_cards,
         &combos,
         &combo_legal,
+        hero_weights,
         villain_weights,
         &linearized.showdown_boards,
         cfr_state,
@@ -2368,17 +2433,57 @@ fn observed_villain_range_weights(
     let hero_mask = hero_cards_from_game(game_state)
         .map(hero_mask)
         .unwrap_or_default();
+    simple_preflop_range_weights(
+        indexer,
+        PreflopClass::Speculative,
+        hero_mask | board_mask_from_game(game_state),
+    )
+}
+
+fn observed_hero_range_weights(game_state: &GameState, indexer: &ComboIndexer) -> Vec<f32> {
+    let board_mask = board_mask_from_game(game_state);
+    if let Some(cards) = hero_cards_from_game(game_state)
+        && let Some(index) = indexer.index(cards[0], cards[1])
+    {
+        let mut weights = vec![0.0; COMBO_COUNT];
+        if hero_mask(cards) & board_mask == 0 {
+            weights[index] = 1.0;
+        }
+        return weights;
+    }
+    simple_preflop_range_weights(indexer, PreflopClass::Playable, board_mask)
+}
+
+fn simple_preflop_range_weights(
+    indexer: &ComboIndexer,
+    minimum_class: PreflopClass,
+    dead_mask: u64,
+) -> Vec<f32> {
     indexer
         .combos()
         .iter()
         .map(|combo| {
-            if combo.collides_with(hero_mask | board_mask_from_game(game_state)) {
+            if combo.collides_with(dead_mask) {
                 0.0
-            } else {
+            } else if classify_pokedr_combo(*combo) >= minimum_class {
                 1.0
+            } else {
+                0.0
             }
         })
         .collect()
+}
+
+fn classify_pokedr_combo(combo: Combo) -> PreflopClass {
+    classify_preflop_values(
+        pokedr_rank_value(combo.first.rank()),
+        pokedr_rank_value(combo.second.rank()),
+        combo.first.suit() == combo.second.suit(),
+    )
+}
+
+fn pokedr_rank_value(rank: PokedrRank) -> u8 {
+    rank as u8 + 2
 }
 
 fn private_infoset(public_infoset: usize, _player: Player, private_combo: usize) -> usize {
@@ -2809,8 +2914,11 @@ impl DumpSolverContext {
     ) -> Self {
         let indexer = ComboIndexer::new();
         let root_dead = root_board(tree).deck_mask();
-        let villain_weights = vec![1.0; COMBO_COUNT];
-        let state = solve_public_tree_cfr(tree, layout, config, &villain_weights);
+        let hero_weights =
+            simple_preflop_range_weights(&indexer, PreflopClass::Playable, root_dead);
+        let villain_weights =
+            simple_preflop_range_weights(&indexer, PreflopClass::Speculative, root_dead);
+        let state = solve_public_tree_cfr(tree, layout, config, &hero_weights, &villain_weights);
         let (average_values, current_values) = cfr_gpu_backend()
             .and_then(|backend| {
                 let matrix_cache =
@@ -2831,6 +2939,7 @@ impl DumpSolverContext {
                         &linearized.child_cards,
                         &combos,
                         &combo_legal,
+                        &hero_weights,
                         &villain_weights,
                         &linearized.showdown_boards,
                         &profile,
@@ -2844,6 +2953,7 @@ impl DumpSolverContext {
                         &linearized.child_cards,
                         &combos,
                         &combo_legal,
+                        &hero_weights,
                         &villain_weights,
                         &linearized.showdown_boards,
                         &state,
@@ -4145,6 +4255,7 @@ mod tests {
             },
         );
         let layout = PostflopDenseLayout::from_tree(&tree);
+        let hero_weights = vec![1.0; COMBO_COUNT];
         let villain_weights = vec![1.0; COMBO_COUNT];
         let state = solve_public_tree_cfr(
             &tree,
@@ -4154,6 +4265,7 @@ mod tests {
                 max_showdown_runouts: 1,
                 ..PokedrAgentConfig::default()
             },
+            &hero_weights,
             &villain_weights,
         );
         let hero_combo = hero_combo_index(

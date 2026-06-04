@@ -664,11 +664,12 @@ fn run_tree_db(mut args: impl Iterator<Item = String>) {
     match args.next().as_deref() {
         Some("build") => run_tree_db_build(args),
         Some("analyze") => run_tree_db_analyze(args),
+        Some("check-line") => run_tree_db_check_line(args),
         Some("top-combos") => run_tree_db_top_combos(args),
         Some("node") => run_tree_db_node(args),
         _ => {
             eprintln!(
-                "usage: pokedr-cli tree-db <build|analyze|top-combos|node>\n  pokedr-cli tree-db build <tree.sqlite> [flop] [--config path.yml]\n  pokedr-cli tree-db analyze <tree.sqlite>\n  pokedr-cli tree-db top-combos <tree.sqlite>\n  pokedr-cli tree-db node <tree.sqlite> <node_id>"
+                "usage: pokedr-cli tree-db <build|analyze|check-line|top-combos|node>\n  pokedr-cli tree-db build <tree.sqlite> [flop] [--config path.yml]\n  pokedr-cli tree-db analyze <tree.sqlite>\n  pokedr-cli tree-db check-line <tree.sqlite> [--limit n]\n  pokedr-cli tree-db top-combos <tree.sqlite>\n  pokedr-cli tree-db node <tree.sqlite> <node_id>"
             );
             std::process::exit(2);
         }
@@ -722,6 +723,41 @@ fn run_tree_db_top_combos(mut args: impl Iterator<Item = String>) {
         "{}",
         serde_json::to_string_pretty(&db_top_combo_gaps(&conn))
             .expect("combo gap JSON must serialize")
+    );
+}
+
+fn run_tree_db_check_line(mut args: impl Iterator<Item = String>) {
+    let Some(db_path) = args.next() else {
+        eprintln!("usage: pokedr-cli tree-db check-line <tree.sqlite> [--limit n]");
+        std::process::exit(2);
+    };
+    let mut limit = 12usize;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--limit" => {
+                let value = args.next().unwrap_or_else(|| {
+                    eprintln!("--limit requires a number");
+                    std::process::exit(2);
+                });
+                limit = value.parse().unwrap_or_else(|_| {
+                    eprintln!("--limit must be a number: {value}");
+                    std::process::exit(2);
+                });
+            }
+            extra => {
+                eprintln!("unexpected argument: {extra}");
+                std::process::exit(2);
+            }
+        }
+    }
+    let conn = Connection::open(&db_path).unwrap_or_else(|error| {
+        eprintln!("failed to open tree DB {db_path}: {error}");
+        std::process::exit(2);
+    });
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&db_check_line_report(&conn, limit))
+            .expect("check line JSON must serialize")
     );
 }
 
@@ -1161,6 +1197,147 @@ fn db_top_combo_gaps(conn: &Connection) -> Value {
     Value::Array(rows.map(Result::unwrap).collect())
 }
 
+fn db_check_line_report(conn: &Connection, limit: usize) -> Value {
+    let root_check_child = conn
+        .query_row(
+            "SELECT child_id FROM actions WHERE node_id = 0 AND action = 'check' LIMIT 1",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or(1);
+    json!({
+        "root_check_child": root_check_child,
+        "flop_villain_node": db_node_detail(conn, root_check_child, limit),
+        "flop_villain_aggressive_combos": db_node_aggressive_combos(conn, root_check_child, limit),
+        "check_subtree_hero_leaks_avg": db_subtree_top_reached_gaps(
+            conn,
+            root_check_child,
+            "avg_gap",
+            "avg_action_ev",
+            "avg_policy_ev",
+            "avg_strategy_weight_sum",
+            limit,
+        ),
+        "check_subtree_hero_leaks_current": db_subtree_top_reached_gaps(
+            conn,
+            root_check_child,
+            "current_gap",
+            "current_action_ev",
+            "current_policy_ev",
+            "current_strategy_weight_sum",
+            limit,
+        ),
+        "check_subtree_villain_turn_barrels": db_subtree_aggressive_nodes(
+            conn,
+            root_check_child,
+            "Villain",
+            "Turn",
+            limit,
+        ),
+    })
+}
+
+fn db_node_aggressive_combos(conn: &Connection, node_id: i64, limit: usize) -> Value {
+    let actions = db_action_labels(conn, node_id);
+    let check_index = actions.iter().position(|action| action == "check");
+    let bet_indices: Vec<_> = actions
+        .iter()
+        .enumerate()
+        .filter_map(|(index, action)| action.starts_with("bet:").then_some(index))
+        .collect();
+    if check_index.is_none() || bet_indices.is_empty() {
+        return Value::Array(Vec::new());
+    }
+    let mut statement = conn
+        .prepare(
+            "SELECT combo_index,
+                    combo,
+                    reach,
+                    weighted_gap,
+                    avg_action_values,
+                    current_action_values,
+                    avg_strategy,
+                    current_strategy,
+                    regrets
+             FROM solver_combos
+             WHERE node_id = ?1",
+        )
+        .unwrap();
+    let mut rows: Vec<Value> = statement
+        .query_map([node_id], |row| {
+            let avg_action_values_text = row.get::<_, Option<String>>(4)?;
+            let current_action_values_text = row.get::<_, Option<String>>(5)?;
+            let avg_strategy_text = row.get::<_, String>(6)?;
+            let current_strategy_text = row.get::<_, String>(7)?;
+            let avg_action_values = avg_action_values_text
+                .as_deref()
+                .and_then(parse_f32_json_array)
+                .unwrap_or_default();
+            let current_action_values = current_action_values_text
+                .as_deref()
+                .and_then(parse_f32_json_array)
+                .unwrap_or_default();
+            let avg_strategy = parse_f32_json_array(&avg_strategy_text).unwrap_or_default();
+            let current_strategy = parse_f32_json_array(&current_strategy_text).unwrap_or_default();
+            let avg_bet_probability = sum_indices(&avg_strategy, &bet_indices);
+            let current_bet_probability = sum_indices(&current_strategy, &bet_indices);
+            let check = check_index.expect("checked above");
+            let avg_check_ev = avg_action_values.get(check).copied().unwrap_or(0.0);
+            let current_check_ev = current_action_values.get(check).copied().unwrap_or(0.0);
+            let (avg_best_bet_index, avg_best_bet_ev) =
+                best_index_value(&avg_action_values, &bet_indices).unwrap_or((0, 0.0));
+            let (current_best_bet_index, current_best_bet_ev) =
+                best_index_value(&current_action_values, &bet_indices).unwrap_or((0, 0.0));
+            let avg_bet_edge = avg_best_bet_ev - avg_check_ev;
+            let current_bet_edge = current_best_bet_ev - current_check_ev;
+            Ok(json!({
+                "combo_index": row.get::<_, i64>(0)?,
+                "combo": row.get::<_, String>(1)?,
+                "reach": row.get::<_, f64>(2)?,
+                "weighted_gap": row.get::<_, f64>(3)?,
+                "avg_bet_probability": avg_bet_probability,
+                "current_bet_probability": current_bet_probability,
+                "avg_check_ev": avg_check_ev,
+                "avg_best_bet": {
+                    "index": avg_best_bet_index,
+                    "action": actions.get(avg_best_bet_index).cloned().unwrap_or_default(),
+                    "ev": avg_best_bet_ev,
+                    "edge_vs_check": avg_bet_edge,
+                },
+                "current_check_ev": current_check_ev,
+                "current_best_bet": {
+                    "index": current_best_bet_index,
+                    "action": actions.get(current_best_bet_index).cloned().unwrap_or_default(),
+                    "ev": current_best_bet_ev,
+                    "edge_vs_check": current_bet_edge,
+                },
+                "avg_action_values": avg_action_values_text.map(json_text_value),
+                "current_action_values": current_action_values_text.map(json_text_value),
+                "avg_strategy": json_text_value(avg_strategy_text),
+                "current_strategy": json_text_value(current_strategy_text),
+                "regrets": json_text_value(row.get::<_, String>(8)?),
+            }))
+        })
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    rows.sort_by(|left, right| {
+        let left_score = left["current_best_bet"]["edge_vs_check"]
+            .as_f64()
+            .unwrap_or(0.0)
+            * left["current_bet_probability"].as_f64().unwrap_or(0.0);
+        let right_score = right["current_best_bet"]["edge_vs_check"]
+            .as_f64()
+            .unwrap_or(0.0)
+            * right["current_bet_probability"].as_f64().unwrap_or(0.0);
+        right_score
+            .partial_cmp(&left_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    rows.truncate(limit);
+    Value::Array(rows)
+}
+
 fn db_node_detail(conn: &Connection, node_id: i64, combo_limit: usize) -> Value {
     let node = conn
         .query_row(
@@ -1445,6 +1622,169 @@ fn db_subtree_top_gaps(
         })
         .unwrap();
     Value::Array(rows.map(Result::unwrap).collect())
+}
+
+fn db_subtree_top_reached_gaps(
+    conn: &Connection,
+    root: i64,
+    gap_column: &str,
+    action_ev_column: &str,
+    policy_column: &str,
+    strategy_weight_column: &str,
+    limit: usize,
+) -> Value {
+    let sql = format!(
+        "WITH RECURSIVE subtree(node_id) AS (
+            SELECT ?1
+            UNION ALL
+            SELECT n.node_id FROM nodes n JOIN subtree s ON n.parent_id = s.node_id
+         )
+         SELECT n.node_id, n.street, n.acting_player, n.pot, n.to_call, n.path, s.{gap_column}, s.{action_ev_column}, s.{policy_column}, s.avg_strategy, s.current_strategy, s.value_reach_sum, s.avg_strategy_weight_sum, s.current_strategy_weight_sum
+         FROM subtree JOIN solver_nodes s ON s.node_id = subtree.node_id
+                      JOIN nodes n ON n.node_id = subtree.node_id
+         WHERE s.{gap_column} IS NOT NULL AND s.{strategy_weight_column} > 1.0e-6
+         ORDER BY s.{gap_column} DESC
+         LIMIT ?2"
+    );
+    let mut statement = conn.prepare(&sql).unwrap();
+    let rows = statement
+        .query_map(params![root, db_usize(limit)], |row| {
+            let node_id = row.get::<_, i64>(0)?;
+            Ok(json!({
+                "node": node_id,
+                "street": row.get::<_, Option<String>>(1)?,
+                "acting_player": row.get::<_, Option<String>>(2)?,
+                "pot": row.get::<_, Option<i64>>(3)?,
+                "to_call": row.get::<_, Option<i64>>(4)?,
+                "path": json_text_value(row.get::<_, String>(5)?),
+                "gap": row.get::<_, f64>(6)?,
+                "action_ev": row.get::<_, Option<String>>(7)?.map(json_text_value),
+                "policy_ev": row.get::<_, Option<f64>>(8)?,
+                "avg_strategy": json_text_value(row.get::<_, String>(9)?),
+                "current_strategy": json_text_value(row.get::<_, String>(10)?),
+                "value_reach_sum": row.get::<_, f64>(11)?,
+                "avg_strategy_weight_sum": row.get::<_, f64>(12)?,
+                "current_strategy_weight_sum": row.get::<_, f64>(13)?,
+                "actions": db_node_actions(conn, node_id),
+            }))
+        })
+        .unwrap();
+    Value::Array(rows.map(Result::unwrap).collect())
+}
+
+fn db_subtree_aggressive_nodes(
+    conn: &Connection,
+    root: i64,
+    acting_player: &str,
+    street: &str,
+    limit: usize,
+) -> Value {
+    let mut statement = conn
+        .prepare(
+            "WITH RECURSIVE subtree(node_id) AS (
+                SELECT ?1
+                UNION ALL
+                SELECT n.node_id FROM nodes n JOIN subtree s ON n.parent_id = s.node_id
+             )
+             SELECT n.node_id,
+                    n.pot,
+                    n.to_call,
+                    n.path,
+                    s.avg_action_ev,
+                    s.current_action_ev,
+                    s.avg_policy_ev,
+                    s.current_policy_ev,
+                    s.avg_strategy,
+                    s.current_strategy,
+                    s.avg_strategy_weight_sum,
+                    s.current_strategy_weight_sum,
+                    s.avg_gap,
+                    s.current_gap
+             FROM subtree JOIN solver_nodes s ON s.node_id = subtree.node_id
+                          JOIN nodes n ON n.node_id = subtree.node_id
+             WHERE n.acting_player = ?2
+               AND n.street = ?3
+               AND n.to_call = 0
+               AND s.current_strategy_weight_sum > 1.0e-6",
+        )
+        .unwrap();
+    let mut rows: Vec<Value> = statement
+        .query_map(params![root, acting_player, street], |row| {
+            let node_id = row.get::<_, i64>(0)?;
+            let actions = db_action_labels(conn, node_id);
+            let bet_indices: Vec<_> = actions
+                .iter()
+                .enumerate()
+                .filter_map(|(index, action)| action.starts_with("bet:").then_some(index))
+                .collect();
+            let avg_strategy_text = row.get::<_, String>(8)?;
+            let current_strategy_text = row.get::<_, String>(9)?;
+            let avg_strategy = parse_f32_json_array(&avg_strategy_text).unwrap_or_default();
+            let current_strategy = parse_f32_json_array(&current_strategy_text).unwrap_or_default();
+            let avg_bet_probability = sum_indices(&avg_strategy, &bet_indices);
+            let current_bet_probability = sum_indices(&current_strategy, &bet_indices);
+            Ok(json!({
+                "node": node_id,
+                "pot": row.get::<_, Option<i64>>(1)?,
+                "to_call": row.get::<_, Option<i64>>(2)?,
+                "path": json_text_value(row.get::<_, String>(3)?),
+                "avg_action_ev": row.get::<_, Option<String>>(4)?.map(json_text_value),
+                "current_action_ev": row.get::<_, Option<String>>(5)?.map(json_text_value),
+                "avg_policy_ev": row.get::<_, Option<f64>>(6)?,
+                "current_policy_ev": row.get::<_, Option<f64>>(7)?,
+                "avg_strategy": json_text_value(avg_strategy_text),
+                "current_strategy": json_text_value(current_strategy_text),
+                "avg_bet_probability": avg_bet_probability,
+                "current_bet_probability": current_bet_probability,
+                "avg_strategy_weight_sum": row.get::<_, f64>(10)?,
+                "current_strategy_weight_sum": row.get::<_, f64>(11)?,
+                "avg_gap": row.get::<_, Option<f64>>(12)?,
+                "current_gap": row.get::<_, Option<f64>>(13)?,
+                "actions": db_node_actions(conn, node_id),
+            }))
+        })
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    rows.sort_by(|left, right| {
+        let left_score = left["current_bet_probability"].as_f64().unwrap_or(0.0)
+            * left["current_strategy_weight_sum"].as_f64().unwrap_or(0.0);
+        let right_score = right["current_bet_probability"].as_f64().unwrap_or(0.0)
+            * right["current_strategy_weight_sum"].as_f64().unwrap_or(0.0);
+        right_score
+            .partial_cmp(&left_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    rows.truncate(limit);
+    Value::Array(rows)
+}
+
+fn db_action_labels(conn: &Connection, node_id: i64) -> Vec<String> {
+    let mut statement = conn
+        .prepare("SELECT action FROM actions WHERE node_id = ?1 ORDER BY action_index")
+        .unwrap();
+    statement
+        .query_map([node_id], |row| row.get::<_, String>(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+}
+
+fn sum_indices(values: &[f32], indices: &[usize]) -> f64 {
+    indices
+        .iter()
+        .filter_map(|index| values.get(*index))
+        .map(|value| f64::from(*value))
+        .sum()
+}
+
+fn best_index_value(values: &[f32], indices: &[usize]) -> Option<(usize, f32)> {
+    indices
+        .iter()
+        .filter_map(|index| values.get(*index).copied().map(|value| (*index, value)))
+        .max_by(|(_, left), (_, right)| {
+            left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal)
+        })
 }
 
 fn vec_json(values: &[f32]) -> String {
