@@ -793,6 +793,34 @@ combo_count` scan itself, not just reduce writes. That likely means fusing card
 mass accumulation into the existing total-prefix scan or building a compact
 per-group summary without a separate per-card pass.
 
+### Terminal CFV Rewrite Ideas
+
+The next larger CFV rewrite should not add another terminal pass. The promising
+direction is to change the layout of the existing terminal operator:
+
+```text
+board-major + strength-group-major raw value
+```
+
+For a fixed final board, all combos in the same strength group share the same
+raw non-blocker value:
+
+```text
+raw[g] = pot * (prefix_group[g] + 0.5 * group_mass[g]) - invested * total_mass
+```
+
+Then per-combo work only needs blocker correction:
+
+```text
+value[h] = raw[group(h)] - blocker_correction[h]
+```
+
+This can reduce duplicate raw-value reads and arithmetic, especially when many
+combos share a strength group. It does not remove blocker work by itself, so it
+should be paired with a compact card/group blocker summary. A board-major batch
+can also reuse the same `combo_order` and `combo_bounds` for many terminal
+nodes sharing the board set. This is a kernel layout rewrite, not a small patch.
+
 ## Next Mathematical Cut
 
 The current implementation is still too close to "run a public tree program on
@@ -1090,6 +1118,59 @@ Current interpretation:
   default without testing other flop textures.
 - The old literature-style starting point `alpha=1.5, gamma=4.0` was on the
   edge of the first grid; expanding `gamma` improved the BR gap.
+
+## PDCFR+ Notes
+
+`CfrVariant::PdcfrPlus { alpha, gamma, eta }` adds one extra dense vector:
+
+```text
+P_t(I,a) = r_t(I,a)
+```
+
+where `r_t(I,a)` is the current iteration's instantaneous counterfactual regret
+increment. The next strategy is produced from a predicted regret:
+
+```text
+R_eff_t(I,a) = R_t(I,a) + eta * P_t(I,a)
+sigma_t(I)  = regret_match(max(R_eff_t(I,a), 0))
+```
+
+Then the stored regret is updated with the DCFR+ style discount and clipping:
+
+```text
+R_{t+1}(I,a) = max(regret_discount(t) * R_t(I,a) + r_t(I,a), 0)
+P_{t+1}(I,a) = r_t(I,a)
+```
+
+So the `P` is not predicting cards, opponent ranges, or action sizes. It is a
+first-order prediction of the next regret direction, using the previous
+instantaneous regret as the predictor. The GPU public-tree path applies the same
+effective regret in reach propagation and in the CFR update kernel.
+
+Runtime selection:
+
+```text
+POKEDR_CFR_VARIANT=pdcfr-plus
+POKEDR_PDCFR_ALPHA=2.5
+POKEDR_PDCFR_GAMMA=8.0
+POKEDR_PDCFR_ETA=1.0
+```
+
+Single-flop `As7h2c`, depth `5`, full terminal runouts, DZN/Vulkan:
+
+```text
+DCFR+ alpha=1.5 gamma=4.0 32:
+  root_br_gap  = 1.243284
+  local_br_gap = 4.303405
+
+PDCFR+ alpha=2.5 gamma=8.0 eta=1.0 32:
+  root_br_gap  = 0.883777
+  local_br_gap = 4.543299
+```
+
+Current interpretation: PDCFR+ is promising on root BR gap for this flop, but
+not an across-the-board win yet. It needs a parameter sweep over `eta` and more
+flop textures before replacing DCFR+ as the default.
 
 ## Immediate Implementation Order
 

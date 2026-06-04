@@ -41,6 +41,7 @@ fn run_one_shot_update(backend: &GpuDenseCfrBackend) {
         CfrVariant::CfrPlus,
         CfrVariant::Discounted,
         CfrVariant::dcfr_plus_default(),
+        CfrVariant::pdcfr_plus_default(),
     ] {
         let config = DenseCfrConfig {
             infosets: 4,
@@ -68,6 +69,7 @@ fn run_one_shot_update(backend: &GpuDenseCfrBackend) {
             cpu.strategy_sum(),
             gpu.strategy_sum(),
         );
+        assert_close("one-shot prediction", cpu.prediction(), gpu.prediction());
     }
 }
 
@@ -112,6 +114,7 @@ fn run_resident_updates(backend: &GpuDenseCfrBackend) {
         CfrVariant::CfrPlus,
         CfrVariant::Discounted,
         CfrVariant::dcfr_plus_default(),
+        CfrVariant::pdcfr_plus_default(),
     ] {
         let config = DenseCfrConfig {
             infosets: 8,
@@ -137,6 +140,11 @@ fn run_resident_updates(backend: &GpuDenseCfrBackend) {
             "resident strategy_sum",
             cpu.state().strategy_sum(),
             downloaded.strategy_sum(),
+        );
+        assert_close(
+            "resident prediction",
+            cpu.state().prediction(),
+            downloaded.prediction(),
         );
     }
 }

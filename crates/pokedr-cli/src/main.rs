@@ -333,8 +333,18 @@ fn env_cfr_variant(name: &str) -> Option<CfrVariant> {
             gamma: env_f32("POKEDR_DCFR_GAMMA")
                 .unwrap_or(pokedr_core::dense_cfr::DEFAULT_DCFR_PLUS_GAMMA),
         }),
+        "pdcfr-plus" | "pdcfrplus" | "pdcfr+" | "pdcfr" => Some(CfrVariant::PdcfrPlus {
+            alpha: env_f32("POKEDR_PDCFR_ALPHA")
+                .unwrap_or(pokedr_core::dense_cfr::DEFAULT_PDCFR_PLUS_ALPHA),
+            gamma: env_f32("POKEDR_PDCFR_GAMMA")
+                .unwrap_or(pokedr_core::dense_cfr::DEFAULT_PDCFR_PLUS_GAMMA),
+            eta: env_f32("POKEDR_PDCFR_ETA")
+                .unwrap_or(pokedr_core::dense_cfr::DEFAULT_PDCFR_PLUS_ETA),
+        }),
         other => {
-            eprintln!("unknown {name}={other}; expected cfr-plus, discounted, or dcfr-plus");
+            eprintln!(
+                "unknown {name}={other}; expected cfr-plus, discounted, dcfr-plus, or pdcfr-plus"
+            );
             std::process::exit(2);
         }
     }

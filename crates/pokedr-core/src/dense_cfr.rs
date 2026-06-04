@@ -1,11 +1,15 @@
 pub const DEFAULT_DCFR_PLUS_ALPHA: f32 = 1.5;
 pub const DEFAULT_DCFR_PLUS_GAMMA: f32 = 4.0;
+pub const DEFAULT_PDCFR_PLUS_ALPHA: f32 = 2.5;
+pub const DEFAULT_PDCFR_PLUS_GAMMA: f32 = 8.0;
+pub const DEFAULT_PDCFR_PLUS_ETA: f32 = 1.0;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum CfrVariant {
     CfrPlus,
     Discounted,
     DcfrPlus { alpha: f32, gamma: f32 },
+    PdcfrPlus { alpha: f32, gamma: f32, eta: f32 },
 }
 
 impl CfrVariant {
@@ -16,8 +20,20 @@ impl CfrVariant {
         }
     }
 
+    pub const fn pdcfr_plus_default() -> Self {
+        Self::PdcfrPlus {
+            alpha: DEFAULT_PDCFR_PLUS_ALPHA,
+            gamma: DEFAULT_PDCFR_PLUS_GAMMA,
+            eta: DEFAULT_PDCFR_PLUS_ETA,
+        }
+    }
+
     pub fn is_dcfr_plus(self) -> bool {
         matches!(self, Self::DcfrPlus { .. })
+    }
+
+    pub fn uses_prediction(self) -> bool {
+        matches!(self, Self::PdcfrPlus { .. })
     }
 }
 
@@ -38,6 +54,7 @@ pub struct DenseCfrState {
     legal_actions: Vec<bool>,
     legal_action_counts: Vec<usize>,
     regrets: Vec<f32>,
+    prediction: Vec<f32>,
     strategy_sum: Vec<f32>,
 }
 
@@ -53,6 +70,7 @@ impl DenseCfrState {
             legal_actions: vec![true; len],
             legal_action_counts: vec![config.actions; config.infosets],
             regrets: vec![0.0; len],
+            prediction: vec![0.0; len],
             strategy_sum: vec![0.0; len],
         }
     }
@@ -75,6 +93,7 @@ impl DenseCfrState {
             legal_actions,
             legal_action_counts,
             regrets: vec![0.0; len],
+            prediction: vec![0.0; len],
             strategy_sum: vec![0.0; len],
         }
     }
@@ -93,6 +112,10 @@ impl DenseCfrState {
 
     pub fn strategy_sum(&self) -> &[f32] {
         &self.strategy_sum
+    }
+
+    pub fn prediction(&self) -> &[f32] {
+        &self.prediction
     }
 
     pub fn legal_actions(&self) -> &[bool] {
@@ -122,17 +145,22 @@ impl DenseCfrState {
         assert!(out.len() >= self.actions);
         let offset = self.offset(infoset);
         let regrets = &self.regrets[offset..offset + self.actions];
+        let prediction = &self.prediction[offset..offset + self.actions];
         let legal = &self.legal_actions[offset..offset + self.actions];
         let normalizer: f32 = regrets
             .iter()
+            .zip(prediction)
             .zip(legal)
             .filter(|(_, is_legal)| **is_legal)
-            .map(|(value, _)| value.max(0.0))
+            .map(|((value, predicted), _)| {
+                effective_regret(self.variant, *value, *predicted).max(0.0)
+            })
             .sum();
         if normalizer > 0.0 {
             for action in 0..self.actions {
                 out[action] = if legal[action] {
-                    regrets[action].max(0.0) / normalizer
+                    effective_regret(self.variant, regrets[action], prediction[action]).max(0.0)
+                        / normalizer
                 } else {
                     0.0
                 };
@@ -199,6 +227,7 @@ impl DenseCfrState {
         for action in 0..self.actions {
             if !self.legal_actions[offset + action] {
                 self.regrets[offset + action] = 0.0;
+                self.prediction[offset + action] = 0.0;
                 self.strategy_sum[offset + action] = 0.0;
                 continue;
             }
@@ -208,10 +237,15 @@ impl DenseCfrState {
             *slot += regret;
             if matches!(
                 self.variant,
-                CfrVariant::CfrPlus | CfrVariant::DcfrPlus { .. }
+                CfrVariant::CfrPlus | CfrVariant::DcfrPlus { .. } | CfrVariant::PdcfrPlus { .. }
             ) {
                 *slot = slot.max(0.0);
             }
+            self.prediction[offset + action] = if self.variant.uses_prediction() {
+                regret
+            } else {
+                0.0
+            };
             self.strategy_sum[offset + action] *=
                 average_strategy_discount(self.variant, iteration);
             self.strategy_sum[offset + action] += strategy_weight * strategy[action];
@@ -348,15 +382,32 @@ fn regret_discount(variant: CfrVariant, iteration: usize) -> f32 {
                 weighted / (weighted + 1.5)
             }
         }
+        CfrVariant::PdcfrPlus { alpha, .. } => {
+            if iteration <= 1 {
+                0.0
+            } else {
+                let weighted = ((iteration - 1) as f32).powf(alpha);
+                weighted / (weighted + 1.5)
+            }
+        }
     }
 }
 
 fn average_strategy_discount(variant: CfrVariant, iteration: usize) -> f32 {
     match variant {
-        CfrVariant::DcfrPlus { gamma, .. } if iteration > 1 => {
+        CfrVariant::DcfrPlus { gamma, .. } | CfrVariant::PdcfrPlus { gamma, .. }
+            if iteration > 1 =>
+        {
             (((iteration - 1) as f32) / iteration as f32).powf(gamma)
         }
         _ => 1.0,
+    }
+}
+
+fn effective_regret(variant: CfrVariant, regret: f32, prediction: f32) -> f32 {
+    match variant {
+        CfrVariant::PdcfrPlus { eta, .. } => regret + eta * prediction,
+        _ => regret,
     }
 }
 
@@ -435,6 +486,44 @@ mod tests {
         assert!((state.strategy_sum()[0] - (0.5 * discount + 1.0)).abs() < 1e-6);
         assert!((state.strategy_sum()[1] - (0.5 * discount)).abs() < 1e-6);
         assert!(state.regrets().iter().all(|value| *value >= 0.0));
+    }
+
+    #[test]
+    fn pdcfr_plus_strategy_uses_previous_instant_regret() {
+        let mut state = DenseCfrState::new(DenseCfrConfig {
+            infosets: 1,
+            actions: 2,
+            variant: CfrVariant::PdcfrPlus {
+                alpha: 2.5,
+                gamma: 8.0,
+                eta: 1.0,
+            },
+        });
+        state.regrets.copy_from_slice(&[0.0, 1.0]);
+        state.prediction.copy_from_slice(&[1.0, 0.0]);
+
+        let mut strategy = [0.0; 2];
+        state.strategy_for(0, &mut strategy);
+
+        assert_eq!(strategy, [0.5, 0.5]);
+    }
+
+    #[test]
+    fn pdcfr_plus_records_current_instant_regret_as_prediction() {
+        let mut state = DenseCfrState::new(DenseCfrConfig {
+            infosets: 1,
+            actions: 2,
+            variant: CfrVariant::PdcfrPlus {
+                alpha: 2.5,
+                gamma: 8.0,
+                eta: 1.0,
+            },
+        });
+
+        state.update_infoset(0, &[1.0, -1.0], 1.0, 1.0, 1);
+
+        assert_eq!(state.prediction(), &[1.0, -1.0]);
+        assert_eq!(state.regrets(), &[1.0, 0.0]);
     }
 
     #[test]

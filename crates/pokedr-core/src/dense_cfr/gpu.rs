@@ -21,6 +21,7 @@ const CFR_UPDATE_SHADER: &str = r#"
 @group(0) @binding(4) var<storage, read> strategy_weights: array<f32>;
 @group(0) @binding(5) var<storage, read> params: array<u32>;
 @group(0) @binding(6) var<storage, read> legal_actions: array<u32>;
+@group(0) @binding(7) var<storage, read_write> prediction: array<f32>;
 
 fn positive(value: f32) -> f32 {
     return max(value, 0.0);
@@ -31,9 +32,18 @@ fn strategy_at(offset: u32, action: u32, actions: u32, normalizer: f32) -> f32 {
         return 0.0;
     }
     if normalizer > 0.0 {
-        return positive(regrets[offset + action]) / normalizer;
+        return positive(effective_regret(offset + action)) / normalizer;
     }
     return 1.0 / f32(actions);
+}
+
+fn effective_regret(index: u32) -> f32 {
+    let variant = params[2];
+    if variant == 3u {
+        let eta = bitcast<f32>(params[6]);
+        return regrets[index] + eta * prediction[index];
+    }
+    return regrets[index];
 }
 
 fn regret_discount(variant: u32, iteration: u32, alpha: f32) -> f32 {
@@ -41,7 +51,7 @@ fn regret_discount(variant: u32, iteration: u32, alpha: f32) -> f32 {
         let t = f32(max(iteration, 1u));
         return t / (t + 1.0);
     }
-    if variant == 2u {
+    if variant == 2u || variant == 3u {
         if iteration <= 1u {
             return 0.0;
         }
@@ -52,7 +62,7 @@ fn regret_discount(variant: u32, iteration: u32, alpha: f32) -> f32 {
 }
 
 fn average_strategy_discount(variant: u32, iteration: u32, gamma: f32) -> f32 {
-    if variant == 2u && iteration > 1u {
+    if (variant == 2u || variant == 3u) && iteration > 1u {
         let t = f32(iteration);
         return pow((t - 1.0) / t, gamma);
     }
@@ -78,7 +88,7 @@ fn update(@builtin(global_invocation_id) id: vec3<u32>) {
     for (var action = 0u; action < actions; action = action + 1u) {
         if legal_actions[offset + action] != 0u {
             legal_count = legal_count + 1u;
-            normalizer = normalizer + positive(regrets[offset + action]);
+            normalizer = normalizer + positive(effective_regret(offset + action));
         }
     }
 
@@ -101,6 +111,7 @@ fn update(@builtin(global_invocation_id) id: vec3<u32>) {
     for (var action = 0u; action < actions; action = action + 1u) {
         if legal_actions[offset + action] == 0u {
             regrets[offset + action] = 0.0;
+            prediction[offset + action] = 0.0;
             strategy_sum[offset + action] = 0.0;
             continue;
         }
@@ -111,10 +122,11 @@ fn update(@builtin(global_invocation_id) id: vec3<u32>) {
         );
         let regret = (action_values[offset + action] - node_value) * reach_weights[infoset];
         var updated = regrets[offset + action] * discount + regret;
-        if variant == 0u || variant == 2u {
+        if variant == 0u || variant == 2u || variant == 3u {
             updated = max(updated, 0.0);
         }
         regrets[offset + action] = updated;
+        prediction[offset + action] = select(0.0, regret, variant == 3u);
         strategy_sum[offset + action] = strategy_sum[offset + action] * average_discount + strategy_weights[infoset] * strategy;
     }
 }
@@ -126,6 +138,7 @@ const PUBLIC_TREE_CFR_UPDATE_SHADER: &str = r#"
 @group(0) @binding(2) var<storage, read> output: array<f32>;
 @group(0) @binding(3) var<storage, read> params: array<u32>;
 @group(0) @binding(4) var<storage, read> legal_actions: array<u32>;
+@group(0) @binding(5) var<storage, read_write> prediction: array<f32>;
 
 fn positive(value: f32) -> f32 {
     return max(value, 0.0);
@@ -136,9 +149,18 @@ fn strategy_at(offset: u32, action: u32, actions: u32, normalizer: f32) -> f32 {
         return 0.0;
     }
     if normalizer > 0.0 {
-        return positive(regrets[offset + action]) / normalizer;
+        return positive(effective_regret(offset + action)) / normalizer;
     }
     return 1.0 / f32(actions);
+}
+
+fn effective_regret(index: u32) -> f32 {
+    let variant = params[2];
+    if variant == 3u {
+        let eta = bitcast<f32>(params[9]);
+        return regrets[index] + eta * prediction[index];
+    }
+    return regrets[index];
 }
 
 fn action_value(action_offset: u32, action_len: u32) -> f32 {
@@ -154,7 +176,7 @@ fn regret_discount(variant: u32, iteration: u32, alpha: f32) -> f32 {
         let t = f32(max(iteration, 1u));
         return t / (t + 1.0);
     }
-    if variant == 2u {
+    if variant == 2u || variant == 3u {
         if iteration <= 1u {
             return 0.0;
         }
@@ -165,7 +187,7 @@ fn regret_discount(variant: u32, iteration: u32, alpha: f32) -> f32 {
 }
 
 fn average_strategy_discount(variant: u32, iteration: u32, gamma: f32) -> f32 {
-    if variant == 2u && iteration > 1u {
+    if (variant == 2u || variant == 3u) && iteration > 1u {
         let t = f32(iteration);
         return pow((t - 1.0) / t, gamma);
     }
@@ -194,7 +216,7 @@ fn update(@builtin(global_invocation_id) id: vec3<u32>) {
     for (var action = 0u; action < actions; action = action + 1u) {
         if legal_actions[offset + action] != 0u {
             legal_count = legal_count + 1u;
-            normalizer = normalizer + positive(regrets[offset + action]);
+            normalizer = normalizer + positive(effective_regret(offset + action));
         }
     }
 
@@ -217,12 +239,13 @@ fn update(@builtin(global_invocation_id) id: vec3<u32>) {
     let reach_weight = output[reach_start + infoset];
     let raw_strategy_weight = output[strategy_start + infoset];
     var strategy_weight = raw_strategy_weight * f32(iteration);
-    if variant == 2u {
+    if variant == 2u || variant == 3u {
         strategy_weight = raw_strategy_weight;
     }
     for (var action = 0u; action < actions; action = action + 1u) {
         if legal_actions[offset + action] == 0u {
             regrets[offset + action] = 0.0;
+            prediction[offset + action] = 0.0;
             strategy_sum[offset + action] = 0.0;
             continue;
         }
@@ -233,10 +256,11 @@ fn update(@builtin(global_invocation_id) id: vec3<u32>) {
         );
         let regret = (action_value(offset + action, action_len) - node_value) * reach_weight;
         var updated = regrets[offset + action] * discount + regret;
-        if variant == 0u || variant == 2u {
+        if variant == 0u || variant == 2u || variant == 3u {
             updated = max(updated, 0.0);
         }
         regrets[offset + action] = updated;
+        prediction[offset + action] = select(0.0, regret, variant == 3u);
         strategy_sum[offset + action] = strategy_sum[offset + action] * average_discount + strategy_weight * strategy;
     }
 }
@@ -757,6 +781,7 @@ struct Params {
 @group(0) @binding(5) var<storage, read_write> hero_reaches: array<f32>;
 @group(0) @binding(6) var<storage, read_write> villain_reaches: array<f32>;
 @group(0) @binding(7) var<uniform> params: Params;
+@group(0) @binding(8) var<storage, read> prediction: array<f32>;
 
 fn combo_has_card(combo: Combo, card: u32) -> bool {
     return combo.cards[0] == card || combo.cards[1] == card;
@@ -769,12 +794,19 @@ fn strategy_probability(node: TreeNode, private_combo: u32, action: u32) -> f32 
     let offset = private_infoset * params.max_actions;
     var normalizer = 0.0;
     for (var i = 0u; i < node.child_count; i = i + 1u) {
-        normalizer = normalizer + max(regrets[offset + i], 0.0);
+        normalizer = normalizer + max(effective_regret(offset + i), 0.0);
     }
     if normalizer > 0.0 {
-        return max(regrets[offset + action], 0.0) / normalizer;
+        return max(effective_regret(offset + action), 0.0) / normalizer;
     }
     return 1.0 / f32(max(node.child_count, 1u));
+}
+
+fn effective_regret(index: u32) -> f32 {
+    if params.value_player == 3u {
+        return regrets[index] + bitcast<f32>(params._pad3) * prediction[index];
+    }
+    return regrets[index];
 }
 
 @compute @workgroup_size(64)
@@ -1926,6 +1958,7 @@ pub struct GpuDenseCfrState {
     legal_actions: Vec<u32>,
     legal_actions_buffer: wgpu::Buffer,
     regrets: wgpu::Buffer,
+    prediction: wgpu::Buffer,
     strategy_sum: wgpu::Buffer,
 }
 
@@ -2394,6 +2427,7 @@ impl GpuDenseCfrBackend {
                 storage_entry(4, true),
                 storage_entry(5, true),
                 storage_entry(6, true),
+                storage_entry(7, false),
             ],
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -2424,6 +2458,7 @@ impl GpuDenseCfrBackend {
                     storage_entry(2, true),
                     storage_entry(3, true),
                     storage_entry(4, true),
+                    storage_entry(5, false),
                 ],
             });
         let public_tree_cfr_update_pipeline_layout =
@@ -2522,6 +2557,7 @@ impl GpuDenseCfrBackend {
                     storage_entry(5, false),
                     storage_entry(6, false),
                     uniform_entry(7),
+                    storage_entry(8, true),
                 ],
             });
         let public_tree_reach_pipeline_layout =
@@ -3058,8 +3094,10 @@ impl GpuDenseCfrBackend {
             iteration as u32,
             variant_dcfr_alpha(state.variant).to_bits(),
             variant_dcfr_gamma(state.variant).to_bits(),
+            variant_prediction_eta(state.variant).to_bits(),
         ];
         let regrets = storage_buffer(&self.device, "regrets", &state.regrets);
+        let prediction = storage_buffer(&self.device, "prediction", &state.prediction);
         let strategy_sum = storage_buffer(&self.device, "strategy sum", &state.strategy_sum);
         let action_values = readonly_buffer(&self.device, "action values", action_values);
         let reach_weights = readonly_buffer(&self.device, "reach weights", reach_weights);
@@ -3082,6 +3120,7 @@ impl GpuDenseCfrBackend {
                 bind_entry(4, &strategy_weights),
                 bind_entry(5, &params),
                 bind_entry(6, &legal_actions),
+                bind_entry(7, &prediction),
             ],
         });
 
@@ -3102,12 +3141,19 @@ impl GpuDenseCfrBackend {
         }
 
         let regret_readback = readback_buffer(&self.device, state.regrets.len());
+        let prediction_readback = readback_buffer(&self.device, state.prediction.len());
         let strategy_readback = readback_buffer(&self.device, state.strategy_sum.len());
         copy_buffer(
             &mut encoder,
             &regrets,
             &regret_readback,
             state.regrets.len(),
+        );
+        copy_buffer(
+            &mut encoder,
+            &prediction,
+            &prediction_readback,
+            state.prediction.len(),
         );
         copy_buffer(
             &mut encoder,
@@ -3124,11 +3170,15 @@ impl GpuDenseCfrBackend {
             .map_err(|error| GpuCfrError::MapFailed(error.to_string()))?;
 
         let regrets_len = state.regrets.len();
+        let prediction_len = state.prediction.len();
         let strategy_sum_len = state.strategy_sum.len();
         let updated_regrets = read_f32_buffer(&self.device, &regret_readback, regrets_len)?;
+        let updated_prediction =
+            read_f32_buffer(&self.device, &prediction_readback, prediction_len)?;
         let updated_strategy_sum =
             read_f32_buffer(&self.device, &strategy_readback, strategy_sum_len)?;
         state.regrets.copy_from_slice(&updated_regrets);
+        state.prediction.copy_from_slice(&updated_prediction);
         state.strategy_sum.copy_from_slice(&updated_strategy_sum);
         Ok(())
     }
@@ -4097,6 +4147,8 @@ impl GpuDenseCfrBackend {
         &self,
         ctx: &GpuPublicTreeIterationContext,
         regrets_buffer: &wgpu::Buffer,
+        prediction_buffer: &wgpu::Buffer,
+        variant: super::CfrVariant,
     ) -> Result<(wgpu::Buffer, usize, usize), GpuCfrError> {
         if std::env::var_os("POKEDR_SOLVER_PROGRESS_OFF").is_none() {
             eprintln!(
@@ -4128,10 +4180,10 @@ impl GpuDenseCfrBackend {
                 node_count: ctx.nodes_len as u32,
                 max_actions: ctx.actions as u32,
                 output_len: init_x_invocations,
-                pair_start: 0,
+                pair_start: variant_code(variant),
                 chunk_pairs: 0,
                 _pad0: 0,
-                _pad1: 0,
+                _pad1: variant_prediction_eta(variant).to_bits(),
             }],
         );
         let reach_init_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -4146,6 +4198,7 @@ impl GpuDenseCfrBackend {
                 bind_entry(5, &ctx.hero_reaches_buffer),
                 bind_entry(6, &ctx.villain_reaches_buffer),
                 bind_entry(7, &reach_init_params),
+                bind_entry(8, prediction_buffer),
             ],
         });
         {
@@ -4173,10 +4226,10 @@ impl GpuDenseCfrBackend {
                     node_count: ctx.nodes_len as u32,
                     max_actions: ctx.actions as u32,
                     output_len: x_invocations,
-                    pair_start: 0,
+                    pair_start: variant_code(variant),
                     chunk_pairs: layer_start as u32,
                     _pad0: layer_edge_count as u32,
-                    _pad1: 0,
+                    _pad1: variant_prediction_eta(variant).to_bits(),
                 }],
             );
             let reach_edge_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -4191,6 +4244,7 @@ impl GpuDenseCfrBackend {
                     bind_entry(5, &ctx.hero_reaches_buffer),
                     bind_entry(6, &ctx.villain_reaches_buffer),
                     bind_entry(7, &reach_edge_params),
+                    bind_entry(8, prediction_buffer),
                 ],
             });
             {
@@ -4410,6 +4464,8 @@ impl GpuDenseCfrBackend {
         showdown_boards: &[GpuFinalBoard],
         _strength_buffer: &wgpu::Buffer,
         regrets_buffer: &wgpu::Buffer,
+        prediction_buffer: &wgpu::Buffer,
+        variant: super::CfrVariant,
         infosets: usize,
         actions: usize,
     ) -> Result<(wgpu::Buffer, usize, usize), GpuCfrError> {
@@ -4581,10 +4637,10 @@ impl GpuDenseCfrBackend {
                 node_count: nodes.len() as u32,
                 max_actions: actions as u32,
                 output_len: init_x_invocations,
-                pair_start: 0,
+                pair_start: variant_code(variant),
                 chunk_pairs: 0,
                 _pad0: 0,
-                _pad1: 0,
+                _pad1: variant_prediction_eta(variant).to_bits(),
             }],
         );
         let reach_init_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -4599,6 +4655,7 @@ impl GpuDenseCfrBackend {
                 bind_entry(5, &hero_reaches_buffer),
                 bind_entry(6, &villain_reaches_buffer),
                 bind_entry(7, &reach_init_params),
+                bind_entry(8, prediction_buffer),
             ],
         });
         {
@@ -4626,10 +4683,10 @@ impl GpuDenseCfrBackend {
                     node_count: nodes.len() as u32,
                     max_actions: actions as u32,
                     output_len: x_invocations,
-                    pair_start: 0,
+                    pair_start: variant_code(variant),
                     chunk_pairs: layer_start as u32,
                     _pad0: layer_edge_count as u32,
-                    _pad1: 0,
+                    _pad1: variant_prediction_eta(variant).to_bits(),
                 }],
             );
             let reach_edge_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -4644,6 +4701,7 @@ impl GpuDenseCfrBackend {
                     bind_entry(5, &hero_reaches_buffer),
                     bind_entry(6, &villain_reaches_buffer),
                     bind_entry(7, &reach_edge_params),
+                    bind_entry(8, prediction_buffer),
                 ],
             });
             {
@@ -4911,6 +4969,8 @@ impl GpuDenseCfrBackend {
         state: &DenseCfrState,
     ) -> Result<GpuRootTerminalValues, GpuCfrError> {
         let regrets_buffer = readonly_buffer(&self.device, "public tree regrets", &state.regrets);
+        let prediction_buffer =
+            readonly_buffer(&self.device, "public tree prediction", &state.prediction);
         let strength_buffer = self.final_board_strength_buffer(combos, showdown_boards)?;
         let (output_buffer, output_len, action_len) = self.public_tree_iteration_output(
             nodes,
@@ -4922,6 +4982,8 @@ impl GpuDenseCfrBackend {
             showdown_boards,
             &strength_buffer,
             &regrets_buffer,
+            &prediction_buffer,
+            state.variant,
             state.infosets,
             state.actions,
         )?;
@@ -5012,6 +5074,8 @@ impl GpuDenseCfrBackend {
             showdown_boards,
             strength_buffer,
             &state.regrets,
+            &state.prediction,
+            state.variant,
             state.infosets,
             state.actions,
         )?;
@@ -5038,6 +5102,7 @@ impl GpuDenseCfrBackend {
                 action_len as u32,
                 reach_start as u32,
                 strategy_start as u32,
+                variant_prediction_eta(state.variant).to_bits(),
             ],
         );
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -5049,6 +5114,7 @@ impl GpuDenseCfrBackend {
                 bind_entry(2, &output_buffer),
                 bind_entry(3, &params),
                 bind_entry(4, &state.legal_actions_buffer),
+                bind_entry(5, &state.prediction),
             ],
         });
         let update_start = profile.then(Instant::now);
@@ -5087,8 +5153,13 @@ impl GpuDenseCfrBackend {
     ) -> Result<(), GpuCfrError> {
         let profile = Self::gpu_profile_enabled();
         let cfv_start = profile.then(Instant::now);
-        let (output_buffer, _output_len, action_len) =
-            self.public_tree_iteration_output_with_context(context, &state.regrets)?;
+        let (output_buffer, _output_len, action_len) = self
+            .public_tree_iteration_output_with_context(
+                context,
+                &state.regrets,
+                &state.prediction,
+                state.variant,
+            )?;
         if let Some(start) = cfv_start {
             self.profile_poll()?;
             eprintln!(
@@ -5112,6 +5183,7 @@ impl GpuDenseCfrBackend {
                 action_len as u32,
                 reach_start as u32,
                 strategy_start as u32,
+                variant_prediction_eta(state.variant).to_bits(),
             ],
         );
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -5123,6 +5195,7 @@ impl GpuDenseCfrBackend {
                 bind_entry(2, &output_buffer),
                 bind_entry(3, &params),
                 bind_entry(4, &state.legal_actions_buffer),
+                bind_entry(5, &state.prediction),
             ],
         });
         let update_start = profile.then(Instant::now);
@@ -5296,6 +5369,7 @@ impl GpuDenseCfrBackend {
             ),
             legal_actions,
             regrets: storage_buffer(&self.device, "resident regrets", &state.regrets),
+            prediction: storage_buffer(&self.device, "resident prediction", &state.prediction),
             strategy_sum: storage_buffer(
                 &self.device,
                 "resident strategy sum",
@@ -5367,6 +5441,7 @@ impl GpuDenseCfrState {
             iteration as u32,
             variant_dcfr_alpha(self.variant).to_bits(),
             variant_dcfr_gamma(self.variant).to_bits(),
+            variant_prediction_eta(self.variant).to_bits(),
         ];
         let action_values =
             readonly_buffer(&backend.device, "resident action values", action_values);
@@ -5391,6 +5466,7 @@ impl GpuDenseCfrState {
                     bind_entry(4, &strategy_weights),
                     bind_entry(5, &params),
                     bind_entry(6, &self.legal_actions_buffer),
+                    bind_entry(7, &self.prediction),
                 ],
             });
 
@@ -5423,6 +5499,7 @@ impl GpuDenseCfrState {
     pub fn download(&self, backend: &GpuDenseCfrBackend) -> Result<DenseCfrState, GpuCfrError> {
         let len = self.infosets * self.actions;
         let regret_readback = readback_buffer(&backend.device, len);
+        let prediction_readback = readback_buffer(&backend.device, len);
         let strategy_readback = readback_buffer(&backend.device, len);
         let mut encoder = backend
             .device
@@ -5430,6 +5507,7 @@ impl GpuDenseCfrState {
                 label: Some("resident dense CFR download encoder"),
             });
         copy_buffer(&mut encoder, &self.regrets, &regret_readback, len);
+        copy_buffer(&mut encoder, &self.prediction, &prediction_readback, len);
         copy_buffer(&mut encoder, &self.strategy_sum, &strategy_readback, len);
         let submission = backend.queue.submit(Some(encoder.finish()));
         backend
@@ -5449,6 +5527,7 @@ impl GpuDenseCfrState {
             legal_actions,
             legal_action_counts,
             regrets: read_f32_buffer(&backend.device, &regret_readback, len)?,
+            prediction: read_f32_buffer(&backend.device, &prediction_readback, len)?,
             strategy_sum: read_f32_buffer(&backend.device, &strategy_readback, len)?,
         })
     }
@@ -5629,20 +5708,32 @@ fn variant_code(variant: super::CfrVariant) -> u32 {
         super::CfrVariant::CfrPlus => 0,
         super::CfrVariant::Discounted => 1,
         super::CfrVariant::DcfrPlus { .. } => 2,
+        super::CfrVariant::PdcfrPlus { .. } => 3,
     }
 }
 
 fn variant_dcfr_alpha(variant: super::CfrVariant) -> f32 {
     match variant {
-        super::CfrVariant::DcfrPlus { alpha, .. } => alpha,
+        super::CfrVariant::DcfrPlus { alpha, .. } | super::CfrVariant::PdcfrPlus { alpha, .. } => {
+            alpha
+        }
         _ => super::DEFAULT_DCFR_PLUS_ALPHA,
     }
 }
 
 fn variant_dcfr_gamma(variant: super::CfrVariant) -> f32 {
     match variant {
-        super::CfrVariant::DcfrPlus { gamma, .. } => gamma,
+        super::CfrVariant::DcfrPlus { gamma, .. } | super::CfrVariant::PdcfrPlus { gamma, .. } => {
+            gamma
+        }
         _ => super::DEFAULT_DCFR_PLUS_GAMMA,
+    }
+}
+
+fn variant_prediction_eta(variant: super::CfrVariant) -> f32 {
+    match variant {
+        super::CfrVariant::PdcfrPlus { eta, .. } => eta,
+        _ => 0.0,
     }
 }
 
