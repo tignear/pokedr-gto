@@ -598,6 +598,7 @@ fn try_solve_fixed_flop_metrics_gpu(
     let mut rows = Vec::with_capacity(checkpoints.len());
     let started = Instant::now();
     let mut completed_iterations = 0usize;
+    let include_local_gaps = std::env::var_os("POKEDR_METRIC_LOCAL_GAPS").is_some();
     for iterations in checkpoints {
         let delta = iterations.saturating_sub(completed_iterations);
         backend
@@ -623,16 +624,20 @@ fn try_solve_fixed_flop_metrics_gpu(
             .as_ref()
             .map(|previous| mean_l1_delta(previous, &root_strategy));
         let root_action_probabilities = root_action_probabilities(layout, &root_strategy);
-        let br_gap = br_gap_metrics_gpu(
-            &backend,
-            tree,
-            &linearized,
-            &combos,
-            &combo_legal,
-            villain_weights,
-            layout,
-            &state,
-        );
+        let br_gap = include_local_gaps
+            .then(|| {
+                br_gap_metrics_gpu(
+                    &backend,
+                    tree,
+                    &linearized,
+                    &combos,
+                    &combo_legal,
+                    villain_weights,
+                    layout,
+                    &state,
+                )
+            })
+            .flatten();
         let recursive_br_gap = recursive_br_gap_metrics_gpu(
             &backend,
             tree,
@@ -642,6 +647,7 @@ fn try_solve_fixed_flop_metrics_gpu(
             villain_weights,
             layout,
             &state,
+            include_local_gaps,
         );
         let diagnostics = cfr_state_diagnostics(&state);
         rows.push(FixedFlopMetricRow {
@@ -771,6 +777,7 @@ fn recursive_br_gap_metrics_gpu(
     villain_weights: &[f32],
     layout: &PostflopDenseLayout,
     state: &DenseCfrState,
+    include_local_gaps: bool,
 ) -> Option<BrGapMetrics> {
     let profile = state.average_strategy_profile_state();
     let hero_values = backend
@@ -809,6 +816,7 @@ fn recursive_br_gap_metrics_gpu(
         villain_weights,
         &hero_values,
         &villain_values,
+        include_local_gaps,
     ))
 }
 
@@ -905,6 +913,7 @@ fn recursive_br_gap_metrics_from_values(
     villain_weights: &[f32],
     hero_values: &GpuRootTerminalValues,
     villain_values: &GpuRootTerminalValues,
+    include_local_gaps: bool,
 ) -> BrGapMetrics {
     let mut strategy = vec![0.0; layout.max_actions()];
     let mut current_strategy = vec![0.0; layout.max_actions()];
@@ -914,9 +923,17 @@ fn recursive_br_gap_metrics_from_values(
     let mut local_weight_sum = 0.0;
     let mut local_gap_detail = None;
 
-    for public_infoset in 0..layout.infoset_count() {
+    let public_infoset_count = if include_local_gaps {
+        layout.infoset_count()
+    } else {
+        1
+    };
+    for public_infoset in 0..public_infoset_count {
         let action_count = layout.action_count(public_infoset);
         for player in [Player::Hero, Player::Villain] {
+            if !include_local_gaps && !(public_infoset == 0 && player == Player::Hero) {
+                continue;
+            }
             let values = match player {
                 Player::Hero => hero_values,
                 Player::Villain => villain_values,
@@ -945,24 +962,26 @@ fn recursive_br_gap_metrics_from_values(
                         root_gap_sum += gap * reach_weight;
                         root_weight_sum += reach_weight;
                     }
-                    let weighted_gap = gap * reach_weight;
-                    local_gap_sum += weighted_gap;
-                    local_weight_sum += reach_weight;
-                    update_local_gap_detail(
-                        &mut local_gap_detail,
-                        tree,
-                        layout,
-                        public_infoset,
-                        player,
-                        combo_index,
-                        gap,
-                        weighted_gap,
-                        reach_weight,
-                        action_values,
-                        &strategy[..action_count],
-                        state,
-                        &mut current_strategy,
-                    );
+                    if include_local_gaps {
+                        let weighted_gap = gap * reach_weight;
+                        local_gap_sum += weighted_gap;
+                        local_weight_sum += reach_weight;
+                        update_local_gap_detail(
+                            &mut local_gap_detail,
+                            tree,
+                            layout,
+                            public_infoset,
+                            player,
+                            combo_index,
+                            gap,
+                            weighted_gap,
+                            reach_weight,
+                            action_values,
+                            &strategy[..action_count],
+                            state,
+                            &mut current_strategy,
+                        );
+                    }
                 }
             }
         }
