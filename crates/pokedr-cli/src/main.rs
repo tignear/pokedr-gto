@@ -29,8 +29,8 @@ fn main() {
 }
 
 fn print_gpu_info() {
-    let backend = match GpuDenseCfrBackend::new() {
-        Ok(backend) => backend,
+    let (info, supports_shader_float32_atomic) = match GpuDenseCfrBackend::probe_adapter() {
+        Ok(probe) => probe,
         Err(GpuCfrError::NoAdapter) => {
             println!("no GPU adapter visible to wgpu");
             return;
@@ -40,16 +40,12 @@ fn print_gpu_info() {
             std::process::exit(1);
         }
     };
-    let info = backend.adapter_info();
     println!("name: {}", info.name);
     println!("backend: {:?}", info.backend);
     println!("device_type: {:?}", info.device_type);
     println!("vendor: 0x{:x}", info.vendor);
     println!("device: 0x{:x}", info.device);
-    println!(
-        "shader_float32_atomic: {}",
-        backend.supports_shader_float32_atomic()
-    );
+    println!("shader_float32_atomic: {}", supports_shader_float32_atomic);
 }
 
 fn run_gpu_smoke() {

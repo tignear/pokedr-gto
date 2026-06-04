@@ -1,4 +1,8 @@
-use std::{collections::BTreeMap, sync::mpsc, time::Instant};
+use std::{
+    collections::BTreeMap,
+    sync::mpsc,
+    time::{Duration, Instant},
+};
 
 use wgpu::util::DeviceExt;
 
@@ -1921,6 +1925,51 @@ fn requested_wgpu_backends() -> Option<wgpu::Backends> {
     (!backends.is_empty()).then_some(backends)
 }
 
+async fn request_gpu_adapter() -> Result<wgpu::Adapter, GpuCfrError> {
+    let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle_from_env();
+    if let Some(backends) = requested_wgpu_backends() {
+        descriptor.backends = backends;
+    } else {
+        #[cfg(windows)]
+        {
+            descriptor.backends = wgpu::Backends::DX12;
+        }
+        #[cfg(not(windows))]
+        {
+            descriptor.backends = wgpu::Backends::VULKAN;
+        }
+    }
+    descriptor
+        .flags
+        .insert(wgpu::InstanceFlags::ALLOW_UNDERLYING_NONCOMPLIANT_ADAPTER);
+    if std::env::var_os("POKEDR_GPU_INIT_TRACE").is_some() {
+        eprintln!(
+            "pokedr: gpu init creating instance backends={:?}",
+            descriptor.backends
+        );
+    }
+    let instance = wgpu::Instance::new(descriptor);
+    if std::env::var_os("POKEDR_GPU_INIT_TRACE").is_some() {
+        eprintln!("pokedr: gpu init requesting high-performance adapter");
+    }
+    let adapter = instance
+        .request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            force_fallback_adapter: false,
+            compatible_surface: None,
+        })
+        .await
+        .map_err(|_| GpuCfrError::NoAdapter)?;
+    if std::env::var_os("POKEDR_GPU_INIT_TRACE").is_some() {
+        let adapter_info = adapter.get_info();
+        eprintln!(
+            "pokedr: gpu init adapter name={} backend={:?}",
+            adapter_info.name, adapter_info.backend
+        );
+    }
+    Ok(adapter)
+}
+
 fn combos_collide_for_order(left: GpuPrivateCombo, right: GpuPrivateCombo) -> bool {
     left.cards[0] == right.cards[0]
         || left.cards[0] == right.cards[1]
@@ -1956,48 +2005,21 @@ impl GpuDenseCfrBackend {
         pollster::block_on(Self::new_async())
     }
 
+    pub fn probe_adapter() -> Result<(wgpu::AdapterInfo, bool), GpuCfrError> {
+        pollster::block_on(Self::probe_adapter_async())
+    }
+
+    pub async fn probe_adapter_async() -> Result<(wgpu::AdapterInfo, bool), GpuCfrError> {
+        let adapter = request_gpu_adapter().await?;
+        let supports_shader_float32_atomic = adapter
+            .features()
+            .contains(wgpu::Features::SHADER_FLOAT32_ATOMIC);
+        Ok((adapter.get_info(), supports_shader_float32_atomic))
+    }
+
     pub async fn new_async() -> Result<Self, GpuCfrError> {
-        let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle_from_env();
-        if let Some(backends) = requested_wgpu_backends() {
-            descriptor.backends = backends;
-        } else {
-            #[cfg(windows)]
-            {
-                descriptor.backends = wgpu::Backends::DX12;
-            }
-            #[cfg(not(windows))]
-            {
-                descriptor.backends = wgpu::Backends::VULKAN;
-            }
-        }
-        descriptor
-            .flags
-            .insert(wgpu::InstanceFlags::ALLOW_UNDERLYING_NONCOMPLIANT_ADAPTER);
-        if std::env::var_os("POKEDR_GPU_INIT_TRACE").is_some() {
-            eprintln!(
-                "pokedr: gpu init creating instance backends={:?}",
-                descriptor.backends
-            );
-        }
-        let instance = wgpu::Instance::new(descriptor);
-        if std::env::var_os("POKEDR_GPU_INIT_TRACE").is_some() {
-            eprintln!("pokedr: gpu init requesting high-performance adapter");
-        }
-        let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::HighPerformance,
-                force_fallback_adapter: false,
-                compatible_surface: None,
-            })
-            .await
-            .map_err(|_| GpuCfrError::NoAdapter)?;
+        let adapter = request_gpu_adapter().await?;
         let adapter_info = adapter.get_info();
-        if std::env::var_os("POKEDR_GPU_INIT_TRACE").is_some() {
-            eprintln!(
-                "pokedr: gpu init adapter name={} backend={:?}",
-                adapter_info.name, adapter_info.backend
-            );
-        }
         let adapter_features = adapter.features();
         let required_limits = adapter.limits();
         if std::env::var_os("POKEDR_GPU_INIT_TRACE").is_some() {
@@ -2980,6 +3002,10 @@ impl GpuDenseCfrBackend {
             .and_then(|value| value.parse::<usize>().ok())
             .unwrap_or(1)
             .max(1);
+        let stage_profile = std::env::var_os("POKEDR_GPU_TERMINAL_STAGE_PROFILE").is_some();
+        let mut partial_elapsed = Duration::ZERO;
+        let mut reduce_elapsed = Duration::ZERO;
+        let mut profiled_chunks = 0usize;
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -3074,6 +3100,49 @@ impl GpuDenseCfrBackend {
                         bind_entry(9, &reduce_params),
                     ],
                 });
+                if stage_profile {
+                    let mut partial_encoder =
+                        self.device
+                            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                                label: Some("public tree terminal partial profile encoder"),
+                            });
+                    {
+                        let mut pass =
+                            partial_encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                                label: Some("public tree streamed terminal partial pass"),
+                                timestamp_writes: None,
+                            });
+                        pass.set_pipeline(&self.public_tree_terminal_partial_pipeline);
+                        pass.set_bind_group(0, &partial_bind_group, &[]);
+                        pass.dispatch_workgroups(partial_x_groups, partial_y_groups, 1);
+                    }
+                    let start = Instant::now();
+                    self.queue.submit(Some(partial_encoder.finish()));
+                    self.profile_poll()?;
+                    partial_elapsed += start.elapsed();
+
+                    let mut reduce_encoder =
+                        self.device
+                            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                                label: Some("public tree terminal reduce profile encoder"),
+                            });
+                    {
+                        let mut pass =
+                            reduce_encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                                label: Some("public tree streamed terminal reduce pass"),
+                                timestamp_writes: None,
+                            });
+                        pass.set_pipeline(&self.public_tree_terminal_reduce_pipeline);
+                        pass.set_bind_group(0, &reduce_bind_group, &[]);
+                        pass.dispatch_workgroups(reduce_x_groups, reduce_y_groups, 1);
+                    }
+                    let start = Instant::now();
+                    self.queue.submit(Some(reduce_encoder.finish()));
+                    self.profile_poll()?;
+                    reduce_elapsed += start.elapsed();
+                    profiled_chunks += 1;
+                    continue;
+                }
                 {
                     let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                         label: Some("public tree streamed terminal partial pass"),
@@ -3109,6 +3178,18 @@ impl GpuDenseCfrBackend {
             self.queue.submit(Some(encoder.finish()));
         }
         self.profile_poll()?;
+        if stage_profile {
+            eprintln!(
+                "pokedr: gpu profile phase=cfv_terminal_partial elapsed_ms={:.3} chunks={}",
+                partial_elapsed.as_secs_f64() * 1000.0,
+                profiled_chunks
+            );
+            eprintln!(
+                "pokedr: gpu profile phase=cfv_terminal_reduce elapsed_ms={:.3} chunks={}",
+                reduce_elapsed.as_secs_f64() * 1000.0,
+                profiled_chunks
+            );
+        }
         Ok(())
     }
 
