@@ -1350,6 +1350,10 @@ fn terminal_card_prefix(
             let bounds = combo_bounds[board * params.combo_count + combo_index];
             let combo = combos[combo_index];
             if bounds.legal != 0u {
+                if bounds.group_start == position {
+                    card_prefix_pairs[output_base + position] =
+                        PrefixPair(hero_sum, villain_sum);
+                }
                 if combo.cards[0] == card || combo.cards[1] == card {
                     hero_sum = hero_sum + hero_reaches[node_offset + combo_index];
                     villain_sum = villain_sum + villain_reaches[node_offset + combo_index];
@@ -1361,6 +1365,7 @@ fn terminal_card_prefix(
             }
         }
     }
+    card_prefix_pairs[output_base + params.combo_count] = PrefixPair(hero_sum, villain_sum);
 }
 "#;
 
