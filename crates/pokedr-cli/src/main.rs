@@ -735,7 +735,8 @@ fn analyze_tree_nodes(nodes: &[Value]) -> Value {
                         "action": json_string_field(action, "action"),
                         "source": json_string_field(action, "source"),
                         "child": child,
-                        "summary": summarize_tree_subset(subtree_nodes.into_iter()),
+                        "summary": summarize_tree_subset(subtree_nodes.iter().copied()),
+                        "solver_summary": summarize_solver_subset(subtree_nodes.iter().copied()),
                     })
                 })
                 .collect::<Vec<_>>()
@@ -745,6 +746,7 @@ fn analyze_tree_nodes(nodes: &[Value]) -> Value {
     json!({
         "root": root,
         "total": total,
+        "solver_summary": summarize_solver_subset(nodes.iter()),
         "root_action_subtrees": root_actions,
     })
 }
@@ -837,6 +839,111 @@ fn summarize_tree_subset<'a>(nodes: impl Iterator<Item = &'a Value>) -> Value {
         "to_call_counts": to_call_counts,
         "terminal_pot_counts": terminal_pot_counts,
     })
+}
+
+fn summarize_solver_subset<'a>(nodes: impl Iterator<Item = &'a Value>) -> Value {
+    let mut solver_nodes = 0usize;
+    let mut avg_gap_sum = 0.0f64;
+    let mut current_gap_sum = 0.0f64;
+    let mut max_avg_gap = 0.0f64;
+    let mut max_current_gap = 0.0f64;
+    let mut top_avg_gaps = Vec::<Value>::new();
+    let mut top_current_gaps = Vec::<Value>::new();
+
+    for node in nodes {
+        let Some(solver) = node.get("solver") else {
+            continue;
+        };
+        let avg_gap = solver_gap(solver, "avg_action_ev", "avg_policy_ev");
+        let current_gap = solver_gap(solver, "current_action_ev", "current_policy_ev");
+        if avg_gap.is_none() && current_gap.is_none() {
+            continue;
+        }
+        solver_nodes += 1;
+        if let Some(gap) = avg_gap {
+            avg_gap_sum += gap;
+            max_avg_gap = max_avg_gap.max(gap);
+            push_top_solver_gap(&mut top_avg_gaps, node, solver, gap, "avg_action_ev");
+        }
+        if let Some(gap) = current_gap {
+            current_gap_sum += gap;
+            max_current_gap = max_current_gap.max(gap);
+            push_top_solver_gap(
+                &mut top_current_gaps,
+                node,
+                solver,
+                gap,
+                "current_action_ev",
+            );
+        }
+    }
+
+    json!({
+        "solver_nodes": solver_nodes,
+        "mean_avg_gap": if solver_nodes > 0 { avg_gap_sum / solver_nodes as f64 } else { 0.0 },
+        "mean_current_gap": if solver_nodes > 0 { current_gap_sum / solver_nodes as f64 } else { 0.0 },
+        "max_avg_gap": max_avg_gap,
+        "max_current_gap": max_current_gap,
+        "top_avg_gaps": top_avg_gaps,
+        "top_current_gaps": top_current_gaps,
+    })
+}
+
+fn solver_gap(solver: &Value, action_ev_key: &str, policy_ev_key: &str) -> Option<f64> {
+    let action_values = solver.get(action_ev_key)?.as_array()?;
+    let policy_ev = solver.get(policy_ev_key)?.as_f64()?;
+    let best = action_values
+        .iter()
+        .filter_map(Value::as_f64)
+        .fold(f64::NEG_INFINITY, f64::max);
+    best.is_finite().then_some((best - policy_ev).max(0.0))
+}
+
+fn push_top_solver_gap(
+    top: &mut Vec<Value>,
+    node: &Value,
+    solver: &Value,
+    gap: f64,
+    action_ev_key: &str,
+) {
+    let action_values = solver
+        .get(action_ev_key)
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let best_action = action_values
+        .iter()
+        .enumerate()
+        .filter_map(|(index, value)| value.as_f64().map(|value| (index, value)))
+        .max_by(|(_, left), (_, right)| {
+            left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|(index, _)| index);
+    let path = node
+        .get("path")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    top.push(json!({
+        "gap": gap,
+        "node": json_usize_field(node, "index"),
+        "infoset": node.get("infoset").cloned().unwrap_or(Value::Null),
+        "best_action": best_action,
+        "action_values": action_values,
+        "policy_ev": solver.get(if action_ev_key == "avg_action_ev" { "avg_policy_ev" } else { "current_policy_ev" }).cloned().unwrap_or(Value::Null),
+        "avg_strategy": solver.get("avg_strategy").cloned().unwrap_or(Value::Null),
+        "current_strategy": solver.get("current_strategy").cloned().unwrap_or(Value::Null),
+        "state": node.get("state").cloned().unwrap_or(Value::Null),
+        "path": path,
+    }));
+    top.sort_by(|left, right| {
+        let left_gap = left.get("gap").and_then(Value::as_f64).unwrap_or(0.0);
+        let right_gap = right.get("gap").and_then(Value::as_f64).unwrap_or(0.0);
+        right_gap
+            .partial_cmp(&left_gap)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    top.truncate(10);
 }
 
 fn node_belongs_to_subtree(

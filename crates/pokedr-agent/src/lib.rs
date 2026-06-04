@@ -2749,6 +2749,11 @@ fn dump_solver_node_json(
     let mut average_strategy = vec![0.0; layout.max_actions()];
     let mut average_sum = vec![0.0; action_count];
     let mut current_sum = vec![0.0; action_count];
+    let mut avg_action_value_sum = vec![0.0; action_count];
+    let mut current_action_value_sum = vec![0.0; action_count];
+    let mut avg_policy_value_sum = 0.0;
+    let mut current_policy_value_sum = 0.0;
+    let mut action_value_weight_sum = 0.0;
     let mut legal_combo_count = 0usize;
     let mut gap_rows = Vec::new();
 
@@ -2767,14 +2772,33 @@ fn dump_solver_node_json(
             average_sum[action] += average_strategy[action];
             current_sum[action] += current_strategy[action];
         }
-        gap_rows.push(dump_solver_combo_row(
+        let row = dump_solver_combo_row(
             context,
             combo_index,
             offset,
             action_count,
             &average_strategy,
             &current_strategy,
-        ));
+        );
+        if row.reach_weight > 0.0 {
+            let value_weight = row.reach_weight;
+            if let Some(values) = &row.avg_action_values {
+                for action in 0..action_count {
+                    avg_action_value_sum[action] += values[action] * value_weight;
+                    avg_policy_value_sum +=
+                        values[action] * average_strategy[action] * value_weight;
+                }
+            }
+            if let Some(values) = &row.current_action_values {
+                for action in 0..action_count {
+                    current_action_value_sum[action] += values[action] * value_weight;
+                    current_policy_value_sum +=
+                        values[action] * current_strategy[action] * value_weight;
+                }
+            }
+            action_value_weight_sum += value_weight;
+        }
+        gap_rows.push(row);
     }
 
     if legal_combo_count > 0 {
@@ -2782,6 +2806,14 @@ fn dump_solver_node_json(
             average_sum[action] /= legal_combo_count as f32;
             current_sum[action] /= legal_combo_count as f32;
         }
+    }
+    if action_value_weight_sum > 0.0 {
+        for action in 0..action_count {
+            avg_action_value_sum[action] /= action_value_weight_sum;
+            current_action_value_sum[action] /= action_value_weight_sum;
+        }
+        avg_policy_value_sum /= action_value_weight_sum;
+        current_policy_value_sum /= action_value_weight_sum;
     }
 
     gap_rows.sort_by(|left, right| {
@@ -2804,7 +2836,7 @@ fn dump_solver_node_json(
         String::new()
     };
     Some(format!(
-        r#"{{"mode":"{:?}","iterations":{},"public_infoset":{},"acting_player":"{:?}","action_count":{},"legal_combo_count":{},"actions":[{}],"avg_strategy":{},"current_strategy":{},"max_gap":{}{}}}"#,
+        r#"{{"mode":"{:?}","iterations":{},"public_infoset":{},"acting_player":"{:?}","action_count":{},"legal_combo_count":{},"actions":[{}],"avg_strategy":{},"current_strategy":{},"avg_action_ev":{},"current_action_ev":{},"avg_policy_ev":{},"current_policy_ev":{},"max_gap":{}{}}}"#,
         context.mode,
         context.iterations,
         public_infoset,
@@ -2826,6 +2858,10 @@ fn dump_solver_node_json(
             .join(","),
         json_f32_array(&average_sum),
         json_f32_array(&current_sum),
+        json_f32_array_or_null(&avg_action_value_sum, action_value_weight_sum > 0.0),
+        json_f32_array_or_null(&current_action_value_sum, action_value_weight_sum > 0.0),
+        json_f32_or_null(avg_policy_value_sum, action_value_weight_sum > 0.0),
+        json_f32_or_null(current_policy_value_sum, action_value_weight_sum > 0.0),
         max_gap.unwrap_or_else(|| "null".to_string()),
         combos
     ))
@@ -3033,6 +3069,14 @@ fn json_f32(value: f32) -> String {
     }
 }
 
+fn json_f32_or_null(value: f32, present: bool) -> String {
+    if present {
+        json_f32(value)
+    } else {
+        "null".to_string()
+    }
+}
+
 fn json_f32_array(values: &[f32]) -> String {
     format!(
         "[{}]",
@@ -3042,6 +3086,14 @@ fn json_f32_array(values: &[f32]) -> String {
             .collect::<Vec<_>>()
             .join(",")
     )
+}
+
+fn json_f32_array_or_null(values: &[f32], present: bool) -> String {
+    if present {
+        json_f32_array(values)
+    } else {
+        "null".to_string()
+    }
 }
 
 fn json_escape(value: &str) -> String {
