@@ -111,7 +111,9 @@ fn update(@builtin(global_invocation_id) id: vec3<u32>) {
     for (var action = 0u; action < actions; action = action + 1u) {
         if legal_actions[offset + action] == 0u {
             regrets[offset + action] = 0.0;
-            prediction[offset + action] = 0.0;
+            if variant == 3u {
+                prediction[offset + action] = 0.0;
+            }
             strategy_sum[offset + action] = 0.0;
             continue;
         }
@@ -126,7 +128,9 @@ fn update(@builtin(global_invocation_id) id: vec3<u32>) {
             updated = max(updated, 0.0);
         }
         regrets[offset + action] = updated;
-        prediction[offset + action] = select(0.0, regret, variant == 3u);
+        if variant == 3u {
+            prediction[offset + action] = regret;
+        }
         strategy_sum[offset + action] = strategy_sum[offset + action] * average_discount + strategy_weights[infoset] * strategy;
     }
 }
@@ -245,7 +249,9 @@ fn update(@builtin(global_invocation_id) id: vec3<u32>) {
     for (var action = 0u; action < actions; action = action + 1u) {
         if legal_actions[offset + action] == 0u {
             regrets[offset + action] = 0.0;
-            prediction[offset + action] = 0.0;
+            if variant == 3u {
+                prediction[offset + action] = 0.0;
+            }
             strategy_sum[offset + action] = 0.0;
             continue;
         }
@@ -260,7 +266,9 @@ fn update(@builtin(global_invocation_id) id: vec3<u32>) {
             updated = max(updated, 0.0);
         }
         regrets[offset + action] = updated;
-        prediction[offset + action] = select(0.0, regret, variant == 3u);
+        if variant == 3u {
+            prediction[offset + action] = regret;
+        }
         strategy_sum[offset + action] = strategy_sum[offset + action] * average_discount + strategy_weight * strategy;
     }
 }
@@ -3141,7 +3149,10 @@ impl GpuDenseCfrBackend {
         }
 
         let regret_readback = readback_buffer(&self.device, state.regrets.len());
-        let prediction_readback = readback_buffer(&self.device, state.prediction.len());
+        let prediction_readback = state
+            .variant
+            .uses_prediction()
+            .then(|| readback_buffer(&self.device, state.prediction.len()));
         let strategy_readback = readback_buffer(&self.device, state.strategy_sum.len());
         copy_buffer(
             &mut encoder,
@@ -3149,12 +3160,14 @@ impl GpuDenseCfrBackend {
             &regret_readback,
             state.regrets.len(),
         );
-        copy_buffer(
-            &mut encoder,
-            &prediction,
-            &prediction_readback,
-            state.prediction.len(),
-        );
+        if let Some(prediction_readback) = &prediction_readback {
+            copy_buffer(
+                &mut encoder,
+                &prediction,
+                prediction_readback,
+                state.prediction.len(),
+            );
+        }
         copy_buffer(
             &mut encoder,
             &strategy_sum,
@@ -3170,15 +3183,16 @@ impl GpuDenseCfrBackend {
             .map_err(|error| GpuCfrError::MapFailed(error.to_string()))?;
 
         let regrets_len = state.regrets.len();
-        let prediction_len = state.prediction.len();
         let strategy_sum_len = state.strategy_sum.len();
         let updated_regrets = read_f32_buffer(&self.device, &regret_readback, regrets_len)?;
-        let updated_prediction =
-            read_f32_buffer(&self.device, &prediction_readback, prediction_len)?;
+        if let Some(prediction_readback) = &prediction_readback {
+            let updated_prediction =
+                read_f32_buffer(&self.device, prediction_readback, state.prediction.len())?;
+            state.prediction.copy_from_slice(&updated_prediction);
+        }
         let updated_strategy_sum =
             read_f32_buffer(&self.device, &strategy_readback, strategy_sum_len)?;
         state.regrets.copy_from_slice(&updated_regrets);
-        state.prediction.copy_from_slice(&updated_prediction);
         state.strategy_sum.copy_from_slice(&updated_strategy_sum);
         Ok(())
     }

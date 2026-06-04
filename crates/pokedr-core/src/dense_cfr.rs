@@ -227,7 +227,9 @@ impl DenseCfrState {
         for action in 0..self.actions {
             if !self.legal_actions[offset + action] {
                 self.regrets[offset + action] = 0.0;
-                self.prediction[offset + action] = 0.0;
+                if self.variant.uses_prediction() {
+                    self.prediction[offset + action] = 0.0;
+                }
                 self.strategy_sum[offset + action] = 0.0;
                 continue;
             }
@@ -241,11 +243,9 @@ impl DenseCfrState {
             ) {
                 *slot = slot.max(0.0);
             }
-            self.prediction[offset + action] = if self.variant.uses_prediction() {
-                regret
-            } else {
-                0.0
-            };
+            if self.variant.uses_prediction() {
+                self.prediction[offset + action] = regret;
+            }
             self.strategy_sum[offset + action] *=
                 average_strategy_discount(self.variant, iteration);
             self.strategy_sum[offset + action] += strategy_weight * strategy[action];
