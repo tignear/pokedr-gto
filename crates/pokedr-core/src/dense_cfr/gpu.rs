@@ -1232,19 +1232,26 @@ struct Params {
 @group(0) @binding(8) var<uniform> params: Params;
 
 @compute @workgroup_size(64)
-fn terminal_card_prefix(@builtin(global_invocation_id) id: vec3<u32>) {
-    let index = id.x + id.y * params.x_invocations;
-    let output_count = params.terminal_count * params.board_count * 52u;
+fn terminal_card_prefix(
+    @builtin(workgroup_id) workgroup_id: vec3<u32>,
+    @builtin(local_invocation_id) local_id: vec3<u32>,
+) {
+    let index = workgroup_id.x + workgroup_id.y * params.x_invocations;
+    let output_count = params.terminal_count * params.board_count;
     if index >= output_count {
         return;
     }
-    let card = index % 52u;
-    let board = (index / 52u) % params.board_count;
-    let terminal_slot = index / (52u * params.board_count);
+    let card = local_id.x;
+    if card >= 52u {
+        return;
+    }
+    let board = index % params.board_count;
+    let terminal_slot = index / params.board_count;
     let node_index = terminal_nodes[terminal_slot];
     let node_offset = node_index * params.combo_count;
     let order_base = board * params.combo_count;
-    let output_base = (terminal_slot * params.board_count * 52u + board * 52u + card) * params.card_stride;
+    let output_base =
+        (terminal_slot * params.board_count * 52u + board * 52u + card) * params.card_stride;
     var hero_sum = 0.0;
     var villain_sum = 0.0;
     card_prefix_pairs[output_base] = PrefixPair(0.0, 0.0);
@@ -1253,12 +1260,17 @@ fn terminal_card_prefix(@builtin(global_invocation_id) id: vec3<u32>) {
         if combo_index != 0xffffffffu {
             let bounds = combo_bounds[board * params.combo_count + combo_index];
             let combo = combos[combo_index];
-            if bounds.legal != 0u && (combo.cards[0] == card || combo.cards[1] == card) {
-                hero_sum = hero_sum + hero_reaches[node_offset + combo_index];
-                villain_sum = villain_sum + villain_reaches[node_offset + combo_index];
+            if bounds.legal != 0u {
+                if combo.cards[0] == card || combo.cards[1] == card {
+                    hero_sum = hero_sum + hero_reaches[node_offset + combo_index];
+                    villain_sum = villain_sum + villain_reaches[node_offset + combo_index];
+                }
+                if bounds.group_end == position + 1u {
+                    card_prefix_pairs[output_base + position + 1u] =
+                        PrefixPair(hero_sum, villain_sum);
+                }
             }
         }
-        card_prefix_pairs[output_base + position + 1u] = PrefixPair(hero_sum, villain_sum);
     }
 }
 "#;
@@ -3561,9 +3573,9 @@ impl GpuDenseCfrBackend {
                         bind_entry(9, &reduce_params),
                     ],
                 });
-                let card_prefix_invocations = terminal_count * group.board_count * Card::COUNT;
-                let (card_prefix_x_groups, card_prefix_y_groups, card_prefix_x_invocations) =
-                    dispatch_grid(card_prefix_invocations);
+                let card_prefix_workgroups = (terminal_count * group.board_count) as u32;
+                let card_prefix_x_groups = card_prefix_workgroups.min(65_535).max(1);
+                let card_prefix_y_groups = card_prefix_workgroups.div_ceil(card_prefix_x_groups);
                 let card_prefix_params = uniform_buffer(
                     &self.device,
                     "public tree streamed terminal card prefix params",
@@ -3573,7 +3585,21 @@ impl GpuDenseCfrBackend {
                         max_actions: group.board_count as u32,
                         output_len: (combo_count + 1) as u32,
                         pair_start: (combo_count + 1) as u32,
-                        chunk_pairs: card_prefix_x_invocations,
+                        chunk_pairs: card_prefix_x_groups,
+                        _pad0: group.board_base as u32,
+                        _pad1: 0,
+                    }],
+                );
+                let card_reduce_params = uniform_buffer(
+                    &self.device,
+                    "public tree streamed terminal card aggregate reduce params",
+                    &[GpuPublicTreeParams {
+                        combo_count: combo_count as u32,
+                        node_count: terminal_count as u32,
+                        max_actions: group.board_count as u32,
+                        output_len: (combo_count + 1) as u32,
+                        pair_start: (combo_count + 1) as u32,
+                        chunk_pairs: reduce_x_invocations,
                         _pad0: group.board_base as u32,
                         _pad1: 0,
                     }],
@@ -3618,7 +3644,7 @@ impl GpuDenseCfrBackend {
                             bind_entry(7, terminal_card_prefix_pairs_buffer),
                             bind_entry(8, hero_values_buffer),
                             bind_entry(9, villain_values_buffer),
-                            bind_entry(10, &card_prefix_params),
+                            bind_entry(10, &card_reduce_params),
                         ],
                     })
                 });

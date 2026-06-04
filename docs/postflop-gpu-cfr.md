@@ -778,13 +778,20 @@ card prefix, 16M pair scratch:
   card_prefix ~918ms
   reduce      ~230ms
   terminal    ~1579ms
+
+card prefix, per-card workgroup and group-boundary writes:
+  partial     ~306ms
+  card_prefix ~703ms
+  reduce      ~259ms
+  terminal    ~1430ms
 ```
 
 So the formula is useful, but materializing all 52 card prefix lanes is too
-much memory traffic. The next viable version needs to avoid writing the full
-`52 * (combo_count + 1)` prefix table, for example by fusing a much smaller
-card/group summary into the existing prefix scan or by only materializing lanes
-actually consumed by a tile.
+much work. Writing only group boundaries helps, but every card lane still scans
+the full combo order. The next viable version needs to avoid the `52 *
+combo_count` scan itself, not just reduce writes. That likely means fusing card
+mass accumulation into the existing total-prefix scan or building a compact
+per-group summary without a separate per-card pass.
 
 ## Next Mathematical Cut
 
