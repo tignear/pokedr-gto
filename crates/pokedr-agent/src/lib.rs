@@ -139,6 +139,9 @@ pub struct LocalGapDetail {
     pub combo: String,
     pub action_values: Vec<f32>,
     pub average_strategy: Vec<f32>,
+    pub current_strategy: Vec<f32>,
+    pub regrets: Vec<f32>,
+    pub strategy_sum: Vec<f32>,
     pub actions: Vec<String>,
 }
 
@@ -736,7 +739,9 @@ fn br_gap_metrics_gpu(
             &profile,
         )
         .ok()?;
-    Some(br_gap_metrics_from_values(tree, layout, &profile, &values))
+    Some(br_gap_metrics_from_values(
+        tree, layout, state, &profile, &values,
+    ))
 }
 
 fn recursive_br_gap_metrics_gpu(
@@ -779,6 +784,7 @@ fn recursive_br_gap_metrics_gpu(
     Some(recursive_br_gap_metrics_from_values(
         tree,
         layout,
+        state,
         &profile,
         &hero_values,
         &villain_values,
@@ -788,10 +794,12 @@ fn recursive_br_gap_metrics_gpu(
 fn br_gap_metrics_from_values(
     tree: &SubgameTree,
     layout: &PostflopDenseLayout,
-    profile: &DenseCfrState,
+    state: &DenseCfrState,
+    _profile: &DenseCfrState,
     values: &GpuRootTerminalValues,
 ) -> BrGapMetrics {
     let mut strategy = vec![0.0; layout.max_actions()];
+    let mut current_strategy = vec![0.0; layout.max_actions()];
     let mut root_gap_sum = 0.0;
     let mut root_weight_sum = 0.0;
     let mut local_gap_sum = 0.0;
@@ -812,7 +820,7 @@ fn br_gap_metrics_from_values(
                 if !best.is_finite() {
                     continue;
                 }
-                profile.average_strategy_for(infoset, &mut strategy);
+                state.average_strategy_for(infoset, &mut strategy);
                 let policy_value = action_values
                     .iter()
                     .zip(&strategy)
@@ -840,6 +848,8 @@ fn br_gap_metrics_from_values(
                         reach_weight,
                         action_values,
                         &strategy[..action_count],
+                        state,
+                        &mut current_strategy,
                     );
                 }
             }
@@ -864,11 +874,13 @@ fn br_gap_metrics_from_values(
 fn recursive_br_gap_metrics_from_values(
     tree: &SubgameTree,
     layout: &PostflopDenseLayout,
-    profile: &DenseCfrState,
+    state: &DenseCfrState,
+    _profile: &DenseCfrState,
     hero_values: &GpuRootTerminalValues,
     villain_values: &GpuRootTerminalValues,
 ) -> BrGapMetrics {
     let mut strategy = vec![0.0; layout.max_actions()];
+    let mut current_strategy = vec![0.0; layout.max_actions()];
     let mut root_gap_sum = 0.0;
     let mut root_weight_sum = 0.0;
     let mut local_gap_sum = 0.0;
@@ -893,7 +905,7 @@ fn recursive_br_gap_metrics_from_values(
                 if !best.is_finite() {
                     continue;
                 }
-                profile.average_strategy_for(infoset, &mut strategy);
+                state.average_strategy_for(infoset, &mut strategy);
                 let policy_value = action_values
                     .iter()
                     .zip(&strategy)
@@ -921,6 +933,8 @@ fn recursive_br_gap_metrics_from_values(
                         reach_weight,
                         action_values,
                         &strategy[..action_count],
+                        state,
+                        &mut current_strategy,
                     );
                 }
             }
@@ -955,6 +969,8 @@ fn update_local_gap_detail(
     reach_weight: f32,
     action_values: &[f32],
     average_strategy: &[f32],
+    state: &DenseCfrState,
+    current_strategy_buffer: &mut [f32],
 ) {
     if current
         .as_ref()
@@ -965,6 +981,9 @@ fn update_local_gap_detail(
     let indexer = ComboIndexer::new();
     let combo = indexer.combo(combo_index);
     let node_index = layout.infoset_node(public_infoset);
+    let infoset = private_infoset(public_infoset, player, combo_index);
+    let offset = infoset * layout.max_actions();
+    state.strategy_for(infoset, current_strategy_buffer);
     let actions = (0..layout.action_count(public_infoset))
         .filter_map(|action| layout.action(tree, public_infoset, action))
         .map(format_action_candidate)
@@ -980,6 +999,9 @@ fn update_local_gap_detail(
         combo: format_pokedr_cards(&[combo.first, combo.second]),
         action_values: action_values.to_vec(),
         average_strategy: average_strategy.to_vec(),
+        current_strategy: current_strategy_buffer[..action_values.len()].to_vec(),
+        regrets: state.regrets()[offset..offset + action_values.len()].to_vec(),
+        strategy_sum: state.strategy_sum()[offset..offset + action_values.len()].to_vec(),
         actions,
     });
 }

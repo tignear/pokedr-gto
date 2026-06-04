@@ -300,7 +300,7 @@ fn run_solve_flop_metrics(flop_arg: Option<&str>) {
 
 fn format_gap_detail(detail: &pokedr_agent::LocalGapDetail) -> String {
     format!(
-        "gap={:.6} weighted_gap={:.6} reach={:.6} public_infoset={} node={} player={:?} combo_index={} combo=[{}] actions=[{}] avg_strategy=[{}] action_values=[{}]",
+        "gap={:.6} weighted_gap={:.6} reach={:.6} public_infoset={} node={} player={:?} combo_index={} combo=[{}] actions=[{}] avg_strategy=[{}] current_strategy=[{}] regrets=[{}] strategy_sum=[{}] action_values=[{}]",
         detail.gap,
         detail.weighted_gap,
         detail.reach_weight,
@@ -312,6 +312,24 @@ fn format_gap_detail(detail: &pokedr_agent::LocalGapDetail) -> String {
         detail.actions.join(","),
         detail
             .average_strategy
+            .iter()
+            .map(|value| format!("{value:.4}"))
+            .collect::<Vec<_>>()
+            .join(","),
+        detail
+            .current_strategy
+            .iter()
+            .map(|value| format!("{value:.4}"))
+            .collect::<Vec<_>>()
+            .join(","),
+        detail
+            .regrets
+            .iter()
+            .map(|value| format!("{value:.4}"))
+            .collect::<Vec<_>>()
+            .join(","),
+        detail
+            .strategy_sum
             .iter()
             .map(|value| format!("{value:.4}"))
             .collect::<Vec<_>>()
