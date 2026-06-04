@@ -317,14 +317,19 @@ fn run_solve_flop_metrics(args: FlopCommandArgs) {
         "solving fixed flop metrics variant={:?} depth={} equity_runout_cap={} terminal_runouts=full iterations={:?} target_bb100={:.2}",
         config.cfr_variant, config.max_depth, config.max_showdown_runouts, iterations, target_bb100
     );
+    let dump_gap_nodes = std::env::var_os("POKEDR_METRIC_LOCAL_GAPS").is_some();
     let mut best_exploitability_bb100 = f32::INFINITY;
     let mut regression_count = 0usize;
     let patience = convergence
         .as_ref()
         .map(|settings| settings.regression_patience)
         .unwrap_or(usize::MAX);
+    let gap_node_config = config.clone();
     pokedr_agent::solve_fixed_flop_metrics_with_callback(flop, config, &iterations, |row| {
         print_metric_row(row, target_bb100);
+        if dump_gap_nodes {
+            print_metric_gap_nodes(flop, gap_node_config.clone(), row);
+        }
         if !row.finite
             || row.current_strategy_norm_error > 1.0e-3
             || row.average_strategy_norm_error > 1.0e-3
@@ -358,6 +363,28 @@ fn run_solve_flop_metrics(args: FlopCommandArgs) {
         }
         true
     });
+}
+
+fn print_metric_gap_nodes(
+    flop: [Card; 3],
+    config: pokedr_agent::PokedrAgentConfig,
+    row: &pokedr_agent::FixedFlopMetricRow,
+) {
+    let mut nodes = Vec::new();
+    if let Some(detail) = &row.local_gap_detail {
+        nodes.push(("local_gap_node", detail.node_index));
+    }
+    if let Some(detail) = &row.recursive_local_gap_detail {
+        if !nodes.iter().any(|(_, node)| *node == detail.node_index) {
+            nodes.push(("recursive_local_gap_node", detail.node_index));
+        }
+    }
+    for (label, node_index) in nodes {
+        match pokedr_agent::dump_fixed_flop_tree_node(flop, config.clone(), node_index) {
+            Some(json) => println!("  {label} {json}"),
+            None => println!("  {label} missing node={node_index}"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]

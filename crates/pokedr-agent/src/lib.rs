@@ -542,6 +542,28 @@ where
 }
 
 pub fn dump_fixed_flop_tree(flop: [PokedrCard; 3], config: PokedrAgentConfig) -> Vec<String> {
+    let (tree, layout) = fixed_flop_tree_and_layout(flop, config);
+    tree.nodes()
+        .iter()
+        .enumerate()
+        .map(|(index, node)| dump_tree_node_json(&tree, &layout, index, node))
+        .collect()
+}
+
+pub fn dump_fixed_flop_tree_node(
+    flop: [PokedrCard; 3],
+    config: PokedrAgentConfig,
+    node_index: usize,
+) -> Option<String> {
+    let (tree, layout) = fixed_flop_tree_and_layout(flop, config);
+    let node = tree.nodes().get(node_index)?;
+    Some(dump_tree_node_json(&tree, &layout, node_index, node))
+}
+
+fn fixed_flop_tree_and_layout(
+    flop: [PokedrCard; 3],
+    config: PokedrAgentConfig,
+) -> (SubgameTree, PostflopDenseLayout) {
     let public_state = PublicState {
         street: Street::Flop,
         board: Board::new(flop.to_vec()),
@@ -564,11 +586,7 @@ pub fn dump_fixed_flop_tree(flop: [PokedrCard; 3], config: PokedrAgentConfig) ->
         },
     );
     let layout = PostflopDenseLayout::from_tree(&tree);
-    tree.nodes()
-        .iter()
-        .enumerate()
-        .map(|(index, node)| dump_tree_node_json(&tree, &layout, index, node))
-        .collect()
+    (tree, layout)
 }
 
 #[allow(clippy::too_many_arguments)]
