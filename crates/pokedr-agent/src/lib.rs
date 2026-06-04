@@ -114,6 +114,9 @@ pub struct FixedFlopMetricRow {
     pub elapsed_secs: f32,
     pub root_strategy_l1_delta: Option<f32>,
     pub root_action_probabilities: Vec<f32>,
+    pub root_exploitability: Option<f32>,
+    pub hero_root_br_value: Option<f32>,
+    pub villain_response_root_value: Option<f32>,
     pub root_br_gap: Option<f32>,
     pub local_br_gap: Option<f32>,
     pub recursive_root_br_gap: Option<f32>,
@@ -502,6 +505,9 @@ pub fn solve_fixed_flop_metrics(
             elapsed_secs,
             root_strategy_l1_delta,
             root_action_probabilities,
+            root_exploitability: None,
+            hero_root_br_value: None,
+            villain_response_root_value: None,
             root_br_gap: None,
             local_br_gap: None,
             recursive_root_br_gap: None,
@@ -644,6 +650,15 @@ fn try_solve_fixed_flop_metrics_gpu(
             elapsed_secs,
             root_strategy_l1_delta,
             root_action_probabilities,
+            root_exploitability: recursive_br_gap
+                .as_ref()
+                .map(|metrics| metrics.root_exploitability),
+            hero_root_br_value: recursive_br_gap
+                .as_ref()
+                .map(|metrics| metrics.hero_root_br_value),
+            villain_response_root_value: recursive_br_gap
+                .as_ref()
+                .map(|metrics| metrics.villain_response_root_value),
             root_br_gap: br_gap.as_ref().map(|metrics| metrics.root_br_gap),
             local_br_gap: br_gap.as_ref().map(|metrics| metrics.local_br_gap),
             recursive_root_br_gap: recursive_br_gap.as_ref().map(|metrics| metrics.root_br_gap),
@@ -713,6 +728,9 @@ fn cfr_state_diagnostics(state: &DenseCfrState) -> CfrDiagnostics {
 struct BrGapMetrics {
     root_br_gap: f32,
     local_br_gap: f32,
+    root_exploitability: f32,
+    hero_root_br_value: f32,
+    villain_response_root_value: f32,
     local_gap_detail: Option<LocalGapDetail>,
 }
 
@@ -867,6 +885,9 @@ fn br_gap_metrics_from_values(
         } else {
             0.0
         },
+        root_exploitability: 0.0,
+        hero_root_br_value: 0.0,
+        villain_response_root_value: 0.0,
         local_gap_detail,
     }
 }
@@ -941,6 +962,9 @@ fn recursive_br_gap_metrics_from_values(
         }
     }
 
+    let root_exploitability =
+        root_exploitability_from_recursive_values(layout, state, hero_values, villain_values);
+
     BrGapMetrics {
         root_br_gap: if root_weight_sum > 0.0 {
             root_gap_sum / root_weight_sum
@@ -952,7 +976,82 @@ fn recursive_br_gap_metrics_from_values(
         } else {
             0.0
         },
+        root_exploitability: root_exploitability.exploitability,
+        hero_root_br_value: root_exploitability.hero_br_value,
+        villain_response_root_value: root_exploitability.villain_response_value,
         local_gap_detail,
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RootExploitability {
+    exploitability: f32,
+    hero_br_value: f32,
+    villain_response_value: f32,
+}
+
+fn root_exploitability_from_recursive_values(
+    layout: &PostflopDenseLayout,
+    state: &DenseCfrState,
+    hero_values: &GpuRootTerminalValues,
+    villain_values: &GpuRootTerminalValues,
+) -> RootExploitability {
+    let root_action_count = layout.action_count(0);
+    let mut strategy = vec![0.0; layout.max_actions()];
+    let mut hero_br_sum = 0.0;
+    let mut villain_response_sum = 0.0;
+    let mut weight_sum = 0.0;
+
+    for combo_index in 0..COMBO_COUNT {
+        let infoset = private_infoset(0, Player::Hero, combo_index);
+        let offset = infoset * layout.max_actions();
+        let weight = hero_values
+            .reach_weights
+            .get(infoset)
+            .copied()
+            .unwrap_or(0.0);
+        if weight <= 0.0 {
+            continue;
+        }
+
+        let hero_action_values = &hero_values.action_values[offset..offset + root_action_count];
+        let villain_response_action_values =
+            &villain_values.action_values[offset..offset + root_action_count];
+        let hero_br = hero_action_values
+            .iter()
+            .copied()
+            .fold(f32::NEG_INFINITY, f32::max);
+        if !hero_br.is_finite() {
+            continue;
+        }
+
+        state.average_strategy_for(infoset, &mut strategy);
+        let villain_response_value = villain_response_action_values
+            .iter()
+            .zip(&strategy)
+            .take(root_action_count)
+            .map(|(value, probability)| value * probability)
+            .sum::<f32>();
+
+        hero_br_sum += hero_br * weight;
+        villain_response_sum += villain_response_value * weight;
+        weight_sum += weight;
+    }
+
+    if weight_sum <= 0.0 {
+        return RootExploitability {
+            exploitability: 0.0,
+            hero_br_value: 0.0,
+            villain_response_value: 0.0,
+        };
+    }
+
+    let hero_br_value = hero_br_sum / weight_sum;
+    let villain_response_value = villain_response_sum / weight_sum;
+    RootExploitability {
+        exploitability: (hero_br_value - villain_response_value).max(0.0),
+        hero_br_value,
+        villain_response_value,
     }
 }
 
