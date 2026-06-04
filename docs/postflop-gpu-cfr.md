@@ -909,6 +909,72 @@ one player's average strategy and enumerating the other player's actions. This
 is not a full production exploitability calculation, but it catches sign errors,
 wrong denominator choices, and strategy applied to the wrong player.
 
+The current `solve-flop-metrics` output includes two best-response gap proxies:
+
+```text
+root_br_gap(t)
+local_br_gap(t)
+```
+
+`root_br_gap` is the average root one-step best-action improvement over the
+current average strategy. `local_br_gap` applies the same one-step check at all
+infosets and weights by reach. These are not full recursive exploitability
+numbers, so do not present them as final game exploitability. They are still a
+better tuning signal than root strategy movement or raw regret mass: a variant
+that merely freezes early can have a small `root_strategy_l1_delta` while still
+having a bad best-response gap.
+
+## DCFR+ Parameter Notes
+
+`CfrVariant::DcfrPlus { alpha, gamma }` uses:
+
+```text
+regret_discount(t) =
+  0                                  if t <= 1
+  (t - 1)^alpha / ((t - 1)^alpha + 1.5) otherwise
+
+average_strategy_discount(t) =
+  ((t - 1) / t)^gamma                if t > 1
+  1                                  otherwise
+```
+
+`alpha` controls how quickly old regrets recover from the first-iteration reset.
+Higher values make the old regret discount approach `1` faster after the first
+few iterations. `gamma` controls how aggressively early average-strategy mass is
+discounted. Higher values make the reported average strategy depend more on
+later iterations.
+
+Single-flop sweep on `As7h2c`, depth `5`, full terminal runouts, using the
+current `root_br_gap` and `local_br_gap` proxies:
+
+```text
+CFR+ 128:
+  root_br_gap  = 0.942252
+  local_br_gap = 4.020251
+
+DCFR+ alpha=1.5 gamma=8.0 128:
+  root_br_gap  = 0.734763
+  local_br_gap = 3.610855
+
+DCFR+ alpha=2.5 gamma=8.0 128:
+  root_br_gap  = 0.710786
+  local_br_gap = 3.595675
+
+DCFR+ alpha=1.5 gamma=12.0 128:
+  root_br_gap  = 0.712415
+  local_br_gap = 3.601657
+```
+
+Current interpretation:
+
+- DCFR+ is better than CFR+ on this fixed flop, but not by an order of
+  magnitude.
+- `alpha=2.5, gamma=8.0` is the current single-flop best among tested values.
+- The gain over nearby settings is small, so do not hard-code this as a global
+  default without testing other flop textures.
+- The old literature-style starting point `alpha=1.5, gamma=4.0` was on the
+  edge of the first grid; expanding `gamma` improved the BR gap.
+
 ## Immediate Implementation Order
 
 1. Add a `solve-flop-metrics` CLI path that runs one fixed flop for iteration
