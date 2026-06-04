@@ -31,6 +31,7 @@ fn main() {
     run_public_tree_showdown_values_match_bruteforce(&backend);
     run_public_tree_multistreet_values_match_cpu_exact(&backend);
     run_public_tree_average_strategy_br_matches_cpu_exact(&backend);
+    run_public_tree_iterations_match_cpu_exact(&backend);
     println!("GPU smoke passed");
 }
 
@@ -947,6 +948,74 @@ fn run_public_tree_average_strategy_br_matches_cpu_exact(backend: &GpuDenseCfrBa
             br_player as usize,
         );
     }
+}
+
+fn run_public_tree_iterations_match_cpu_exact(backend: &GpuDenseCfrBackend) {
+    let fixture = multistreet_public_tree_fixture();
+    let config = DenseCfrConfig {
+        infosets: fixture.public_infosets * fixture.combos.len() * 2,
+        actions: 2,
+        variant: CfrVariant::DcfrPlus {
+            alpha: 1.5,
+            gamma: 4.0,
+        },
+    };
+    let legal_actions = vec![true; config.infosets * config.actions];
+    let mut cpu = DenseCfrState::new_with_legal_actions(config.clone(), legal_actions.clone());
+    let mut gpu = backend.zeroed_state_with_legal_actions(config, legal_actions);
+
+    for iteration in 1..=5 {
+        let values = cpu_exact_public_tree_values(
+            &fixture.nodes,
+            &fixture.children,
+            &fixture.child_cards,
+            &fixture.combos,
+            &fixture.villain_weights,
+            &fixture.boards,
+            &cpu,
+            fixture.public_infosets,
+            2,
+        );
+        cpu.update_all_infosets(
+            &values.action_values,
+            &values.reach_weights,
+            &values.strategy_weights,
+            iteration,
+        );
+    }
+
+    backend
+        .public_tree_run_iterations(
+            &fixture.nodes,
+            &fixture.children,
+            &fixture.child_cards,
+            &fixture.combos,
+            &vec![1; fixture.combos.len()],
+            &fixture.villain_weights,
+            &fixture.boards,
+            &mut gpu,
+            5,
+        )
+        .unwrap_or_else(|error| fail(&format!("GPU public tree CFR iterations failed: {error:?}")));
+    let downloaded = gpu
+        .download(backend)
+        .unwrap_or_else(|error| fail(&format!("GPU public tree CFR download failed: {error:?}")));
+
+    assert_close(
+        "public tree CFR regret",
+        cpu.regrets(),
+        downloaded.regrets(),
+    );
+    assert_close(
+        "public tree CFR strategy sum",
+        cpu.strategy_sum(),
+        downloaded.strategy_sum(),
+    );
+    assert_close(
+        "public tree CFR prediction",
+        cpu.prediction(),
+        downloaded.prediction(),
+    );
 }
 
 struct PublicTreeFixture {
