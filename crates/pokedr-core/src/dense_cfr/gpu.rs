@@ -1660,12 +1660,24 @@ fn backup_layer(@builtin(global_invocation_id) id: vec3<u32>) {
             let villain_child_value = villain_values[child_offset];
             if node.acting_player == 0u {
                 let probability = strategy_from_reach(node_index, child, combo, 0u);
-                hero_value = hero_value + probability * hero_child_value;
+                if params.value_player == 0u {
+                    if action == 0u || hero_child_value > hero_value {
+                        hero_value = hero_child_value;
+                    }
+                } else {
+                    hero_value = hero_value + probability * hero_child_value;
+                }
                 villain_value = villain_value + villain_child_value;
             } else {
                 let probability = strategy_from_reach(node_index, child, combo, 1u);
                 hero_value = hero_value + hero_child_value;
-                villain_value = villain_value + probability * villain_child_value;
+                if params.value_player == 1u {
+                    if action == 0u || villain_child_value > villain_value {
+                        villain_value = villain_child_value;
+                    }
+                } else {
+                    villain_value = villain_value + probability * villain_child_value;
+                }
             }
         }
     } else if node.kind == 1u {
@@ -3910,6 +3922,7 @@ impl GpuDenseCfrBackend {
         combo_count: usize,
         node_count: usize,
         max_actions: usize,
+        br_player: u32,
     ) -> Result<(), GpuCfrError> {
         for &(layer_start, layer_end) in backup_layer_ranges.iter().rev() {
             let layer_node_count = layer_end - layer_start;
@@ -3926,7 +3939,7 @@ impl GpuDenseCfrBackend {
                     node_count: node_count as u32,
                     max_actions: max_actions as u32,
                     output_len: x_invocations,
-                    pair_start: 0,
+                    pair_start: br_player,
                     chunk_pairs: layer_start as u32,
                     _pad0: layer_node_count as u32,
                     _pad1: 0,
@@ -4163,6 +4176,7 @@ impl GpuDenseCfrBackend {
         regrets_buffer: &wgpu::Buffer,
         prediction_buffer: &wgpu::Buffer,
         variant: super::CfrVariant,
+        br_player: u32,
     ) -> Result<(wgpu::Buffer, usize, usize), GpuCfrError> {
         if std::env::var_os("POKEDR_SOLVER_PROGRESS_OFF").is_none() {
             eprintln!(
@@ -4328,6 +4342,7 @@ impl GpuDenseCfrBackend {
             ctx.combos_len,
             ctx.nodes_len,
             ctx.actions,
+            br_player,
         )?;
         encoder = self.finish_profile_phase(encoder, "cfv_backup", phase_start)?;
         phase_start = profile.then(Instant::now);
@@ -4480,6 +4495,7 @@ impl GpuDenseCfrBackend {
         regrets_buffer: &wgpu::Buffer,
         prediction_buffer: &wgpu::Buffer,
         variant: super::CfrVariant,
+        br_player: u32,
         infosets: usize,
         actions: usize,
     ) -> Result<(wgpu::Buffer, usize, usize), GpuCfrError> {
@@ -4786,6 +4802,7 @@ impl GpuDenseCfrBackend {
             combos.len(),
             nodes.len(),
             actions,
+            br_player,
         )?;
         encoder = self.finish_profile_phase(encoder, "cfv_backup", phase_start)?;
         phase_start = profile.then(Instant::now);
@@ -4982,6 +4999,59 @@ impl GpuDenseCfrBackend {
         showdown_boards: &[GpuFinalBoard],
         state: &DenseCfrState,
     ) -> Result<GpuRootTerminalValues, GpuCfrError> {
+        self.public_tree_values_with_br_player(
+            nodes,
+            children,
+            child_cards,
+            combos,
+            combo_legal,
+            villain_weights,
+            showdown_boards,
+            state,
+            2,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn public_tree_best_response_values(
+        &self,
+        nodes: &[GpuPublicTreeNode],
+        children: &[u32],
+        child_cards: &[u32],
+        combos: &[GpuPrivateCombo],
+        combo_legal: &[u32],
+        villain_weights: &[f32],
+        showdown_boards: &[GpuFinalBoard],
+        state: &DenseCfrState,
+        br_player: u32,
+    ) -> Result<GpuRootTerminalValues, GpuCfrError> {
+        assert!(br_player < 2, "best-response player must be 0 or 1");
+        self.public_tree_values_with_br_player(
+            nodes,
+            children,
+            child_cards,
+            combos,
+            combo_legal,
+            villain_weights,
+            showdown_boards,
+            state,
+            br_player,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn public_tree_values_with_br_player(
+        &self,
+        nodes: &[GpuPublicTreeNode],
+        children: &[u32],
+        child_cards: &[u32],
+        combos: &[GpuPrivateCombo],
+        combo_legal: &[u32],
+        villain_weights: &[f32],
+        showdown_boards: &[GpuFinalBoard],
+        state: &DenseCfrState,
+        br_player: u32,
+    ) -> Result<GpuRootTerminalValues, GpuCfrError> {
         let regrets_buffer = readonly_buffer(&self.device, "public tree regrets", &state.regrets);
         let prediction_buffer =
             readonly_buffer(&self.device, "public tree prediction", &state.prediction);
@@ -4998,6 +5068,7 @@ impl GpuDenseCfrBackend {
             &regrets_buffer,
             &prediction_buffer,
             state.variant,
+            br_player,
             state.infosets,
             state.actions,
         )?;
@@ -5090,6 +5161,7 @@ impl GpuDenseCfrBackend {
             &state.regrets,
             &state.prediction,
             state.variant,
+            2,
             state.infosets,
             state.actions,
         )?;
@@ -5173,6 +5245,7 @@ impl GpuDenseCfrBackend {
                 &state.regrets,
                 &state.prediction,
                 state.variant,
+                2,
             )?;
         if let Some(start) = cfv_start {
             self.profile_poll()?;

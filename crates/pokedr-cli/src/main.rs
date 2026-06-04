@@ -264,7 +264,7 @@ fn run_solve_flop_metrics(flop_arg: Option<&str>) {
             .collect::<Vec<_>>()
             .join(",");
         println!(
-            "board={} iterations={} elapsed={:.2}s root_l1_delta={} root_actions=[{}] root_br_gap={} local_br_gap={} regret_mass={:.3} illegal_mass={:.6} current_norm_err={:.6} avg_norm_err={:.6} finite={}",
+            "board={} iterations={} elapsed={:.2}s root_l1_delta={} root_actions=[{}] root_br_gap={} local_br_gap={} recursive_root_br_gap={} recursive_local_br_gap={} regret_mass={:.3} illegal_mass={:.6} current_norm_err={:.6} avg_norm_err={:.6} finite={}",
             row.board,
             row.iterations,
             row.elapsed_secs,
@@ -274,6 +274,12 @@ fn run_solve_flop_metrics(flop_arg: Option<&str>) {
                 .map(|value| format!("{value:.6}"))
                 .unwrap_or_else(|| "n/a".to_string()),
             row.local_br_gap
+                .map(|value| format!("{value:.6}"))
+                .unwrap_or_else(|| "n/a".to_string()),
+            row.recursive_root_br_gap
+                .map(|value| format!("{value:.6}"))
+                .unwrap_or_else(|| "n/a".to_string()),
+            row.recursive_local_br_gap
                 .map(|value| format!("{value:.6}"))
                 .unwrap_or_else(|| "n/a".to_string()),
             row.positive_regret_mass,

@@ -1058,6 +1058,8 @@ The current `solve-flop-metrics` output includes two best-response gap proxies:
 ```text
 root_br_gap(t)
 local_br_gap(t)
+recursive_root_br_gap(t)
+recursive_local_br_gap(t)
 ```
 
 `root_br_gap` is the average root one-step best-action improvement over the
@@ -1067,6 +1069,13 @@ numbers, so do not present them as final game exploitability. They are still a
 better tuning signal than root strategy movement or raw regret mass: a variant
 that merely freezes early can have a small `root_strategy_l1_delta` while still
 having a bad best-response gap.
+
+`recursive_root_br_gap` and `recursive_local_br_gap` use the same terminal CFV
+pipeline, but the backup pass is run in best-response mode: at the evaluated
+player's decision nodes it uses `max_a V(a)`, while opponent decision nodes use
+the evaluated average strategy. This is closer to a solver stopping metric than
+the one-step gaps, and it is intentionally computed only at checkpoints because
+it requires extra hero/villain BR backups.
 
 ## DCFR+ Parameter Notes
 
