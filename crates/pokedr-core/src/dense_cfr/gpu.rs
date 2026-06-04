@@ -1601,8 +1601,8 @@ fn fold_value(@builtin(global_invocation_id) id: vec3<u32>) {
         hero_payoff = node.pot - node.hero_invested;
     }
     let value_index = node_offset + combo;
-    hero_values[value_index] = villain_noncolliding * hero_payoff * node._pad1;
-    villain_values[value_index] = hero_noncolliding * (-hero_payoff) * node._pad1;
+    hero_values[value_index] = select(0.0, villain_noncolliding * hero_payoff * node._pad1, hero_self > 0.0);
+    villain_values[value_index] = select(0.0, hero_noncolliding * (-hero_payoff) * node._pad1, villain_self > 0.0);
 }
 "#;
 
