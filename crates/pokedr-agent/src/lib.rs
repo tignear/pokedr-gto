@@ -2565,7 +2565,8 @@ enum DumpSolverMode {
 
 struct DumpSolverContext {
     state: DenseCfrState,
-    values: Option<GpuRootTerminalValues>,
+    average_values: Option<GpuRootTerminalValues>,
+    current_values: Option<GpuRootTerminalValues>,
     indexer: ComboIndexer,
     root_dead: u64,
     iterations: usize,
@@ -2584,34 +2585,51 @@ impl DumpSolverContext {
         let root_dead = root_board(tree).deck_mask();
         let villain_weights = vec![1.0; COMBO_COUNT];
         let state = solve_public_tree_cfr(tree, layout, config, &villain_weights);
-        let values = cfr_gpu_backend().and_then(|backend| {
-            let matrix_cache =
-                RefCell::new(ShowdownMatrixCache::new(showdown_matrix_cache_capacity()));
-            let linearized =
-                linearize_gpu_public_tree(tree, layout, &backend, config, &matrix_cache)?;
-            let combos = gpu_private_combos();
-            let combo_legal = indexer
-                .combos()
-                .iter()
-                .map(|combo| (!combo.collides_with(root_dead)) as u32)
-                .collect::<Vec<_>>();
-            let profile = state.average_strategy_profile_state();
-            backend
-                .public_tree_iteration_values(
-                    &linearized.nodes,
-                    &linearized.children,
-                    &linearized.child_cards,
-                    &combos,
-                    &combo_legal,
-                    &villain_weights,
-                    &linearized.showdown_boards,
-                    &profile,
-                )
-                .ok()
-        });
+        let (average_values, current_values) = cfr_gpu_backend()
+            .and_then(|backend| {
+                let matrix_cache =
+                    RefCell::new(ShowdownMatrixCache::new(showdown_matrix_cache_capacity()));
+                let linearized =
+                    linearize_gpu_public_tree(tree, layout, &backend, config, &matrix_cache)?;
+                let combos = gpu_private_combos();
+                let combo_legal = indexer
+                    .combos()
+                    .iter()
+                    .map(|combo| (!combo.collides_with(root_dead)) as u32)
+                    .collect::<Vec<_>>();
+                let profile = state.average_strategy_profile_state();
+                let average_values = backend
+                    .public_tree_iteration_values(
+                        &linearized.nodes,
+                        &linearized.children,
+                        &linearized.child_cards,
+                        &combos,
+                        &combo_legal,
+                        &villain_weights,
+                        &linearized.showdown_boards,
+                        &profile,
+                    )
+                    .ok()?;
+                backend.wait_idle().ok()?;
+                let current_values = backend
+                    .public_tree_iteration_values(
+                        &linearized.nodes,
+                        &linearized.children,
+                        &linearized.child_cards,
+                        &combos,
+                        &combo_legal,
+                        &villain_weights,
+                        &linearized.showdown_boards,
+                        &state,
+                    )
+                    .ok()?;
+                Some((Some(average_values), Some(current_values)))
+            })
+            .unwrap_or((None, None));
         Some(Self {
             state,
-            values,
+            average_values,
+            current_values,
             indexer,
             root_dead,
             iterations: config.cfr_iterations.max(1),
@@ -2821,7 +2839,8 @@ struct DumpSolverComboRow {
     weighted_gap: f32,
     best_action: Option<usize>,
     policy_value: Option<f32>,
-    action_values: Option<Vec<f32>>,
+    avg_action_values: Option<Vec<f32>>,
+    current_action_values: Option<Vec<f32>>,
     average_strategy: Vec<f32>,
     current_strategy: Vec<f32>,
     regrets: Vec<f32>,
@@ -2831,7 +2850,7 @@ struct DumpSolverComboRow {
 impl DumpSolverComboRow {
     fn to_json(&self) -> String {
         format!(
-            r#"{{"combo_index":{},"combo":"{}","reach":{},"gap":{},"weighted_gap":{},"best_action":{},"policy_value":{},"action_values":{},"avg_strategy":{},"current_strategy":{},"regrets":{},"strategy_sum":{}}}"#,
+            r#"{{"combo_index":{},"combo":"{}","reach":{},"gap":{},"weighted_gap":{},"best_action":{},"policy_value":{},"avg_action_values":{},"current_action_values":{},"avg_strategy":{},"current_strategy":{},"regrets":{},"strategy_sum":{}}}"#,
             self.combo_index,
             json_escape(&self.combo),
             json_f32(self.reach_weight),
@@ -2843,7 +2862,11 @@ impl DumpSolverComboRow {
             self.policy_value
                 .map(json_f32)
                 .unwrap_or_else(|| "null".to_string()),
-            self.action_values
+            self.avg_action_values
+                .as_ref()
+                .map(|values| json_f32_array(values))
+                .unwrap_or_else(|| "null".to_string()),
+            self.current_action_values
                 .as_ref()
                 .map(|values| json_f32_array(values))
                 .unwrap_or_else(|| "null".to_string()),
@@ -2866,17 +2889,21 @@ fn dump_solver_combo_row(
     let combo = context.indexer.combo(combo_index);
     let regrets = context.state.regrets()[offset..offset + action_count].to_vec();
     let strategy_sum = context.state.strategy_sum()[offset..offset + action_count].to_vec();
-    let action_values = context
-        .values
+    let avg_action_values = context
+        .average_values
+        .as_ref()
+        .map(|values| values.action_values[offset..offset + action_count].to_vec());
+    let current_action_values = context
+        .current_values
         .as_ref()
         .map(|values| values.action_values[offset..offset + action_count].to_vec());
     let reach_weight = context
-        .values
+        .average_values
         .as_ref()
         .and_then(|values| values.reach_weights.get(offset / context.state.actions()))
         .copied()
         .unwrap_or(0.0);
-    let (best_action, gap, policy_value) = action_values
+    let (best_action, gap, policy_value) = avg_action_values
         .as_ref()
         .map(|values| {
             let (best_action, best_value) = values
@@ -2908,7 +2935,8 @@ fn dump_solver_combo_row(
         weighted_gap: gap * reach_weight,
         best_action,
         policy_value,
-        action_values,
+        avg_action_values,
+        current_action_values,
         average_strategy: average_strategy[..action_count].to_vec(),
         current_strategy: current_strategy[..action_count].to_vec(),
         regrets,
