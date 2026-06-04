@@ -448,6 +448,18 @@ pub fn solve_fixed_flop_metrics(
     base_config: PokedrAgentConfig,
     iteration_counts: &[usize],
 ) -> Vec<FixedFlopMetricRow> {
+    solve_fixed_flop_metrics_with_callback(flop, base_config, iteration_counts, |_| true)
+}
+
+pub fn solve_fixed_flop_metrics_with_callback<F>(
+    flop: [PokedrCard; 3],
+    base_config: PokedrAgentConfig,
+    iteration_counts: &[usize],
+    mut on_row: F,
+) -> Vec<FixedFlopMetricRow>
+where
+    F: FnMut(&FixedFlopMetricRow) -> bool,
+{
     let public_state = PublicState {
         street: Street::Flop,
         board: Board::new(flop.to_vec()),
@@ -482,6 +494,7 @@ pub fn solve_fixed_flop_metrics(
         root_dead,
         &flop,
         iteration_counts,
+        &mut on_row,
     ) {
         return rows;
     }
@@ -521,6 +534,9 @@ pub fn solve_fixed_flop_metrics(
             finite: diagnostics.finite,
         });
         previous_root_strategy = Some(root_strategy);
+        if !on_row(rows.last().expect("metric row must exist")) {
+            break;
+        }
     }
     rows
 }
@@ -565,6 +581,7 @@ fn try_solve_fixed_flop_metrics_gpu(
     root_dead: u64,
     flop: &[PokedrCard; 3],
     iteration_counts: &[usize],
+    on_row: &mut dyn FnMut(&FixedFlopMetricRow) -> bool,
 ) -> Option<Vec<FixedFlopMetricRow>> {
     let backend = cfr_gpu_backend()?;
     let matrix_cache = RefCell::new(ShowdownMatrixCache::new(showdown_matrix_cache_capacity()));
@@ -682,6 +699,9 @@ fn try_solve_fixed_flop_metrics_gpu(
         });
         previous_root_strategy = Some(root_strategy);
         backend.wait_idle().ok()?;
+        if !on_row(rows.last().expect("metric row must exist")) {
+            break;
+        }
     }
     Some(rows)
 }

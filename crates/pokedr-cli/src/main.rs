@@ -300,71 +300,121 @@ fn run_solve_flop_metrics(args: FlopCommandArgs) {
         std::process::exit(2);
     });
     let config = match_config(cli_config.as_ref());
-    let iterations = metric_iterations(cli_config.as_ref());
+    let convergence = metric_convergence_settings();
+    let iterations = convergence
+        .as_ref()
+        .map(|settings| metric_convergence_iterations(settings))
+        .unwrap_or_else(|| metric_iterations(cli_config.as_ref()));
+    let target_bb100 = convergence
+        .as_ref()
+        .map(|settings| settings.target_bb100)
+        .unwrap_or(PIO_STYLE_TARGET_BB100);
     println!(
-        "solving fixed flop metrics variant={:?} depth={} equity_runout_cap={} terminal_runouts=full iterations={:?}",
-        config.cfr_variant, config.max_depth, config.max_showdown_runouts, iterations
+        "solving fixed flop metrics variant={:?} depth={} equity_runout_cap={} terminal_runouts=full iterations={:?} target_bb100={:.2}",
+        config.cfr_variant, config.max_depth, config.max_showdown_runouts, iterations, target_bb100
     );
-    for row in pokedr_agent::solve_fixed_flop_metrics(flop, config, &iterations) {
-        let delta = row
-            .root_strategy_l1_delta
+    let mut best_exploitability_bb100 = f32::INFINITY;
+    let mut regression_count = 0usize;
+    let patience = convergence
+        .as_ref()
+        .map(|settings| settings.regression_patience)
+        .unwrap_or(usize::MAX);
+    pokedr_agent::solve_fixed_flop_metrics_with_callback(flop, config, &iterations, |row| {
+        print_metric_row(row, target_bb100);
+        if !row.finite
+            || row.current_strategy_norm_error > 1.0e-3
+            || row.average_strategy_norm_error > 1.0e-3
+        {
+            eprintln!(
+                "stopping metrics: solver produced non-finite or denormalized strategy state"
+            );
+            return false;
+        }
+        let Some(exploitability_bb100) = row.root_exploitability.map(|value| value * 100.0) else {
+            return true;
+        };
+        if exploitability_bb100 <= target_bb100 {
+            eprintln!(
+                "stopping metrics: reached target exploitability {:.3} <= {:.3} bb/100",
+                exploitability_bb100, target_bb100
+            );
+            return false;
+        }
+        if exploitability_bb100 + 0.25 < best_exploitability_bb100 {
+            best_exploitability_bb100 = exploitability_bb100;
+            regression_count = 0;
+        } else if exploitability_bb100 > best_exploitability_bb100 + 1.0 {
+            regression_count += 1;
+            if regression_count >= patience {
+                eprintln!(
+                    "stopping metrics: exploitability regressed for {regression_count} checkpoints; best={best_exploitability_bb100:.3} current={exploitability_bb100:.3} bb/100"
+                );
+                return false;
+            }
+        }
+        true
+    });
+}
+
+fn print_metric_row(row: &pokedr_agent::FixedFlopMetricRow, target_bb100: f32) {
+    let delta = row
+        .root_strategy_l1_delta
+        .map(|value| format!("{value:.6}"))
+        .unwrap_or_else(|| "n/a".to_string());
+    let root_actions = row
+        .root_action_probabilities
+        .iter()
+        .map(|value| format!("{value:.4}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let root_exploitability_bb100 = row.root_exploitability.map(|value| value * 100.0);
+    let root_converged = root_exploitability_bb100
+        .map(|value| value <= target_bb100)
+        .unwrap_or(false);
+    println!(
+        "board={} iterations={} elapsed={:.2}s root_l1_delta={} root_actions=[{}] root_exploitability={} root_exploitability_bb100={} pio_style_target_bb100={:.2} pio_style_converged={} hero_root_br_value={} villain_root_br_value={} root_br_gap={} local_br_gap={} recursive_root_br_gap={} recursive_local_br_gap={} regret_mass={:.3} illegal_mass={:.6} current_norm_err={:.6} avg_norm_err={:.6} finite={}",
+        row.board,
+        row.iterations,
+        row.elapsed_secs,
+        delta,
+        root_actions,
+        row.root_exploitability
             .map(|value| format!("{value:.6}"))
-            .unwrap_or_else(|| "n/a".to_string());
-        let root_actions = row
-            .root_action_probabilities
-            .iter()
-            .map(|value| format!("{value:.4}"))
-            .collect::<Vec<_>>()
-            .join(",");
-        let root_exploitability_bb100 = row.root_exploitability.map(|value| value * 100.0);
-        let root_converged = root_exploitability_bb100
-            .map(|value| value <= PIO_STYLE_TARGET_BB100)
-            .unwrap_or(false);
-        println!(
-            "board={} iterations={} elapsed={:.2}s root_l1_delta={} root_actions=[{}] root_exploitability={} root_exploitability_bb100={} pio_style_target_bb100={:.2} pio_style_converged={} hero_root_br_value={} villain_root_br_value={} root_br_gap={} local_br_gap={} recursive_root_br_gap={} recursive_local_br_gap={} regret_mass={:.3} illegal_mass={:.6} current_norm_err={:.6} avg_norm_err={:.6} finite={}",
-            row.board,
-            row.iterations,
-            row.elapsed_secs,
-            delta,
-            root_actions,
-            row.root_exploitability
-                .map(|value| format!("{value:.6}"))
-                .unwrap_or_else(|| "n/a".to_string()),
-            root_exploitability_bb100
-                .map(|value| format!("{value:.3}"))
-                .unwrap_or_else(|| "n/a".to_string()),
-            PIO_STYLE_TARGET_BB100,
-            root_converged,
-            row.hero_root_br_value
-                .map(|value| format!("{value:.6}"))
-                .unwrap_or_else(|| "n/a".to_string()),
-            row.villain_root_br_value
-                .map(|value| format!("{value:.6}"))
-                .unwrap_or_else(|| "n/a".to_string()),
-            row.root_br_gap
-                .map(|value| format!("{value:.6}"))
-                .unwrap_or_else(|| "n/a".to_string()),
-            row.local_br_gap
-                .map(|value| format!("{value:.6}"))
-                .unwrap_or_else(|| "n/a".to_string()),
-            row.recursive_root_br_gap
-                .map(|value| format!("{value:.6}"))
-                .unwrap_or_else(|| "n/a".to_string()),
-            row.recursive_local_br_gap
-                .map(|value| format!("{value:.6}"))
-                .unwrap_or_else(|| "n/a".to_string()),
-            row.positive_regret_mass,
-            row.illegal_strategy_mass,
-            row.current_strategy_norm_error,
-            row.average_strategy_norm_error,
-            row.finite
-        );
-        if let Some(detail) = &row.local_gap_detail {
-            println!("  local_gap_detail {}", format_gap_detail(detail));
-        }
-        if let Some(detail) = &row.recursive_local_gap_detail {
-            println!("  recursive_local_gap_detail {}", format_gap_detail(detail));
-        }
+            .unwrap_or_else(|| "n/a".to_string()),
+        root_exploitability_bb100
+            .map(|value| format!("{value:.3}"))
+            .unwrap_or_else(|| "n/a".to_string()),
+        target_bb100,
+        root_converged,
+        row.hero_root_br_value
+            .map(|value| format!("{value:.6}"))
+            .unwrap_or_else(|| "n/a".to_string()),
+        row.villain_root_br_value
+            .map(|value| format!("{value:.6}"))
+            .unwrap_or_else(|| "n/a".to_string()),
+        row.root_br_gap
+            .map(|value| format!("{value:.6}"))
+            .unwrap_or_else(|| "n/a".to_string()),
+        row.local_br_gap
+            .map(|value| format!("{value:.6}"))
+            .unwrap_or_else(|| "n/a".to_string()),
+        row.recursive_root_br_gap
+            .map(|value| format!("{value:.6}"))
+            .unwrap_or_else(|| "n/a".to_string()),
+        row.recursive_local_br_gap
+            .map(|value| format!("{value:.6}"))
+            .unwrap_or_else(|| "n/a".to_string()),
+        row.positive_regret_mass,
+        row.illegal_strategy_mass,
+        row.current_strategy_norm_error,
+        row.average_strategy_norm_error,
+        row.finite
+    );
+    if let Some(detail) = &row.local_gap_detail {
+        println!("  local_gap_detail {}", format_gap_detail(detail));
+    }
+    if let Some(detail) = &row.recursive_local_gap_detail {
+        println!("  recursive_local_gap_detail {}", format_gap_detail(detail));
     }
 }
 
@@ -493,6 +543,46 @@ fn metric_iterations(config: Option<&CliConfigFile>) -> Vec<usize> {
                 .filter(|values| !values.is_empty())
         })
         .unwrap_or_else(|| vec![1, 2, 4, 8, 16, 32])
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MetricConvergenceSettings {
+    interval: usize,
+    max_iterations: usize,
+    target_bb100: f32,
+    regression_patience: usize,
+}
+
+fn metric_convergence_settings() -> Option<MetricConvergenceSettings> {
+    let requested = std::env::var_os("POKEDR_METRIC_UNTIL_CONVERGED").is_some()
+        || std::env::var_os("POKEDR_METRIC_INTERVAL").is_some()
+        || std::env::var_os("POKEDR_METRIC_MAX_ITERATIONS").is_some()
+        || std::env::var_os("POKEDR_METRIC_TARGET_BB100").is_some();
+    requested.then(|| {
+        let interval = env_usize("POKEDR_METRIC_INTERVAL").unwrap_or(64).max(1);
+        let max_iterations = env_usize("POKEDR_METRIC_MAX_ITERATIONS")
+            .unwrap_or(4096)
+            .max(interval);
+        MetricConvergenceSettings {
+            interval,
+            max_iterations,
+            target_bb100: env_f32("POKEDR_METRIC_TARGET_BB100").unwrap_or(1.0),
+            regression_patience: env_usize("POKEDR_METRIC_REGRESSION_PATIENCE").unwrap_or(3),
+        }
+    })
+}
+
+fn metric_convergence_iterations(settings: &MetricConvergenceSettings) -> Vec<usize> {
+    let mut iterations = Vec::new();
+    let mut next = settings.interval;
+    while next < settings.max_iterations {
+        iterations.push(next);
+        next = next.saturating_add(settings.interval);
+    }
+    if iterations.last().copied() != Some(settings.max_iterations) {
+        iterations.push(settings.max_iterations);
+    }
+    iterations
 }
 
 fn fixed_flop_config(cli_config: Option<&CliConfigFile>) -> pokedr_agent::PokedrAgentConfig {
