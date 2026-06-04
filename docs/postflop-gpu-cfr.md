@@ -748,6 +748,44 @@ depth 5, WSL/DZN profiling showed reduce dropping from about `381ms` to
 `135ms` of the stage-profile run. Card aggregate can target that cost, but it
 does not remove prefix construction or board iteration by itself.
 
+An experimental per-card prefix path was implemented behind
+`POKEDR_GPU_TERMINAL_CARD_PREFIX=1`:
+
+```text
+card_prefix[z,b,card,position] =
+  sum_{ordered_position < position, combo contains card} reach[combo]
+```
+
+This makes blocker correction O(1) in the reduce shader by evaluating
+`block_total`, `block_win`, and `block_tie` from two card lanes. It is exact,
+but it is not faster on the current WSL/DZN path. On `As7h2c`, depth 5,
+one iteration:
+
+```text
+baseline:
+  partial     ~275ms
+  reduce      ~382ms
+  terminal    ~797ms
+
+card prefix, 8M pair scratch:
+  partial     ~305ms
+  card_prefix ~929ms
+  reduce      ~255ms
+  terminal    ~1648ms
+
+card prefix, 16M pair scratch:
+  partial     ~280ms
+  card_prefix ~918ms
+  reduce      ~230ms
+  terminal    ~1579ms
+```
+
+So the formula is useful, but materializing all 52 card prefix lanes is too
+much memory traffic. The next viable version needs to avoid writing the full
+`52 * (combo_count + 1)` prefix table, for example by fusing a much smaller
+card/group summary into the existing prefix scan or by only materializing lanes
+actually consumed by a tile.
+
 ## Next Mathematical Cut
 
 The current implementation is still too close to "run a public tree program on
