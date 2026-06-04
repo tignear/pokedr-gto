@@ -45,6 +45,8 @@ struct TreeDbBuildArgs {
     flop: Option<String>,
     config_path: Option<String>,
     combo_limit: usize,
+    iterations: Option<usize>,
+    max_depth: Option<usize>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -549,11 +551,13 @@ fn print_metric_row(row: &pokedr_agent::FixedFlopMetricRow, target_bb100: f32) {
         .collect::<Vec<_>>()
         .join(",");
     let root_exploitability_bb100 = row.root_exploitability.map(|value| value * 100.0);
+    let current_root_exploitability_bb100 =
+        row.current_root_exploitability.map(|value| value * 100.0);
     let root_converged = root_exploitability_bb100
         .map(|value| value <= target_bb100)
         .unwrap_or(false);
     println!(
-        "board={} iterations={} elapsed={:.2}s root_l1_delta={} root_actions=[{}] root_exploitability={} root_exploitability_bb100={} pio_style_target_bb100={:.2} pio_style_converged={} hero_root_br_value={} villain_root_br_value={} root_br_gap={} local_br_gap={} recursive_root_br_gap={} recursive_local_br_gap={} regret_mass={:.3} illegal_mass={:.6} current_norm_err={:.6} avg_norm_err={:.6} finite={}",
+        "board={} iterations={} elapsed={:.2}s root_l1_delta={} root_actions=[{}] root_exploitability={} root_exploitability_bb100={} current_root_exploitability={} current_root_exploitability_bb100={} pio_style_target_bb100={:.2} pio_style_converged={} hero_root_br_value={} villain_root_br_value={} current_hero_root_br_value={} current_villain_root_br_value={} root_br_gap={} local_br_gap={} recursive_root_br_gap={} recursive_local_br_gap={} regret_mass={:.3} illegal_mass={:.6} current_norm_err={:.6} avg_norm_err={:.6} finite={}",
         row.board,
         row.iterations,
         row.elapsed_secs,
@@ -565,12 +569,24 @@ fn print_metric_row(row: &pokedr_agent::FixedFlopMetricRow, target_bb100: f32) {
         root_exploitability_bb100
             .map(|value| format!("{value:.3}"))
             .unwrap_or_else(|| "n/a".to_string()),
+        row.current_root_exploitability
+            .map(|value| format!("{value:.6}"))
+            .unwrap_or_else(|| "n/a".to_string()),
+        current_root_exploitability_bb100
+            .map(|value| format!("{value:.3}"))
+            .unwrap_or_else(|| "n/a".to_string()),
         target_bb100,
         root_converged,
         row.hero_root_br_value
             .map(|value| format!("{value:.6}"))
             .unwrap_or_else(|| "n/a".to_string()),
         row.villain_root_br_value
+            .map(|value| format!("{value:.6}"))
+            .unwrap_or_else(|| "n/a".to_string()),
+        row.current_hero_root_br_value
+            .map(|value| format!("{value:.6}"))
+            .unwrap_or_else(|| "n/a".to_string()),
+        row.current_villain_root_br_value
             .map(|value| format!("{value:.6}"))
             .unwrap_or_else(|| "n/a".to_string()),
         row.root_br_gap
@@ -648,9 +664,11 @@ fn run_tree_db(mut args: impl Iterator<Item = String>) {
     match args.next().as_deref() {
         Some("build") => run_tree_db_build(args),
         Some("analyze") => run_tree_db_analyze(args),
+        Some("top-combos") => run_tree_db_top_combos(args),
+        Some("node") => run_tree_db_node(args),
         _ => {
             eprintln!(
-                "usage: pokedr-cli tree-db <build|analyze>\n  pokedr-cli tree-db build <tree.sqlite> [flop] [--config path.yml]\n  pokedr-cli tree-db analyze <tree.sqlite>"
+                "usage: pokedr-cli tree-db <build|analyze|top-combos|node>\n  pokedr-cli tree-db build <tree.sqlite> [flop] [--config path.yml]\n  pokedr-cli tree-db analyze <tree.sqlite>\n  pokedr-cli tree-db top-combos <tree.sqlite>\n  pokedr-cli tree-db node <tree.sqlite> <node_id>"
             );
             std::process::exit(2);
         }
@@ -664,7 +682,13 @@ fn run_tree_db_build(mut args: impl Iterator<Item = String>) {
         eprintln!("{error}");
         std::process::exit(2);
     });
-    let config = match_config(cli_config.as_ref());
+    let mut config = match_config(cli_config.as_ref());
+    if let Some(iterations) = build_args.iterations {
+        config.cfr_iterations = iterations.max(1);
+    }
+    if let Some(max_depth) = build_args.max_depth {
+        config.max_depth = max_depth;
+    }
     let dump = pokedr_agent::build_fixed_flop_tree_dump_with_combo_limit(
         flop,
         config,
@@ -678,6 +702,69 @@ fn run_tree_db_build(mut args: impl Iterator<Item = String>) {
         dump.solver_nodes.len(),
         dump.solver_combos.len(),
         build_args.db_path
+    );
+}
+
+fn run_tree_db_top_combos(mut args: impl Iterator<Item = String>) {
+    let Some(db_path) = args.next() else {
+        eprintln!("usage: pokedr-cli tree-db top-combos <tree.sqlite>");
+        std::process::exit(2);
+    };
+    if let Some(extra) = args.next() {
+        eprintln!("unexpected argument: {extra}");
+        std::process::exit(2);
+    }
+    let conn = Connection::open(&db_path).unwrap_or_else(|error| {
+        eprintln!("failed to open tree DB {db_path}: {error}");
+        std::process::exit(2);
+    });
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&db_top_combo_gaps(&conn))
+            .expect("combo gap JSON must serialize")
+    );
+}
+
+fn run_tree_db_node(mut args: impl Iterator<Item = String>) {
+    let Some(db_path) = args.next() else {
+        eprintln!("usage: pokedr-cli tree-db node <tree.sqlite> <node_id> [--limit n]");
+        std::process::exit(2);
+    };
+    let Some(node_id) = args.next() else {
+        eprintln!("usage: pokedr-cli tree-db node <tree.sqlite> <node_id> [--limit n]");
+        std::process::exit(2);
+    };
+    let mut limit = 16usize;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--limit" => {
+                let value = args.next().unwrap_or_else(|| {
+                    eprintln!("--limit requires a number");
+                    std::process::exit(2);
+                });
+                limit = value.parse().unwrap_or_else(|_| {
+                    eprintln!("--limit must be a number: {value}");
+                    std::process::exit(2);
+                });
+            }
+            extra => {
+                eprintln!("unexpected argument: {extra}");
+                std::process::exit(2);
+            }
+        }
+    }
+    let node_id = node_id.parse::<i64>().unwrap_or_else(|_| {
+        eprintln!("node_id must be an integer: {node_id}");
+        std::process::exit(2);
+    });
+    let conn = Connection::open(&db_path).unwrap_or_else(|error| {
+        eprintln!("failed to open tree DB {db_path}: {error}");
+        std::process::exit(2);
+    });
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&db_node_detail(&conn, node_id, limit))
+            .expect("node detail JSON must serialize")
     );
 }
 
@@ -740,6 +827,9 @@ fn write_tree_db(path: &str, dump: &pokedr_agent::FixedFlopTreeDump) {
             acting_player TEXT NOT NULL,
             action_count INTEGER NOT NULL,
             legal_combo_count INTEGER NOT NULL,
+            value_reach_sum REAL NOT NULL,
+            avg_strategy_weight_sum REAL NOT NULL,
+            current_strategy_weight_sum REAL NOT NULL,
             avg_strategy TEXT NOT NULL,
             current_strategy TEXT NOT NULL,
             avg_action_ev TEXT,
@@ -755,6 +845,8 @@ fn write_tree_db(path: &str, dump: &pokedr_agent::FixedFlopTreeDump) {
             combo TEXT NOT NULL,
             reach REAL NOT NULL,
             weighted_gap REAL NOT NULL,
+            avg_strategy_weight REAL NOT NULL,
+            current_strategy_weight REAL NOT NULL,
             avg_action_values TEXT,
             current_action_values TEXT,
             avg_strategy TEXT NOT NULL,
@@ -818,7 +910,7 @@ fn write_tree_db(path: &str, dump: &pokedr_agent::FixedFlopTreeDump) {
     }
     {
         let mut statement = tx.prepare(
-            "INSERT INTO solver_nodes VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            "INSERT INTO solver_nodes VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
         ).unwrap();
         for node in &dump.solver_nodes {
             statement
@@ -829,6 +921,9 @@ fn write_tree_db(path: &str, dump: &pokedr_agent::FixedFlopTreeDump) {
                     node.acting_player,
                     db_usize(node.action_count),
                     db_usize(node.legal_combo_count),
+                    node.value_reach_sum,
+                    node.avg_strategy_weight_sum,
+                    node.current_strategy_weight_sum,
                     vec_json(&node.avg_strategy),
                     vec_json(&node.current_strategy),
                     opt_vec_json(&node.avg_action_ev),
@@ -844,7 +939,7 @@ fn write_tree_db(path: &str, dump: &pokedr_agent::FixedFlopTreeDump) {
     {
         let mut statement = tx
             .prepare(
-                "INSERT INTO solver_combos VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                "INSERT INTO solver_combos VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             )
             .unwrap();
         for combo in &dump.solver_combos {
@@ -855,6 +950,8 @@ fn write_tree_db(path: &str, dump: &pokedr_agent::FixedFlopTreeDump) {
                     combo.combo,
                     combo.reach,
                     combo.weighted_gap,
+                    combo.avg_strategy_weight,
+                    combo.current_strategy_weight,
                     opt_vec_json(&combo.avg_action_values),
                     opt_vec_json(&combo.current_action_values),
                     vec_json(&combo.avg_strategy),
@@ -871,8 +968,12 @@ fn write_tree_db(path: &str, dump: &pokedr_agent::FixedFlopTreeDump) {
 fn analyze_tree_db(conn: &Connection) -> Value {
     json!({
         "counts": db_counts(conn),
+        "gap_breakdown": db_gap_breakdown(conn),
         "top_avg_gaps": db_top_gaps(conn, "avg_gap", "avg_action_ev", "avg_policy_ev"),
+        "top_reached_avg_gaps": db_top_reached_gaps(conn, "avg_gap", "avg_action_ev", "avg_policy_ev", "avg_strategy_weight_sum"),
         "top_current_gaps": db_top_gaps(conn, "current_gap", "current_action_ev", "current_policy_ev"),
+        "top_reached_current_gaps": db_top_reached_gaps(conn, "current_gap", "current_action_ev", "current_policy_ev", "current_strategy_weight_sum"),
+        "top_combo_gaps": db_top_combo_gaps(conn),
         "root_action_subtrees": db_root_action_subtrees(conn),
     })
 }
@@ -892,6 +993,43 @@ fn db_counts(conn: &Connection) -> Value {
     })
 }
 
+fn db_gap_breakdown(conn: &Connection) -> Value {
+    let mut statement = conn
+        .prepare(
+            "SELECT n.street,
+                    n.acting_player,
+                    n.to_call,
+                    s.action_count,
+                    COUNT(*),
+                    AVG(s.avg_gap),
+                    MAX(s.avg_gap),
+                    AVG(s.current_gap),
+                    MAX(s.current_gap)
+             FROM solver_nodes s JOIN nodes n ON n.node_id = s.node_id
+             WHERE s.avg_gap IS NOT NULL OR s.current_gap IS NOT NULL
+             GROUP BY n.street, n.acting_player, n.to_call, s.action_count
+             ORDER BY MAX(s.avg_gap) DESC
+             LIMIT 40",
+        )
+        .unwrap();
+    let rows = statement
+        .query_map([], |row| {
+            Ok(json!({
+                "street": row.get::<_, Option<String>>(0)?,
+                "acting_player": row.get::<_, Option<String>>(1)?,
+                "to_call": row.get::<_, Option<i64>>(2)?,
+                "action_count": row.get::<_, i64>(3)?,
+                "nodes": row.get::<_, i64>(4)?,
+                "mean_avg_gap": row.get::<_, Option<f64>>(5)?.unwrap_or(0.0),
+                "max_avg_gap": row.get::<_, Option<f64>>(6)?.unwrap_or(0.0),
+                "mean_current_gap": row.get::<_, Option<f64>>(7)?.unwrap_or(0.0),
+                "max_current_gap": row.get::<_, Option<f64>>(8)?.unwrap_or(0.0),
+            }))
+        })
+        .unwrap();
+    Value::Array(rows.map(Result::unwrap).collect())
+}
+
 fn db_top_gaps(
     conn: &Connection,
     gap_column: &str,
@@ -899,7 +1037,7 @@ fn db_top_gaps(
     policy_column: &str,
 ) -> Value {
     let sql = format!(
-        "SELECT n.node_id, n.street, n.acting_player, n.pot, n.to_call, n.path, s.{gap_column}, s.{action_ev_column}, s.{policy_column}, s.avg_strategy, s.current_strategy
+        "SELECT n.node_id, n.street, n.acting_player, n.pot, n.to_call, n.path, s.{gap_column}, s.{action_ev_column}, s.{policy_column}, s.avg_strategy, s.current_strategy, s.value_reach_sum, s.avg_strategy_weight_sum, s.current_strategy_weight_sum
          FROM solver_nodes s JOIN nodes n ON n.node_id = s.node_id
          WHERE s.{gap_column} IS NOT NULL
          ORDER BY s.{gap_column} DESC
@@ -920,6 +1058,297 @@ fn db_top_gaps(
                 "policy_ev": row.get::<_, Option<f64>>(8)?,
                 "avg_strategy": json_text_value(row.get::<_, String>(9)?),
                 "current_strategy": json_text_value(row.get::<_, String>(10)?),
+                "value_reach_sum": row.get::<_, f64>(11)?,
+                "avg_strategy_weight_sum": row.get::<_, f64>(12)?,
+                "current_strategy_weight_sum": row.get::<_, f64>(13)?,
+                "actions": db_node_actions(conn, row.get::<_, i64>(0)?),
+            }))
+        })
+        .unwrap();
+    Value::Array(rows.map(Result::unwrap).collect())
+}
+
+fn db_top_reached_gaps(
+    conn: &Connection,
+    gap_column: &str,
+    action_ev_column: &str,
+    policy_column: &str,
+    strategy_weight_column: &str,
+) -> Value {
+    let sql = format!(
+        "SELECT n.node_id, n.street, n.acting_player, n.pot, n.to_call, n.path, s.{gap_column}, s.{action_ev_column}, s.{policy_column}, s.avg_strategy, s.current_strategy, s.value_reach_sum, s.avg_strategy_weight_sum, s.current_strategy_weight_sum
+         FROM solver_nodes s JOIN nodes n ON n.node_id = s.node_id
+         WHERE s.{gap_column} IS NOT NULL AND s.{strategy_weight_column} > 1.0e-6
+         ORDER BY s.{gap_column} DESC
+         LIMIT 20"
+    );
+    let mut statement = conn.prepare(&sql).unwrap();
+    let rows = statement
+        .query_map([], |row| {
+            Ok(json!({
+                "node": row.get::<_, i64>(0)?,
+                "street": row.get::<_, Option<String>>(1)?,
+                "acting_player": row.get::<_, Option<String>>(2)?,
+                "pot": row.get::<_, Option<i64>>(3)?,
+                "to_call": row.get::<_, Option<i64>>(4)?,
+                "path": json_text_value(row.get::<_, String>(5)?),
+                "gap": row.get::<_, f64>(6)?,
+                "action_ev": row.get::<_, Option<String>>(7)?.map(json_text_value),
+                "policy_ev": row.get::<_, Option<f64>>(8)?,
+                "avg_strategy": json_text_value(row.get::<_, String>(9)?),
+                "current_strategy": json_text_value(row.get::<_, String>(10)?),
+                "value_reach_sum": row.get::<_, f64>(11)?,
+                "avg_strategy_weight_sum": row.get::<_, f64>(12)?,
+                "current_strategy_weight_sum": row.get::<_, f64>(13)?,
+                "actions": db_node_actions(conn, row.get::<_, i64>(0)?),
+            }))
+        })
+        .unwrap();
+    Value::Array(rows.map(Result::unwrap).collect())
+}
+
+fn db_top_combo_gaps(conn: &Connection) -> Value {
+    let mut statement = conn
+        .prepare(
+            "SELECT c.node_id,
+                    n.street,
+                    n.acting_player,
+                    n.pot,
+                    n.to_call,
+                    n.path,
+                    c.combo_index,
+                    c.combo,
+                    c.reach,
+                    c.weighted_gap,
+                    c.avg_strategy_weight,
+                    c.current_strategy_weight,
+                    c.avg_action_values,
+                    c.current_action_values,
+                    c.avg_strategy,
+                    c.current_strategy,
+                    c.regrets
+             FROM solver_combos c JOIN nodes n ON n.node_id = c.node_id
+             ORDER BY c.weighted_gap DESC
+             LIMIT 20",
+        )
+        .unwrap();
+    let rows = statement
+        .query_map([], |row| {
+            let node_id = row.get::<_, i64>(0)?;
+            Ok(json!({
+                "node": node_id,
+                "street": row.get::<_, Option<String>>(1)?,
+                "acting_player": row.get::<_, Option<String>>(2)?,
+                "pot": row.get::<_, Option<i64>>(3)?,
+                "to_call": row.get::<_, Option<i64>>(4)?,
+                "path": json_text_value(row.get::<_, String>(5)?),
+                "combo_index": row.get::<_, i64>(6)?,
+                "combo": row.get::<_, String>(7)?,
+                "reach": row.get::<_, f64>(8)?,
+                "weighted_gap": row.get::<_, f64>(9)?,
+                "local_gap": local_gap(row.get::<_, f64>(8)?, row.get::<_, f64>(9)?),
+                "avg_strategy_weight": row.get::<_, f64>(10)?,
+                "current_strategy_weight": row.get::<_, f64>(11)?,
+                "avg_action_values": row.get::<_, Option<String>>(12)?.map(json_text_value),
+                "current_action_values": row.get::<_, Option<String>>(13)?.map(json_text_value),
+                "avg_strategy": json_text_value(row.get::<_, String>(14)?),
+                "current_strategy": json_text_value(row.get::<_, String>(15)?),
+                "regrets": json_text_value(row.get::<_, String>(16)?),
+                "actions": db_node_actions(conn, node_id),
+            }))
+        })
+        .unwrap();
+    Value::Array(rows.map(Result::unwrap).collect())
+}
+
+fn db_node_detail(conn: &Connection, node_id: i64, combo_limit: usize) -> Value {
+    let node = conn
+        .query_row(
+            "SELECT node_id, parent_id, kind, infoset, path, street, board, acting_player, pot, to_call, hero_invested, villain_invested, terminal_kind
+             FROM nodes
+             WHERE node_id = ?1",
+            [node_id],
+            |row| {
+                Ok(json!({
+                    "node": row.get::<_, i64>(0)?,
+                    "parent": row.get::<_, Option<i64>>(1)?,
+                    "kind": row.get::<_, String>(2)?,
+                    "infoset": row.get::<_, Option<i64>>(3)?,
+                    "path": json_text_value(row.get::<_, String>(4)?),
+                    "street": row.get::<_, Option<String>>(5)?,
+                    "board": row.get::<_, Option<String>>(6)?,
+                    "acting_player": row.get::<_, Option<String>>(7)?,
+                    "pot": row.get::<_, Option<i64>>(8)?,
+                    "to_call": row.get::<_, Option<i64>>(9)?,
+                    "hero_invested": row.get::<_, Option<i64>>(10)?,
+                    "villain_invested": row.get::<_, Option<i64>>(11)?,
+                    "terminal_kind": row.get::<_, Option<String>>(12)?,
+                }))
+            },
+        )
+        .unwrap_or_else(|error| {
+            eprintln!("failed to find node {node_id}: {error}");
+            std::process::exit(2);
+        });
+
+    json!({
+        "node": node,
+        "actions": db_node_actions(conn, node_id),
+        "solver": db_solver_node(conn, node_id),
+        "top_combos_by_local_gap": db_node_combos(conn, node_id, "local", combo_limit),
+        "top_combos_by_weighted_gap": db_node_combos(conn, node_id, "weighted", combo_limit),
+    })
+}
+
+fn db_solver_node(conn: &Connection, node_id: i64) -> Value {
+    conn.query_row(
+        "SELECT infoset,
+                iterations,
+                acting_player,
+                action_count,
+                legal_combo_count,
+                value_reach_sum,
+                avg_strategy_weight_sum,
+                current_strategy_weight_sum,
+                avg_strategy,
+                current_strategy,
+                avg_action_ev,
+                current_action_ev,
+                avg_policy_ev,
+                current_policy_ev,
+                avg_gap,
+                current_gap
+         FROM solver_nodes
+         WHERE node_id = ?1",
+        [node_id],
+        |row| {
+            Ok(json!({
+                "infoset": row.get::<_, i64>(0)?,
+                "iterations": row.get::<_, i64>(1)?,
+                "acting_player": row.get::<_, String>(2)?,
+                "action_count": row.get::<_, i64>(3)?,
+                "legal_combo_count": row.get::<_, i64>(4)?,
+                "value_reach_sum": row.get::<_, f64>(5)?,
+                "avg_strategy_weight_sum": row.get::<_, f64>(6)?,
+                "current_strategy_weight_sum": row.get::<_, f64>(7)?,
+                "avg_strategy": json_text_value(row.get::<_, String>(8)?),
+                "current_strategy": json_text_value(row.get::<_, String>(9)?),
+                "avg_action_ev": row.get::<_, Option<String>>(10)?.map(json_text_value),
+                "current_action_ev": row.get::<_, Option<String>>(11)?.map(json_text_value),
+                "avg_policy_ev": row.get::<_, Option<f64>>(12)?,
+                "current_policy_ev": row.get::<_, Option<f64>>(13)?,
+                "avg_gap": row.get::<_, Option<f64>>(14)?,
+                "current_gap": row.get::<_, Option<f64>>(15)?,
+            }))
+        },
+    )
+    .unwrap_or(Value::Null)
+}
+
+fn db_node_combos(conn: &Connection, node_id: i64, order: &str, limit: usize) -> Value {
+    let order_sql = match order {
+        "local" => "CASE WHEN reach > 0.0 THEN weighted_gap / reach ELSE 0.0 END DESC",
+        "weighted" => "weighted_gap DESC",
+        _ => unreachable!("unknown combo order"),
+    };
+    let sql = format!(
+        "SELECT combo_index,
+                combo,
+                reach,
+                weighted_gap,
+                avg_strategy_weight,
+                current_strategy_weight,
+                avg_action_values,
+                current_action_values,
+                avg_strategy,
+                current_strategy,
+                regrets,
+                strategy_sum
+         FROM solver_combos
+         WHERE node_id = ?1
+         ORDER BY {order_sql}
+         LIMIT ?2"
+    );
+    let mut statement = conn.prepare(&sql).unwrap();
+    let rows = statement
+        .query_map(params![node_id, db_usize(limit)], |row| {
+            let reach = row.get::<_, f64>(2)?;
+            let weighted_gap = row.get::<_, f64>(3)?;
+            let avg_strategy_weight = row.get::<_, f64>(4)?;
+            let current_strategy_weight = row.get::<_, f64>(5)?;
+            let avg_action_values = row.get::<_, Option<String>>(6)?;
+            let current_action_values = row.get::<_, Option<String>>(7)?;
+            let avg_strategy = row.get::<_, String>(8)?;
+            let current_strategy = row.get::<_, String>(9)?;
+            let regrets = row.get::<_, String>(10)?;
+            let strategy_sum = row.get::<_, String>(11)?;
+            let avg_action_values_json = avg_action_values.clone().map(json_text_value);
+            let current_action_values_json = current_action_values.clone().map(json_text_value);
+            let avg_strategy_json = json_text_value(avg_strategy.clone());
+            let current_strategy_json = json_text_value(current_strategy.clone());
+            let regrets_json = json_text_value(regrets.clone());
+            let strategy_sum_json = json_text_value(strategy_sum.clone());
+            Ok(json!({
+                "combo_index": row.get::<_, i64>(0)?,
+                "combo": row.get::<_, String>(1)?,
+                "reach": reach,
+                "weighted_gap": weighted_gap,
+                "local_gap": local_gap(reach, weighted_gap),
+                "avg_strategy_weight": avg_strategy_weight,
+                "current_strategy_weight": current_strategy_weight,
+                "avg_best": avg_action_values.as_deref().and_then(best_action_summary),
+                "current_best": current_action_values.as_deref().and_then(best_action_summary),
+                "avg_action_values": avg_action_values_json,
+                "current_action_values": current_action_values_json,
+                "avg_strategy": avg_strategy_json,
+                "current_strategy": current_strategy_json,
+                "regrets": regrets_json,
+                "regret_best": best_action_summary(&regrets),
+                "strategy_sum": strategy_sum_json,
+                "strategy_sum_total": json_f32_sum(&strategy_sum),
+            }))
+        })
+        .unwrap();
+    Value::Array(rows.map(Result::unwrap).collect())
+}
+
+fn local_gap(reach: f64, weighted_gap: f64) -> Option<f64> {
+    (reach > 0.0).then_some(weighted_gap / reach)
+}
+
+fn best_action_summary(json_text: &str) -> Option<Value> {
+    let values = parse_f32_json_array(json_text)?;
+    let (index, value) = values
+        .iter()
+        .copied()
+        .enumerate()
+        .max_by(|(_, left), (_, right)| {
+            left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal)
+        })?;
+    Some(json!({ "index": index, "value": value }))
+}
+
+fn json_f32_sum(json_text: &str) -> f64 {
+    parse_f32_json_array(json_text)
+        .map(|values| values.into_iter().map(f64::from).sum())
+        .unwrap_or(0.0)
+}
+
+fn parse_f32_json_array(json_text: &str) -> Option<Vec<f32>> {
+    serde_json::from_str::<Vec<f32>>(json_text).ok()
+}
+
+fn db_node_actions(conn: &Connection, node_id: i64) -> Value {
+    let mut statement = conn
+        .prepare("SELECT action_index, action, child_id, source FROM actions WHERE node_id = ?1 ORDER BY action_index")
+        .unwrap();
+    let rows = statement
+        .query_map([node_id], |row| {
+            Ok(json!({
+                "index": row.get::<_, i64>(0)?,
+                "action": row.get::<_, String>(1)?,
+                "child": row.get::<_, i64>(2)?,
+                "source": row.get::<_, String>(3)?,
             }))
         })
         .unwrap();
@@ -940,6 +1369,8 @@ fn db_root_action_subtrees(conn: &Connection) -> Value {
                 "action": action,
                 "child": child_id,
                 "solver_summary": db_subtree_solver_summary(conn, child_id),
+                "top_avg_gaps": db_subtree_top_gaps(conn, child_id, "avg_gap", "avg_action_ev", "avg_policy_ev"),
+                "top_current_gaps": db_subtree_top_gaps(conn, child_id, "current_gap", "current_action_ev", "current_policy_ev"),
             }))
         })
         .unwrap();
@@ -971,6 +1402,49 @@ fn db_subtree_solver_summary(conn: &Connection, root: i64) -> Value {
         },
     )
     .unwrap()
+}
+
+fn db_subtree_top_gaps(
+    conn: &Connection,
+    root: i64,
+    gap_column: &str,
+    action_ev_column: &str,
+    policy_column: &str,
+) -> Value {
+    let sql = format!(
+        "WITH RECURSIVE subtree(node_id) AS (
+            SELECT ?1
+            UNION ALL
+            SELECT n.node_id FROM nodes n JOIN subtree s ON n.parent_id = s.node_id
+         )
+         SELECT n.node_id, n.street, n.acting_player, n.pot, n.to_call, n.path, s.{gap_column}, s.{action_ev_column}, s.{policy_column}, s.avg_strategy, s.current_strategy
+         FROM subtree JOIN solver_nodes s ON s.node_id = subtree.node_id
+                      JOIN nodes n ON n.node_id = subtree.node_id
+         WHERE s.{gap_column} IS NOT NULL
+         ORDER BY s.{gap_column} DESC
+         LIMIT 5"
+    );
+    let mut statement = conn.prepare(&sql).unwrap();
+    let rows = statement
+        .query_map([root], |row| {
+            let node_id = row.get::<_, i64>(0)?;
+            Ok(json!({
+                "node": node_id,
+                "street": row.get::<_, Option<String>>(1)?,
+                "acting_player": row.get::<_, Option<String>>(2)?,
+                "pot": row.get::<_, Option<i64>>(3)?,
+                "to_call": row.get::<_, Option<i64>>(4)?,
+                "path": json_text_value(row.get::<_, String>(5)?),
+                "gap": row.get::<_, f64>(6)?,
+                "action_ev": row.get::<_, Option<String>>(7)?.map(json_text_value),
+                "policy_ev": row.get::<_, Option<f64>>(8)?,
+                "avg_strategy": json_text_value(row.get::<_, String>(9)?),
+                "current_strategy": json_text_value(row.get::<_, String>(10)?),
+                "actions": db_node_actions(conn, node_id),
+            }))
+        })
+        .unwrap();
+    Value::Array(rows.map(Result::unwrap).collect())
 }
 
 fn vec_json(values: &[f32]) -> String {
@@ -1016,6 +1490,8 @@ fn parse_tree_db_build_args(args: &mut impl Iterator<Item = String>) -> TreeDbBu
         flop: None,
         config_path: None,
         combo_limit: 32,
+        iterations: None,
+        max_depth: None,
     };
     let mut args = args.peekable();
     while let Some(arg) = args.next() {
@@ -1038,6 +1514,26 @@ fn parse_tree_db_build_args(args: &mut impl Iterator<Item = String>) -> TreeDbBu
             }
             "--full-combos" => {
                 parsed.combo_limit = usize::MAX;
+            }
+            "--iterations" => {
+                let value = args.next().unwrap_or_else(|| {
+                    eprintln!("--iterations requires a number");
+                    std::process::exit(2);
+                });
+                parsed.iterations = Some(value.parse().unwrap_or_else(|_| {
+                    eprintln!("--iterations must be a number: {value}");
+                    std::process::exit(2);
+                }));
+            }
+            "--max-depth" => {
+                let value = args.next().unwrap_or_else(|| {
+                    eprintln!("--max-depth requires a number");
+                    std::process::exit(2);
+                });
+                parsed.max_depth = Some(value.parse().unwrap_or_else(|_| {
+                    eprintln!("--max-depth must be a number: {value}");
+                    std::process::exit(2);
+                }));
             }
             value if value.starts_with("--") => {
                 eprintln!("unknown tree-db build option: {value}");

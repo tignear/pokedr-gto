@@ -115,8 +115,11 @@ pub struct FixedFlopMetricRow {
     pub root_strategy_l1_delta: Option<f32>,
     pub root_action_probabilities: Vec<f32>,
     pub root_exploitability: Option<f32>,
+    pub current_root_exploitability: Option<f32>,
     pub hero_root_br_value: Option<f32>,
     pub villain_root_br_value: Option<f32>,
+    pub current_hero_root_br_value: Option<f32>,
+    pub current_villain_root_br_value: Option<f32>,
     pub root_br_gap: Option<f32>,
     pub local_br_gap: Option<f32>,
     pub recursive_root_br_gap: Option<f32>,
@@ -190,6 +193,9 @@ pub struct SolverNodeRecord {
     pub acting_player: String,
     pub action_count: usize,
     pub legal_combo_count: usize,
+    pub value_reach_sum: f32,
+    pub avg_strategy_weight_sum: f32,
+    pub current_strategy_weight_sum: f32,
     pub avg_strategy: Vec<f32>,
     pub current_strategy: Vec<f32>,
     pub avg_action_ev: Option<Vec<f32>>,
@@ -207,6 +213,8 @@ pub struct SolverComboRecord {
     pub combo: String,
     pub reach: f32,
     pub weighted_gap: f32,
+    pub avg_strategy_weight: f32,
+    pub current_strategy_weight: f32,
     pub avg_action_values: Option<Vec<f32>>,
     pub current_action_values: Option<Vec<f32>>,
     pub avg_strategy: Vec<f32>,
@@ -586,8 +594,11 @@ where
             root_strategy_l1_delta,
             root_action_probabilities,
             root_exploitability: None,
+            current_root_exploitability: None,
             hero_root_br_value: None,
             villain_root_br_value: None,
+            current_hero_root_br_value: None,
+            current_villain_root_br_value: None,
             root_br_gap: None,
             local_br_gap: None,
             recursive_root_br_gap: None,
@@ -821,6 +832,17 @@ fn try_solve_fixed_flop_metrics_gpu(
             &state,
             include_local_gaps,
         );
+        let current_recursive_br_gap = recursive_br_gap_metrics_gpu_with_profile(
+            &backend,
+            tree,
+            &linearized,
+            &combos,
+            &combo_legal,
+            villain_weights,
+            layout,
+            &state,
+            false,
+        );
         let diagnostics = cfr_state_diagnostics(&state);
         rows.push(FixedFlopMetricRow {
             board: format_pokedr_cards(flop),
@@ -831,10 +853,19 @@ fn try_solve_fixed_flop_metrics_gpu(
             root_exploitability: recursive_br_gap
                 .as_ref()
                 .map(|metrics| metrics.root_exploitability),
+            current_root_exploitability: current_recursive_br_gap
+                .as_ref()
+                .map(|metrics| metrics.root_exploitability),
             hero_root_br_value: recursive_br_gap
                 .as_ref()
                 .map(|metrics| metrics.hero_root_br_value),
             villain_root_br_value: recursive_br_gap
+                .as_ref()
+                .map(|metrics| metrics.villain_root_br_value),
+            current_hero_root_br_value: current_recursive_br_gap
+                .as_ref()
+                .map(|metrics| metrics.hero_root_br_value),
+            current_villain_root_br_value: current_recursive_br_gap
                 .as_ref()
                 .map(|metrics| metrics.villain_root_br_value),
             root_br_gap: br_gap.as_ref().map(|metrics| metrics.root_br_gap),
@@ -956,6 +987,58 @@ fn recursive_br_gap_metrics_gpu(
     include_local_gaps: bool,
 ) -> Option<BrGapMetrics> {
     let profile = state.average_strategy_profile_state();
+    recursive_br_gap_metrics_gpu_for_profile(
+        backend,
+        tree,
+        linearized,
+        combos,
+        combo_legal,
+        villain_weights,
+        layout,
+        state,
+        &profile,
+        include_local_gaps,
+    )
+}
+
+fn recursive_br_gap_metrics_gpu_with_profile(
+    backend: &GpuDenseCfrBackend,
+    tree: &SubgameTree,
+    linearized: &GpuLinearizedPublicTree,
+    combos: &[GpuPrivateCombo],
+    combo_legal: &[u32],
+    villain_weights: &[f32],
+    layout: &PostflopDenseLayout,
+    state: &DenseCfrState,
+    include_local_gaps: bool,
+) -> Option<BrGapMetrics> {
+    recursive_br_gap_metrics_gpu_for_profile(
+        backend,
+        tree,
+        linearized,
+        combos,
+        combo_legal,
+        villain_weights,
+        layout,
+        state,
+        state,
+        include_local_gaps,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn recursive_br_gap_metrics_gpu_for_profile(
+    backend: &GpuDenseCfrBackend,
+    tree: &SubgameTree,
+    linearized: &GpuLinearizedPublicTree,
+    combos: &[GpuPrivateCombo],
+    combo_legal: &[u32],
+    villain_weights: &[f32],
+    layout: &PostflopDenseLayout,
+    state: &DenseCfrState,
+    profile: &DenseCfrState,
+    include_local_gaps: bool,
+) -> Option<BrGapMetrics> {
     let hero_values = backend
         .public_tree_best_response_values(
             &linearized.nodes,
@@ -965,7 +1048,7 @@ fn recursive_br_gap_metrics_gpu(
             combo_legal,
             villain_weights,
             &linearized.showdown_boards,
-            &profile,
+            profile,
             0,
         )
         .ok()?;
@@ -979,7 +1062,7 @@ fn recursive_br_gap_metrics_gpu(
             combo_legal,
             villain_weights,
             &linearized.showdown_boards,
-            &profile,
+            profile,
             1,
         )
         .ok()?;
@@ -988,7 +1071,7 @@ fn recursive_br_gap_metrics_gpu(
         tree,
         layout,
         state,
-        &profile,
+        profile,
         combos,
         combo_legal,
         villain_weights,
@@ -1002,7 +1085,7 @@ fn br_gap_metrics_from_values(
     tree: &SubgameTree,
     layout: &PostflopDenseLayout,
     state: &DenseCfrState,
-    _profile: &DenseCfrState,
+    profile: &DenseCfrState,
     values: &GpuRootTerminalValues,
 ) -> BrGapMetrics {
     let mut strategy = vec![0.0; layout.max_actions()];
@@ -1028,7 +1111,7 @@ fn br_gap_metrics_from_values(
                 if !best.is_finite() {
                     continue;
                 }
-                state.average_strategy_for(infoset, &mut strategy);
+                profile.strategy_for(infoset, &mut strategy);
                 let policy_value = action_values
                     .iter()
                     .zip(&strategy)
@@ -3023,6 +3106,8 @@ struct DumpSolverComboRow {
     reach_weight: f32,
     gap: f32,
     weighted_gap: f32,
+    avg_strategy_weight: f32,
+    current_strategy_weight: f32,
     best_action: Option<usize>,
     policy_value: Option<f32>,
     avg_action_values: Option<Vec<f32>>,
@@ -3036,12 +3121,14 @@ struct DumpSolverComboRow {
 impl DumpSolverComboRow {
     fn to_json(&self) -> String {
         format!(
-            r#"{{"combo_index":{},"combo":"{}","reach":{},"gap":{},"weighted_gap":{},"best_action":{},"policy_value":{},"avg_action_values":{},"current_action_values":{},"avg_strategy":{},"current_strategy":{},"regrets":{},"strategy_sum":{}}}"#,
+            r#"{{"combo_index":{},"combo":"{}","reach":{},"gap":{},"weighted_gap":{},"avg_strategy_weight":{},"current_strategy_weight":{},"best_action":{},"policy_value":{},"avg_action_values":{},"current_action_values":{},"avg_strategy":{},"current_strategy":{},"regrets":{},"strategy_sum":{}}}"#,
             self.combo_index,
             json_escape(&self.combo),
             json_f32(self.reach_weight),
             json_f32(self.gap),
             json_f32(self.weighted_gap),
+            json_f32(self.avg_strategy_weight),
+            json_f32(self.current_strategy_weight),
             self.best_action
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "null".to_string()),
@@ -3089,6 +3176,26 @@ fn dump_solver_combo_row(
         .and_then(|values| values.reach_weights.get(offset / context.state.actions()))
         .copied()
         .unwrap_or(0.0);
+    let avg_strategy_weight = context
+        .average_values
+        .as_ref()
+        .and_then(|values| {
+            values
+                .strategy_weights
+                .get(offset / context.state.actions())
+        })
+        .copied()
+        .unwrap_or(0.0);
+    let current_strategy_weight = context
+        .current_values
+        .as_ref()
+        .and_then(|values| {
+            values
+                .strategy_weights
+                .get(offset / context.state.actions())
+        })
+        .copied()
+        .unwrap_or(0.0);
     let (best_action, gap, policy_value) = avg_action_values
         .as_ref()
         .map(|values| {
@@ -3119,6 +3226,8 @@ fn dump_solver_combo_row(
         reach_weight,
         gap,
         weighted_gap: gap * reach_weight,
+        avg_strategy_weight,
+        current_strategy_weight,
         best_action,
         policy_value,
         avg_action_values,
@@ -3212,6 +3321,8 @@ fn solver_node_records(
     let mut avg_policy_value_sum = 0.0;
     let mut current_policy_value_sum = 0.0;
     let mut action_value_weight_sum = 0.0;
+    let mut avg_strategy_weight_sum = 0.0;
+    let mut current_strategy_weight_sum = 0.0;
     let mut legal_combo_count = 0usize;
     let mut combo_rows = Vec::new();
 
@@ -3238,6 +3349,8 @@ fn solver_node_records(
             &average_strategy,
             &current_strategy,
         );
+        avg_strategy_weight_sum += row.avg_strategy_weight;
+        current_strategy_weight_sum += row.current_strategy_weight;
         if row.reach_weight > 0.0 {
             let value_weight = row.reach_weight;
             if let Some(values) = &row.avg_action_values {
@@ -3304,6 +3417,8 @@ fn solver_node_records(
             combo: row.combo.clone(),
             reach: row.reach_weight,
             weighted_gap: row.weighted_gap,
+            avg_strategy_weight: row.avg_strategy_weight,
+            current_strategy_weight: row.current_strategy_weight,
             avg_action_values: row.avg_action_values.clone(),
             current_action_values: row.current_action_values.clone(),
             avg_strategy: row.average_strategy.clone(),
@@ -3321,6 +3436,9 @@ fn solver_node_records(
             acting_player: format!("{:?}", state.acting_player),
             action_count,
             legal_combo_count,
+            value_reach_sum: action_value_weight_sum,
+            avg_strategy_weight_sum,
+            current_strategy_weight_sum,
             avg_strategy: average_sum,
             current_strategy: current_sum,
             avg_action_ev: has_ev.then_some(avg_action_value_sum),
