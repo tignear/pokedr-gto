@@ -529,23 +529,37 @@ fn try_solve_fixed_flop_metrics_gpu(
             iteration_counts
         );
     }
-    let snapshots = backend
-        .public_tree_run_iteration_checkpoints(
-            &linearized.nodes,
-            &linearized.children,
-            &linearized.child_cards,
-            &combos,
-            &combo_legal,
-            villain_weights,
-            &linearized.showdown_boards,
-            &mut gpu_state,
-            iteration_counts,
-        )
-        .ok()?;
-
+    let mut checkpoints: Vec<_> = iteration_counts
+        .iter()
+        .copied()
+        .map(|value| value.max(1))
+        .collect();
+    checkpoints.sort_unstable();
+    checkpoints.dedup();
     let mut previous_root_strategy: Option<Vec<f32>> = None;
-    let mut rows = Vec::with_capacity(snapshots.len());
-    for (iterations, state, elapsed_secs) in snapshots {
+    let mut rows = Vec::with_capacity(checkpoints.len());
+    let started = Instant::now();
+    let mut completed_iterations = 0usize;
+    for iterations in checkpoints {
+        let delta = iterations.saturating_sub(completed_iterations);
+        backend
+            .public_tree_run_iterations_from(
+                &linearized.nodes,
+                &linearized.children,
+                &linearized.child_cards,
+                &combos,
+                &combo_legal,
+                villain_weights,
+                &linearized.showdown_boards,
+                &mut gpu_state,
+                completed_iterations + 1,
+                delta,
+            )
+            .ok()?;
+        completed_iterations = iterations;
+
+        let state = gpu_state.download(&backend).ok()?;
+        let elapsed_secs = started.elapsed().as_secs_f32();
         let root_strategy = root_average_strategy(layout, &state, indexer, root_dead);
         let root_strategy_l1_delta = previous_root_strategy
             .as_ref()
@@ -589,6 +603,7 @@ fn try_solve_fixed_flop_metrics_gpu(
             finite: diagnostics.finite,
         });
         previous_root_strategy = Some(root_strategy);
+        backend.wait_idle().ok()?;
     }
     Some(rows)
 }

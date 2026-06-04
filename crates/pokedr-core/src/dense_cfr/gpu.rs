@@ -3093,6 +3093,10 @@ impl GpuDenseCfrBackend {
             .contains(wgpu::Features::SHADER_FLOAT32_ATOMIC)
     }
 
+    pub fn wait_idle(&self) -> Result<(), GpuCfrError> {
+        self.profile_poll()
+    }
+
     fn gpu_profile_enabled() -> bool {
         std::env::var_os("POKEDR_GPU_PROFILE").is_some()
     }
@@ -5422,6 +5426,37 @@ impl GpuDenseCfrBackend {
         state: &mut GpuDenseCfrState,
         iterations: usize,
     ) -> Result<(), GpuCfrError> {
+        self.public_tree_run_iterations_from(
+            nodes,
+            children,
+            child_cards,
+            combos,
+            combo_legal,
+            villain_weights,
+            showdown_boards,
+            state,
+            1,
+            iterations.max(1),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn public_tree_run_iterations_from(
+        &self,
+        nodes: &[GpuPublicTreeNode],
+        children: &[u32],
+        child_cards: &[u32],
+        combos: &[GpuPrivateCombo],
+        combo_legal: &[u32],
+        villain_weights: &[f32],
+        showdown_boards: &[GpuFinalBoard],
+        state: &mut GpuDenseCfrState,
+        first_iteration: usize,
+        iterations: usize,
+    ) -> Result<(), GpuCfrError> {
+        if iterations == 0 {
+            return Ok(());
+        }
         let profile = Self::gpu_profile_enabled();
         let setup_start = profile.then(Instant::now);
         let context = self.public_tree_iteration_context(
@@ -5446,7 +5481,7 @@ impl GpuDenseCfrBackend {
             .and_then(|value| value.parse::<usize>().ok())
             .unwrap_or(4)
             .max(1);
-        for iteration in 1..=iterations.max(1) {
+        for iteration in first_iteration..first_iteration + iterations {
             self.public_tree_update_state_with_context(&context, state, iteration)?;
             if iteration % flush_interval == 0 {
                 let flush_start = profile.then(Instant::now);
@@ -5465,6 +5500,7 @@ impl GpuDenseCfrBackend {
                 }
             }
         }
+        self.wait_idle()?;
         Ok(())
     }
 
