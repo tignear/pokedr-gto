@@ -188,7 +188,7 @@ impl DenseCfrState {
                 effective_regret(self.variant, *value, *predicted).max(0.0)
             })
             .sum();
-        if normalizer > 0.0 {
+        if normalizer > f32::EPSILON {
             for action in 0..self.actions {
                 out[action] = if legal[action] {
                     effective_regret(self.variant, regrets[action], prediction[action]).max(0.0)
@@ -217,7 +217,7 @@ impl DenseCfrState {
             .filter(|(_, is_legal)| **is_legal)
             .map(|(value, _)| *value)
             .sum();
-        if normalizer > 0.0 {
+        if normalizer > f32::EPSILON {
             for action in 0..self.actions {
                 out[action] = if legal[action] {
                     sum[action] / normalizer
@@ -226,10 +226,7 @@ impl DenseCfrState {
                 };
             }
         } else {
-            let uniform = 1.0 / self.legal_action_counts[infoset] as f32;
-            for action in 0..self.actions {
-                out[action] = if legal[action] { uniform } else { 0.0 };
-            }
+            self.strategy_for(infoset, out);
         }
     }
 
