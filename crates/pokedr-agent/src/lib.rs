@@ -2500,6 +2500,7 @@ fn dump_tree_node_json(
         .map(|value| value.to_string())
         .unwrap_or_else(|| "null".to_string());
     let children = json_usize_array(&node.children);
+    let path = dump_tree_path_json(tree, index);
     let infoset = layout
         .node_infoset(index)
         .map(|value| value.to_string())
@@ -2554,8 +2555,50 @@ fn dump_tree_node_json(
         ),
     };
     format!(
-        r#"{{"index":{index},"parent":{parent},"children":{children},"infoset":{infoset},"kind":{kind}}}"#
+        r#"{{"index":{index},"parent":{parent},"children":{children},"path":[{path}],"infoset":{infoset},"kind":{kind}}}"#
     )
+}
+
+fn dump_tree_path_json(tree: &SubgameTree, index: usize) -> String {
+    let mut edges = Vec::new();
+    let mut child_index = index;
+    while let Some(parent_index) = tree.nodes()[child_index].parent {
+        edges.push(dump_tree_edge_json(tree, parent_index, child_index));
+        child_index = parent_index;
+    }
+    edges.reverse();
+    edges.join(",")
+}
+
+fn dump_tree_edge_json(tree: &SubgameTree, parent_index: usize, child_index: usize) -> String {
+    let action_index = tree.nodes()[parent_index]
+        .children
+        .iter()
+        .position(|candidate| *candidate == child_index);
+    match (&tree.nodes()[parent_index].kind, action_index) {
+        (PublicNodeKind::Decision { actions, .. }, Some(action_index)) => {
+            let action = &actions[action_index];
+            format!(
+                r#"{{"from":{},"to":{},"kind":"action","index":{},"action":"{}","source":"{:?}"}}"#,
+                parent_index,
+                child_index,
+                action_index,
+                json_escape(&format_player_action(action.action)),
+                action.source
+            )
+        }
+        (PublicNodeKind::Chance { cards, .. }, Some(action_index)) => format!(
+            r#"{{"from":{},"to":{},"kind":"card","index":{},"card":"{}"}}"#,
+            parent_index,
+            child_index,
+            action_index,
+            json_escape(&format_pokedr_cards(&[cards[action_index]]))
+        ),
+        _ => format!(
+            r#"{{"from":{},"to":{},"kind":"unknown"}}"#,
+            parent_index, child_index
+        ),
+    }
 }
 
 fn dump_public_state_json(state: &PublicState) -> String {
