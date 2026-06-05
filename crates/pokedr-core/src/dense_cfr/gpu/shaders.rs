@@ -960,7 +960,7 @@ struct ChunkParams {
 @group(0) @binding(0) var<storage, read> nodes: array<TreeNode>;
 @group(0) @binding(1) var<storage, read> terminal_refs: array<TerminalRef>;
 @group(0) @binding(2) var<storage, read> combo_order: array<u32>;
-@group(0) @binding(3) var<storage, read> combo_bounds: array<Bounds>;
+@group(0) @binding(3) var<storage, read> combo_bounds: array<u32>;
 @group(0) @binding(4) var<storage, read> hero_reaches: array<f32>;
 @group(0) @binding(5) var<storage, read> villain_reaches: array<f32>;
 @group(0) @binding(6) var<storage, read_write> prefix_pairs: array<PrefixPair>;
@@ -969,6 +969,10 @@ var<immediate> chunk: ChunkParams;
 
 const TERMINAL_PREFIX_CAPACITY: u32 = 2048u;
 var<workgroup> scan_pairs: array<PrefixPair, 2048>;
+
+fn bounds_legal(bounds: u32) -> u32 {
+    return (bounds >> 24u) & 1u;
+}
 
 fn terminal_scan_upsweep(stride: u32, local_index: u32) {
     let step = stride * 2u;
@@ -1020,7 +1024,7 @@ fn terminal_partial(
             let combo = combo_order[order_base + position];
             if combo != 0xffffffffu {
                 let bounds = combo_bounds[table_board * params.combo_count + combo];
-                if bounds.legal != 0u {
+                if bounds_legal(bounds) != 0u {
                     pair = PrefixPair(
                         hero_reaches[node_offset + combo],
                         villain_reaches[node_offset + combo],
@@ -1138,12 +1142,16 @@ struct ChunkParams {
 @group(0) @binding(0) var<storage, read> nodes: array<TreeNode>;
 @group(0) @binding(1) var<storage, read> terminal_refs: array<TerminalRef>;
 @group(0) @binding(2) var<storage, read> combo_order: array<u32>;
-@group(0) @binding(3) var<storage, read> combo_bounds: array<Bounds>;
+@group(0) @binding(3) var<storage, read> combo_bounds: array<u32>;
 @group(0) @binding(4) var<storage, read> hero_reaches: array<f32>;
 @group(0) @binding(5) var<storage, read> villain_reaches: array<f32>;
 @group(0) @binding(6) var<storage, read_write> prefix_pairs: array<PrefixPair>;
 @group(0) @binding(7) var<uniform> params: Params;
 var<immediate> chunk: ChunkParams;
+
+fn bounds_legal(bounds: u32) -> u32 {
+    return (bounds >> 24u) & 1u;
+}
 
 @compute @workgroup_size(64)
 fn terminal_partial(@builtin(global_invocation_id) id: vec3<u32>) {
@@ -1168,7 +1176,7 @@ fn terminal_partial(@builtin(global_invocation_id) id: vec3<u32>) {
         let combo = combo_order[order_base + position];
         if combo != 0xffffffffu {
             let bounds = combo_bounds[table_board * params.combo_count + combo];
-            if bounds.legal != 0u {
+            if bounds_legal(bounds) != 0u {
                 hero_sum = hero_sum + hero_reaches[node_offset + combo];
                 villain_sum = villain_sum + villain_reaches[node_offset + combo];
             }
@@ -1226,7 +1234,7 @@ struct ChunkParams {
 
 @group(0) @binding(0) var<storage, read> nodes: array<TreeNode>;
 @group(0) @binding(1) var<storage, read> terminal_refs: array<TerminalRef>;
-@group(0) @binding(2) var<storage, read> combo_bounds: array<Bounds>;
+@group(0) @binding(2) var<storage, read> combo_bounds: array<u32>;
 @group(0) @binding(3) var<storage, read> blocker_neighbors: array<u32>;
 @group(0) @binding(4) var<storage, read> hero_reaches: array<f32>;
 @group(0) @binding(5) var<storage, read> villain_reaches: array<f32>;
@@ -1235,6 +1243,18 @@ struct ChunkParams {
 @group(0) @binding(8) var<storage, read_write> villain_values: array<f32>;
 @group(0) @binding(9) var<uniform> params: Params;
 var<immediate> chunk: ChunkParams;
+
+fn bounds_start(bounds: u32) -> u32 {
+    return bounds & 0x0fffu;
+}
+
+fn bounds_end(bounds: u32) -> u32 {
+    return (bounds >> 12u) & 0x0fffu;
+}
+
+fn bounds_legal(bounds: u32) -> u32 {
+    return (bounds >> 24u) & 1u;
+}
 
 @compute @workgroup_size(64)
 fn terminal_reduce(@builtin(global_invocation_id) id: vec3<u32>) {
@@ -1256,13 +1276,15 @@ fn terminal_reduce(@builtin(global_invocation_id) id: vec3<u32>) {
     for (var local_board = 0u; local_board < node.board_count; local_board = local_board + 1u) {
         let table_board = terminal_ref.table * params.board_count + local_board;
         let bounds = combo_bounds[table_board * params.combo_count + combo];
-        if bounds.legal == 0u {
+        if bounds_legal(bounds) == 0u {
             continue;
         }
+        let group_start = bounds_start(bounds);
+        let group_end = bounds_end(bounds);
         let prefix_base = (terminal_slot * params.board_count + local_board) * params.prefix_stride;
         let total_pair = prefix_pairs[prefix_base + params.combo_count];
-        let win_pair = prefix_pairs[prefix_base + bounds.group_start];
-        let tie_pair = prefix_pairs[prefix_base + bounds.group_end];
+        let win_pair = prefix_pairs[prefix_base + group_start];
+        let tie_pair = prefix_pairs[prefix_base + group_end];
         var hero_win = win_pair.villain;
         var hero_tie = tie_pair.villain - win_pair.villain;
         var hero_total = total_pair.villain;
@@ -1277,17 +1299,17 @@ fn terminal_reduce(@builtin(global_invocation_id) id: vec3<u32>) {
                 continue;
             }
             let opponent_bounds = combo_bounds[table_board * params.combo_count + opponent];
-            if opponent_bounds.legal == 0u {
+            if bounds_legal(opponent_bounds) == 0u {
                 continue;
             }
             let opponent_hero_reach = hero_reaches[node_offset + opponent];
             let opponent_villain_reach = villain_reaches[node_offset + opponent];
             hero_total = hero_total - opponent_villain_reach;
             villain_total = villain_total - opponent_hero_reach;
-            if opponent_bounds.group_end <= bounds.group_start {
+            if bounds_end(opponent_bounds) <= group_start {
                 hero_win = hero_win - opponent_villain_reach;
                 villain_win = villain_win - opponent_hero_reach;
-            } else if opponent_bounds.group_start == bounds.group_start {
+            } else if bounds_start(opponent_bounds) == group_start {
                 hero_tie = hero_tie - opponent_villain_reach;
                 villain_tie = villain_tie - opponent_hero_reach;
             }
@@ -1348,12 +1370,24 @@ struct Params {
 @group(0) @binding(0) var<storage, read> nodes: array<TreeNode>;
 @group(0) @binding(1) var<storage, read> terminal_refs: array<TerminalRef>;
 @group(0) @binding(2) var<storage, read> combo_order: array<u32>;
-@group(0) @binding(3) var<storage, read> combo_bounds: array<Bounds>;
+@group(0) @binding(3) var<storage, read> combo_bounds: array<u32>;
 @group(0) @binding(4) var<storage, read> combos: array<Combo>;
 @group(0) @binding(5) var<storage, read> hero_reaches: array<f32>;
 @group(0) @binding(6) var<storage, read> villain_reaches: array<f32>;
 @group(0) @binding(7) var<storage, read_write> card_prefix_pairs: array<PrefixPair>;
 @group(0) @binding(8) var<uniform> params: Params;
+
+fn bounds_start(bounds: u32) -> u32 {
+    return bounds & 0x0fffu;
+}
+
+fn bounds_end(bounds: u32) -> u32 {
+    return (bounds >> 12u) & 0x0fffu;
+}
+
+fn bounds_legal(bounds: u32) -> u32 {
+    return (bounds >> 24u) & 1u;
+}
 
 @compute @workgroup_size(64)
 fn terminal_card_prefix(
@@ -1387,8 +1421,8 @@ fn terminal_card_prefix(
         if combo_index != 0xffffffffu {
             let bounds = combo_bounds[table_board * params.combo_count + combo_index];
             let combo = combos[combo_index];
-            if bounds.legal != 0u {
-                if bounds.group_start == position {
+            if bounds_legal(bounds) != 0u {
+                if bounds_start(bounds) == position {
                     card_prefix_pairs[output_base + position] =
                         PrefixPair(hero_sum, villain_sum);
                 }
@@ -1396,7 +1430,7 @@ fn terminal_card_prefix(
                     hero_sum = hero_sum + hero_reaches[node_offset + combo_index];
                     villain_sum = villain_sum + villain_reaches[node_offset + combo_index];
                 }
-                if bounds.group_end == position + 1u {
+                if bounds_end(bounds) == position + 1u {
                     card_prefix_pairs[output_base + position + 1u] =
                         PrefixPair(hero_sum, villain_sum);
                 }
@@ -1450,7 +1484,7 @@ struct Params {
 
 @group(0) @binding(0) var<storage, read> nodes: array<TreeNode>;
 @group(0) @binding(1) var<storage, read> terminal_refs: array<TerminalRef>;
-@group(0) @binding(2) var<storage, read> combo_bounds: array<Bounds>;
+@group(0) @binding(2) var<storage, read> combo_bounds: array<u32>;
 @group(0) @binding(3) var<storage, read> combos: array<Combo>;
 @group(0) @binding(4) var<storage, read> hero_reaches: array<f32>;
 @group(0) @binding(5) var<storage, read> villain_reaches: array<f32>;
@@ -1459,6 +1493,18 @@ struct Params {
 @group(0) @binding(8) var<storage, read_write> hero_values: array<f32>;
 @group(0) @binding(9) var<storage, read_write> villain_values: array<f32>;
 @group(0) @binding(10) var<uniform> params: Params;
+
+fn bounds_start(bounds: u32) -> u32 {
+    return bounds & 0x0fffu;
+}
+
+fn bounds_end(bounds: u32) -> u32 {
+    return (bounds >> 12u) & 0x0fffu;
+}
+
+fn bounds_legal(bounds: u32) -> u32 {
+    return (bounds >> 24u) & 1u;
+}
 
 fn card_prefix_base(terminal_slot: u32, local_board: u32, card: u32) -> u32 {
     return (terminal_slot * params.board_count * 52u + local_board * 52u + card) * params.card_stride;
@@ -1485,24 +1531,26 @@ fn terminal_reduce(@builtin(global_invocation_id) id: vec3<u32>) {
     for (var local_board = 0u; local_board < node.board_count; local_board = local_board + 1u) {
         let table_board = terminal_ref.table * params.board_count + local_board;
         let bounds = combo_bounds[table_board * params.combo_count + combo];
-        if bounds.legal == 0u {
+        if bounds_legal(bounds) == 0u {
             continue;
         }
+        let group_start = bounds_start(bounds);
+        let group_end = bounds_end(bounds);
         let prefix_base = (terminal_slot * params.board_count + local_board) * params.prefix_stride;
         let total_pair = prefix_pairs[prefix_base + params.combo_count];
-        let win_pair = prefix_pairs[prefix_base + bounds.group_start];
-        let tie_pair = prefix_pairs[prefix_base + bounds.group_end];
+        let win_pair = prefix_pairs[prefix_base + group_start];
+        let tie_pair = prefix_pairs[prefix_base + group_end];
 
         let card0_base = card_prefix_base(terminal_slot, local_board, private_combo.cards[0]);
         let card1_base = card_prefix_base(terminal_slot, local_board, private_combo.cards[1]);
         let card0_total = card_prefix_pairs[card0_base + params.combo_count];
         let card1_total = card_prefix_pairs[card1_base + params.combo_count];
-        let card0_win = card_prefix_pairs[card0_base + bounds.group_start];
-        let card1_win = card_prefix_pairs[card1_base + bounds.group_start];
-        let card0_tie_start = card_prefix_pairs[card0_base + bounds.group_start];
-        let card0_tie_end = card_prefix_pairs[card0_base + bounds.group_end];
-        let card1_tie_start = card_prefix_pairs[card1_base + bounds.group_start];
-        let card1_tie_end = card_prefix_pairs[card1_base + bounds.group_end];
+        let card0_win = card_prefix_pairs[card0_base + group_start];
+        let card1_win = card_prefix_pairs[card1_base + group_start];
+        let card0_tie_start = card_prefix_pairs[card0_base + group_start];
+        let card0_tie_end = card_prefix_pairs[card0_base + group_end];
+        let card1_tie_start = card_prefix_pairs[card1_base + group_start];
+        let card1_tie_end = card_prefix_pairs[card1_base + group_end];
 
         let self_hero = hero_reaches[node_offset + combo];
         let self_villain = villain_reaches[node_offset + combo];

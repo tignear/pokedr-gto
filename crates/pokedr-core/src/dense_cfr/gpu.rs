@@ -274,7 +274,15 @@ struct GpuTerminalGroupData {
     board_count: usize,
     terminal_refs: Vec<GpuTerminalRef>,
     combo_order: Vec<u32>,
-    combo_bounds: Vec<GpuShowdownComboBounds>,
+    combo_bounds: Vec<u32>,
+}
+
+fn pack_showdown_bounds(bounds: GpuShowdownComboBounds) -> u32 {
+    debug_assert!(bounds.group_start < 4096);
+    debug_assert!(bounds.group_end < 4096);
+    (bounds.group_start & 0x0fff)
+        | ((bounds.group_end & 0x0fff) << 12)
+        | ((bounds.legal & 0x0001) << 24)
 }
 
 #[repr(C)]
@@ -420,9 +428,9 @@ fn terminal_group_data(
             continue;
         }
 
-        let table_bytes_per_unique_board = board_count.saturating_mul(combos.len()).saturating_mul(
-            std::mem::size_of::<u32>() + std::mem::size_of::<GpuShowdownComboBounds>(),
-        );
+        let table_bytes_per_unique_board = board_count
+            .saturating_mul(combos.len())
+            .saturating_mul(std::mem::size_of::<u32>() + std::mem::size_of::<u32>());
         let max_unique_tables_per_group =
             (MAX_TERMINAL_GROUP_TABLE_BYTES / table_bytes_per_unique_board).max(1);
 
@@ -451,7 +459,8 @@ fn terminal_group_data(
                         let (node_combo_order, node_combo_bounds) =
                             showdown_strength_order_data(combos, boards);
                         combo_order.extend(node_combo_order);
-                        combo_bounds.extend(node_combo_bounds);
+                        combo_bounds
+                            .extend(node_combo_bounds.into_iter().map(pack_showdown_bounds));
                         table_slots.insert(board_base, table);
                         table
                     }
