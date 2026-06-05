@@ -2066,24 +2066,14 @@ fn action_edge_tile(@builtin(global_invocation_id) id: vec3<u32>) {
     );
     action_values[action_index] = action_value;
     if edge.action == 0u {
-        let private_combo = combos[combo];
-        let aggregate_base = node.public_infoset * 53u;
         var own_reach = hero_reaches[parent_combo_index];
-        var opponent_weight = villain_aggregates[aggregate_base]
-            - villain_aggregates[aggregate_base + private_combo.cards[0] + 1u]
-            - villain_aggregates[aggregate_base + private_combo.cards[1] + 1u]
-            + max(root_reach_weights[params.combo_count + combo], 0.0);
         if node.acting_player == 1u {
             own_reach = villain_reaches[parent_combo_index];
-            opponent_weight = hero_aggregates[aggregate_base]
-                - hero_aggregates[aggregate_base + private_combo.cards[0] + 1u]
-                - hero_aggregates[aggregate_base + private_combo.cards[1] + 1u]
-                + max(root_reach_weights[combo], 0.0);
         }
-        if own_reach <= 0.0 || opponent_weight <= 0.0 {
+        if own_reach <= 0.0 {
             strategy_weights[local_private_infoset] = 0.0;
         } else {
-            strategy_weights[local_private_infoset] = node._pad1 * own_reach * opponent_weight;
+            strategy_weights[local_private_infoset] = node._pad1 * own_reach;
         }
     }
 }
