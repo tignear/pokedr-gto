@@ -88,6 +88,11 @@ struct FlopMetricsArgs {
         help = "Compute root best-response metrics only when root_l1_delta is at or below this threshold"
     )]
     br_on_root_delta: Option<f32>,
+    #[arg(
+        long,
+        help = "Compute root best-response metrics at checkpoint iterations divisible by this value"
+    )]
+    br_every: Option<usize>,
     #[arg(long, help = "Also compute current-strategy best-response metrics")]
     current_br: bool,
     #[arg(
@@ -472,6 +477,10 @@ fn run_solve_flop_metrics(args: FlopMetricsArgs) {
     let metric_options = pokedr_agent::FixedFlopMetricOptions {
         br_metrics: args.br_metrics,
         br_on_root_delta,
+        br_every_iterations: args
+            .br_every
+            .or_else(|| env_usize("POKEDR_METRIC_BR_EVERY"))
+            .filter(|value| *value > 0),
         current_br_metrics: args.current_br,
         diagnostics: args.diagnostics,
         local_gaps: dump_gap_nodes,

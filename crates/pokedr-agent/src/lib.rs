@@ -153,6 +153,7 @@ pub struct FixedFlopMetricRow {
 pub struct FixedFlopMetricOptions {
     pub br_metrics: bool,
     pub br_on_root_delta: Option<f32>,
+    pub br_every_iterations: Option<usize>,
     pub current_br_metrics: bool,
     pub diagnostics: bool,
     pub local_gaps: bool,
@@ -165,6 +166,10 @@ impl FixedFlopMetricOptions {
             br_on_root_delta: std::env::var("POKEDR_METRIC_BR_ON_ROOT_DELTA")
                 .ok()
                 .and_then(|value| value.parse().ok()),
+            br_every_iterations: std::env::var("POKEDR_METRIC_BR_EVERY")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .filter(|value| *value > 0),
             current_br_metrics: std::env::var_os("POKEDR_METRIC_CURRENT_BR").is_some(),
             diagnostics: std::env::var_os("POKEDR_METRIC_DIAGNOSTICS").is_some(),
             local_gaps: std::env::var_os("POKEDR_METRIC_LOCAL_GAPS").is_some(),
@@ -949,10 +954,14 @@ fn try_solve_fixed_flop_metrics_gpu(
         backend.wait_idle().ok()?;
         completed_iterations = iterations;
 
+        let should_compute_periodic_br = metric_options
+            .br_every_iterations
+            .is_some_and(|interval| iterations % interval == 0);
         let need_full_state_before_root = include_br_metrics
             || include_current_br
             || include_local_gaps
             || include_diagnostics
+            || should_compute_periodic_br
             || metric_cpu_exploitability_enabled();
         let mut state = need_full_state_before_root
             .then(|| gpu_state.download(&backend))
@@ -975,7 +984,8 @@ fn try_solve_fixed_flop_metrics_gpu(
             .br_on_root_delta
             .zip(root_strategy_l1_delta)
             .is_some_and(|(threshold, delta)| delta <= threshold);
-        let compute_br_metrics = include_br_metrics || should_compute_stable_br;
+        let compute_br_metrics =
+            include_br_metrics || should_compute_stable_br || should_compute_periodic_br;
         if compute_br_metrics && state.is_none() {
             state = Some(gpu_state.download(&backend).ok()?);
         }
