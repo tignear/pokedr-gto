@@ -470,7 +470,7 @@ fn run_solve_flop_metrics(args: FlopMetricsArgs) {
         (convergence.is_some() && !explicit_iterations && !args.br_metrics).then_some(0.001)
     });
     let metric_options = pokedr_agent::FixedFlopMetricOptions {
-        br_metrics: args.br_metrics || (convergence.is_some() && !explicit_iterations),
+        br_metrics: args.br_metrics,
         br_on_root_delta,
         current_br_metrics: args.current_br,
         diagnostics: args.diagnostics,
