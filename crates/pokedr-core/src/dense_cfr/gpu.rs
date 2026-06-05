@@ -848,7 +848,8 @@ fn effective_regret(index: u32) -> f32 {
 }
 
 fn strategy_probability(node: TreeNode, private_combo: u32, action: u32) -> f32 {
-    let private_infoset = node.public_infoset * params.combo_count + private_combo;
+    let public_base = params.node_count;
+    let private_infoset = (node.public_infoset - public_base) * params.combo_count + private_combo;
     let offset = private_infoset * params.max_actions;
     var normalizer = 0.0;
     for (var i = 0u; i < node.child_count; i = i + 1u) {
@@ -1767,10 +1768,10 @@ struct Params {
     node_count: u32,
     max_actions: u32,
     output_len: u32,
-    value_player: u32,
+    value_player_and_flags: u32,
     child_tile_start: u32,
     child_tile_end: u32,
-    variant: u32,
+    public_infoset_end: u32,
     public_infoset_base: u32,
 };
 
@@ -1789,14 +1790,26 @@ struct Params {
 @group(0) @binding(12) var<uniform> params: Params;
 
 fn effective_regret(index: u32) -> f32 {
-    if params.variant == 3u {
+    if variant() == 3u {
         return regrets[index] + prediction[index];
     }
     return regrets[index];
 }
 
+fn value_player() -> u32 {
+    return params.value_player_and_flags & 0xffu;
+}
+
+fn variant() -> u32 {
+    return (params.value_player_and_flags >> 8u) & 0xffu;
+}
+
+fn include_chance_nodes() -> bool {
+    return ((params.value_player_and_flags >> 16u) & 1u) != 0u;
+}
+
 fn strategy_probability(node: TreeNode, private_combo: u32, action: u32) -> f32 {
-    let private_infoset = node.public_infoset * params.combo_count + private_combo;
+    let private_infoset = (node.public_infoset - params.public_infoset_base) * params.combo_count + private_combo;
     let offset = private_infoset * params.max_actions;
     var normalizer = 0.0;
     for (var i = 0u; i < node.child_count; i = i + 1u) {
@@ -1818,7 +1831,15 @@ fn backup_child_tile(@builtin(global_invocation_id) id: vec3<u32>) {
     let combo = index % params.combo_count;
     let node_slot = index / params.combo_count;
     let node = parent_nodes[node_slot];
-    if node.kind != 0u && node.kind != 1u {
+    if node.kind == 0u {
+        if node.public_infoset < params.public_infoset_base || node.public_infoset >= params.public_infoset_end {
+            return;
+        }
+    } else if node.kind == 1u {
+        if !include_chance_nodes() {
+            return;
+        }
+    } else {
         return;
     }
 
@@ -1838,7 +1859,7 @@ fn backup_child_tile(@builtin(global_invocation_id) id: vec3<u32>) {
             villain_value = villain_value + villain_child_value;
         } else if node.acting_player == 0u {
             let probability = strategy_probability(node, combo, action);
-            if params.value_player == 0u {
+            if value_player() == 0u {
                 hero_value = max(hero_value, hero_child_value);
             } else {
                 hero_value = hero_value + probability * hero_child_value;
@@ -1847,7 +1868,7 @@ fn backup_child_tile(@builtin(global_invocation_id) id: vec3<u32>) {
         } else {
             let probability = strategy_probability(node, combo, action);
             hero_value = hero_value + hero_child_value;
-            if params.value_player == 1u {
+            if value_player() == 1u {
                 villain_value = max(villain_value, villain_child_value);
             } else {
                 villain_value = villain_value + probability * villain_child_value;
@@ -4384,6 +4405,17 @@ impl GpuDenseCfrBackend {
             let child_tile_index = edge_tile.child_tile.node_start / ctx.layered.node_tile_size;
             let parent_tile = &ctx.layer_tiles[edge_tile.parent_layer][parent_tile_index];
             let child_tile = &ctx.layer_tiles[edge_tile.child_layer][child_tile_index];
+            let parent_layer_nodes = &ctx.layered.layers[edge_tile.parent_layer].nodes
+                [parent_tile.node_start..parent_tile.node_end];
+            let Some((public_base, public_end)) =
+                public_infoset_range_for_edges(parent_layer_nodes, &edge_tile.edges)
+            else {
+                continue;
+            };
+            let infoset_base = public_base * ctx.combos_len;
+            let infoset_len = (public_end - public_base) * ctx.combos_len;
+            let action_base = infoset_base * ctx.actions;
+            let action_len = infoset_len * ctx.actions;
             let edge_buffer = readonly_buffer(
                 &self.device,
                 "public tree layer reach edges",
@@ -4396,7 +4428,7 @@ impl GpuDenseCfrBackend {
                 "public tree layer reach edge params",
                 &[GpuPublicTreeParams {
                     combo_count: ctx.combos_len as u32,
-                    node_count: 0,
+                    node_count: public_base as u32,
                     max_actions: ctx.actions as u32,
                     output_len: x_invocations,
                     pair_start: variant_code(variant),
@@ -4414,14 +4446,24 @@ impl GpuDenseCfrBackend {
                     bind_entry(1, &edge_buffer),
                     bind_entry(2, &ctx.combo_buffer),
                     bind_entry(3, &ctx.root_weights_buffer),
-                    bind_entry(4, regrets_buffer),
+                    bind_entry_range(
+                        4,
+                        regrets_buffer,
+                        f32_range_byte_offset(action_base),
+                        f32_range_byte_size(action_len),
+                    ),
                     bind_entry(5, &parent_tile.hero_reaches_buffer),
                     bind_entry(6, &parent_tile.villain_reaches_buffer),
                     bind_entry(7, &parent_tile.combo_live_buffer),
                     bind_entry(8, &child_tile.hero_reaches_buffer),
                     bind_entry(9, &child_tile.villain_reaches_buffer),
                     bind_entry(10, &child_tile.combo_live_buffer),
-                    bind_entry(11, prediction_buffer),
+                    bind_entry_range(
+                        11,
+                        prediction_buffer,
+                        f32_range_byte_offset(action_base),
+                        f32_range_byte_size(action_len),
+                    ),
                     bind_entry(12, &params),
                 ],
             });
@@ -4488,50 +4530,130 @@ impl GpuDenseCfrBackend {
                 }
 
                 for child_tile in &ctx.layer_tiles[child_layer_index] {
-                    let params = uniform_buffer(
-                        &self.device,
-                        "public tree layer backup child params",
-                        &[GpuPublicTreeParams {
-                            combo_count: ctx.combos_len as u32,
-                            node_count: (parent_tile.node_end - parent_tile.node_start) as u32,
-                            max_actions: ctx.actions as u32,
-                            output_len: x_invocations,
-                            pair_start: br_player,
-                            chunk_pairs: child_tile.node_start as u32,
-                            _pad0: child_tile.node_end as u32,
-                            _pad1: variant_code(variant),
-                            _pad2: public_infoset_base_for_tile(
-                                &ctx.layered.layers[parent_layer_index].nodes
-                                    [parent_tile.node_start..parent_tile.node_end],
-                            ) as u32,
-                        }],
-                    );
-                    let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                        label: Some("public tree layer backup child bind group"),
-                        layout: &self.public_tree_layer_backup_child_bind_group_layout,
-                        entries: &[
-                            bind_entry(0, &parent_tile.node_buffer),
-                            bind_entry(1, &parent_tile.child_buffer),
-                            bind_entry(2, &child_tile.hero_values_buffer),
-                            bind_entry(3, &child_tile.villain_values_buffer),
-                            bind_entry(4, &parent_tile.hero_reaches_buffer),
-                            bind_entry(5, &parent_tile.villain_reaches_buffer),
-                            bind_entry(6, &child_tile.hero_reaches_buffer),
-                            bind_entry(7, &child_tile.villain_reaches_buffer),
-                            bind_entry(8, &parent_tile.hero_values_buffer),
-                            bind_entry(9, &parent_tile.villain_values_buffer),
-                            bind_entry(10, regrets_buffer),
-                            bind_entry(11, prediction_buffer),
-                            bind_entry(12, &params),
-                        ],
-                    });
-                    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                        label: Some("public tree layer backup child pass"),
-                        timestamp_writes: None,
-                    });
-                    pass.set_pipeline(&self.public_tree_layer_backup_child_pipeline);
-                    pass.set_bind_group(0, &bind_group, &[]);
-                    pass.dispatch_workgroups(x_groups, y_groups, 1);
+                    let parent_layer_nodes = &ctx.layered.layers[parent_layer_index].nodes
+                        [parent_tile.node_start..parent_tile.node_end];
+                    let public_range = public_infoset_range_for_nodes(parent_layer_nodes);
+                    let max_binding_f32 =
+                        (self.device.limits().max_storage_buffer_binding_size as usize / 4).max(1);
+                    let max_chunk_publics =
+                        (max_binding_f32 / (ctx.combos_len.max(1) * ctx.actions.max(1))).max(1);
+                    let max_chunk_publics = (max_chunk_publics / 32).max(1) * 32;
+                    let mut include_chance = true;
+                    if let Some((public_base, public_end)) = public_range {
+                        for chunk_public_base in
+                            (public_base..public_end).step_by(max_chunk_publics)
+                        {
+                            let chunk_public_end =
+                                (chunk_public_base + max_chunk_publics).min(public_end);
+                            let infoset_base = chunk_public_base * ctx.combos_len;
+                            let infoset_len =
+                                (chunk_public_end - chunk_public_base) * ctx.combos_len;
+                            let action_base = infoset_base * ctx.actions;
+                            let action_len = infoset_len * ctx.actions;
+                            let flags = br_player
+                                | (variant_code(variant) << 8)
+                                | ((include_chance as u32) << 16);
+                            include_chance = false;
+                            let params = uniform_buffer(
+                                &self.device,
+                                "public tree layer backup child params",
+                                &[GpuPublicTreeParams {
+                                    combo_count: ctx.combos_len as u32,
+                                    node_count: (parent_tile.node_end - parent_tile.node_start)
+                                        as u32,
+                                    max_actions: ctx.actions as u32,
+                                    output_len: x_invocations,
+                                    pair_start: flags,
+                                    chunk_pairs: child_tile.node_start as u32,
+                                    _pad0: child_tile.node_end as u32,
+                                    _pad1: chunk_public_end as u32,
+                                    _pad2: chunk_public_base as u32,
+                                }],
+                            );
+                            let bind_group =
+                                self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                                    label: Some("public tree layer backup child bind group"),
+                                    layout: &self.public_tree_layer_backup_child_bind_group_layout,
+                                    entries: &[
+                                        bind_entry(0, &parent_tile.node_buffer),
+                                        bind_entry(1, &parent_tile.child_buffer),
+                                        bind_entry(2, &child_tile.hero_values_buffer),
+                                        bind_entry(3, &child_tile.villain_values_buffer),
+                                        bind_entry(4, &parent_tile.hero_reaches_buffer),
+                                        bind_entry(5, &parent_tile.villain_reaches_buffer),
+                                        bind_entry(6, &child_tile.hero_reaches_buffer),
+                                        bind_entry(7, &child_tile.villain_reaches_buffer),
+                                        bind_entry(8, &parent_tile.hero_values_buffer),
+                                        bind_entry(9, &parent_tile.villain_values_buffer),
+                                        bind_entry_range(
+                                            10,
+                                            regrets_buffer,
+                                            f32_range_byte_offset(action_base),
+                                            f32_range_byte_size(action_len),
+                                        ),
+                                        bind_entry_range(
+                                            11,
+                                            prediction_buffer,
+                                            f32_range_byte_offset(action_base),
+                                            f32_range_byte_size(action_len),
+                                        ),
+                                        bind_entry(12, &params),
+                                    ],
+                                });
+                            let mut pass =
+                                encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                                    label: Some("public tree layer backup child pass"),
+                                    timestamp_writes: None,
+                                });
+                            pass.set_pipeline(&self.public_tree_layer_backup_child_pipeline);
+                            pass.set_bind_group(0, &bind_group, &[]);
+                            pass.dispatch_workgroups(x_groups, y_groups, 1);
+                        }
+                    } else {
+                        let flags = br_player | (variant_code(variant) << 8) | (1u32 << 16);
+                        let params = uniform_buffer(
+                            &self.device,
+                            "public tree layer backup child params",
+                            &[GpuPublicTreeParams {
+                                combo_count: ctx.combos_len as u32,
+                                node_count: (parent_tile.node_end - parent_tile.node_start) as u32,
+                                max_actions: ctx.actions as u32,
+                                output_len: x_invocations,
+                                pair_start: flags,
+                                chunk_pairs: child_tile.node_start as u32,
+                                _pad0: child_tile.node_end as u32,
+                                _pad1: 0,
+                                _pad2: 0,
+                            }],
+                        );
+                        let bind_group =
+                            self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                                label: Some("public tree layer backup child bind group"),
+                                layout: &self.public_tree_layer_backup_child_bind_group_layout,
+                                entries: &[
+                                    bind_entry(0, &parent_tile.node_buffer),
+                                    bind_entry(1, &parent_tile.child_buffer),
+                                    bind_entry(2, &child_tile.hero_values_buffer),
+                                    bind_entry(3, &child_tile.villain_values_buffer),
+                                    bind_entry(4, &parent_tile.hero_reaches_buffer),
+                                    bind_entry(5, &parent_tile.villain_reaches_buffer),
+                                    bind_entry(6, &child_tile.hero_reaches_buffer),
+                                    bind_entry(7, &child_tile.villain_reaches_buffer),
+                                    bind_entry(8, &parent_tile.hero_values_buffer),
+                                    bind_entry(9, &parent_tile.villain_values_buffer),
+                                    bind_entry(10, &ctx.dummy_buffer),
+                                    bind_entry(11, &ctx.dummy_buffer),
+                                    bind_entry(12, &params),
+                                ],
+                            });
+                        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                            label: Some("public tree layer backup child pass"),
+                            timestamp_writes: None,
+                        });
+                        pass.set_pipeline(&self.public_tree_layer_backup_child_pipeline);
+                        pass.set_bind_group(0, &bind_group, &[]);
+                        pass.dispatch_workgroups(x_groups, y_groups, 1);
+                    }
                 }
             }
         }
@@ -6130,12 +6252,6 @@ fn public_infoset_range_for_nodes(nodes: &[GpuPublicTreeNode]) -> Option<(usize,
         found = true;
     }
     found.then_some((public_infoset_bind_base(min_infoset), max_infoset + 1))
-}
-
-fn public_infoset_base_for_tile(nodes: &[GpuPublicTreeNode]) -> usize {
-    public_infoset_range_for_nodes(nodes)
-        .map(|(base, _)| base)
-        .unwrap_or(0)
 }
 
 fn public_infoset_range_for_edges(
