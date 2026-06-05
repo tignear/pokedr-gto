@@ -2292,9 +2292,6 @@ struct GpuPublicTreeLayerTileBuffers {
     child_buffer: wgpu::Buffer,
     fold_terminal_nodes: Vec<u32>,
     showdown_terminal_groups: Vec<GpuTerminalGroupCache>,
-    terminal_refs_buffer: wgpu::Buffer,
-    terminal_combo_order_buffer: wgpu::Buffer,
-    terminal_combo_bounds_buffer: wgpu::Buffer,
     hero_reaches_buffer: wgpu::Buffer,
     villain_reaches_buffer: wgpu::Buffer,
     combo_live_buffer: wgpu::Buffer,
@@ -2339,6 +2336,14 @@ struct GpuPublicTreeLayered {
 }
 
 struct GpuTerminalGroupCache {
+    board_count: usize,
+    terminal_count: usize,
+    terminal_refs_buffer: wgpu::Buffer,
+    combo_order_buffer: wgpu::Buffer,
+    combo_bounds_buffer: wgpu::Buffer,
+}
+
+struct GpuTerminalGroupData {
     board_count: usize,
     terminal_refs: Vec<GpuTerminalRef>,
     combo_order: Vec<u32>,
@@ -2465,12 +2470,12 @@ fn showdown_blocker_neighbors(combos: &[GpuPrivateCombo]) -> (Vec<u32>, usize) {
     (blocker_neighbors, blocker_neighbor_stride)
 }
 
-fn terminal_group_caches(
+fn terminal_group_data(
     nodes: &[GpuPublicTreeNode],
     terminal_nodes: &[u32],
     combos: &[GpuPrivateCombo],
     showdown_boards: &[GpuFinalBoard],
-) -> Vec<GpuTerminalGroupCache> {
+) -> Vec<GpuTerminalGroupData> {
     const MAX_TERMINAL_GROUP_TABLE_BYTES: usize = 124 * 1024 * 1024;
 
     let mut groups: BTreeMap<usize, Vec<u32>> = BTreeMap::new();
@@ -2530,7 +2535,7 @@ fn terminal_group_caches(
                 });
                 index += 1;
             }
-            caches.push(GpuTerminalGroupCache {
+            caches.push(GpuTerminalGroupData {
                 board_count,
                 terminal_refs,
                 combo_order,
@@ -3788,9 +3793,6 @@ impl GpuDenseCfrBackend {
         &self,
         node_buffer: &wgpu::Buffer,
         terminal_groups: &[GpuTerminalGroupCache],
-        terminal_refs_buffer: &wgpu::Buffer,
-        combo_order_buffer: &wgpu::Buffer,
-        combo_bounds_buffer: &wgpu::Buffer,
         combo_buffer: &wgpu::Buffer,
         blocker_neighbors_buffer: &wgpu::Buffer,
         hero_reaches_buffer: &wgpu::Buffer,
@@ -3826,30 +3828,15 @@ impl GpuDenseCfrBackend {
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("public tree streamed terminal encoder"),
-            });
+        });
         let mut pending_chunks = 0usize;
         for group in terminal_groups {
-            self.queue.write_buffer(
-                terminal_refs_buffer,
-                0,
-                bytemuck::cast_slice(&group.terminal_refs),
-            );
-            self.queue.write_buffer(
-                combo_order_buffer,
-                0,
-                bytemuck::cast_slice(&group.combo_order),
-            );
-            self.queue.write_buffer(
-                combo_bounds_buffer,
-                0,
-                bytemuck::cast_slice(&group.combo_bounds),
-            );
             let partial_params = uniform_buffer(
                 &self.device,
                 "public tree streamed terminal partial params",
                 &[GpuPublicTreeParams {
                     combo_count: combo_count as u32,
-                    node_count: group.terminal_refs.len() as u32,
+                    node_count: group.terminal_count as u32,
                     max_actions: group.board_count as u32,
                     output_len: (combo_count + 1) as u32,
                     pair_start: combo_count as u32,
@@ -3865,9 +3852,9 @@ impl GpuDenseCfrBackend {
                 layout: &self.public_tree_terminal_partial_bind_group_layout,
                 entries: &[
                     bind_entry(0, node_buffer),
-                    bind_entry(1, terminal_refs_buffer),
-                    bind_entry(2, combo_order_buffer),
-                    bind_entry(3, combo_bounds_buffer),
+                    bind_entry(1, &group.terminal_refs_buffer),
+                    bind_entry(2, &group.combo_order_buffer),
+                    bind_entry(3, &group.combo_bounds_buffer),
                     bind_entry(4, hero_reaches_buffer),
                     bind_entry(5, villain_reaches_buffer),
                     bind_entry(6, terminal_prefix_pairs_buffer),
@@ -3879,7 +3866,7 @@ impl GpuDenseCfrBackend {
                 "public tree streamed terminal reduce params",
                 &[GpuPublicTreeParams {
                     combo_count: combo_count as u32,
-                    node_count: group.terminal_refs.len() as u32,
+                    node_count: group.terminal_count as u32,
                     max_actions: group.board_count as u32,
                     output_len: (combo_count + 1) as u32,
                     pair_start: blocker_neighbor_stride as u32,
@@ -3895,8 +3882,8 @@ impl GpuDenseCfrBackend {
                 layout: &self.public_tree_terminal_reduce_bind_group_layout,
                 entries: &[
                     bind_entry(0, node_buffer),
-                    bind_entry(1, terminal_refs_buffer),
-                    bind_entry(2, combo_bounds_buffer),
+                    bind_entry(1, &group.terminal_refs_buffer),
+                    bind_entry(2, &group.combo_bounds_buffer),
                     bind_entry(3, blocker_neighbors_buffer),
                     bind_entry(4, hero_reaches_buffer),
                     bind_entry(5, villain_reaches_buffer),
@@ -3917,12 +3904,11 @@ impl GpuDenseCfrBackend {
             let terminal_chunk_size = prefix_chunk_size
                 .min(card_prefix_chunk_size)
                 .max(1)
-                .min(group.terminal_refs.len().max(1));
+                .min(group.terminal_count.max(1));
             let chunk_use_card_prefix =
                 use_card_prefix && card_prefix_pairs_per_terminal <= max_terminal_card_prefix_pairs;
-            for terminal_start in (0..group.terminal_refs.len()).step_by(terminal_chunk_size) {
-                let terminal_count =
-                    terminal_chunk_size.min(group.terminal_refs.len() - terminal_start);
+            for terminal_start in (0..group.terminal_count).step_by(terminal_chunk_size) {
+                let terminal_count = terminal_chunk_size.min(group.terminal_count - terminal_start);
                 let partial_workgroups = (terminal_count * group.board_count) as u32;
                 let partial_x_groups = partial_workgroups.min(65_535).max(1);
                 let partial_y_groups = partial_workgroups.div_ceil(partial_x_groups);
@@ -3993,9 +3979,9 @@ impl GpuDenseCfrBackend {
                                 ),
                             entries: &[
                                 bind_entry(0, node_buffer),
-                                bind_entry(1, terminal_refs_buffer),
-                                bind_entry(2, combo_order_buffer),
-                                bind_entry(3, combo_bounds_buffer),
+                                bind_entry(1, &group.terminal_refs_buffer),
+                                bind_entry(2, &group.combo_order_buffer),
+                                bind_entry(3, &group.combo_bounds_buffer),
                                 bind_entry(4, combo_buffer),
                                 bind_entry(5, hero_reaches_buffer),
                                 bind_entry(6, villain_reaches_buffer),
@@ -4015,8 +4001,8 @@ impl GpuDenseCfrBackend {
                             ),
                         entries: &[
                             bind_entry(0, node_buffer),
-                            bind_entry(1, terminal_refs_buffer),
-                            bind_entry(2, combo_bounds_buffer),
+                            bind_entry(1, &group.terminal_refs_buffer),
+                            bind_entry(2, &group.combo_bounds_buffer),
                             bind_entry(3, combo_buffer),
                             bind_entry(4, hero_reaches_buffer),
                             bind_entry(5, villain_reaches_buffer),
@@ -4278,98 +4264,89 @@ impl GpuDenseCfrBackend {
                             node_end,
                             combos.len(),
                         );
-                        let showdown_terminal_groups = terminal_group_caches(
+                        let showdown_terminal_group_data = terminal_group_data(
                             &tile_nodes,
                             &showdown_terminal_nodes,
                             combos,
                             showdown_boards,
                         );
-                        let max_terminal_refs_len = showdown_terminal_groups
-                            .iter()
-                            .map(|group| group.terminal_refs.len())
-                            .max()
-                            .unwrap_or(1)
-                            .max(1);
-                        let max_combo_order_len = showdown_terminal_groups
-                            .iter()
-                            .map(|group| group.combo_order.len())
-                            .max()
-                            .unwrap_or(1)
-                            .max(1);
-                        let max_combo_bounds_len = showdown_terminal_groups
-                            .iter()
-                            .map(|group| group.combo_bounds.len())
-                            .max()
-                            .unwrap_or(1)
-                            .max(1);
+                        let node_buffer = readonly_buffer(
+                            &self.device,
+                            "public tree layer tile nodes",
+                            &tile_nodes,
+                        );
+                        let child_buffer = readonly_buffer(
+                            &self.device,
+                            "public tree layer tile children",
+                            &tile_children,
+                        );
+                        let hero_reaches_buffer = uninit_storage_buffer(
+                            &self.device,
+                            "public tree layer tile hero reaches",
+                            value_len,
+                            false,
+                        );
+                        let villain_reaches_buffer = uninit_storage_buffer(
+                            &self.device,
+                            "public tree layer tile villain reaches",
+                            value_len,
+                            false,
+                        );
+                        let combo_live_buffer = readonly_buffer(
+                            &self.device,
+                            "public tree layer tile combo live mask",
+                            &tile_combo_live,
+                        );
+                        let hero_values_buffer = uninit_storage_buffer(
+                            &self.device,
+                            "public tree layer tile hero values",
+                            value_len,
+                            true,
+                        );
+                        let villain_values_buffer = uninit_storage_buffer(
+                            &self.device,
+                            "public tree layer tile villain values",
+                            value_len,
+                            true,
+                        );
+                        let showdown_terminal_groups = showdown_terminal_group_data
+                            .into_iter()
+                            .map(|group| {
+                                let terminal_count = group.terminal_refs.len();
+                                GpuTerminalGroupCache {
+                                    board_count: group.board_count,
+                                    terminal_count,
+                                    terminal_refs_buffer: readonly_buffer(
+                                        &self.device,
+                                        "public tree resident terminal refs",
+                                        &group.terminal_refs,
+                                    ),
+                                    combo_order_buffer: readonly_buffer(
+                                        &self.device,
+                                        "public tree resident terminal combo strength order",
+                                        &group.combo_order,
+                                    ),
+                                    combo_bounds_buffer: readonly_buffer(
+                                        &self.device,
+                                        "public tree resident terminal combo strength bounds",
+                                        &group.combo_bounds,
+                                    ),
+                                }
+                            })
+                            .collect();
 
                         GpuPublicTreeLayerTileBuffers {
                             node_start,
                             node_end,
-                            node_buffer: readonly_buffer(
-                                &self.device,
-                                "public tree layer tile nodes",
-                                &tile_nodes,
-                            ),
-                            child_buffer: readonly_buffer(
-                                &self.device,
-                                "public tree layer tile children",
-                                &tile_children,
-                            ),
+                            node_buffer,
+                            child_buffer,
                             fold_terminal_nodes,
                             showdown_terminal_groups,
-                            terminal_refs_buffer: uninit_storage_buffer_typed::<GpuTerminalRef>(
-                                &self.device,
-                                "public tree streamed terminal refs scratch",
-                                max_terminal_refs_len,
-                                false,
-                                true,
-                            ),
-                            terminal_combo_order_buffer: uninit_storage_buffer_typed::<u32>(
-                                &self.device,
-                                "public tree streamed terminal combo strength order scratch",
-                                max_combo_order_len,
-                                false,
-                                true,
-                            ),
-                            terminal_combo_bounds_buffer: uninit_storage_buffer_typed::<
-                                GpuShowdownComboBounds,
-                            >(
-                                &self.device,
-                                "public tree streamed terminal combo strength bounds scratch",
-                                max_combo_bounds_len,
-                                false,
-                                true,
-                            ),
-                            hero_reaches_buffer: uninit_storage_buffer(
-                                &self.device,
-                                "public tree layer tile hero reaches",
-                                value_len,
-                                false,
-                            ),
-                            villain_reaches_buffer: uninit_storage_buffer(
-                                &self.device,
-                                "public tree layer tile villain reaches",
-                                value_len,
-                                false,
-                            ),
-                            combo_live_buffer: readonly_buffer(
-                                &self.device,
-                                "public tree layer tile combo live mask",
-                                &tile_combo_live,
-                            ),
-                            hero_values_buffer: uninit_storage_buffer(
-                                &self.device,
-                                "public tree layer tile hero values",
-                                value_len,
-                                true,
-                            ),
-                            villain_values_buffer: uninit_storage_buffer(
-                                &self.device,
-                                "public tree layer tile villain values",
-                                value_len,
-                                true,
-                            ),
+                            hero_reaches_buffer,
+                            villain_reaches_buffer,
+                            combo_live_buffer,
+                            hero_values_buffer,
+                            villain_values_buffer,
                         }
                     })
                     .collect()
@@ -5360,9 +5337,6 @@ impl GpuDenseCfrBackend {
                 self.fill_terminal_values_streaming(
                     &tile.node_buffer,
                     &tile.showdown_terminal_groups,
-                    &tile.terminal_refs_buffer,
-                    &tile.terminal_combo_order_buffer,
-                    &tile.terminal_combo_bounds_buffer,
                     &ctx.combo_buffer,
                     &ctx.terminal_blocker_neighbors_buffer,
                     &tile.hero_reaches_buffer,
