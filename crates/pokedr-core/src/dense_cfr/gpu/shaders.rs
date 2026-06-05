@@ -808,6 +808,12 @@ struct Edge {
     action: u32,
     card: u32,
 };
+struct EdgeGroup {
+    parent: u32,
+    first_edge: u32,
+    edge_count: u32,
+    _pad0: u32,
+};
 struct TreeNode {
     kind: u32,
     acting_player: u32,
@@ -835,17 +841,18 @@ struct Params {
 
 @group(0) @binding(0) var<storage, read> parent_nodes: array<TreeNode>;
 @group(0) @binding(1) var<storage, read> edges: array<Edge>;
-@group(0) @binding(2) var<storage, read> combos: array<Combo>;
-@group(0) @binding(3) var<storage, read> root_reach_weights: array<f32>;
-@group(0) @binding(4) var<storage, read> regrets: array<f32>;
-@group(0) @binding(5) var<storage, read> parent_hero_reaches: array<f32>;
-@group(0) @binding(6) var<storage, read> parent_villain_reaches: array<f32>;
-@group(0) @binding(7) var<storage, read> parent_combo_live: array<u32>;
-@group(0) @binding(8) var<storage, read_write> child_hero_reaches: array<f32>;
-@group(0) @binding(9) var<storage, read_write> child_villain_reaches: array<f32>;
-@group(0) @binding(10) var<storage, read_write> child_combo_live: array<atomic<u32>>;
-@group(0) @binding(11) var<storage, read> prediction: array<f32>;
-@group(0) @binding(12) var<uniform> params: Params;
+@group(0) @binding(2) var<storage, read> edge_groups: array<EdgeGroup>;
+@group(0) @binding(3) var<storage, read> combos: array<Combo>;
+@group(0) @binding(4) var<storage, read> root_reach_weights: array<f32>;
+@group(0) @binding(5) var<storage, read> regrets: array<f32>;
+@group(0) @binding(6) var<storage, read> parent_hero_reaches: array<f32>;
+@group(0) @binding(7) var<storage, read> parent_villain_reaches: array<f32>;
+@group(0) @binding(8) var<storage, read> parent_combo_live: array<u32>;
+@group(0) @binding(9) var<storage, read_write> child_hero_reaches: array<f32>;
+@group(0) @binding(10) var<storage, read_write> child_villain_reaches: array<f32>;
+@group(0) @binding(11) var<storage, read_write> child_combo_live: array<atomic<u32>>;
+@group(0) @binding(12) var<storage, read> prediction: array<f32>;
+@group(0) @binding(13) var<uniform> params: Params;
 
 fn combo_has_card(combo: Combo, card: u32) -> bool {
     return combo.cards[0] == card || combo.cards[1] == card;
@@ -858,18 +865,30 @@ fn effective_regret(index: u32) -> f32 {
     return regrets[index];
 }
 
-fn strategy_probability(node: TreeNode, private_combo: u32, action: u32) -> f32 {
+fn private_infoset_action_offset(node: TreeNode, private_combo: u32) -> u32 {
     let public_base = params.node_count;
     let private_infoset = (node.public_infoset - public_base) * params.combo_count + private_combo;
-    let offset = private_infoset * params.max_actions;
+    return private_infoset * params.max_actions;
+}
+
+fn strategy_normalizer(offset: u32, child_count: u32) -> f32 {
     var normalizer = 0.0;
-    for (var i = 0u; i < node.child_count; i = i + 1u) {
+    for (var i = 0u; i < child_count; i = i + 1u) {
         normalizer = normalizer + max(effective_regret(offset + i), 0.0);
     }
+    return normalizer;
+}
+
+fn strategy_probability_from_normalizer(
+    offset: u32,
+    child_count: u32,
+    action: u32,
+    normalizer: f32,
+) -> f32 {
     if normalizer > 0.0 {
         return max(effective_regret(offset + action), 0.0) / normalizer;
     }
-    return 1.0 / f32(max(node.child_count, 1u));
+    return 1.0 / f32(max(child_count, 1u));
 }
 
 @compute @workgroup_size(64)
@@ -880,32 +899,47 @@ fn reach_edge_tile(@builtin(global_invocation_id) id: vec3<u32>) {
         return;
     }
     let combo = index % params.combo_count;
-    let edge_slot = index / params.combo_count;
-    let edge = edges[edge_slot];
-    let node = parent_nodes[edge.parent];
-    let parent_offset = edge.parent * params.combo_count + combo;
-    let child_offset = edge.child * params.combo_count + combo;
+    let group_slot = index / params.combo_count;
+    let group = edge_groups[group_slot];
+    let node = parent_nodes[group.parent];
+    let parent_offset = group.parent * params.combo_count + combo;
     let hero_reach = parent_hero_reaches[parent_offset];
     let villain_reach = parent_villain_reaches[parent_offset];
     if node.kind == 0u {
-        let probability = strategy_probability(node, combo, edge.action);
         let is_br_player = params.aux0 < 2u && node.acting_player == params.aux0;
-        if node.acting_player == 0u {
-            child_hero_reaches[child_offset] =
-                hero_reach * select(probability, 1.0, is_br_player);
-            child_villain_reaches[child_offset] = villain_reach;
-        } else {
-            child_hero_reaches[child_offset] = hero_reach;
-            child_villain_reaches[child_offset] =
-                villain_reach * select(probability, 1.0, is_br_player);
+        let action_offset = private_infoset_action_offset(node, combo);
+        let normalizer = strategy_normalizer(action_offset, node.child_count);
+        for (var group_edge = 0u; group_edge < group.edge_count; group_edge = group_edge + 1u) {
+            let edge = edges[group.first_edge + group_edge];
+            let child_offset = edge.child * params.combo_count + combo;
+            let probability = strategy_probability_from_normalizer(
+                action_offset,
+                node.child_count,
+                edge.action,
+                normalizer,
+            );
+            if node.acting_player == 0u {
+                child_hero_reaches[child_offset] =
+                    hero_reach * select(probability, 1.0, is_br_player);
+                child_villain_reaches[child_offset] = villain_reach;
+            } else {
+                child_hero_reaches[child_offset] = hero_reach;
+                child_villain_reaches[child_offset] =
+                    villain_reach * select(probability, 1.0, is_br_player);
+            }
         }
     } else if node.kind == 1u {
-        if combo_has_card(combos[combo], edge.card) {
-            child_hero_reaches[child_offset] = 0.0;
-            child_villain_reaches[child_offset] = 0.0;
-        } else {
-            child_hero_reaches[child_offset] = hero_reach;
-            child_villain_reaches[child_offset] = villain_reach;
+        let private_combo = combos[combo];
+        for (var group_edge = 0u; group_edge < group.edge_count; group_edge = group_edge + 1u) {
+            let edge = edges[group.first_edge + group_edge];
+            let child_offset = edge.child * params.combo_count + combo;
+            if combo_has_card(private_combo, edge.card) {
+                child_hero_reaches[child_offset] = 0.0;
+                child_villain_reaches[child_offset] = 0.0;
+            } else {
+                child_hero_reaches[child_offset] = hero_reach;
+                child_villain_reaches[child_offset] = villain_reach;
+            }
         }
     }
 }
@@ -2041,7 +2075,7 @@ fn denominator_tile(@builtin(global_invocation_id) id: vec3<u32>) {
     let decision_slot = index / params.combo_count;
     let node_slot = edges[decision_slot].parent;
     let node = nodes[node_slot];
-    if node.kind != 0u || node.acting_player != params.value_player {
+    if node.kind != 0u {
         return;
     }
     if node.public_infoset < params.public_infoset_count || node.public_infoset >= params._pad0 {
@@ -2093,7 +2127,7 @@ fn action_edge_tile(@builtin(global_invocation_id) id: vec3<u32>) {
     let edge_slot = index / params.combo_count;
     let edge = edges[edge_slot];
     let node = nodes[edge.parent];
-    if node.kind != 0u || node.acting_player != params.value_player {
+    if node.kind != 0u {
         return;
     }
     let parent_combo_index = edge.parent * params.combo_count + combo;
@@ -2110,7 +2144,7 @@ fn action_edge_tile(@builtin(global_invocation_id) id: vec3<u32>) {
     let action_value = select(
         child_villain_values[child_offset],
         child_hero_values[child_offset],
-        params.value_player == 0u
+        node.acting_player == 0u
     );
     action_values[action_index] = action_value;
     if edge.action == 0u {
