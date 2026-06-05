@@ -64,6 +64,32 @@ ideas.
   lightweight iterations stayed around `9.96s` to `10.00s`.
 - Decision: keep the existing default. Scratch budget is not the next lever.
 
+## 2026-06-05: Table-major terminal reference ordering
+
+- Tried: sort terminal refs by `(final_board_table, node)` inside each terminal
+  group so terminals sharing the same board table are contiguous.
+- Expected: improve cache locality for `combo_order`/`combo_bounds` reads and
+  prepare the data layout for batched board-table kernels.
+- Result: no speedup. On `As7h2c`, `depth=5`, `16` lightweight iterations were
+  about `10.05s`, versus about `9.96s` with the original order.
+- Decision: reverted. Contiguity alone is not enough; batching must actually
+  reuse rank/blocker work inside the shader.
+
+## 2026-06-05: Direct board-table batch4 terminal matvec
+
+- Tried: for `board_count == 1`, skip prefix construction and evaluate up to
+  four terminals sharing one final board table in one shader invocation. The
+  kernel reused the rank/blocker classification across four reach vectors, but
+  scanned all `1326` opponent combos directly.
+- Expected: trade extra arithmetic for higher compute occupancy and reuse
+  `combo_bounds` classification across terminal columns.
+- Result: much slower. On `As7h2c`, `depth=5`, one iteration moved to about
+  `15.05s` versus roughly `11.3s` for the prefix/blocker path.
+- Decision: reverted. The prefix path is doing important asymptotic work:
+  direct all-opponent matvec multiplies too much. A viable batched kernel must
+  keep the prefix/rank prefix idea and only batch the blocker correction or
+  terminal columns where it does not reintroduce the full opponent loop.
+
 ## 2026-06-05: Resident terminal bind groups
 
 - Tried: create terminal partial/reduce bind groups and uniform buffers once in
