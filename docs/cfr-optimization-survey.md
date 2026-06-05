@@ -173,3 +173,24 @@ steady-state iteration cost.
    paths only when their error can be evaluated against the exact path.
 5. Revisit GPU terminal CFV only with a board/group-major design that avoids
    materializing `52 * combo_count` card-prefix lanes.
+
+## Local Benchmark Command
+
+Use `solve-flop-variant-bench` to compare solver variants under one tree/action
+configuration:
+
+```text
+cargo run --release -p pokedr-cli -- solve-flop-variant-bench As7h2c \
+  --bench-iterations 64,128,256,512 \
+  --target-bb100 1
+```
+
+By default it compares CFR+, DCFR+, scheduled DCFR+, and PDCFR+. It computes
+root exploitability at the final checkpoint only, so intermediate checkpoints
+stay relatively cheap. Use `--bench-br-every N` to compute exploitability at
+every checkpoint divisible by `N`, which enables `delta_bb100_per_s` between BR
+checkpoints. Use `--bench-diagnostics` only when regret/norm diagnostics are
+needed, because it forces full state downloads at every checkpoint.
+
+The practical target for this project is `converged=true` at `target_bb100=1`.
+Runs that are faster but miss that threshold are not acceptable defaults.

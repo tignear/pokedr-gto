@@ -19,6 +19,7 @@ fn main() {
         Command::SolveFlop(args) => run_solve_flop(args),
         Command::SolveFlopMetrics(args) => run_solve_flop_metrics(args),
         Command::SolveFlopSweep(args) => run_solve_flop_sweep(args),
+        Command::SolveFlopVariantBench(args) => run_solve_flop_variant_bench(args),
         Command::TreeDb { command } => run_tree_db_command(command),
         Command::RsPokerSmoke => run_rs_poker_smoke(),
         Command::RsPokerTrace => run_rs_poker_trace(),
@@ -40,6 +41,7 @@ enum Command {
     SolveFlop(FlopSolveArgs),
     SolveFlopMetrics(FlopMetricsArgs),
     SolveFlopSweep(FlopSweepArgs),
+    SolveFlopVariantBench(FlopVariantBenchArgs),
     TreeDb {
         #[command(subcommand)]
         command: TreeDbCommand,
@@ -120,6 +122,35 @@ struct FlopSweepArgs {
         help = "PDCFR eta schedules as start:end:horizon"
     )]
     sweep_eta_schedules: Vec<String>,
+}
+
+#[derive(Debug, Args, Clone)]
+struct FlopVariantBenchArgs {
+    #[arg(default_value = "As7h2c")]
+    flop: String,
+    #[command(flatten)]
+    solver: SolverOptions,
+    #[arg(
+        long,
+        value_delimiter = ',',
+        help = "CFR variants to compare; defaults to cfr-plus,dcfr-plus,dcfr-schedule,pdcfr-plus"
+    )]
+    bench_variants: Vec<CfrVariantOption>,
+    #[arg(
+        long,
+        value_delimiter = ',',
+        help = "Metric checkpoints for each variant; defaults to 64,128,256"
+    )]
+    bench_iterations: Vec<usize>,
+    #[arg(long, help = "Target root exploitability in bb/100; default 1.0")]
+    target_bb100: Option<f32>,
+    #[arg(
+        long,
+        help = "Compute BR/exploitability at checkpoints divisible by this value; defaults to the final checkpoint"
+    )]
+    bench_br_every: Option<usize>,
+    #[arg(long, help = "Download full CFR state diagnostics at each checkpoint")]
+    bench_diagnostics: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -628,6 +659,159 @@ fn run_solve_flop_sweep(args: FlopSweepArgs) {
     for (rank, result) in results.iter().enumerate() {
         print_sweep_result(rank + 1, result.candidate, &result.row);
     }
+}
+
+#[derive(Debug, Clone)]
+struct VariantBenchResult {
+    variant_label: String,
+    row: pokedr_agent::FixedFlopMetricRow,
+    delta_bb100_per_s: Option<f32>,
+}
+
+fn run_solve_flop_variant_bench(args: FlopVariantBenchArgs) {
+    let flop = parse_flop(&args.flop).unwrap_or_else(|error| {
+        eprintln!("{error}");
+        std::process::exit(2);
+    });
+    let base_config = match_config(&args.solver);
+    let variants = variant_bench_variants(&args);
+    let iterations = variant_bench_iterations(&args);
+    let target_bb100 = args.target_bb100.unwrap_or(1.0).max(0.0);
+    eprintln!(
+        "benchmarking fixed flop variants board={} depth={} terminal_runouts={} iterations={:?} variants={} target_bb100={:.2}",
+        format_pokedr_cards_for_cli(&flop),
+        base_config.max_depth,
+        format_terminal_runouts(base_config.max_showdown_runouts),
+        iterations,
+        variants.len(),
+        target_bb100
+    );
+
+    let br_every_iterations = args
+        .bench_br_every
+        .filter(|value| *value > 0)
+        .or_else(|| iterations.iter().copied().max());
+    let metric_options = pokedr_agent::FixedFlopMetricOptions {
+        br_metrics: false,
+        br_on_root_delta: None,
+        br_every_iterations,
+        current_br_metrics: false,
+        diagnostics: args.bench_diagnostics,
+        local_gaps: false,
+    };
+    let mut results = Vec::new();
+    for variant in variants {
+        let mut config = base_config.clone();
+        config.cfr_variant = cfr_variant_from_options(variant, &args.solver);
+        config.cfr_iterations = iterations.iter().copied().max().unwrap_or(1);
+        let label = cfr_variant_option_label(variant).to_string();
+        eprintln!("running variant {label} {:?}", config.cfr_variant);
+        let rows = pokedr_agent::solve_fixed_flop_metrics_with_options_and_callback(
+            flop,
+            config,
+            &iterations,
+            metric_options,
+            |_| true,
+        );
+        let mut previous: Option<pokedr_agent::FixedFlopMetricRow> = None;
+        for row in rows {
+            let delta_bb100_per_s = previous
+                .as_ref()
+                .and_then(|previous| checkpoint_delta_bb100_per_s(previous, &row));
+            previous = Some(row.clone());
+            results.push(VariantBenchResult {
+                variant_label: label.clone(),
+                row,
+                delta_bb100_per_s,
+            });
+        }
+    }
+
+    println!(
+        "variant,iterations,elapsed_s,root_exploitability_bb100,target_bb100,converged,delta_bb100_per_s,root_l1_delta,root_actions,regret_mass,current_norm_err,avg_norm_err,finite"
+    );
+    for result in &results {
+        print_variant_bench_result(result, target_bb100);
+    }
+}
+
+fn variant_bench_variants(args: &FlopVariantBenchArgs) -> Vec<CfrVariantOption> {
+    (!args.bench_variants.is_empty())
+        .then(|| args.bench_variants.clone())
+        .unwrap_or_else(|| {
+            vec![
+                CfrVariantOption::CfrPlus,
+                CfrVariantOption::DcfrPlus,
+                CfrVariantOption::DcfrSchedule,
+                CfrVariantOption::PdcfrPlus,
+            ]
+        })
+}
+
+fn variant_bench_iterations(args: &FlopVariantBenchArgs) -> Vec<usize> {
+    let mut iterations = (!args.bench_iterations.is_empty())
+        .then(|| args.bench_iterations.clone())
+        .unwrap_or_else(|| vec![64, 128, 256])
+        .into_iter()
+        .filter(|value| *value > 0)
+        .collect::<Vec<_>>();
+    iterations.sort_unstable();
+    iterations.dedup();
+    if iterations.is_empty() {
+        eprintln!("--bench-iterations must contain at least one positive value");
+        std::process::exit(2);
+    }
+    iterations
+}
+
+fn checkpoint_delta_bb100_per_s(
+    previous: &pokedr_agent::FixedFlopMetricRow,
+    current: &pokedr_agent::FixedFlopMetricRow,
+) -> Option<f32> {
+    let previous_bb100 = previous.root_exploitability? * 100.0;
+    let current_bb100 = current.root_exploitability? * 100.0;
+    let elapsed_delta = current.elapsed_secs - previous.elapsed_secs;
+    (elapsed_delta > 0.0).then_some((previous_bb100 - current_bb100) / elapsed_delta)
+}
+
+fn cfr_variant_option_label(value: CfrVariantOption) -> &'static str {
+    match value {
+        CfrVariantOption::CfrPlus => "cfr-plus",
+        CfrVariantOption::Discounted => "discounted",
+        CfrVariantOption::DcfrPlus => "dcfr-plus",
+        CfrVariantOption::DcfrSchedule => "dcfr-schedule",
+        CfrVariantOption::PdcfrPlus => "pdcfr-plus",
+    }
+}
+
+fn print_variant_bench_result(result: &VariantBenchResult, target_bb100: f32) {
+    let row = &result.row;
+    let root_exploitability_bb100 = row.root_exploitability.map(|value| value * 100.0);
+    let converged = root_exploitability_bb100
+        .map(|value| value <= target_bb100)
+        .unwrap_or(false);
+    let root_actions = row
+        .root_action_probabilities
+        .iter()
+        .map(|value| format!("{value:.4}"))
+        .collect::<Vec<_>>()
+        .join("|");
+    println!(
+        "{},{},{:.2},{},{:.2},{},{},{},{},{:.3},{:.6},{:.6},{}",
+        result.variant_label,
+        row.iterations,
+        row.elapsed_secs,
+        format_optional(root_exploitability_bb100, 3),
+        target_bb100,
+        converged,
+        format_optional(result.delta_bb100_per_s, 3),
+        format_optional(row.root_strategy_l1_delta, 6),
+        root_actions,
+        row.positive_regret_mass,
+        row.current_strategy_norm_error,
+        row.average_strategy_norm_error,
+        row.finite
+    );
 }
 
 fn pdcfr_sweep_candidates(args: &FlopSweepArgs) -> Vec<PdcfrSweepCandidate> {
