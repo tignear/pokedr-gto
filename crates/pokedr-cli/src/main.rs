@@ -2442,14 +2442,12 @@ struct MetricConvergenceSettings {
 }
 
 fn metric_convergence_settings(args: &FlopMetricsArgs) -> Option<MetricConvergenceSettings> {
-    let requested = !explicit_metric_iterations_requested(args)
-        || args.metric_interval.is_some()
+    let convergence_requested = args.metric_interval.is_some()
         || args.metric_max_iterations.is_some()
-        || args.target_bb100.is_some()
         || std::env::var_os("POKEDR_METRIC_UNTIL_CONVERGED").is_some()
         || std::env::var_os("POKEDR_METRIC_INTERVAL").is_some()
-        || std::env::var_os("POKEDR_METRIC_MAX_ITERATIONS").is_some()
-        || std::env::var_os("POKEDR_METRIC_TARGET_BB100").is_some();
+        || std::env::var_os("POKEDR_METRIC_MAX_ITERATIONS").is_some();
+    let requested = !explicit_metric_iterations_requested(args) || convergence_requested;
     requested.then(|| {
         let interval = args
             .metric_interval

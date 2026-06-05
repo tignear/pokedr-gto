@@ -2103,15 +2103,6 @@ impl GpuDenseCfrBackend {
                     pending_chunks = 0;
                 }
             }
-            if pending_chunks > 0 {
-                self.queue.submit(Some(encoder.finish()));
-                encoder = self
-                    .device
-                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                        label: Some("public tree streamed terminal encoder"),
-                    });
-                pending_chunks = 0;
-            }
         }
         if pending_chunks > 0 {
             self.queue.submit(Some(encoder.finish()));
