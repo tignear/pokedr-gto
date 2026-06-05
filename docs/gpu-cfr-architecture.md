@@ -116,8 +116,8 @@ can still materialize it on demand in a slower diagnostic path.
 
 ## Practical Next Step
 
-Before changing storage, add output-stage profiling to split the currently
-combined `cfv_decision_denominator` phase into:
+Output-stage profiling now splits the formerly combined
+`cfv_decision_denominator` phase into:
 
 ```text
 decision_aggregate
@@ -127,6 +127,33 @@ action_edge
 cfr_update
 ```
 
-If `action_edge + cfr_update` is a large fraction, implement option 2. If
-`decision_denominator` dominates, first fuse/replace denominator and strategy
-weight generation.
+On `As7h2c`, `depth=5`, one iteration, the measured shape is roughly:
+
+```text
+decision_aggregate:    15ms
+decision_denominator:  78ms
+strategy_aggregate:     9ms
+action_edge:          338ms
+cfr_update:             9ms
+```
+
+The heavy part is `action_edge`, not `cfr_update`. The immediate target is
+therefore to remove the action-value materialization pass for the common case.
+
+The current tiling already has nearly all decision actions co-located:
+
+```text
+complete_decision_groups: 29985
+split_decision_groups:      22
+```
+
+That suggests a staged implementation:
+
+1. add a fused complete-group update path for decision groups where
+   `group.edge_count == node.child_count`;
+2. add an infoset skip mask so the existing CFR update ignores fused infosets;
+3. restrict the old `action_edge` materialization path to the split groups;
+4. keep split groups on the old path until a child locator table exists.
+
+This should remove most `action_edge` traffic without solving the general
+cross-tile child gather problem first.

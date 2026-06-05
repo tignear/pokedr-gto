@@ -3248,6 +3248,8 @@ impl GpuDenseCfrBackend {
             let mut decision_edges = 0usize;
             let mut chance_edges = 0usize;
             let mut chance_only_tiles = 0usize;
+            let mut complete_decision_groups = 0usize;
+            let mut split_decision_groups = 0usize;
             for edge_tile in &ctx.layered.reach_edge_tiles {
                 let parent = &ctx.layered.layers[edge_tile.parent_layer];
                 let mut tile_decision_edges = 0usize;
@@ -3261,6 +3263,17 @@ impl GpuDenseCfrBackend {
                         tile_chance_edges += 1;
                     }
                 }
+                for group in &edge_tile.groups {
+                    let node =
+                        parent.nodes[edge_tile.parent_tile.node_start + group.parent as usize];
+                    if node.kind == 0 {
+                        if group.edge_count == node.child_count {
+                            complete_decision_groups += 1;
+                        } else {
+                            split_decision_groups += 1;
+                        }
+                    }
+                }
                 if tile_decision_edges == 0 && tile_chance_edges > 0 {
                     chance_only_tiles += 1;
                 }
@@ -3268,11 +3281,13 @@ impl GpuDenseCfrBackend {
                 chance_edges += tile_chance_edges;
             }
             eprintln!(
-                "pokedr: gpu profile reach edge_tiles={} chance_only_tiles={} decision_edges={} chance_edges={}",
+                "pokedr: gpu profile reach edge_tiles={} chance_only_tiles={} decision_edges={} chance_edges={} complete_decision_groups={} split_decision_groups={}",
                 ctx.layered.reach_edge_tiles.len(),
                 chance_only_tiles,
                 decision_edges,
                 chance_edges,
+                complete_decision_groups,
+                split_decision_groups,
             );
             self.propagate_layer_reach_inits(&mut encoder, ctx, variant, iteration);
             encoder = self.finish_profile_phase(encoder, "cfv_reach_init", phase_start)?;
