@@ -2842,6 +2842,9 @@ impl GpuDenseCfrBackend {
                 self.finish_profile_phase(encoder, "cfv_output_decision_aggregate", stage_start)?;
             stage_start = Some(Instant::now());
         }
+        if split_only_action_edges && ctx.split_public_infosets.is_empty() {
+            return Ok(encoder);
+        }
 
         for (layer_index, layer_tiles) in ctx.layer_tiles.iter().enumerate() {
             for tile in layer_tiles {
@@ -3376,6 +3379,7 @@ impl GpuDenseCfrBackend {
             });
         let mut phase_start = profile.then(Instant::now);
         if profile && std::env::var_os("POKEDR_GPU_REACH_PROFILE").is_some() {
+            let split_trace = std::env::var_os("POKEDR_GPU_SPLIT_TRACE").is_some();
             let mut decision_edges = 0usize;
             let mut chance_edges = 0usize;
             let mut chance_only_tiles = 0usize;
@@ -3406,6 +3410,26 @@ impl GpuDenseCfrBackend {
                         } else {
                             split_decision_groups += 1;
                             split_decision_edges += group.edge_count as usize;
+                            if split_trace {
+                                let start = group.first_edge as usize;
+                                let end = start + group.edge_count as usize;
+                                let actions: Vec<u32> = edge_tile.edges[start..end]
+                                    .iter()
+                                    .map(|edge| edge.action)
+                                    .collect();
+                                eprintln!(
+                                    "pokedr: gpu split group parent_layer={} child_layer={} parent_tile_start={} child_tile_start={} parent_local={} public_infoset={} child_count={} edge_count={} actions={:?}",
+                                    edge_tile.parent_layer,
+                                    edge_tile.child_layer,
+                                    edge_tile.parent_tile.node_start,
+                                    edge_tile.child_tile.node_start,
+                                    group.parent,
+                                    node.public_infoset,
+                                    node.child_count,
+                                    group.edge_count,
+                                    actions,
+                                );
+                            }
                         }
                     }
                 }
@@ -4808,8 +4832,33 @@ fn public_tree_layered(
 
     let max_depth = depths.iter().copied().max().unwrap_or(0);
     let mut layer_globals = vec![Vec::new(); max_depth + 1];
-    for (node_index, depth) in depths.iter().copied().enumerate() {
-        layer_globals[depth].push(node_index as u32);
+    for (node_index, &depth) in depths.iter().enumerate() {
+        if depth == 0 {
+            layer_globals[0].push(node_index as u32);
+        }
+    }
+    for depth in 0..max_depth {
+        let mut seen_next = vec![false; nodes.len()];
+        let parent_globals = layer_globals[depth].clone();
+        for parent_index in parent_globals {
+            let parent = nodes[parent_index as usize];
+            if parent.kind != 0 && parent.kind != 1 {
+                continue;
+            }
+            for action in 0..parent.child_count as usize {
+                let child = children[parent.first_child as usize + action] as usize;
+                if depths[child] == depth + 1 && !seen_next[child] {
+                    seen_next[child] = true;
+                    layer_globals[depth + 1].push(child as u32);
+                }
+            }
+        }
+        for (node_index, &node_depth) in depths.iter().enumerate() {
+            if node_depth == depth + 1 && !seen_next[node_index] {
+                seen_next[node_index] = true;
+                layer_globals[depth + 1].push(node_index as u32);
+            }
+        }
     }
 
     let mut global_to_layer = vec![(0u32, 0u32); nodes.len()];
@@ -4848,7 +4897,12 @@ fn public_tree_layered(
         });
     }
 
-    let node_tile_size = layer_node_tile_size(combo_count, max_storage_buffer_binding_size);
+    let node_tile_alignment = decision_child_count_alignment(nodes);
+    let node_tile_size = layer_node_tile_size(
+        combo_count,
+        max_storage_buffer_binding_size,
+        node_tile_alignment,
+    );
     let max_layer_tiles = layers
         .iter()
         .map(|layer| layer.nodes.len().div_ceil(node_tile_size))
@@ -4867,7 +4921,11 @@ fn public_tree_layered(
     }
 }
 
-fn layer_node_tile_size(combo_count: usize, max_storage_buffer_binding_size: u64) -> usize {
+fn layer_node_tile_size(
+    combo_count: usize,
+    max_storage_buffer_binding_size: u64,
+    node_tile_alignment: usize,
+) -> usize {
     let bytes_per_node = combo_count.max(1) as u64 * std::mem::size_of::<f32>() as u64;
     let value_tile_nodes = (max_storage_buffer_binding_size / bytes_per_node)
         .max(1)
@@ -4879,7 +4937,38 @@ fn layer_node_tile_size(combo_count: usize, max_storage_buffer_binding_size: u64
         .max(1)
         .try_into()
         .unwrap_or(usize::MAX);
-    value_tile_nodes.min(state_tile_publics).max(1)
+    let tile_nodes = value_tile_nodes.min(state_tile_publics).max(1);
+    if node_tile_alignment > 1 && tile_nodes >= node_tile_alignment {
+        (tile_nodes / node_tile_alignment).max(1) * node_tile_alignment
+    } else {
+        tile_nodes
+    }
+}
+
+fn decision_child_count_alignment(nodes: &[GpuPublicTreeNode]) -> usize {
+    nodes
+        .iter()
+        .filter(|node| node.kind == 0 && node.child_count > 1)
+        .map(|node| node.child_count as usize)
+        .fold(1usize, |alignment, child_count| {
+            lcm_usize(alignment, child_count).min(64)
+        })
+}
+
+fn lcm_usize(left: usize, right: usize) -> usize {
+    if left == 0 || right == 0 {
+        return 1;
+    }
+    left / gcd_usize(left, right) * right
+}
+
+fn gcd_usize(mut left: usize, mut right: usize) -> usize {
+    while right != 0 {
+        let next = left % right;
+        left = right;
+        right = next;
+    }
+    left
 }
 
 fn public_tree_layer_edge_tiles(

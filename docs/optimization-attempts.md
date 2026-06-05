@@ -122,3 +122,22 @@ ideas.
   correctness for complete groups, but do not expect this path alone to produce
   the needed order-of-magnitude gain. The remaining target is eliminating or
   redesigning the split fallback/global action-value output stage.
+
+## 2026-06-05: Decision-child aligned layer tiles
+
+- Tried: reorder layer-local nodes in parent/child order and align the GPU
+  node tile size down to the LCM of decision-node child counts. On the current
+  flop tree this alignment is `12` because decision fanouts include the usual
+  small action counts such as `2`, `3`, and `4`.
+- Expected: prevent a decision node's child actions from being split across
+  child-tile boundaries, letting every decision group use the fused CFR update
+  path.
+- Result: kept. On `As7h2c`, `depth=5`, split decision groups moved from
+  `22` groups / `33` edges to `0`. `cfv_output_action_edge` moved from about
+  `225ms` to effectively zero, and skipping now-unused denominator/strategy
+  output passes moved one-iteration CFV from about `2.33s` to about `1.99s`.
+  `128` lightweight iterations moved from about `48.32s` to about `46.83s`.
+- Validation: GPU smoke passed, and a `32` iteration run with BR metrics
+  produced finite strategies with root profile values summing to zero.
+- Decision: keep. This is a real tiling/dataflow fix, not just a micro-kernel
+  tweak. The next major costs are still reach propagation and terminal CFV.
