@@ -90,3 +90,17 @@ ideas.
   lightweight iterations moved from `50.41s` to `49.41s`.
 - Decision: keep. This is an actual algebra/dataflow cleanup, but terminal and
   reach propagation still dominate.
+
+## 2026-06-05: Group-major action value materialization
+
+- Tried: change `action_edge_tile` from one invocation per `(edge, combo)` to
+  one invocation per `(decision edge group, combo)`, looping sibling actions in
+  the shader and writing the same `action_values` table.
+- Expected: reduce invocations and parent-side reads by roughly the branching
+  factor.
+- Result: no meaningful speedup. On `As7h2c`, `depth=5`, one-iteration
+  `cfv_output_action_edge` stayed around `338-340ms`.
+- Decision: reverted. This confirms `action_edge` is dominated by writing the
+  global `action_values` materialization surface, not by invocation count or
+  repeated parent reads. The next real optimization must remove or bypass that
+  table for most infosets.
