@@ -727,7 +727,7 @@ fn run_solve_flop_variant_bench(args: FlopVariantBenchArgs) {
     }
 
     println!(
-        "variant,iterations,elapsed_s,root_exploitability_bb100,target_bb100,converged,delta_bb100_per_s,root_l1_delta,root_actions,positive_regret_mass,negative_regret_mass,negative_regret_count,deep_negative_regret_count,rbp_private_prune_pct,rbp_public_edge_prune_pct,rbp_public_subtree_prune_pct,rbp_public_terminal_prune_pct,current_norm_err,avg_norm_err,finite"
+        "variant,iterations,elapsed_s,root_exploitability_bb100,target_bb100,converged,delta_bb100_per_s,root_l1_delta,root_actions,positive_regret_mass,negative_regret_mass,negative_regret_count,deep_negative_regret_count,rbp_private_prune_pct,rbp_public_edge_prune_pct,rbp_public_subtree_prune_pct,rbp_public_terminal_prune_pct,rbp_active_terminal_lane_pct,rbp_active_showdown_lane_pct,current_norm_err,avg_norm_err,finite"
     );
     for result in &results {
         print_variant_bench_result(result, target_bb100);
@@ -813,8 +813,16 @@ fn print_variant_bench_result(result: &VariantBenchResult, target_bb100: f32) {
         row.rbp_fully_prunable_public_edge_terminal_nodes,
         row.rbp_public_edge_terminal_nodes,
     );
+    let rbp_active_terminal_lane_pct = percentage(
+        row.rbp_active_terminal_combo_lanes,
+        row.rbp_terminal_combo_lanes,
+    );
+    let rbp_active_showdown_lane_pct = percentage(
+        row.rbp_active_showdown_combo_lanes,
+        row.rbp_showdown_combo_lanes,
+    );
     println!(
-        "{},{},{:.2},{},{:.2},{},{},{},{},{:.3},{:.3},{},{},{},{},{},{},{:.6},{:.6},{}",
+        "{},{},{:.2},{},{:.2},{},{},{},{},{:.3},{:.3},{},{},{},{},{},{},{},{},{:.6},{:.6},{}",
         result.variant_label,
         row.iterations,
         row.elapsed_secs,
@@ -832,6 +840,8 @@ fn print_variant_bench_result(result: &VariantBenchResult, target_bb100: f32) {
         format_optional(rbp_public_edge_prune_pct, 3),
         format_optional(rbp_public_subtree_prune_pct, 3),
         format_optional(rbp_public_terminal_prune_pct, 3),
+        format_optional(rbp_active_terminal_lane_pct, 3),
+        format_optional(rbp_active_showdown_lane_pct, 3),
         row.current_strategy_norm_error,
         row.average_strategy_norm_error,
         row.finite
@@ -955,7 +965,7 @@ fn print_metric_row(row: &pokedr_agent::FixedFlopMetricRow, target_bb100: f32) {
         .map(|value| value <= target_bb100)
         .unwrap_or(false);
     println!(
-        "board={} iterations={} elapsed={:.2}s root_l1_delta={} root_actions=[{}] root_exploitability={} root_exploitability_bb100={} current_root_exploitability={} current_root_exploitability_bb100={} cpu_root_exploitability={} cpu_root_exploitability_bb100={} cpu_gpu_root_exploitability_delta={} cpu_gpu_root_exploitability_delta_bb100={} pio_style_target_bb100={:.2} pio_style_converged={} hero_root_br_value={} villain_root_br_value={} hero_root_profile_value={} villain_root_profile_value={} root_profile_value_sum={} cpu_hero_root_br_value={} cpu_villain_root_br_value={} cpu_hero_root_profile_value={} cpu_villain_root_profile_value={} cpu_root_profile_value_sum={} current_hero_root_br_value={} current_villain_root_br_value={} current_hero_root_profile_value={} current_villain_root_profile_value={} current_root_profile_value_sum={} root_br_gap={} local_br_gap={} recursive_root_br_gap={} recursive_local_br_gap={} positive_regret_mass={:.3} negative_regret_mass={:.3} negative_regret_count={} deep_negative_regret_count={} rbp_private_prune_pct={} rbp_public_edge_prune_pct={} rbp_public_subtree_prune_pct={} rbp_public_terminal_prune_pct={} illegal_mass={:.6} current_norm_err={:.6} avg_norm_err={:.6} finite={}",
+        "board={} iterations={} elapsed={:.2}s root_l1_delta={} root_actions=[{}] root_exploitability={} root_exploitability_bb100={} current_root_exploitability={} current_root_exploitability_bb100={} cpu_root_exploitability={} cpu_root_exploitability_bb100={} cpu_gpu_root_exploitability_delta={} cpu_gpu_root_exploitability_delta_bb100={} pio_style_target_bb100={:.2} pio_style_converged={} hero_root_br_value={} villain_root_br_value={} hero_root_profile_value={} villain_root_profile_value={} root_profile_value_sum={} cpu_hero_root_br_value={} cpu_villain_root_br_value={} cpu_hero_root_profile_value={} cpu_villain_root_profile_value={} cpu_root_profile_value_sum={} current_hero_root_br_value={} current_villain_root_br_value={} current_hero_root_profile_value={} current_villain_root_profile_value={} current_root_profile_value_sum={} root_br_gap={} local_br_gap={} recursive_root_br_gap={} recursive_local_br_gap={} positive_regret_mass={:.3} negative_regret_mass={:.3} negative_regret_count={} deep_negative_regret_count={} rbp_private_prune_pct={} rbp_public_edge_prune_pct={} rbp_public_subtree_prune_pct={} rbp_public_terminal_prune_pct={} rbp_active_terminal_lane_pct={} rbp_active_showdown_lane_pct={} illegal_mass={:.6} current_norm_err={:.6} avg_norm_err={:.6} finite={}",
         row.board,
         row.iterations,
         row.elapsed_secs,
@@ -1076,6 +1086,20 @@ fn print_metric_row(row: &pokedr_agent::FixedFlopMetricRow, target_bb100: f32) {
             percentage(
                 row.rbp_fully_prunable_public_edge_terminal_nodes,
                 row.rbp_public_edge_terminal_nodes
+            ),
+            3
+        ),
+        format_optional(
+            percentage(
+                row.rbp_active_terminal_combo_lanes,
+                row.rbp_terminal_combo_lanes
+            ),
+            3
+        ),
+        format_optional(
+            percentage(
+                row.rbp_active_showdown_combo_lanes,
+                row.rbp_showdown_combo_lanes
             ),
             3
         ),

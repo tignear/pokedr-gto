@@ -156,6 +156,20 @@ regret signal is spread across private combo/action slots, but no public action
 edge is prunable for every legal private combo. A useful implementation needs
 private-action RBP state on the GPU, not only public-subtree deletion.
 
+Active terminal-lane propagation gives the same conclusion. If the threshold is
+applied to private actions and propagated through public chance cards, the
+active showdown combo lanes are:
+
+```text
+board   depth  iter  active terminal lanes  active showdown lanes
+As7h2c  4      64    86.252%                86.202%
+As7h2c  4      256   84.939%                84.883%
+```
+
+So an ideal compact-list terminal kernel would save about 14-15% of terminal
+lanes on this tree, not an order of magnitude. Regret pruning is still useful
+for correctness/solver hygiene, but it is not the missing 10x CFV speedup here.
+
 Relevant source:
 
 - https://papers.neurips.cc/paper/5910-regret-based-pruning-in-extensive-form-games

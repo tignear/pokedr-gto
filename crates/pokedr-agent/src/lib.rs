@@ -154,6 +154,10 @@ pub struct FixedFlopMetricRow {
     pub rbp_fully_prunable_public_edge_subtree_nodes: usize,
     pub rbp_public_edge_terminal_nodes: usize,
     pub rbp_fully_prunable_public_edge_terminal_nodes: usize,
+    pub rbp_terminal_combo_lanes: usize,
+    pub rbp_active_terminal_combo_lanes: usize,
+    pub rbp_showdown_combo_lanes: usize,
+    pub rbp_active_showdown_combo_lanes: usize,
     pub illegal_strategy_mass: f32,
     pub current_strategy_norm_error: f32,
     pub average_strategy_norm_error: f32,
@@ -773,6 +777,10 @@ where
             rbp_public_edge_terminal_nodes: diagnostics.rbp_public_edge_terminal_nodes,
             rbp_fully_prunable_public_edge_terminal_nodes: diagnostics
                 .rbp_fully_prunable_public_edge_terminal_nodes,
+            rbp_terminal_combo_lanes: diagnostics.rbp_terminal_combo_lanes,
+            rbp_active_terminal_combo_lanes: diagnostics.rbp_active_terminal_combo_lanes,
+            rbp_showdown_combo_lanes: diagnostics.rbp_showdown_combo_lanes,
+            rbp_active_showdown_combo_lanes: diagnostics.rbp_active_showdown_combo_lanes,
             illegal_strategy_mass: diagnostics.illegal_strategy_mass,
             current_strategy_norm_error: diagnostics.current_strategy_norm_error,
             average_strategy_norm_error: diagnostics.average_strategy_norm_error,
@@ -1188,6 +1196,10 @@ fn try_solve_fixed_flop_metrics_gpu(
             rbp_public_edge_terminal_nodes: diagnostics.rbp_public_edge_terminal_nodes,
             rbp_fully_prunable_public_edge_terminal_nodes: diagnostics
                 .rbp_fully_prunable_public_edge_terminal_nodes,
+            rbp_terminal_combo_lanes: diagnostics.rbp_terminal_combo_lanes,
+            rbp_active_terminal_combo_lanes: diagnostics.rbp_active_terminal_combo_lanes,
+            rbp_showdown_combo_lanes: diagnostics.rbp_showdown_combo_lanes,
+            rbp_active_showdown_combo_lanes: diagnostics.rbp_active_showdown_combo_lanes,
             illegal_strategy_mass: diagnostics.illegal_strategy_mass,
             current_strategy_norm_error: diagnostics.current_strategy_norm_error,
             average_strategy_norm_error: diagnostics.average_strategy_norm_error,
@@ -1215,6 +1227,10 @@ struct CfrDiagnostics {
     rbp_fully_prunable_public_edge_subtree_nodes: usize,
     rbp_public_edge_terminal_nodes: usize,
     rbp_fully_prunable_public_edge_terminal_nodes: usize,
+    rbp_terminal_combo_lanes: usize,
+    rbp_active_terminal_combo_lanes: usize,
+    rbp_showdown_combo_lanes: usize,
+    rbp_active_showdown_combo_lanes: usize,
     illegal_strategy_mass: f32,
     current_strategy_norm_error: f32,
     average_strategy_norm_error: f32,
@@ -1236,6 +1252,10 @@ impl CfrDiagnostics {
             rbp_fully_prunable_public_edge_subtree_nodes: 0,
             rbp_public_edge_terminal_nodes: 0,
             rbp_fully_prunable_public_edge_terminal_nodes: 0,
+            rbp_terminal_combo_lanes: 0,
+            rbp_active_terminal_combo_lanes: 0,
+            rbp_showdown_combo_lanes: 0,
+            rbp_active_showdown_combo_lanes: 0,
             illegal_strategy_mass: f32::NAN,
             current_strategy_norm_error: 0.0,
             average_strategy_norm_error: 0.0,
@@ -1307,6 +1327,10 @@ fn cfr_state_diagnostics(
         rbp_public_edge_terminal_nodes: pruning.public_edge_terminal_nodes,
         rbp_fully_prunable_public_edge_terminal_nodes: pruning
             .fully_prunable_public_edge_terminal_nodes,
+        rbp_terminal_combo_lanes: pruning.terminal_combo_lanes,
+        rbp_active_terminal_combo_lanes: pruning.active_terminal_combo_lanes,
+        rbp_showdown_combo_lanes: pruning.showdown_combo_lanes,
+        rbp_active_showdown_combo_lanes: pruning.active_showdown_combo_lanes,
         illegal_strategy_mass,
         current_strategy_norm_error,
         average_strategy_norm_error,
@@ -1324,6 +1348,10 @@ struct RegretBasedPruningEstimate {
     fully_prunable_public_edge_subtree_nodes: usize,
     public_edge_terminal_nodes: usize,
     fully_prunable_public_edge_terminal_nodes: usize,
+    terminal_combo_lanes: usize,
+    active_terminal_combo_lanes: usize,
+    showdown_combo_lanes: usize,
+    active_showdown_combo_lanes: usize,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -1341,6 +1369,11 @@ fn regret_based_pruning_estimate(
 ) -> RegretBasedPruningEstimate {
     let threshold = regret_based_pruning_threshold();
     let legal_combos = legal_private_combos(indexer, root_dead).collect::<Vec<_>>();
+    let combo_masks = indexer
+        .combos()
+        .iter()
+        .map(|combo| combo.deck_mask())
+        .collect::<Vec<_>>();
     let subtree_sizes = subtree_sizes(tree);
     let mut estimate = RegretBasedPruningEstimate::default();
 
@@ -1389,7 +1422,124 @@ fn regret_based_pruning_estimate(
         }
     }
 
+    estimate_active_terminal_lanes(
+        &mut estimate,
+        state,
+        tree,
+        layout,
+        &legal_combos,
+        &combo_masks,
+        threshold,
+    );
     estimate
+}
+
+fn estimate_active_terminal_lanes(
+    estimate: &mut RegretBasedPruningEstimate,
+    state: &DenseCfrState,
+    tree: &SubgameTree,
+    layout: &PostflopDenseLayout,
+    legal_combos: &[usize],
+    combo_masks: &[u64],
+    threshold: f32,
+) {
+    let combo_count = combo_masks.len();
+    let mut root_active = vec![0u8; combo_count].into_boxed_slice();
+    for &combo_index in legal_combos {
+        root_active[combo_index] = 1;
+    }
+    let mut hero_active: Vec<Option<Box<[u8]>>> = vec![None; tree.nodes().len()];
+    let mut villain_active: Vec<Option<Box<[u8]>>> = vec![None; tree.nodes().len()];
+    hero_active[0] = Some(root_active.clone());
+    villain_active[0] = Some(root_active);
+
+    for node_index in 0..tree.nodes().len() {
+        let Some(hero_here) = hero_active[node_index].take() else {
+            continue;
+        };
+        let Some(villain_here) = villain_active[node_index].take() else {
+            continue;
+        };
+        match &tree.nodes()[node_index].kind {
+            PublicNodeKind::Decision {
+                state: public_state,
+                actions,
+            } => {
+                let Some(public_infoset) = layout.node_infoset(node_index) else {
+                    continue;
+                };
+                for (action_index, _) in actions.iter().enumerate() {
+                    let Some(child) = layout.child_for_action(public_infoset, action_index) else {
+                        continue;
+                    };
+                    let mut next_hero = hero_here.clone();
+                    let mut next_villain = villain_here.clone();
+                    let actor_active = match public_state.acting_player {
+                        Player::Hero => &mut next_hero,
+                        Player::Villain => &mut next_villain,
+                    };
+                    for &combo_index in legal_combos {
+                        if actor_active[combo_index] == 0 {
+                            continue;
+                        }
+                        let private_infoset = private_infoset(
+                            public_infoset,
+                            public_state.acting_player,
+                            combo_index,
+                        );
+                        let offset = private_infoset * state.actions() + action_index;
+                        if offset >= state.legal_actions().len()
+                            || !state.legal_actions()[offset]
+                            || state.regrets()[offset] <= threshold
+                        {
+                            actor_active[combo_index] = 0;
+                        }
+                    }
+                    merge_active(&mut hero_active[child], &next_hero);
+                    merge_active(&mut villain_active[child], &next_villain);
+                }
+            }
+            PublicNodeKind::Chance { cards, .. } => {
+                for (card, &child) in cards.iter().zip(&tree.nodes()[node_index].children) {
+                    let card_mask = card.deck_mask();
+                    let mut next_hero = hero_here.clone();
+                    let mut next_villain = villain_here.clone();
+                    for &combo_index in legal_combos {
+                        if combo_masks[combo_index] & card_mask != 0 {
+                            next_hero[combo_index] = 0;
+                            next_villain[combo_index] = 0;
+                        }
+                    }
+                    merge_active(&mut hero_active[child], &next_hero);
+                    merge_active(&mut villain_active[child], &next_villain);
+                }
+            }
+            PublicNodeKind::Terminal { kind, .. } => {
+                let active = legal_combos
+                    .iter()
+                    .filter(|&&combo_index| {
+                        hero_here[combo_index] != 0 || villain_here[combo_index] != 0
+                    })
+                    .count();
+                estimate.terminal_combo_lanes += legal_combos.len();
+                estimate.active_terminal_combo_lanes += active;
+                if matches!(kind, TerminalKind::Showdown) {
+                    estimate.showdown_combo_lanes += legal_combos.len();
+                    estimate.active_showdown_combo_lanes += active;
+                }
+            }
+        }
+    }
+}
+
+fn merge_active(target: &mut Option<Box<[u8]>>, source: &[u8]) {
+    if let Some(target) = target {
+        for (left, right) in target.iter_mut().zip(source) {
+            *left |= *right;
+        }
+    } else {
+        *target = Some(source.to_vec().into_boxed_slice());
+    }
 }
 
 fn regret_based_pruning_threshold() -> f32 {
