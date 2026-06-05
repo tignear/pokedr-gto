@@ -903,11 +903,6 @@ fn reach_edge_tile(@builtin(global_invocation_id) id: vec3<u32>) {
     let child_offset = edge.child * params.combo_count + combo;
     let hero_reach = parent_hero_reaches[parent_offset];
     let villain_reach = parent_villain_reaches[parent_offset];
-    let parent_live_word = parent_offset >> 5u;
-    let parent_live_mask = 1u << (parent_offset & 31u);
-    let child_live_word = child_offset >> 5u;
-    let child_live_mask = 1u << (child_offset & 31u);
-    let live = (parent_combo_live[parent_live_word] & parent_live_mask) != 0u;
     if node.kind == 0u {
         let probability = strategy_probability(node, combo, edge.action);
         let is_br_player = params.aux0 < 2u && node.acting_player == params.aux0;
@@ -920,24 +915,13 @@ fn reach_edge_tile(@builtin(global_invocation_id) id: vec3<u32>) {
             child_villain_reaches[child_offset] =
                 villain_reach * select(probability, 1.0, is_br_player);
         }
-        if live {
-            atomicOr(&child_combo_live[child_live_word], child_live_mask);
-        } else {
-            atomicAnd(&child_combo_live[child_live_word], 0xffffffffu ^ child_live_mask);
-        }
     } else if node.kind == 1u {
         if combo_has_card(combos[combo], edge.card) {
             child_hero_reaches[child_offset] = 0.0;
             child_villain_reaches[child_offset] = 0.0;
-            atomicAnd(&child_combo_live[child_live_word], 0xffffffffu ^ child_live_mask);
         } else {
             child_hero_reaches[child_offset] = hero_reach;
             child_villain_reaches[child_offset] = villain_reach;
-            if live {
-                atomicOr(&child_combo_live[child_live_word], child_live_mask);
-            } else {
-                atomicAnd(&child_combo_live[child_live_word], 0xffffffffu ^ child_live_mask);
-            }
         }
     }
 }
@@ -2285,6 +2269,7 @@ struct GpuPublicTreeIterationContext {
     strategy_weights_buffer: wgpu::Buffer,
     dummy_buffer: wgpu::Buffer,
     layer_tiles: Vec<Vec<GpuPublicTreeLayerTileBuffers>>,
+    reach_edge_buffers: Vec<wgpu::Buffer>,
     fold_terminal_nodes: Vec<u32>,
     showdown_terminal_nodes: Vec<u32>,
     terminal_tile_count: usize,
@@ -4244,12 +4229,13 @@ impl GpuDenseCfrBackend {
         layered: &GpuPublicTreeLayered,
         combos: &[GpuPrivateCombo],
         showdown_boards: &[GpuFinalBoard],
+        combo_live_masks: &[Vec<u32>],
     ) -> Vec<Vec<GpuPublicTreeLayerTileBuffers>> {
         layered
             .layers
             .iter()
             .enumerate()
-            .map(|(_, layer)| {
+            .map(|(layer_index, layer)| {
                 (0..layer.nodes.len())
                     .step_by(layered.node_tile_size)
                     .map(|node_start| {
@@ -4283,7 +4269,15 @@ impl GpuDenseCfrBackend {
                         }
 
                         let value_len = tile_nodes.len() * combos.len();
-                        let live_word_len = value_len.div_ceil(32).max(1);
+                        let tile_combo_live = tile_combo_live_words(
+                            combo_live_masks
+                                .get(layer_index)
+                                .map(Vec::as_slice)
+                                .unwrap_or(&[]),
+                            node_start,
+                            node_end,
+                            combos.len(),
+                        );
                         let showdown_terminal_groups = terminal_group_caches(
                             &tile_nodes,
                             &showdown_terminal_nodes,
@@ -4359,11 +4353,10 @@ impl GpuDenseCfrBackend {
                                 value_len,
                                 false,
                             ),
-                            combo_live_buffer: uninit_storage_buffer(
+                            combo_live_buffer: readonly_buffer(
                                 &self.device,
                                 "public tree layer tile combo live mask",
-                                live_word_len,
-                                false,
+                                &tile_combo_live,
                             ),
                             hero_values_buffer: uninit_storage_buffer(
                                 &self.device,
@@ -4394,8 +4387,31 @@ impl GpuDenseCfrBackend {
         br_player: u32,
         iteration: usize,
     ) {
-        for layer_tiles in &ctx.layer_tiles {
-            for tile in layer_tiles {
+        self.propagate_layer_reach_inits(encoder, ctx, variant, iteration);
+        self.propagate_layer_reach_edges(
+            encoder,
+            ctx,
+            regrets_buffer,
+            prediction_buffer,
+            variant,
+            br_player,
+            iteration,
+        );
+    }
+
+    fn propagate_layer_reach_inits(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        ctx: &GpuPublicTreeIterationContext,
+        variant: super::CfrVariant,
+        iteration: usize,
+    ) {
+        let full_init = std::env::var_os("POKEDR_GPU_FULL_REACH_INIT").is_some();
+        for (layer_index, layer_tiles) in ctx.layer_tiles.iter().enumerate() {
+            for (tile_index, tile) in layer_tiles.iter().enumerate() {
+                if !full_init && !(layer_index == 0 && tile_index == 0) {
+                    continue;
+                }
                 let value_count = (tile.node_end - tile.node_start) * ctx.combos_len;
                 if value_count == 0 {
                     continue;
@@ -4437,8 +4453,24 @@ impl GpuDenseCfrBackend {
                 pass.dispatch_workgroups(x_groups, y_groups, 1);
             }
         }
+    }
 
-        for edge_tile in &ctx.layered.reach_edge_tiles {
+    fn propagate_layer_reach_edges(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        ctx: &GpuPublicTreeIterationContext,
+        regrets_buffer: &wgpu::Buffer,
+        prediction_buffer: &wgpu::Buffer,
+        variant: super::CfrVariant,
+        br_player: u32,
+        iteration: usize,
+    ) {
+        for (edge_tile, edge_buffer) in ctx
+            .layered
+            .reach_edge_tiles
+            .iter()
+            .zip(&ctx.reach_edge_buffers)
+        {
             let parent_tile_index = edge_tile.parent_tile.node_start / ctx.layered.node_tile_size;
             let child_tile_index = edge_tile.child_tile.node_start / ctx.layered.node_tile_size;
             let parent_tile = &ctx.layer_tiles[edge_tile.parent_layer][parent_tile_index];
@@ -4456,11 +4488,6 @@ impl GpuDenseCfrBackend {
             } else {
                 (0, 0)
             };
-            let edge_buffer = readonly_buffer(
-                &self.device,
-                "public tree layer reach edges",
-                &edge_tile.edges,
-            );
             let invocation_count = edge_tile.edges.len() * ctx.combos_len;
             let (x_groups, y_groups, x_invocations) = dispatch_grid(invocation_count);
             let params = uniform_buffer(
@@ -4484,7 +4511,7 @@ impl GpuDenseCfrBackend {
                 layout: &self.public_tree_layer_reach_edge_bind_group_layout,
                 entries: &[
                     bind_entry(0, &parent_tile.node_buffer),
-                    bind_entry(1, &edge_buffer),
+                    bind_entry(1, edge_buffer),
                     bind_entry(2, &ctx.combo_buffer),
                     bind_entry(3, &ctx.root_weights_buffer),
                     if action_len > 0 {
@@ -4928,16 +4955,16 @@ impl GpuDenseCfrBackend {
             }
         }
 
-        for edge_tile in &ctx.layered.reach_edge_tiles {
+        for (edge_tile, edge_buffer) in ctx
+            .layered
+            .reach_edge_tiles
+            .iter()
+            .zip(&ctx.reach_edge_buffers)
+        {
             let parent_tile_index = edge_tile.parent_tile.node_start / ctx.layered.node_tile_size;
             let child_tile_index = edge_tile.child_tile.node_start / ctx.layered.node_tile_size;
             let parent_tile = &ctx.layer_tiles[edge_tile.parent_layer][parent_tile_index];
             let child_tile = &ctx.layer_tiles[edge_tile.child_layer][child_tile_index];
-            let edge_buffer = readonly_buffer(
-                &self.device,
-                "public tree layer action edges",
-                &edge_tile.edges,
-            );
             let parent_layer_nodes = &ctx.layered.layers[edge_tile.parent_layer].nodes
                 [parent_tile.node_start..parent_tile.node_end];
             let Some((public_base, public_end)) =
@@ -4985,7 +5012,7 @@ impl GpuDenseCfrBackend {
                             f32_range_byte_size(action_len),
                         ),
                         bind_entry(7, &parent_tile.combo_live_buffer),
-                        bind_entry(8, &edge_buffer),
+                        bind_entry(8, edge_buffer),
                         bind_entry(9, &child_tile.hero_values_buffer),
                         bind_entry(10, &child_tile.villain_values_buffer),
                         bind_entry(11, &ctx.root_weights_buffer),
@@ -5172,7 +5199,24 @@ impl GpuDenseCfrBackend {
             decision_aggregate_len,
             false,
         );
-        let layer_tiles = self.public_tree_layer_tile_buffers(&layered, combos, showdown_boards);
+        let reach_edge_buffers = layered
+            .reach_edge_tiles
+            .iter()
+            .map(|edge_tile| {
+                readonly_buffer(
+                    &self.device,
+                    "public tree layer resident edges",
+                    &edge_tile.edges,
+                )
+            })
+            .collect();
+        let combo_live_masks = public_tree_static_combo_live_masks(&layered, combos, combo_legal);
+        let layer_tiles = self.public_tree_layer_tile_buffers(
+            &layered,
+            combos,
+            showdown_boards,
+            &combo_live_masks,
+        );
 
         GpuPublicTreeIterationContext {
             nodes_len: nodes.len(),
@@ -5189,6 +5233,7 @@ impl GpuDenseCfrBackend {
             strategy_weights_buffer,
             dummy_buffer,
             layer_tiles,
+            reach_edge_buffers,
             fold_terminal_nodes,
             showdown_terminal_nodes,
             terminal_tile_count,
@@ -5235,16 +5280,61 @@ impl GpuDenseCfrBackend {
                 label: Some("public tree iteration encoder"),
             });
         let mut phase_start = profile.then(Instant::now);
-        self.propagate_layer_reaches(
-            &mut encoder,
-            ctx,
-            regrets_buffer,
-            prediction_buffer,
-            variant,
-            br_player,
-            iteration,
-        );
-        encoder = self.finish_profile_phase(encoder, "cfv_reach", phase_start)?;
+        if profile && std::env::var_os("POKEDR_GPU_REACH_PROFILE").is_some() {
+            let mut decision_edges = 0usize;
+            let mut chance_edges = 0usize;
+            let mut chance_only_tiles = 0usize;
+            for edge_tile in &ctx.layered.reach_edge_tiles {
+                let parent = &ctx.layered.layers[edge_tile.parent_layer];
+                let mut tile_decision_edges = 0usize;
+                let mut tile_chance_edges = 0usize;
+                for edge in &edge_tile.edges {
+                    let node =
+                        parent.nodes[edge_tile.parent_tile.node_start + edge.parent as usize];
+                    if node.kind == 0 {
+                        tile_decision_edges += 1;
+                    } else if node.kind == 1 {
+                        tile_chance_edges += 1;
+                    }
+                }
+                if tile_decision_edges == 0 && tile_chance_edges > 0 {
+                    chance_only_tiles += 1;
+                }
+                decision_edges += tile_decision_edges;
+                chance_edges += tile_chance_edges;
+            }
+            eprintln!(
+                "pokedr: gpu profile reach edge_tiles={} chance_only_tiles={} decision_edges={} chance_edges={}",
+                ctx.layered.reach_edge_tiles.len(),
+                chance_only_tiles,
+                decision_edges,
+                chance_edges,
+            );
+            self.propagate_layer_reach_inits(&mut encoder, ctx, variant, iteration);
+            encoder = self.finish_profile_phase(encoder, "cfv_reach_init", phase_start)?;
+            phase_start = profile.then(Instant::now);
+            self.propagate_layer_reach_edges(
+                &mut encoder,
+                ctx,
+                regrets_buffer,
+                prediction_buffer,
+                variant,
+                br_player,
+                iteration,
+            );
+            encoder = self.finish_profile_phase(encoder, "cfv_reach_edges", phase_start)?;
+        } else {
+            self.propagate_layer_reaches(
+                &mut encoder,
+                ctx,
+                regrets_buffer,
+                prediction_buffer,
+                variant,
+                br_player,
+                iteration,
+            );
+            encoder = self.finish_profile_phase(encoder, "cfv_reach", phase_start)?;
+        }
         phase_start = profile.then(Instant::now);
 
         for layer_tiles in &ctx.layer_tiles {
@@ -6342,6 +6432,93 @@ fn f32_range_byte_offset(elements: usize) -> u64 {
 
 fn f32_range_byte_size(elements: usize) -> u64 {
     byte_len::<f32>(elements.max(1))
+}
+
+fn public_tree_static_combo_live_masks(
+    layered: &GpuPublicTreeLayered,
+    combos: &[GpuPrivateCombo],
+    combo_legal: &[u32],
+) -> Vec<Vec<u32>> {
+    let combo_count = combos.len();
+    let mut masks = layered
+        .layers
+        .iter()
+        .map(|layer| vec![0u32; (layer.nodes.len() * combo_count).div_ceil(32).max(1)])
+        .collect::<Vec<_>>();
+    if layered.layers.is_empty() || combo_count == 0 {
+        return masks;
+    }
+
+    for combo in 0..combo_count {
+        if combo_legal.get(combo).copied().unwrap_or(0) != 0 {
+            set_combo_live_bit(&mut masks[0], combo);
+        }
+    }
+
+    for layer_index in 0..layered.layers.len().saturating_sub(1) {
+        let child_layer_index = layer_index + 1;
+        let layer = &layered.layers[layer_index];
+        for (parent_slot, node) in layer.nodes.iter().copied().enumerate() {
+            if node.kind != 0 && node.kind != 1 {
+                continue;
+            }
+            for action in 0..node.child_count as usize {
+                let child_offset = node.first_child as usize + action;
+                let child_slot = layer.children[child_offset] as usize;
+                let chance_card = layer.child_cards.get(child_offset).copied().unwrap_or(52);
+                for (combo, private_combo) in combos.iter().enumerate() {
+                    if !combo_live_bit(&masks[layer_index], parent_slot * combo_count + combo) {
+                        continue;
+                    }
+                    if node.kind == 1
+                        && (private_combo.cards[0] == chance_card
+                            || private_combo.cards[1] == chance_card)
+                    {
+                        continue;
+                    }
+                    set_combo_live_bit(
+                        &mut masks[child_layer_index],
+                        child_slot * combo_count + combo,
+                    );
+                }
+            }
+        }
+    }
+
+    masks
+}
+
+fn tile_combo_live_words(
+    layer_words: &[u32],
+    node_start: usize,
+    node_end: usize,
+    combo_count: usize,
+) -> Vec<u32> {
+    let value_len = (node_end - node_start) * combo_count;
+    let mut words = vec![0u32; value_len.div_ceil(32).max(1)];
+    for source_slot in node_start..node_end {
+        for combo in 0..combo_count {
+            let source_index = source_slot * combo_count + combo;
+            if combo_live_bit(layer_words, source_index) {
+                let local_slot = source_slot - node_start;
+                set_combo_live_bit(&mut words, local_slot * combo_count + combo);
+            }
+        }
+    }
+    words
+}
+
+fn combo_live_bit(words: &[u32], index: usize) -> bool {
+    words
+        .get(index >> 5)
+        .map(|word| (word & (1u32 << (index & 31))) != 0)
+        .unwrap_or(false)
+}
+
+fn set_combo_live_bit(words: &mut [u32], index: usize) {
+    if let Some(word) = words.get_mut(index >> 5) {
+        *word |= 1u32 << (index & 31);
+    }
 }
 
 fn public_tree_layered(
