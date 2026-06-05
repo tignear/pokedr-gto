@@ -967,7 +967,7 @@ struct ChunkParams {
 @group(0) @binding(7) var<uniform> params: Params;
 var<immediate> chunk: ChunkParams;
 
-pub(super) const TERMINAL_PREFIX_CAPACITY: u32 = 2048u;
+const TERMINAL_PREFIX_CAPACITY: u32 = 2048u;
 var<workgroup> scan_pairs: array<PrefixPair, 2048>;
 
 fn terminal_scan_upsweep(stride: u32, local_index: u32) {
