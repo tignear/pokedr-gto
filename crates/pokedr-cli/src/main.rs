@@ -484,7 +484,6 @@ fn run_solve_flop_metrics(args: FlopMetricsArgs) {
     });
     let config = match_config(&args.solver);
     let convergence = metric_convergence_settings(&args);
-    let explicit_iterations = explicit_metric_iterations_requested(&args);
     let iterations = convergence
         .as_ref()
         .map(|settings| metric_convergence_iterations(settings))
@@ -502,12 +501,9 @@ fn run_solve_flop_metrics(args: FlopMetricsArgs) {
         target_bb100
     );
     let dump_gap_nodes = args.local_gaps || std::env::var_os("POKEDR_METRIC_LOCAL_GAPS").is_some();
-    let br_on_root_delta = args.br_on_root_delta.or_else(|| {
-        (convergence.is_some() && !explicit_iterations && !args.br_metrics).then_some(0.001)
-    });
     let metric_options = pokedr_agent::FixedFlopMetricOptions {
         br_metrics: args.br_metrics,
-        br_on_root_delta,
+        br_on_root_delta: args.br_on_root_delta,
         br_every_iterations: args
             .br_every
             .or_else(|| env_usize("POKEDR_METRIC_BR_EVERY"))
