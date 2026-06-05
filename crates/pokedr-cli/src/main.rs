@@ -65,18 +65,18 @@ struct FlopMetricsArgs {
     #[arg(
         long,
         value_delimiter = ',',
-        help = "Metric checkpoints, for example 64,128,256"
+        help = "Explicit metric checkpoints; overrides target-based checkpoint generation"
     )]
     metric_iterations: Vec<usize>,
+    #[arg(long, help = "Target-based checkpoint interval")]
+    metric_interval: Option<usize>,
+    #[arg(long, help = "Maximum iterations for target-based metrics")]
+    metric_max_iterations: Option<usize>,
     #[arg(
         long,
-        help = "Emit checkpoints every N iterations until max iterations"
+        help = "Stop once root exploitability reaches this bb/100 target; default 1.0"
     )]
-    metric_interval: Option<usize>,
-    #[arg(long, help = "Maximum iterations for interval-based metrics")]
-    metric_max_iterations: Option<usize>,
-    #[arg(long, default_value_t = 1.0)]
-    target_bb100: f32,
+    target_bb100: Option<f32>,
     #[arg(long, default_value_t = 3)]
     regression_patience: usize,
     #[arg(long)]
@@ -413,8 +413,11 @@ fn run_solve_flop(args: FlopSolveArgs) {
     });
     let config = fixed_flop_config(&args.solver);
     println!(
-        "solving fixed flop iterations={} variant={:?} depth={} equity_runout_cap={} terminal_runouts=full",
-        config.cfr_iterations, config.cfr_variant, config.max_depth, config.max_showdown_runouts
+        "solving fixed flop iterations={} variant={:?} depth={} terminal_runouts={}",
+        config.cfr_iterations,
+        config.cfr_variant,
+        config.max_depth,
+        format_terminal_runouts(config.max_showdown_runouts)
     );
     let summary = pokedr_agent::solve_fixed_flop_once(flop, config);
     println!("board: {}", summary.board);
@@ -442,10 +445,14 @@ fn run_solve_flop_metrics(args: FlopMetricsArgs) {
     let target_bb100 = convergence
         .as_ref()
         .map(|settings| settings.target_bb100)
-        .unwrap_or(args.target_bb100.max(0.0));
+        .unwrap_or_else(|| metric_target_bb100(&args));
     println!(
-        "solving fixed flop metrics variant={:?} depth={} equity_runout_cap={} terminal_runouts=full iterations={:?} target_bb100={:.2}",
-        config.cfr_variant, config.max_depth, config.max_showdown_runouts, iterations, target_bb100
+        "solving fixed flop metrics variant={:?} depth={} terminal_runouts={} iterations={:?} target_bb100={:.2}",
+        config.cfr_variant,
+        config.max_depth,
+        format_terminal_runouts(config.max_showdown_runouts),
+        iterations,
+        target_bb100
     );
     let dump_gap_nodes = args.local_gaps || std::env::var_os("POKEDR_METRIC_LOCAL_GAPS").is_some();
     let mut best_exploitability_bb100 = f32::INFINITY;
@@ -546,10 +553,10 @@ fn run_solve_flop_sweep(args: FlopSweepArgs) {
         .max(1);
     let candidates = pdcfr_sweep_candidates(&args);
     eprintln!(
-        "sweeping fixed flop pdcfr-plus board={} depth={} equity_runout_cap={} iterations={} candidates={}",
+        "sweeping fixed flop pdcfr-plus board={} depth={} terminal_runouts={} iterations={} candidates={}",
         format_pokedr_cards_for_cli(&flop),
         base_config.max_depth,
-        base_config.max_showdown_runouts,
+        format_terminal_runouts(base_config.max_showdown_runouts),
         iterations,
         candidates.len()
     );
@@ -2419,6 +2426,17 @@ fn metric_iterations(args: &FlopMetricsArgs) -> Vec<usize> {
         .unwrap_or_else(|| vec![1, 2, 4, 8, 16, 32])
 }
 
+fn explicit_metric_iterations_requested(args: &FlopMetricsArgs) -> bool {
+    !args.metric_iterations.is_empty() || std::env::var_os("POKEDR_METRIC_ITERATIONS").is_some()
+}
+
+fn metric_target_bb100(args: &FlopMetricsArgs) -> f32 {
+    env_f32("POKEDR_METRIC_TARGET_BB100")
+        .or(args.target_bb100)
+        .unwrap_or(1.0)
+        .max(0.0)
+}
+
 #[derive(Debug, Clone, Copy)]
 struct MetricConvergenceSettings {
     interval: usize,
@@ -2428,8 +2446,10 @@ struct MetricConvergenceSettings {
 }
 
 fn metric_convergence_settings(args: &FlopMetricsArgs) -> Option<MetricConvergenceSettings> {
-    let requested = args.metric_interval.is_some()
+    let requested = !explicit_metric_iterations_requested(args)
+        || args.metric_interval.is_some()
         || args.metric_max_iterations.is_some()
+        || args.target_bb100.is_some()
         || std::env::var_os("POKEDR_METRIC_UNTIL_CONVERGED").is_some()
         || std::env::var_os("POKEDR_METRIC_INTERVAL").is_some()
         || std::env::var_os("POKEDR_METRIC_MAX_ITERATIONS").is_some()
@@ -2448,7 +2468,7 @@ fn metric_convergence_settings(args: &FlopMetricsArgs) -> Option<MetricConvergen
         MetricConvergenceSettings {
             interval,
             max_iterations,
-            target_bb100: env_f32("POKEDR_METRIC_TARGET_BB100").unwrap_or(args.target_bb100),
+            target_bb100: metric_target_bb100(args),
             regression_patience: env_usize("POKEDR_METRIC_REGRESSION_PATIENCE")
                 .unwrap_or(args.regression_patience),
         }
@@ -2556,6 +2576,14 @@ fn parse_terminal_runouts(value: &str) -> usize {
         eprintln!("--terminal-runouts must be a positive integer or full: {value}");
         std::process::exit(2);
     })
+}
+
+fn format_terminal_runouts(value: usize) -> String {
+    if value == usize::MAX {
+        "full".to_string()
+    } else {
+        value.to_string()
+    }
 }
 
 fn env_cfr_variant(name: &str) -> Option<CfrVariant> {
