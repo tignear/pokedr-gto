@@ -4734,7 +4734,7 @@ mod tests {
             villain_weights[hero_combo_index(&indexer, combo)] = 1.0;
         }
         let state = solve_public_tree_cfr(&tree, &layout, &config, &hero_weights, &villain_weights);
-        let exploitability = cpu_recursive_root_exploitability(
+        let oracle_gap = cpu_pairwise_oracle_root_gap(
             &tree,
             &layout,
             &state,
@@ -4745,9 +4745,9 @@ mod tests {
         );
 
         assert!(
-            exploitability * 100.0 < 1.0,
-            "sparse depth3 exploitability stayed at {:.3} bb/100",
-            exploitability * 100.0
+            oracle_gap * 100.0 < 1.0,
+            "sparse depth3 pairwise oracle gap stayed at {:.3} bb/100",
+            oracle_gap * 100.0
         );
     }
 
@@ -5548,7 +5548,7 @@ mod tests {
             false,
         )
         .expect("GPU recursive BR metric should run");
-        let exploitability = cpu_recursive_root_exploitability(
+        let oracle_gap = cpu_pairwise_oracle_root_gap(
             &tree,
             &layout,
             &state,
@@ -5561,15 +5561,19 @@ mod tests {
         backend.wait_idle().ok();
         std::mem::forget(backend);
         assert!(
-            exploitability * 100.0 < 1.0,
-            "GPU sparse depth3 exploitability stayed at {:.3} bb/100",
-            exploitability * 100.0
+            oracle_gap * 100.0 < 1.0,
+            "GPU sparse depth3 pairwise oracle gap stayed at {:.3} bb/100",
+            oracle_gap * 100.0
         );
         assert!(
-            (gpu_metrics.root_exploitability - exploitability).abs() < 1e-3,
-            "GPU metric exploitability {:.6} differs from CPU exploitability {:.6}",
+            gpu_metrics.root_exploitability.is_finite(),
+            "GPU root exploitability should be finite"
+        );
+        assert!(
+            oracle_gap + 1e-3 >= gpu_metrics.root_exploitability,
+            "pairwise oracle gap {:.6} should upper-bound GPU infoset BR exploitability {:.6}",
+            oracle_gap,
             gpu_metrics.root_exploitability,
-            exploitability
         );
     }
 
@@ -5701,7 +5705,7 @@ mod tests {
             &matrix_cache,
         )
         .expect("GPU resident solve should run");
-        let cpu_exploitability = cpu_recursive_root_exploitability(
+        let cpu_oracle_gap = cpu_pairwise_oracle_root_gap(
             &tree,
             &layout,
             &state,
@@ -5737,10 +5741,10 @@ mod tests {
         backend.wait_idle().ok();
         std::mem::forget(backend);
         assert!(
-            (gpu_metrics.root_exploitability - cpu_exploitability).abs() < 1e-3,
-            "GPU recursive exploitability mismatch: gpu={} cpu={}",
+            cpu_oracle_gap + 1e-3 >= gpu_metrics.root_exploitability,
+            "pairwise oracle gap should upper-bound GPU infoset BR exploitability: gpu={} oracle={}",
             gpu_metrics.root_exploitability,
-            cpu_exploitability
+            cpu_oracle_gap
         );
     }
 
@@ -5790,7 +5794,7 @@ mod tests {
             &matrix_cache,
         )
         .expect("GPU resident solve should run");
-        let cpu_exploitability = cpu_recursive_root_exploitability(
+        let cpu_oracle_gap = cpu_pairwise_oracle_root_gap(
             &tree,
             &layout,
             &state,
@@ -5826,10 +5830,10 @@ mod tests {
         backend.wait_idle().ok();
         std::mem::forget(backend);
         assert!(
-            (gpu_metrics.root_exploitability - cpu_exploitability).abs() < 1e-3,
-            "GPU limited fixed-flop-range recursive exploitability mismatch: gpu={} cpu={}",
+            cpu_oracle_gap + 1e-3 >= gpu_metrics.root_exploitability,
+            "pairwise oracle gap should upper-bound GPU infoset BR exploitability on limited fixed-flop ranges: gpu={} oracle={}",
             gpu_metrics.root_exploitability,
-            cpu_exploitability
+            cpu_oracle_gap
         );
     }
 
@@ -5876,7 +5880,128 @@ mod tests {
         (hero_weights, villain_weights)
     }
 
-    fn cpu_recursive_root_exploitability(
+    fn infoset_br_hero_payoff(action_values: &[Vec<f32>], opponent_weights: &[f32]) -> f32 {
+        assert!(!action_values.is_empty());
+        assert!(
+            action_values
+                .iter()
+                .all(|values| values.len() == opponent_weights.len())
+        );
+        action_values
+            .iter()
+            .map(|values| {
+                values
+                    .iter()
+                    .zip(opponent_weights)
+                    .map(|(value, weight)| value * weight)
+                    .sum::<f32>()
+            })
+            .fold(f32::NEG_INFINITY, f32::max)
+    }
+
+    fn clairvoyant_pairwise_br_hero_payoff(
+        action_values: &[Vec<f32>],
+        opponent_weights: &[f32],
+    ) -> f32 {
+        assert!(!action_values.is_empty());
+        let opponent_count = opponent_weights.len();
+        assert!(
+            action_values
+                .iter()
+                .all(|values| values.len() == opponent_count)
+        );
+        (0..opponent_count)
+            .map(|opponent| {
+                let best = action_values
+                    .iter()
+                    .map(|values| values[opponent])
+                    .fold(f32::NEG_INFINITY, f32::max);
+                best * opponent_weights[opponent]
+            })
+            .sum()
+    }
+
+    fn infoset_br_villain_payoff(action_values: &[Vec<f32>], opponent_weights: &[f32]) -> f32 {
+        assert!(!action_values.is_empty());
+        assert!(
+            action_values
+                .iter()
+                .all(|values| values.len() == opponent_weights.len())
+        );
+        action_values
+            .iter()
+            .map(|values| {
+                values
+                    .iter()
+                    .zip(opponent_weights)
+                    .map(|(value, weight)| value * weight)
+                    .sum::<f32>()
+            })
+            .fold(f32::INFINITY, f32::min)
+    }
+
+    fn clairvoyant_pairwise_villain_payoff(
+        action_values: &[Vec<f32>],
+        opponent_weights: &[f32],
+    ) -> f32 {
+        assert!(!action_values.is_empty());
+        let opponent_count = opponent_weights.len();
+        assert!(
+            action_values
+                .iter()
+                .all(|values| values.len() == opponent_count)
+        );
+        (0..opponent_count)
+            .map(|opponent| {
+                let best = action_values
+                    .iter()
+                    .map(|values| values[opponent])
+                    .fold(f32::INFINITY, f32::min);
+                best * opponent_weights[opponent]
+            })
+            .sum()
+    }
+
+    #[test]
+    fn infoset_br_chooses_one_action_before_observing_opponent_combo() {
+        let opponent_weights = [0.5, 0.5];
+        let action_values = vec![vec![10.0, -10.0], vec![0.0, 0.0]];
+
+        let infoset_br = infoset_br_hero_payoff(&action_values, &opponent_weights);
+        let clairvoyant_br = clairvoyant_pairwise_br_hero_payoff(&action_values, &opponent_weights);
+
+        assert!((infoset_br - 0.0).abs() < 1e-6);
+        assert!((clairvoyant_br - 5.0).abs() < 1e-6);
+        assert!(clairvoyant_br > infoset_br);
+    }
+
+    #[test]
+    fn villain_infoset_br_chooses_one_action_before_observing_hero_combo() {
+        let opponent_weights = [0.5, 0.5];
+        let action_values = vec![vec![10.0, -10.0], vec![0.0, 0.0]];
+
+        let infoset_br = infoset_br_villain_payoff(&action_values, &opponent_weights);
+        let clairvoyant_br = clairvoyant_pairwise_villain_payoff(&action_values, &opponent_weights);
+
+        assert!((infoset_br - 0.0).abs() < 1e-6);
+        assert!((clairvoyant_br - -5.0).abs() < 1e-6);
+        assert!(clairvoyant_br < infoset_br);
+    }
+
+    #[test]
+    fn infoset_br_weights_reachable_opponent_combos_before_choosing_action() {
+        let opponent_weights = [0.9, 0.1];
+        let action_values = vec![vec![10.0, -10.0], vec![0.0, 0.0]];
+
+        let infoset_br = infoset_br_hero_payoff(&action_values, &opponent_weights);
+        let clairvoyant_br = clairvoyant_pairwise_br_hero_payoff(&action_values, &opponent_weights);
+
+        assert!((infoset_br - 8.0).abs() < 1e-6);
+        assert!((clairvoyant_br - 9.0).abs() < 1e-6);
+        assert!(clairvoyant_br > infoset_br);
+    }
+
+    fn cpu_pairwise_oracle_root_gap(
         tree: &SubgameTree,
         layout: &PostflopDenseLayout,
         state: &DenseCfrState,
@@ -5917,7 +6042,7 @@ mod tests {
                         equity_cache: HashMap::new(),
                     };
                     hero_br_sum += joint_weight
-                        * cpu_recursive_br_hero_payoff(
+                        * cpu_pairwise_oracle_br_hero_payoff(
                             tree,
                             layout,
                             0,
@@ -5954,7 +6079,7 @@ mod tests {
                     equity_cache: HashMap::new(),
                 };
                 weighted_value += joint_weight
-                    * -cpu_recursive_br_hero_payoff(
+                    * -cpu_pairwise_oracle_br_hero_payoff(
                         tree,
                         layout,
                         0,
@@ -5977,7 +6102,7 @@ mod tests {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn cpu_recursive_br_hero_payoff(
+    fn cpu_pairwise_oracle_br_hero_payoff(
         tree: &SubgameTree,
         layout: &PostflopDenseLayout,
         node_index: usize,
@@ -6010,7 +6135,7 @@ mod tests {
                     let child = layout
                         .child_for_action(public_infoset, action_index)
                         .expect("legal action must have a child");
-                    values.push(cpu_recursive_br_hero_payoff(
+                    values.push(cpu_pairwise_oracle_br_hero_payoff(
                         tree,
                         layout,
                         child,
@@ -6050,7 +6175,7 @@ mod tests {
                     if card.deck_mask() & private_dead_mask(ctx) != 0 {
                         continue;
                     }
-                    sum += cpu_recursive_br_hero_payoff(
+                    sum += cpu_pairwise_oracle_br_hero_payoff(
                         tree,
                         layout,
                         *child,
