@@ -116,8 +116,12 @@ pub struct FixedFlopMetricRow {
     pub root_action_probabilities: Vec<f32>,
     pub root_exploitability: Option<f32>,
     pub current_root_exploitability: Option<f32>,
+    pub cpu_root_exploitability: Option<f32>,
+    pub cpu_gpu_root_exploitability_delta: Option<f32>,
     pub hero_root_br_value: Option<f32>,
     pub villain_root_br_value: Option<f32>,
+    pub cpu_hero_root_br_value: Option<f32>,
+    pub cpu_villain_root_br_value: Option<f32>,
     pub current_hero_root_br_value: Option<f32>,
     pub current_villain_root_br_value: Option<f32>,
     pub root_br_gap: Option<f32>,
@@ -628,8 +632,12 @@ where
             root_action_probabilities,
             root_exploitability: None,
             current_root_exploitability: None,
+            cpu_root_exploitability: None,
+            cpu_gpu_root_exploitability_delta: None,
             hero_root_br_value: None,
             villain_root_br_value: None,
+            cpu_hero_root_br_value: None,
+            cpu_villain_root_br_value: None,
             current_hero_root_br_value: None,
             current_villain_root_br_value: None,
             root_br_gap: None,
@@ -890,6 +898,26 @@ fn try_solve_fixed_flop_metrics_gpu(
             &state,
             false,
         );
+        let cpu_exploitability = metric_cpu_exploitability_enabled().then(|| {
+            cpu_infoset_root_exploitability(
+                tree,
+                layout,
+                &state,
+                indexer,
+                hero_weights,
+                villain_weights,
+                base_config.max_showdown_runouts,
+            )
+        });
+        let root_exploitability = recursive_br_gap
+            .as_ref()
+            .map(|metrics| metrics.root_exploitability);
+        let cpu_root_exploitability = cpu_exploitability
+            .as_ref()
+            .map(|metrics| metrics.exploitability);
+        let cpu_gpu_root_exploitability_delta = root_exploitability
+            .zip(cpu_root_exploitability)
+            .map(|(gpu, cpu)| gpu - cpu);
         let diagnostics = cfr_state_diagnostics(&state);
         rows.push(FixedFlopMetricRow {
             board: format_pokedr_cards(flop),
@@ -897,18 +925,24 @@ fn try_solve_fixed_flop_metrics_gpu(
             elapsed_secs,
             root_strategy_l1_delta,
             root_action_probabilities,
-            root_exploitability: recursive_br_gap
-                .as_ref()
-                .map(|metrics| metrics.root_exploitability),
+            root_exploitability,
             current_root_exploitability: current_recursive_br_gap
                 .as_ref()
                 .map(|metrics| metrics.root_exploitability),
+            cpu_root_exploitability,
+            cpu_gpu_root_exploitability_delta,
             hero_root_br_value: recursive_br_gap
                 .as_ref()
                 .map(|metrics| metrics.hero_root_br_value),
             villain_root_br_value: recursive_br_gap
                 .as_ref()
                 .map(|metrics| metrics.villain_root_br_value),
+            cpu_hero_root_br_value: cpu_exploitability
+                .as_ref()
+                .map(|metrics| metrics.hero_br_value),
+            cpu_villain_root_br_value: cpu_exploitability
+                .as_ref()
+                .map(|metrics| metrics.villain_br_value),
             current_hero_root_br_value: current_recursive_br_gap
                 .as_ref()
                 .map(|metrics| metrics.hero_root_br_value),
@@ -1415,6 +1449,391 @@ fn root_exploitability_from_recursive_values(
         hero_br_value,
         villain_br_value,
     }
+}
+
+fn metric_cpu_exploitability_enabled() -> bool {
+    std::env::var_os("POKEDR_METRIC_CPU_EXPLOITABILITY").is_some()
+}
+
+#[derive(Clone, Copy)]
+struct ActiveCombo {
+    index: usize,
+    cards: [PokedrCard; 2],
+    mask: u64,
+    weight: f32,
+}
+
+fn cpu_infoset_root_exploitability(
+    tree: &SubgameTree,
+    layout: &PostflopDenseLayout,
+    state: &DenseCfrState,
+    indexer: &ComboIndexer,
+    hero_weights: &[f32],
+    villain_weights: &[f32],
+    max_showdown_runouts: usize,
+) -> RootExploitability {
+    let root_dead = root_board(tree).deck_mask();
+    let heroes = active_weighted_combos(indexer, root_dead, hero_weights);
+    let villains = active_weighted_combos(indexer, root_dead, villain_weights);
+    let pair_count = heroes.len() * villains.len();
+    let matrix_cache = RefCell::new(ShowdownMatrixCache::new(1));
+
+    let mut hero_reach = vec![0.0; pair_count];
+    let mut villain_reach = vec![0.0; pair_count];
+    let mut joint_weight_sum = 0.0;
+    for (h, hero) in heroes.iter().enumerate() {
+        for (v, villain) in villains.iter().enumerate() {
+            if hero.mask & villain.mask != 0 {
+                continue;
+            }
+            let pair = h * villains.len() + v;
+            hero_reach[pair] = villain.weight;
+            villain_reach[pair] = hero.weight;
+            joint_weight_sum += hero.weight * villain.weight;
+        }
+    }
+
+    if joint_weight_sum <= 0.0 {
+        return RootExploitability {
+            exploitability: 0.0,
+            hero_br_value: 0.0,
+            villain_br_value: 0.0,
+        };
+    }
+
+    let hero_values = cpu_infoset_br_hero_payoff_matrix(
+        tree,
+        layout,
+        0,
+        None,
+        None,
+        &heroes,
+        &villains,
+        Player::Hero,
+        state,
+        &matrix_cache,
+        max_showdown_runouts,
+        &hero_reach,
+    );
+    let villain_values = cpu_infoset_br_hero_payoff_matrix(
+        tree,
+        layout,
+        0,
+        None,
+        None,
+        &heroes,
+        &villains,
+        Player::Villain,
+        state,
+        &matrix_cache,
+        max_showdown_runouts,
+        &villain_reach,
+    );
+
+    let mut hero_br_sum = 0.0;
+    let mut villain_br_sum = 0.0;
+    for (h, hero) in heroes.iter().enumerate() {
+        for (v, villain) in villains.iter().enumerate() {
+            if hero.mask & villain.mask != 0 {
+                continue;
+            }
+            let pair = h * villains.len() + v;
+            let joint = hero.weight * villain.weight;
+            hero_br_sum += joint * hero_values[pair];
+            villain_br_sum += joint * -villain_values[pair];
+        }
+    }
+
+    let hero_br_value = hero_br_sum / joint_weight_sum;
+    let villain_br_value = villain_br_sum / joint_weight_sum;
+    RootExploitability {
+        exploitability: (hero_br_value + villain_br_value).max(0.0),
+        hero_br_value,
+        villain_br_value,
+    }
+}
+
+fn active_weighted_combos(
+    indexer: &ComboIndexer,
+    root_dead: u64,
+    weights: &[f32],
+) -> Vec<ActiveCombo> {
+    legal_private_combos(indexer, root_dead)
+        .filter_map(|combo_index| {
+            let weight = weights.get(combo_index).copied().unwrap_or(0.0);
+            if weight <= 0.0 {
+                return None;
+            }
+            let cards = combo_cards(indexer.combo(combo_index));
+            Some(ActiveCombo {
+                index: combo_index,
+                cards,
+                mask: hero_mask(cards),
+                weight,
+            })
+        })
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cpu_infoset_br_hero_payoff_matrix(
+    tree: &SubgameTree,
+    layout: &PostflopDenseLayout,
+    node_index: usize,
+    parent_state: Option<&PublicState>,
+    parent_action: Option<PlayerAction>,
+    heroes: &[ActiveCombo],
+    villains: &[ActiveCombo],
+    br_player: Player,
+    state: &DenseCfrState,
+    matrix_cache: &RefCell<ShowdownMatrixCache>,
+    max_showdown_runouts: usize,
+    reach: &[f32],
+) -> Vec<f32> {
+    let pair_count = heroes.len() * villains.len();
+    match &tree.nodes()[node_index].kind {
+        PublicNodeKind::Decision {
+            state: public_state,
+            actions,
+        } => {
+            let public_infoset = layout
+                .node_infoset(node_index)
+                .expect("decision nodes have infosets");
+            let action_count = actions.len();
+            let mut child_values = Vec::with_capacity(action_count);
+            let mut strategy = vec![0.0; layout.max_actions()];
+            for action_index in 0..action_count {
+                let child = layout
+                    .child_for_action(public_infoset, action_index)
+                    .expect("legal action must have a child");
+                let mut child_reach = reach.to_vec();
+                if public_state.acting_player != br_player {
+                    for (h, hero) in heroes.iter().enumerate() {
+                        for (v, villain) in villains.iter().enumerate() {
+                            let pair = h * villains.len() + v;
+                            if child_reach[pair] <= 0.0 {
+                                continue;
+                            }
+                            let acting_combo = match public_state.acting_player {
+                                Player::Hero => hero.index,
+                                Player::Villain => villain.index,
+                            };
+                            let infoset = private_infoset(
+                                public_infoset,
+                                public_state.acting_player,
+                                acting_combo,
+                            );
+                            state.average_strategy_for(infoset, &mut strategy);
+                            child_reach[pair] *= strategy[action_index];
+                        }
+                    }
+                }
+                child_values.push(cpu_infoset_br_hero_payoff_matrix(
+                    tree,
+                    layout,
+                    child,
+                    Some(public_state),
+                    Some(actions[action_index].action),
+                    heroes,
+                    villains,
+                    br_player,
+                    state,
+                    matrix_cache,
+                    max_showdown_runouts,
+                    &child_reach,
+                ));
+            }
+
+            if public_state.acting_player == br_player {
+                cpu_infoset_choose_br_action(
+                    &child_values,
+                    reach,
+                    heroes.len(),
+                    villains.len(),
+                    br_player,
+                )
+            } else {
+                let mut result = vec![0.0; pair_count];
+                for (action_index, child) in child_values.iter().enumerate() {
+                    for (h, hero) in heroes.iter().enumerate() {
+                        for (v, villain) in villains.iter().enumerate() {
+                            let pair = h * villains.len() + v;
+                            let acting_combo = match public_state.acting_player {
+                                Player::Hero => hero.index,
+                                Player::Villain => villain.index,
+                            };
+                            let infoset = private_infoset(
+                                public_infoset,
+                                public_state.acting_player,
+                                acting_combo,
+                            );
+                            state.average_strategy_for(infoset, &mut strategy);
+                            result[pair] += strategy[action_index] * child[pair];
+                        }
+                    }
+                }
+                result
+            }
+        }
+        PublicNodeKind::Chance { cards, .. } => {
+            let mut result = vec![0.0; pair_count];
+            let mut valid_counts = vec![0usize; pair_count];
+            let pair_dead = pair_dead_masks(heroes, villains);
+            for (card, child) in cards.iter().zip(&tree.nodes()[node_index].children) {
+                let card_mask = card.deck_mask();
+                let mut child_reach = vec![0.0; pair_count];
+                for pair in 0..pair_count {
+                    if card_mask & pair_dead[pair] == 0 {
+                        valid_counts[pair] += 1;
+                    }
+                }
+                for pair in 0..pair_count {
+                    if card_mask & pair_dead[pair] == 0 {
+                        let count = cards
+                            .iter()
+                            .filter(|candidate| candidate.deck_mask() & pair_dead[pair] == 0)
+                            .count();
+                        if count > 0 {
+                            child_reach[pair] = reach[pair] / count as f32;
+                        }
+                    }
+                }
+                let child_values = cpu_infoset_br_hero_payoff_matrix(
+                    tree,
+                    layout,
+                    *child,
+                    None,
+                    None,
+                    heroes,
+                    villains,
+                    br_player,
+                    state,
+                    matrix_cache,
+                    max_showdown_runouts,
+                    &child_reach,
+                );
+                for pair in 0..pair_count {
+                    if card_mask & pair_dead[pair] == 0 {
+                        result[pair] += child_values[pair];
+                    }
+                }
+            }
+            for pair in 0..pair_count {
+                if valid_counts[pair] > 0 {
+                    result[pair] /= valid_counts[pair] as f32;
+                }
+            }
+            result
+        }
+        PublicNodeKind::Terminal {
+            kind,
+            board,
+            pot,
+            hero_invested,
+            ..
+        } => {
+            let mut result = vec![0.0; pair_count];
+            for (h, hero) in heroes.iter().enumerate() {
+                for (v, villain) in villains.iter().enumerate() {
+                    let pair = h * villains.len() + v;
+                    if hero.mask & villain.mask != 0 {
+                        continue;
+                    }
+                    result[pair] = match kind {
+                        TerminalKind::Fold => fold_utility(
+                            parent_state.expect("fold terminal must have a parent decision"),
+                            parent_action.expect("fold terminal must have a parent action"),
+                            *pot,
+                            *hero_invested,
+                        ),
+                        TerminalKind::Showdown => {
+                            let mut ctx = PostflopEvaluationContext {
+                                hero_cards: hero.cards,
+                                villain_cards: villain.cards,
+                                hero_combo: hero.index,
+                                villain_combo: villain.index,
+                                gpu_backend: None,
+                                matrix_cache,
+                                max_showdown_runouts,
+                                equity_cache: HashMap::new(),
+                            };
+                            showdown_utility(*pot, *hero_invested, board, &mut ctx)
+                        }
+                    };
+                }
+            }
+            result
+        }
+    }
+}
+
+fn cpu_infoset_choose_br_action(
+    child_values: &[Vec<f32>],
+    reach: &[f32],
+    hero_count: usize,
+    villain_count: usize,
+    br_player: Player,
+) -> Vec<f32> {
+    let mut result = vec![0.0; hero_count * villain_count];
+    match br_player {
+        Player::Hero => {
+            for h in 0..hero_count {
+                let mut best_action = 0usize;
+                let mut best_value = f32::NEG_INFINITY;
+                for (action_index, values) in child_values.iter().enumerate() {
+                    let mut value = 0.0;
+                    let mut weight = 0.0;
+                    for v in 0..villain_count {
+                        let pair = h * villain_count + v;
+                        value += reach[pair] * values[pair];
+                        weight += reach[pair];
+                    }
+                    if weight > 0.0 && value > best_value {
+                        best_value = value;
+                        best_action = action_index;
+                    }
+                }
+                for v in 0..villain_count {
+                    let pair = h * villain_count + v;
+                    result[pair] = child_values[best_action][pair];
+                }
+            }
+        }
+        Player::Villain => {
+            for v in 0..villain_count {
+                let mut best_action = 0usize;
+                let mut best_value = f32::INFINITY;
+                for (action_index, values) in child_values.iter().enumerate() {
+                    let mut value = 0.0;
+                    let mut weight = 0.0;
+                    for h in 0..hero_count {
+                        let pair = h * villain_count + v;
+                        value += reach[pair] * values[pair];
+                        weight += reach[pair];
+                    }
+                    if weight > 0.0 && value < best_value {
+                        best_value = value;
+                        best_action = action_index;
+                    }
+                }
+                for h in 0..hero_count {
+                    let pair = h * villain_count + v;
+                    result[pair] = child_values[best_action][pair];
+                }
+            }
+        }
+    }
+    result
+}
+
+fn pair_dead_masks(heroes: &[ActiveCombo], villains: &[ActiveCombo]) -> Vec<u64> {
+    let mut masks = Vec::with_capacity(heroes.len() * villains.len());
+    for hero in heroes {
+        for villain in villains {
+            masks.push(hero.mask | villain.mask);
+        }
+    }
+    masks
 }
 
 fn infoset_acting_player(
@@ -6152,387 +6571,6 @@ mod tests {
             return 0.0;
         }
         (hero_br_sum / joint_weight_sum + villain_br_sum / joint_weight_sum).max(0.0)
-    }
-
-    #[derive(Clone, Copy)]
-    struct ActiveCombo {
-        index: usize,
-        cards: [PokedrCard; 2],
-        mask: u64,
-        weight: f32,
-    }
-
-    fn cpu_infoset_root_exploitability(
-        tree: &SubgameTree,
-        layout: &PostflopDenseLayout,
-        state: &DenseCfrState,
-        indexer: &ComboIndexer,
-        hero_weights: &[f32],
-        villain_weights: &[f32],
-        max_showdown_runouts: usize,
-    ) -> RootExploitability {
-        let root_dead = root_board(tree).deck_mask();
-        let heroes = active_weighted_combos(indexer, root_dead, hero_weights);
-        let villains = active_weighted_combos(indexer, root_dead, villain_weights);
-        let pair_count = heroes.len() * villains.len();
-        let matrix_cache = RefCell::new(ShowdownMatrixCache::new(1));
-
-        let mut hero_reach = vec![0.0; pair_count];
-        let mut villain_reach = vec![0.0; pair_count];
-        let mut joint_weight_sum = 0.0;
-        for (h, hero) in heroes.iter().enumerate() {
-            for (v, villain) in villains.iter().enumerate() {
-                if hero.mask & villain.mask != 0 {
-                    continue;
-                }
-                let pair = h * villains.len() + v;
-                hero_reach[pair] = villain.weight;
-                villain_reach[pair] = hero.weight;
-                joint_weight_sum += hero.weight * villain.weight;
-            }
-        }
-
-        if joint_weight_sum <= 0.0 {
-            return RootExploitability {
-                exploitability: 0.0,
-                hero_br_value: 0.0,
-                villain_br_value: 0.0,
-            };
-        }
-
-        let hero_values = cpu_infoset_br_hero_payoff_matrix(
-            tree,
-            layout,
-            0,
-            None,
-            None,
-            &heroes,
-            &villains,
-            Player::Hero,
-            state,
-            &matrix_cache,
-            max_showdown_runouts,
-            &hero_reach,
-        );
-        let villain_values = cpu_infoset_br_hero_payoff_matrix(
-            tree,
-            layout,
-            0,
-            None,
-            None,
-            &heroes,
-            &villains,
-            Player::Villain,
-            state,
-            &matrix_cache,
-            max_showdown_runouts,
-            &villain_reach,
-        );
-
-        let mut hero_br_sum = 0.0;
-        let mut villain_br_sum = 0.0;
-        for (h, hero) in heroes.iter().enumerate() {
-            for (v, villain) in villains.iter().enumerate() {
-                if hero.mask & villain.mask != 0 {
-                    continue;
-                }
-                let pair = h * villains.len() + v;
-                let joint = hero.weight * villain.weight;
-                hero_br_sum += joint * hero_values[pair];
-                villain_br_sum += joint * -villain_values[pair];
-            }
-        }
-
-        let hero_br_value = hero_br_sum / joint_weight_sum;
-        let villain_br_value = villain_br_sum / joint_weight_sum;
-        RootExploitability {
-            exploitability: (hero_br_value + villain_br_value).max(0.0),
-            hero_br_value,
-            villain_br_value,
-        }
-    }
-
-    fn active_weighted_combos(
-        indexer: &ComboIndexer,
-        root_dead: u64,
-        weights: &[f32],
-    ) -> Vec<ActiveCombo> {
-        legal_private_combos(indexer, root_dead)
-            .filter_map(|combo_index| {
-                let weight = weights.get(combo_index).copied().unwrap_or(0.0);
-                if weight <= 0.0 {
-                    return None;
-                }
-                let cards = combo_cards(indexer.combo(combo_index));
-                Some(ActiveCombo {
-                    index: combo_index,
-                    cards,
-                    mask: hero_mask(cards),
-                    weight,
-                })
-            })
-            .collect()
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn cpu_infoset_br_hero_payoff_matrix(
-        tree: &SubgameTree,
-        layout: &PostflopDenseLayout,
-        node_index: usize,
-        parent_state: Option<&PublicState>,
-        parent_action: Option<PlayerAction>,
-        heroes: &[ActiveCombo],
-        villains: &[ActiveCombo],
-        br_player: Player,
-        state: &DenseCfrState,
-        matrix_cache: &RefCell<ShowdownMatrixCache>,
-        max_showdown_runouts: usize,
-        reach: &[f32],
-    ) -> Vec<f32> {
-        let pair_count = heroes.len() * villains.len();
-        match &tree.nodes()[node_index].kind {
-            PublicNodeKind::Decision {
-                state: public_state,
-                actions,
-            } => {
-                let public_infoset = layout
-                    .node_infoset(node_index)
-                    .expect("decision nodes have infosets");
-                let action_count = actions.len();
-                let mut child_values = Vec::with_capacity(action_count);
-                let mut strategy = vec![0.0; layout.max_actions()];
-                for action_index in 0..action_count {
-                    let child = layout
-                        .child_for_action(public_infoset, action_index)
-                        .expect("legal action must have a child");
-                    let mut child_reach = reach.to_vec();
-                    if public_state.acting_player != br_player {
-                        for (h, hero) in heroes.iter().enumerate() {
-                            for (v, villain) in villains.iter().enumerate() {
-                                let pair = h * villains.len() + v;
-                                if child_reach[pair] <= 0.0 {
-                                    continue;
-                                }
-                                let acting_combo = match public_state.acting_player {
-                                    Player::Hero => hero.index,
-                                    Player::Villain => villain.index,
-                                };
-                                let infoset = private_infoset(
-                                    public_infoset,
-                                    public_state.acting_player,
-                                    acting_combo,
-                                );
-                                state.average_strategy_for(infoset, &mut strategy);
-                                child_reach[pair] *= strategy[action_index];
-                            }
-                        }
-                    }
-                    child_values.push(cpu_infoset_br_hero_payoff_matrix(
-                        tree,
-                        layout,
-                        child,
-                        Some(public_state),
-                        Some(actions[action_index].action),
-                        heroes,
-                        villains,
-                        br_player,
-                        state,
-                        matrix_cache,
-                        max_showdown_runouts,
-                        &child_reach,
-                    ));
-                }
-
-                if public_state.acting_player == br_player {
-                    cpu_infoset_choose_br_action(
-                        &child_values,
-                        reach,
-                        heroes.len(),
-                        villains.len(),
-                        br_player,
-                    )
-                } else {
-                    let mut result = vec![0.0; pair_count];
-                    for (action_index, child) in child_values.iter().enumerate() {
-                        for (h, hero) in heroes.iter().enumerate() {
-                            for (v, villain) in villains.iter().enumerate() {
-                                let pair = h * villains.len() + v;
-                                let acting_combo = match public_state.acting_player {
-                                    Player::Hero => hero.index,
-                                    Player::Villain => villain.index,
-                                };
-                                let infoset = private_infoset(
-                                    public_infoset,
-                                    public_state.acting_player,
-                                    acting_combo,
-                                );
-                                state.average_strategy_for(infoset, &mut strategy);
-                                result[pair] += strategy[action_index] * child[pair];
-                            }
-                        }
-                    }
-                    result
-                }
-            }
-            PublicNodeKind::Chance { cards, .. } => {
-                let mut result = vec![0.0; pair_count];
-                let mut valid_counts = vec![0usize; pair_count];
-                let pair_dead = pair_dead_masks(heroes, villains);
-                for (card, child) in cards.iter().zip(&tree.nodes()[node_index].children) {
-                    let card_mask = card.deck_mask();
-                    let mut child_reach = vec![0.0; pair_count];
-                    for pair in 0..pair_count {
-                        if card_mask & pair_dead[pair] == 0 {
-                            valid_counts[pair] += 1;
-                        }
-                    }
-                    for pair in 0..pair_count {
-                        if card_mask & pair_dead[pair] == 0 {
-                            let count = cards
-                                .iter()
-                                .filter(|candidate| candidate.deck_mask() & pair_dead[pair] == 0)
-                                .count();
-                            if count > 0 {
-                                child_reach[pair] = reach[pair] / count as f32;
-                            }
-                        }
-                    }
-                    let child_values = cpu_infoset_br_hero_payoff_matrix(
-                        tree,
-                        layout,
-                        *child,
-                        None,
-                        None,
-                        heroes,
-                        villains,
-                        br_player,
-                        state,
-                        matrix_cache,
-                        max_showdown_runouts,
-                        &child_reach,
-                    );
-                    for pair in 0..pair_count {
-                        if card_mask & pair_dead[pair] == 0 {
-                            result[pair] += child_values[pair];
-                        }
-                    }
-                }
-                for pair in 0..pair_count {
-                    if valid_counts[pair] > 0 {
-                        result[pair] /= valid_counts[pair] as f32;
-                    }
-                }
-                result
-            }
-            PublicNodeKind::Terminal {
-                kind,
-                board,
-                pot,
-                hero_invested,
-                ..
-            } => {
-                let mut result = vec![0.0; pair_count];
-                for (h, hero) in heroes.iter().enumerate() {
-                    for (v, villain) in villains.iter().enumerate() {
-                        let pair = h * villains.len() + v;
-                        if hero.mask & villain.mask != 0 {
-                            continue;
-                        }
-                        result[pair] = match kind {
-                            TerminalKind::Fold => fold_utility(
-                                parent_state.expect("fold terminal must have a parent decision"),
-                                parent_action.expect("fold terminal must have a parent action"),
-                                *pot,
-                                *hero_invested,
-                            ),
-                            TerminalKind::Showdown => {
-                                let mut ctx = PostflopEvaluationContext {
-                                    hero_cards: hero.cards,
-                                    villain_cards: villain.cards,
-                                    hero_combo: hero.index,
-                                    villain_combo: villain.index,
-                                    gpu_backend: None,
-                                    matrix_cache,
-                                    max_showdown_runouts,
-                                    equity_cache: HashMap::new(),
-                                };
-                                showdown_utility(*pot, *hero_invested, board, &mut ctx)
-                            }
-                        };
-                    }
-                }
-                result
-            }
-        }
-    }
-
-    fn cpu_infoset_choose_br_action(
-        child_values: &[Vec<f32>],
-        reach: &[f32],
-        hero_count: usize,
-        villain_count: usize,
-        br_player: Player,
-    ) -> Vec<f32> {
-        let mut result = vec![0.0; hero_count * villain_count];
-        match br_player {
-            Player::Hero => {
-                for h in 0..hero_count {
-                    let mut best_action = 0usize;
-                    let mut best_value = f32::NEG_INFINITY;
-                    for (action_index, values) in child_values.iter().enumerate() {
-                        let mut value = 0.0;
-                        let mut weight = 0.0;
-                        for v in 0..villain_count {
-                            let pair = h * villain_count + v;
-                            value += reach[pair] * values[pair];
-                            weight += reach[pair];
-                        }
-                        if weight > 0.0 && value > best_value {
-                            best_value = value;
-                            best_action = action_index;
-                        }
-                    }
-                    for v in 0..villain_count {
-                        let pair = h * villain_count + v;
-                        result[pair] = child_values[best_action][pair];
-                    }
-                }
-            }
-            Player::Villain => {
-                for v in 0..villain_count {
-                    let mut best_action = 0usize;
-                    let mut best_value = f32::INFINITY;
-                    for (action_index, values) in child_values.iter().enumerate() {
-                        let mut value = 0.0;
-                        let mut weight = 0.0;
-                        for h in 0..hero_count {
-                            let pair = h * villain_count + v;
-                            value += reach[pair] * values[pair];
-                            weight += reach[pair];
-                        }
-                        if weight > 0.0 && value < best_value {
-                            best_value = value;
-                            best_action = action_index;
-                        }
-                    }
-                    for h in 0..hero_count {
-                        let pair = h * villain_count + v;
-                        result[pair] = child_values[best_action][pair];
-                    }
-                }
-            }
-        }
-        result
-    }
-
-    fn pair_dead_masks(heroes: &[ActiveCombo], villains: &[ActiveCombo]) -> Vec<u64> {
-        let mut masks = Vec::with_capacity(heroes.len() * villains.len());
-        for hero in heroes {
-            for villain in villains {
-                masks.push(hero.mask | villain.mask);
-            }
-        }
-        masks
     }
 
     #[allow(clippy::too_many_arguments)]
