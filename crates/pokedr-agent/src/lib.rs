@@ -143,6 +143,9 @@ pub struct FixedFlopMetricRow {
     pub local_gap_detail: Option<LocalGapDetail>,
     pub recursive_local_gap_detail: Option<LocalGapDetail>,
     pub positive_regret_mass: f32,
+    pub negative_regret_mass: f32,
+    pub negative_regret_count: usize,
+    pub deep_negative_regret_count: usize,
     pub illegal_strategy_mass: f32,
     pub current_strategy_norm_error: f32,
     pub average_strategy_norm_error: f32,
@@ -747,6 +750,9 @@ where
             local_gap_detail: None,
             recursive_local_gap_detail: None,
             positive_regret_mass: diagnostics.positive_regret_mass,
+            negative_regret_mass: diagnostics.negative_regret_mass,
+            negative_regret_count: diagnostics.negative_regret_count,
+            deep_negative_regret_count: diagnostics.deep_negative_regret_count,
             illegal_strategy_mass: diagnostics.illegal_strategy_mass,
             current_strategy_norm_error: diagnostics.current_strategy_norm_error,
             average_strategy_norm_error: diagnostics.average_strategy_norm_error,
@@ -1148,6 +1154,9 @@ fn try_solve_fixed_flop_metrics_gpu(
             recursive_local_gap_detail: recursive_br_gap
                 .and_then(|metrics| metrics.local_gap_detail),
             positive_regret_mass: diagnostics.positive_regret_mass,
+            negative_regret_mass: diagnostics.negative_regret_mass,
+            negative_regret_count: diagnostics.negative_regret_count,
+            deep_negative_regret_count: diagnostics.deep_negative_regret_count,
             illegal_strategy_mass: diagnostics.illegal_strategy_mass,
             current_strategy_norm_error: diagnostics.current_strategy_norm_error,
             average_strategy_norm_error: diagnostics.average_strategy_norm_error,
@@ -1164,6 +1173,9 @@ fn try_solve_fixed_flop_metrics_gpu(
 
 struct CfrDiagnostics {
     positive_regret_mass: f32,
+    negative_regret_mass: f32,
+    negative_regret_count: usize,
+    deep_negative_regret_count: usize,
     illegal_strategy_mass: f32,
     current_strategy_norm_error: f32,
     average_strategy_norm_error: f32,
@@ -1174,6 +1186,9 @@ impl CfrDiagnostics {
     fn skipped() -> Self {
         Self {
             positive_regret_mass: f32::NAN,
+            negative_regret_mass: f32::NAN,
+            negative_regret_count: 0,
+            deep_negative_regret_count: 0,
             illegal_strategy_mass: f32::NAN,
             current_strategy_norm_error: 0.0,
             average_strategy_norm_error: 0.0,
@@ -1189,6 +1204,18 @@ fn cfr_state_diagnostics(state: &DenseCfrState) -> CfrDiagnostics {
         .copied()
         .map(|value| value.max(0.0))
         .sum();
+    let negative_regret_mass = state
+        .regrets()
+        .iter()
+        .copied()
+        .map(|value| (-value).max(0.0))
+        .sum();
+    let negative_regret_count = state.regrets().iter().filter(|value| **value < 0.0).count();
+    let deep_negative_regret_count = state
+        .regrets()
+        .iter()
+        .filter(|value| **value <= -1.0)
+        .count();
     let illegal_strategy_mass = state
         .strategy_sum()
         .iter()
@@ -1212,6 +1239,9 @@ fn cfr_state_diagnostics(state: &DenseCfrState) -> CfrDiagnostics {
     }
     CfrDiagnostics {
         positive_regret_mass,
+        negative_regret_mass,
+        negative_regret_count,
+        deep_negative_regret_count,
         illegal_strategy_mass,
         current_strategy_norm_error,
         average_strategy_norm_error,

@@ -134,6 +134,15 @@ signal needed to prove an action can be skipped. The `dcfr` variant keeps both
 positive and negative cumulative regrets and is the right prerequisite for any
 exact pruning experiment.
 
+Local probe, `As7h2c`, depth 4, 64 iterations, `dcfr`, full terminal runouts:
+diagnostics reported `negative_regret_count=388004` and
+`deep_negative_regret_count=365424` (`regret <= -1`). There is enough negative
+regret signal to pursue pruning. A correct GPU implementation still needs an
+action-level `prune_until`/resume buffer; merely treating negative-regret
+actions as zero-probability is not enough because CFR still needs
+counterfactual action values unless the RBP bound says the action can safely
+skip updates.
+
 Relevant source:
 
 - https://papers.neurips.cc/paper/5910-regret-based-pruning-in-extensive-form-games
