@@ -128,6 +128,12 @@ Sandholm show paths with sufficiently negative regret can be skipped until the
 earliest iteration they could become positive, preserving CFR convergence and
 giving order-of-magnitude speedups in experiments.
 
+Implementation note: exact regret-based pruning needs the negative cumulative
+regret to still exist. CFR+/DCFR+/PDCFR+ clip regret at zero, so they erase the
+signal needed to prove an action can be skipped. The `dcfr` variant keeps both
+positive and negative cumulative regrets and is the right prerequisite for any
+exact pruning experiment.
+
 Relevant source:
 
 - https://papers.neurips.cc/paper/5910-regret-based-pruning-in-extensive-form-games
@@ -185,12 +191,13 @@ cargo run --release -p pokedr-cli -- solve-flop-variant-bench As7h2c \
   --target-bb100 1
 ```
 
-By default it compares CFR+, DCFR+, scheduled DCFR+, and PDCFR+. It computes
-root exploitability at the final checkpoint only, so intermediate checkpoints
-stay relatively cheap. Use `--bench-br-every N` to compute exploitability at
-every checkpoint divisible by `N`, which enables `delta_bb100_per_s` between BR
-checkpoints. Use `--bench-diagnostics` only when regret/norm diagnostics are
-needed, because it forces full state downloads at every checkpoint.
+By default it compares CFR+, unclipped DCFR, DCFR+, scheduled DCFR+, and
+PDCFR+. It computes root exploitability at the final checkpoint only, so
+intermediate checkpoints stay relatively cheap. Use `--bench-br-every N` to
+compute exploitability at every checkpoint divisible by `N`, which enables
+`delta_bb100_per_s` between BR checkpoints. Use `--bench-diagnostics` only when
+regret/norm diagnostics are needed, because it forces full state downloads at
+every checkpoint.
 
 The practical target for this project is `converged=true` at `target_bb100=1`.
 Runs that are faster but miss that threshold are not acceptable defaults.

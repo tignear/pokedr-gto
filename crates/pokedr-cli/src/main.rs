@@ -133,7 +133,7 @@ struct FlopVariantBenchArgs {
     #[arg(
         long,
         value_delimiter = ',',
-        help = "CFR variants to compare; defaults to cfr-plus,dcfr-plus,dcfr-schedule,pdcfr-plus"
+        help = "CFR variants to compare; defaults to cfr-plus,dcfr,dcfr-plus,dcfr-schedule,pdcfr-plus"
     )]
     bench_variants: Vec<CfrVariantOption>,
     #[arg(
@@ -220,9 +220,11 @@ struct SolverOptions {
     river_bets: Vec<f32>,
     #[arg(long, value_delimiter = ',', help = "Raise pot fractions")]
     raises: Vec<f32>,
-    #[arg(long, help = "DCFR+ alpha")]
+    #[arg(long, help = "DCFR/DCFR+ alpha")]
     dcfr_alpha: Option<f32>,
-    #[arg(long, help = "DCFR+ gamma")]
+    #[arg(long, help = "DCFR beta for negative regrets")]
+    dcfr_beta: Option<f32>,
+    #[arg(long, help = "DCFR/DCFR+ gamma")]
     dcfr_gamma: Option<f32>,
     #[arg(long, help = "Scheduled DCFR+ alpha at iteration 1")]
     dcfr_alpha_start: Option<f32>,
@@ -250,6 +252,7 @@ struct SolverOptions {
 enum CfrVariantOption {
     CfrPlus,
     Discounted,
+    Dcfr,
     DcfrPlus,
     DcfrSchedule,
     PdcfrPlus,
@@ -737,6 +740,7 @@ fn variant_bench_variants(args: &FlopVariantBenchArgs) -> Vec<CfrVariantOption> 
         .unwrap_or_else(|| {
             vec![
                 CfrVariantOption::CfrPlus,
+                CfrVariantOption::Dcfr,
                 CfrVariantOption::DcfrPlus,
                 CfrVariantOption::DcfrSchedule,
                 CfrVariantOption::PdcfrPlus,
@@ -774,6 +778,7 @@ fn cfr_variant_option_label(value: CfrVariantOption) -> &'static str {
     match value {
         CfrVariantOption::CfrPlus => "cfr-plus",
         CfrVariantOption::Discounted => "discounted",
+        CfrVariantOption::Dcfr => "dcfr",
         CfrVariantOption::DcfrPlus => "dcfr-plus",
         CfrVariantOption::DcfrSchedule => "dcfr-schedule",
         CfrVariantOption::PdcfrPlus => "pdcfr-plus",
@@ -2791,7 +2796,14 @@ fn env_cfr_variant(name: &str) -> Option<CfrVariant> {
 fn parse_env_cfr_variant(name: &str, value: &str) -> CfrVariant {
     match normalize_variant(value).as_str() {
         "cfr" | "cfr-plus" | "cfrplus" | "plus" => CfrVariant::CfrPlus,
-        "discounted" | "dcfr" => CfrVariant::Discounted,
+        "discounted" => CfrVariant::Discounted,
+        "dcfr" => CfrVariant::Dcfr {
+            alpha: env_f32("POKEDR_DCFR_ALPHA")
+                .unwrap_or(pokedr_core::dense_cfr::DEFAULT_DCFR_ALPHA),
+            beta: env_f32("POKEDR_DCFR_BETA").unwrap_or(pokedr_core::dense_cfr::DEFAULT_DCFR_BETA),
+            gamma: env_f32("POKEDR_DCFR_GAMMA")
+                .unwrap_or(pokedr_core::dense_cfr::DEFAULT_DCFR_GAMMA),
+        },
         "dcfr-plus" | "dcfrplus" | "dcfr+" => CfrVariant::DcfrPlus {
             alpha: env_f32("POKEDR_DCFR_ALPHA")
                 .unwrap_or(pokedr_core::dense_cfr::DEFAULT_DCFR_PLUS_ALPHA),
@@ -2826,7 +2838,7 @@ fn parse_env_cfr_variant(name: &str, value: &str) -> CfrVariant {
         },
         other => {
             eprintln!(
-                "unknown {name}={other}; expected cfr-plus, discounted, dcfr-plus, dcfr-schedule, or pdcfr-plus"
+                "unknown {name}={other}; expected cfr-plus, discounted, dcfr, dcfr-plus, dcfr-schedule, or pdcfr-plus"
             );
             std::process::exit(2);
         }
@@ -2837,6 +2849,17 @@ fn cfr_variant_from_options(value: CfrVariantOption, options: &SolverOptions) ->
     match value {
         CfrVariantOption::CfrPlus => CfrVariant::CfrPlus,
         CfrVariantOption::Discounted => CfrVariant::Discounted,
+        CfrVariantOption::Dcfr => CfrVariant::Dcfr {
+            alpha: options
+                .dcfr_alpha
+                .unwrap_or(pokedr_core::dense_cfr::DEFAULT_DCFR_ALPHA),
+            beta: options
+                .dcfr_beta
+                .unwrap_or(pokedr_core::dense_cfr::DEFAULT_DCFR_BETA),
+            gamma: options
+                .dcfr_gamma
+                .unwrap_or(pokedr_core::dense_cfr::DEFAULT_DCFR_GAMMA),
+        },
         CfrVariantOption::DcfrPlus => CfrVariant::DcfrPlus {
             alpha: options
                 .dcfr_alpha

@@ -31,10 +31,18 @@ fn effective_regret(index: u32) -> f32 {
     return regrets[index];
 }
 
-fn regret_discount(variant: u32, iteration: u32, alpha: f32) -> f32 {
+fn regret_discount(variant: u32, iteration: u32, alpha: f32, beta: f32, old_regret: f32) -> f32 {
     if variant == 1u {
         let t = f32(max(iteration, 1u));
         return t / (t + 1.0);
+    }
+    if variant == 5u {
+        if iteration <= 1u {
+            return 0.0;
+        }
+        let exponent = select(beta, alpha, old_regret > 0.0);
+        let weighted = pow(f32(iteration - 1u), exponent);
+        return weighted / (weighted + 1.0);
     }
     if variant == 2u || variant == 3u || variant == 4u {
         if iteration <= 1u {
@@ -47,7 +55,7 @@ fn regret_discount(variant: u32, iteration: u32, alpha: f32) -> f32 {
 }
 
 fn average_strategy_discount(variant: u32, iteration: u32, gamma: f32) -> f32 {
-    if (variant == 2u || variant == 3u || variant == 4u) && iteration > 1u {
+    if (variant == 2u || variant == 3u || variant == 4u || variant == 5u) && iteration > 1u {
         let t = f32(iteration);
         return pow((t - 1.0) / t, gamma);
     }
@@ -75,6 +83,7 @@ fn update(@builtin(global_invocation_id) id: vec3<u32>) {
     let iteration = params[3];
     let dcfr_alpha = bitcast<f32>(params[4]);
     let dcfr_gamma = bitcast<f32>(params[5]);
+    let dcfr_beta = bitcast<f32>(params[9]);
     if infoset >= infosets {
         return;
     }
@@ -102,7 +111,6 @@ fn update(@builtin(global_invocation_id) id: vec3<u32>) {
         node_value = node_value + strategy * action_values[offset + action];
     }
 
-    let discount = regret_discount(variant, iteration, dcfr_alpha);
     let average_discount = average_strategy_discount(variant, iteration, dcfr_gamma);
 
     for (var action = 0u; action < actions; action = action + 1u) {
@@ -120,7 +128,7 @@ fn update(@builtin(global_invocation_id) id: vec3<u32>) {
             normalizer > 0.0
         );
         let regret = (action_values[offset + action] - node_value) * reach_weights[infoset];
-        var updated = regrets[offset + action] * discount + regret;
+        var updated = regrets[offset + action] * regret_discount(variant, iteration, dcfr_alpha, dcfr_beta, regrets[offset + action]) + regret;
         if variant == 0u || variant == 2u || variant == 3u || variant == 4u {
             updated = max(updated, 0.0);
         }
@@ -176,10 +184,18 @@ fn action_value(action_offset: u32, infoset: u32) -> f32 {
     return 0.0;
 }
 
-fn regret_discount(variant: u32, iteration: u32, alpha: f32) -> f32 {
+fn regret_discount(variant: u32, iteration: u32, alpha: f32, beta: f32, old_regret: f32) -> f32 {
     if variant == 1u {
         let t = f32(max(iteration, 1u));
         return t / (t + 1.0);
+    }
+    if variant == 5u {
+        if iteration <= 1u {
+            return 0.0;
+        }
+        let exponent = select(beta, alpha, old_regret > 0.0);
+        let weighted = pow(f32(iteration - 1u), exponent);
+        return weighted / (weighted + 1.0);
     }
     if variant == 2u || variant == 3u || variant == 4u {
         if iteration <= 1u {
@@ -192,7 +208,7 @@ fn regret_discount(variant: u32, iteration: u32, alpha: f32) -> f32 {
 }
 
 fn average_strategy_discount(variant: u32, iteration: u32, gamma: f32) -> f32 {
-    if (variant == 2u || variant == 3u || variant == 4u) && iteration > 1u {
+    if (variant == 2u || variant == 3u || variant == 4u || variant == 5u) && iteration > 1u {
         let t = f32(iteration);
         return pow((t - 1.0) / t, gamma);
     }
@@ -220,6 +236,7 @@ fn update(@builtin(global_invocation_id) id: vec3<u32>) {
     let iteration = params[3];
     let dcfr_alpha = bitcast<f32>(params[4]);
     let dcfr_gamma = bitcast<f32>(params[5]);
+    let dcfr_beta = bitcast<f32>(params[11]);
     if infoset >= infosets {
         return;
     }
@@ -253,13 +270,12 @@ fn update(@builtin(global_invocation_id) id: vec3<u32>) {
         node_value = node_value + strategy * action_value(offset + action, infoset);
     }
 
-    let discount = regret_discount(variant, iteration, dcfr_alpha);
     let average_discount = average_strategy_discount(variant, iteration, dcfr_gamma);
 
     let reach_weight = reach_weights[infoset];
     let raw_strategy_weight = strategy_weights[infoset];
     var strategy_weight = raw_strategy_weight * f32(iteration);
-    if variant == 2u || variant == 3u || variant == 4u {
+    if variant == 2u || variant == 3u || variant == 4u || variant == 5u {
         strategy_weight = raw_strategy_weight;
     }
     if params[7] != 0u || bitcast<f32>(params[8]) != 0.0 {
@@ -280,7 +296,7 @@ fn update(@builtin(global_invocation_id) id: vec3<u32>) {
             normalizer > 0.0
         );
         let regret = (action_value(offset + action, infoset) - node_value) * reach_weight;
-        var updated = regrets[offset + action] * discount + regret;
+        var updated = regrets[offset + action] * regret_discount(variant, iteration, dcfr_alpha, dcfr_beta, regrets[offset + action]) + regret;
         if variant == 0u || variant == 2u || variant == 3u || variant == 4u {
             updated = max(updated, 0.0);
         }
@@ -332,6 +348,7 @@ struct Params {
     eta_bits: u32,
     alpha_bits: u32,
     gamma_bits: u32,
+    beta_bits: u32,
     avg_delay: u32,
     avg_power_bits: u32,
 };
@@ -375,10 +392,18 @@ fn strategy_at_fused(offset: u32, action: u32, legal_count: u32, normalizer: f32
     return 1.0 / f32(max(legal_count, 1u));
 }
 
-fn regret_discount_fused() -> f32 {
+fn regret_discount_fused(old_regret: f32) -> f32 {
     if params.variant == 1u {
         let t = f32(max(params.iteration, 1u));
         return t / (t + 1.0);
+    }
+    if params.variant == 5u {
+        if params.iteration <= 1u {
+            return 0.0;
+        }
+        let exponent = select(bitcast<f32>(params.beta_bits), bitcast<f32>(params.alpha_bits), old_regret > 0.0);
+        let weighted = pow(f32(params.iteration - 1u), exponent);
+        return weighted / (weighted + 1.0);
     }
     if params.variant == 2u || params.variant == 3u || params.variant == 4u {
         if params.iteration <= 1u {
@@ -391,7 +416,7 @@ fn regret_discount_fused() -> f32 {
 }
 
 fn average_strategy_discount_fused() -> f32 {
-    if (params.variant == 2u || params.variant == 3u || params.variant == 4u) && params.iteration > 1u {
+    if (params.variant == 2u || params.variant == 3u || params.variant == 4u || params.variant == 5u) && params.iteration > 1u {
         let t = f32(params.iteration);
         return pow((t - 1.0) / t, bitcast<f32>(params.gamma_bits));
     }
@@ -482,10 +507,9 @@ fn fused_update_tile(@builtin(global_invocation_id) id: vec3<u32>) {
         node_value = node_value + strategy * q;
     }
 
-    let discount = regret_discount_fused();
     let average_discount = average_strategy_discount_fused();
     var strategy_weight = node._pad1 * own_reach * f32(params.iteration);
-    if params.variant == 2u || params.variant == 3u || params.variant == 4u {
+    if params.variant == 2u || params.variant == 3u || params.variant == 4u || params.variant == 5u {
         strategy_weight = node._pad1 * own_reach;
     }
     if params.avg_delay != 0u || bitcast<f32>(params.avg_power_bits) != 0.0 {
@@ -503,7 +527,7 @@ fn fused_update_tile(@builtin(global_invocation_id) id: vec3<u32>) {
         }
         let strategy = strategy_at_fused(action_offset, action, legal_count, normalizer);
         let regret = (q_values[action] - node_value) * reach_weight;
-        var updated = regrets[action_offset + action] * discount + regret;
+        var updated = regrets[action_offset + action] * regret_discount_fused(regrets[action_offset + action]) + regret;
         if params.variant == 0u || params.variant == 2u || params.variant == 3u || params.variant == 4u {
             updated = max(updated, 0.0);
         }

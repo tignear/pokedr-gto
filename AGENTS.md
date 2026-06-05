@@ -23,3 +23,12 @@ moving on. Include the date, what was tried, why it was expected to help, the
 measurement or failure mode, and why it was not kept. This avoids retrying the
 same card-prefix, parallel-reduce, buffer-layout, or driver-workaround ideas
 without new evidence.
+
+## CFR references
+
+`rs_poker` 4.1.0 has an Arena CFR implementation under
+`src/arena/cfr`, but it is not a full-range public-tree postflop solver. It
+uses a lazily expanded arena tree plus `little_sorry::RegretMatcher` and
+rollout/simulation rewards. Treat it as a reference for simple tree storage and
+action-generation plumbing, not as a correctness oracle for this solver's CFV,
+BR, or exploitability calculations.

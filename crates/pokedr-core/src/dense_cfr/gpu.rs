@@ -293,6 +293,7 @@ struct GpuPublicTreeFusedUpdateParams {
     eta_bits: u32,
     alpha_bits: u32,
     gamma_bits: u32,
+    beta_bits: u32,
     avg_delay: u32,
     avg_power_bits: u32,
 }
@@ -1360,6 +1361,7 @@ impl GpuDenseCfrBackend {
             variant_prediction_eta(state.variant, iteration).to_bits(),
             super::average_strategy_delay() as u32,
             super::average_strategy_power().to_bits(),
+            variant_dcfr_beta(state.variant, iteration).to_bits(),
         ];
         let regrets = storage_buffer(&self.device, "regrets", &state.regrets);
         let prediction = storage_buffer(&self.device, "prediction", &state.prediction);
@@ -3555,6 +3557,7 @@ impl GpuDenseCfrBackend {
                     super::average_strategy_power().to_bits(),
                     infoset_start as u32,
                     context.combos_len as u32,
+                    variant_dcfr_beta(state.variant, iteration).to_bits(),
                 ],
             );
             let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -3679,6 +3682,7 @@ impl GpuDenseCfrBackend {
                     eta_bits: variant_prediction_eta(state.variant, iteration).to_bits(),
                     alpha_bits: variant_dcfr_alpha(state.variant, iteration).to_bits(),
                     gamma_bits: variant_dcfr_gamma(state.variant, iteration).to_bits(),
+                    beta_bits: variant_dcfr_beta(state.variant, iteration).to_bits(),
                     avg_delay: super::average_strategy_delay() as u32,
                     avg_power_bits: super::average_strategy_power().to_bits(),
                 }],
@@ -3992,6 +3996,7 @@ impl GpuDenseCfrState {
             variant_prediction_eta(self.variant, iteration).to_bits(),
             super::average_strategy_delay() as u32,
             super::average_strategy_power().to_bits(),
+            variant_dcfr_beta(self.variant, iteration).to_bits(),
         ];
         let action_values =
             readonly_buffer(&backend.device, "resident action values", action_values);
@@ -4313,11 +4318,13 @@ fn variant_code(variant: super::CfrVariant) -> u32 {
         super::CfrVariant::DcfrPlus { .. } => 2,
         super::CfrVariant::PdcfrPlus { .. } => 3,
         super::CfrVariant::DcfrSchedule { .. } => 4,
+        super::CfrVariant::Dcfr { .. } => 5,
     }
 }
 
 fn variant_dcfr_alpha(variant: super::CfrVariant, iteration: usize) -> f32 {
     match variant {
+        super::CfrVariant::Dcfr { alpha, .. } => alpha,
         super::CfrVariant::DcfrPlus { alpha, .. } | super::CfrVariant::PdcfrPlus { alpha, .. } => {
             alpha
         }
@@ -4331,8 +4338,16 @@ fn variant_dcfr_alpha(variant: super::CfrVariant, iteration: usize) -> f32 {
     }
 }
 
+fn variant_dcfr_beta(variant: super::CfrVariant, _iteration: usize) -> f32 {
+    match variant {
+        super::CfrVariant::Dcfr { beta, .. } => beta,
+        _ => super::DEFAULT_DCFR_BETA,
+    }
+}
+
 fn variant_dcfr_gamma(variant: super::CfrVariant, iteration: usize) -> f32 {
     match variant {
+        super::CfrVariant::Dcfr { gamma, .. } => gamma,
         super::CfrVariant::DcfrPlus { gamma, .. } | super::CfrVariant::PdcfrPlus { gamma, .. } => {
             gamma
         }
