@@ -433,7 +433,7 @@ fn regret_discount(variant: CfrVariant, iteration: usize) -> f32 {
             } else {
                 let alpha = dcfr_alpha(variant, iteration);
                 let weighted = ((iteration - 1) as f32).powf(alpha);
-                weighted / (weighted + 1.5)
+                weighted / (weighted + 1.0)
             }
         }
     }
@@ -605,6 +605,18 @@ mod tests {
         assert!((state.strategy_sum()[0] - (0.5 * discount + 1.0)).abs() < 1e-6);
         assert!((state.strategy_sum()[1] - (0.5 * discount)).abs() < 1e-6);
         assert!(state.regrets().iter().all(|value| *value >= 0.0));
+    }
+
+    #[test]
+    fn dcfr_plus_regret_discount_matches_weighted_cfr_plus_formula() {
+        let variant = CfrVariant::DcfrPlus {
+            alpha: 2.0,
+            gamma: 4.0,
+        };
+
+        assert_eq!(regret_discount(variant, 1), 0.0);
+        assert!((regret_discount(variant, 2) - 0.5).abs() < 1e-6);
+        assert!((regret_discount(variant, 3) - 0.8).abs() < 1e-6);
     }
 
     #[test]

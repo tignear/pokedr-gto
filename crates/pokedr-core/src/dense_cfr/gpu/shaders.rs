@@ -41,7 +41,7 @@ fn regret_discount(variant: u32, iteration: u32, alpha: f32) -> f32 {
             return 0.0;
         }
         let weighted = pow(f32(iteration - 1u), alpha);
-        return weighted / (weighted + 1.5);
+        return weighted / (weighted + 1.0);
     }
     return 1.0;
 }
@@ -186,7 +186,7 @@ fn regret_discount(variant: u32, iteration: u32, alpha: f32) -> f32 {
             return 0.0;
         }
         let weighted = pow(f32(iteration - 1u), alpha);
-        return weighted / (weighted + 1.5);
+        return weighted / (weighted + 1.0);
     }
     return 1.0;
 }
@@ -385,7 +385,7 @@ fn regret_discount_fused() -> f32 {
             return 0.0;
         }
         let weighted = pow(f32(params.iteration - 1u), bitcast<f32>(params.alpha_bits));
-        return weighted / (weighted + 1.5);
+        return weighted / (weighted + 1.0);
     }
     return 1.0;
 }

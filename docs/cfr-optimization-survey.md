@@ -196,12 +196,13 @@ The practical target for this project is `converged=true` at `target_bb100=1`.
 Runs that are faster but miss that threshold are not acceptable defaults.
 
 Current local WSL/DZN baseline on `As7h2c`, depth 5, full terminal runouts,
-target `1bb/100`:
+target `1bb/100`, after correcting the DCFR+/PDCFR+ regret discount denominator
+to the weighted CFR+ formula `w/(w + 1)`:
 
 ```text
 variant        iterations  elapsed_s  root_exploitability_bb100  converged
-dcfr-plus      512         175.43     0.700                       true
-dcfr-schedule  512         175.36     0.636                       true
+dcfr-plus      512         174.89     0.698                       true
+dcfr-schedule  512         176.15     0.566                       true
 ```
 
 This confirms 512 iterations is enough for this fixed flop/tree, assuming the
