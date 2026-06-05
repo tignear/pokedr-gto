@@ -83,6 +83,11 @@ struct FlopMetricsArgs {
     local_gaps: bool,
     #[arg(long, help = "Compute root best-response metrics at each checkpoint")]
     br_metrics: bool,
+    #[arg(
+        long,
+        help = "Compute root best-response metrics only when root_l1_delta is at or below this threshold"
+    )]
+    br_on_root_delta: Option<f32>,
     #[arg(long, help = "Also compute current-strategy best-response metrics")]
     current_br: bool,
     #[arg(
@@ -461,22 +466,16 @@ fn run_solve_flop_metrics(args: FlopMetricsArgs) {
         target_bb100
     );
     let dump_gap_nodes = args.local_gaps || std::env::var_os("POKEDR_METRIC_LOCAL_GAPS").is_some();
-    let need_br_metrics = args.br_metrics || (convergence.is_some() && !explicit_iterations);
-    if need_br_metrics {
-        unsafe {
-            std::env::set_var("POKEDR_METRIC_BR", "1");
-        }
-    }
-    if args.current_br {
-        unsafe {
-            std::env::set_var("POKEDR_METRIC_CURRENT_BR", "1");
-        }
-    }
-    if args.diagnostics {
-        unsafe {
-            std::env::set_var("POKEDR_METRIC_DIAGNOSTICS", "1");
-        }
-    }
+    let br_on_root_delta = args.br_on_root_delta.or_else(|| {
+        (convergence.is_some() && !explicit_iterations && !args.br_metrics).then_some(0.001)
+    });
+    let metric_options = pokedr_agent::FixedFlopMetricOptions {
+        br_metrics: args.br_metrics || (convergence.is_some() && !explicit_iterations),
+        br_on_root_delta,
+        current_br_metrics: args.current_br,
+        diagnostics: args.diagnostics,
+        local_gaps: dump_gap_nodes,
+    };
     let mut best_exploitability_bb100 = f32::INFINITY;
     let mut regression_count = 0usize;
     let patience = convergence
@@ -484,44 +483,51 @@ fn run_solve_flop_metrics(args: FlopMetricsArgs) {
         .map(|settings| settings.regression_patience)
         .unwrap_or(usize::MAX);
     let gap_node_config = config.clone();
-    pokedr_agent::solve_fixed_flop_metrics_with_callback(flop, config, &iterations, |row| {
-        print_metric_row(row, target_bb100);
-        if dump_gap_nodes {
-            print_metric_gap_nodes(flop, gap_node_config.clone(), row);
-        }
-        if !row.finite
-            || row.current_strategy_norm_error > 1.0e-3
-            || row.average_strategy_norm_error > 1.0e-3
-        {
-            eprintln!(
-                "stopping metrics: solver produced non-finite or denormalized strategy state"
-            );
-            return false;
-        }
-        let Some(exploitability_bb100) = row.root_exploitability.map(|value| value * 100.0) else {
-            return true;
-        };
-        if exploitability_bb100 <= target_bb100 {
-            eprintln!(
-                "stopping metrics: reached target exploitability {:.3} <= {:.3} bb/100",
-                exploitability_bb100, target_bb100
-            );
-            return false;
-        }
-        if exploitability_bb100 + 0.25 < best_exploitability_bb100 {
-            best_exploitability_bb100 = exploitability_bb100;
-            regression_count = 0;
-        } else if exploitability_bb100 > best_exploitability_bb100 + 1.0 {
-            regression_count += 1;
-            if regression_count >= patience {
+    pokedr_agent::solve_fixed_flop_metrics_with_options_and_callback(
+        flop,
+        config,
+        &iterations,
+        metric_options,
+        |row| {
+            print_metric_row(row, target_bb100);
+            if dump_gap_nodes {
+                print_metric_gap_nodes(flop, gap_node_config.clone(), row);
+            }
+            if !row.finite
+                || row.current_strategy_norm_error > 1.0e-3
+                || row.average_strategy_norm_error > 1.0e-3
+            {
                 eprintln!(
-                    "stopping metrics: exploitability regressed for {regression_count} checkpoints; best={best_exploitability_bb100:.3} current={exploitability_bb100:.3} bb/100"
+                    "stopping metrics: solver produced non-finite or denormalized strategy state"
                 );
                 return false;
             }
-        }
-        true
-    });
+            let Some(exploitability_bb100) = row.root_exploitability.map(|value| value * 100.0)
+            else {
+                return true;
+            };
+            if exploitability_bb100 <= target_bb100 {
+                eprintln!(
+                    "stopping metrics: reached target exploitability {:.3} <= {:.3} bb/100",
+                    exploitability_bb100, target_bb100
+                );
+                return false;
+            }
+            if exploitability_bb100 + 0.25 < best_exploitability_bb100 {
+                best_exploitability_bb100 = exploitability_bb100;
+                regression_count = 0;
+            } else if exploitability_bb100 > best_exploitability_bb100 + 1.0 {
+                regression_count += 1;
+                if regression_count >= patience {
+                    eprintln!(
+                        "stopping metrics: exploitability regressed for {regression_count} checkpoints; best={best_exploitability_bb100:.3} current={exploitability_bb100:.3} bb/100"
+                    );
+                    return false;
+                }
+            }
+            true
+        },
+    );
 }
 
 fn print_metric_gap_nodes(

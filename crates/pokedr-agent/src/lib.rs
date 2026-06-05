@@ -149,6 +149,35 @@ pub struct FixedFlopMetricRow {
     pub finite: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FixedFlopMetricOptions {
+    pub br_metrics: bool,
+    pub br_on_root_delta: Option<f32>,
+    pub current_br_metrics: bool,
+    pub diagnostics: bool,
+    pub local_gaps: bool,
+}
+
+impl FixedFlopMetricOptions {
+    pub fn from_environment() -> Self {
+        Self {
+            br_metrics: std::env::var_os("POKEDR_METRIC_BR").is_some(),
+            br_on_root_delta: std::env::var("POKEDR_METRIC_BR_ON_ROOT_DELTA")
+                .ok()
+                .and_then(|value| value.parse().ok()),
+            current_br_metrics: std::env::var_os("POKEDR_METRIC_CURRENT_BR").is_some(),
+            diagnostics: std::env::var_os("POKEDR_METRIC_DIAGNOSTICS").is_some(),
+            local_gaps: std::env::var_os("POKEDR_METRIC_LOCAL_GAPS").is_some(),
+        }
+    }
+}
+
+impl Default for FixedFlopMetricOptions {
+    fn default() -> Self {
+        Self::from_environment()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct LocalGapDetail {
     pub gap: f32,
@@ -594,6 +623,25 @@ pub fn solve_fixed_flop_metrics_with_callback<F>(
     flop: [PokedrCard; 3],
     base_config: PokedrAgentConfig,
     iteration_counts: &[usize],
+    on_row: F,
+) -> Vec<FixedFlopMetricRow>
+where
+    F: FnMut(&FixedFlopMetricRow) -> bool,
+{
+    solve_fixed_flop_metrics_with_options_and_callback(
+        flop,
+        base_config,
+        iteration_counts,
+        FixedFlopMetricOptions::default(),
+        on_row,
+    )
+}
+
+pub fn solve_fixed_flop_metrics_with_options_and_callback<F>(
+    flop: [PokedrCard; 3],
+    base_config: PokedrAgentConfig,
+    iteration_counts: &[usize],
+    metric_options: FixedFlopMetricOptions,
     mut on_row: F,
 ) -> Vec<FixedFlopMetricRow>
 where
@@ -634,6 +682,7 @@ where
         root_dead,
         &flop,
         iteration_counts,
+        metric_options,
         &mut on_row,
     ) {
         return rows;
@@ -840,6 +889,7 @@ fn try_solve_fixed_flop_metrics_gpu(
     root_dead: u64,
     flop: &[PokedrCard; 3],
     iteration_counts: &[usize],
+    metric_options: FixedFlopMetricOptions,
     on_row: &mut dyn FnMut(&FixedFlopMetricRow) -> bool,
 ) -> Option<Vec<FixedFlopMetricRow>> {
     let backend = cfr_gpu_backend()?;
@@ -875,10 +925,10 @@ fn try_solve_fixed_flop_metrics_gpu(
     let mut rows = Vec::with_capacity(checkpoints.len());
     let started = Instant::now();
     let mut completed_iterations = 0usize;
-    let include_local_gaps = std::env::var_os("POKEDR_METRIC_LOCAL_GAPS").is_some();
-    let include_br_metrics = std::env::var_os("POKEDR_METRIC_BR").is_some();
-    let include_current_br = std::env::var_os("POKEDR_METRIC_CURRENT_BR").is_some();
-    let include_diagnostics = std::env::var_os("POKEDR_METRIC_DIAGNOSTICS").is_some();
+    let include_local_gaps = metric_options.local_gaps;
+    let include_br_metrics = metric_options.br_metrics;
+    let include_current_br = metric_options.current_br_metrics;
+    let include_diagnostics = metric_options.diagnostics;
     for iterations in checkpoints {
         let delta = iterations.saturating_sub(completed_iterations);
         backend
@@ -899,12 +949,12 @@ fn try_solve_fixed_flop_metrics_gpu(
         backend.wait_idle().ok()?;
         completed_iterations = iterations;
 
-        let need_full_state = include_br_metrics
+        let need_full_state_before_root = include_br_metrics
             || include_current_br
             || include_local_gaps
             || include_diagnostics
             || metric_cpu_exploitability_enabled();
-        let state = need_full_state
+        let mut state = need_full_state_before_root
             .then(|| gpu_state.download(&backend))
             .transpose()
             .ok()?;
@@ -921,6 +971,14 @@ fn try_solve_fixed_flop_metrics_gpu(
         let root_strategy_l1_delta = previous_root_strategy
             .as_ref()
             .map(|previous| mean_l1_delta(previous, &root_strategy));
+        let should_compute_stable_br = metric_options
+            .br_on_root_delta
+            .zip(root_strategy_l1_delta)
+            .is_some_and(|(threshold, delta)| delta <= threshold);
+        let compute_br_metrics = include_br_metrics || should_compute_stable_br;
+        if compute_br_metrics && state.is_none() {
+            state = Some(gpu_state.download(&backend).ok()?);
+        }
         let root_action_probabilities = weighted_root_action_probabilities(
             layout,
             &root_strategy,
@@ -943,7 +1001,7 @@ fn try_solve_fixed_flop_metrics_gpu(
                 )
             })
             .flatten();
-        let recursive_br_gap = include_br_metrics
+        let recursive_br_gap = compute_br_metrics
             .then(|| {
                 recursive_br_gap_metrics_gpu(
                     &backend,
