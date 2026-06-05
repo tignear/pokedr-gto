@@ -156,10 +156,6 @@ struct SolverOptions {
     max_depth: Option<usize>,
     #[arg(long, help = "Maximum raises per street")]
     max_raises_per_street: Option<u8>,
-    #[arg(long, value_name = "N|full", help = "Terminal showdown runout cap")]
-    terminal_runouts: Option<String>,
-    #[arg(long, hide = true)]
-    max_showdown_runouts: Option<usize>,
     #[arg(long, help = "Maximum non-call/check/fold actions at one decision")]
     max_aggressive_actions: Option<usize>,
     #[arg(long, help = "Merge generated sizings closer than this log ratio")]
@@ -2504,9 +2500,9 @@ fn match_config(options: &SolverOptions) -> pokedr_agent::PokedrAgentConfig {
     if let Some(value) = env_usize("POKEDR_MAX_RAISES_PER_STREET") {
         config.max_raises_per_street = value.min(u8::MAX as usize) as u8;
     }
-    config.max_showdown_runouts =
-        env_usize("POKEDR_MAX_SHOWDOWN_RUNOUTS").unwrap_or(config.max_showdown_runouts);
+    config.max_showdown_runouts = usize::MAX;
     apply_solver_options(&mut config, options);
+    config.max_showdown_runouts = usize::MAX;
     config
 }
 
@@ -2522,14 +2518,6 @@ fn apply_solver_options(config: &mut pokedr_agent::PokedrAgentConfig, options: &
     }
     if let Some(value) = options.max_raises_per_street {
         config.max_raises_per_street = value;
-    }
-    if let Some(value) = options
-        .terminal_runouts
-        .as_deref()
-        .map(parse_terminal_runouts)
-        .or(options.max_showdown_runouts)
-    {
-        config.max_showdown_runouts = value;
     }
     if let Some(value) = options.max_aggressive_actions {
         config.action_set.max_aggressive_actions = value;
@@ -2566,16 +2554,6 @@ fn clean_fractions(name: &str, values: &[f32]) -> Vec<f32> {
         std::process::exit(2);
     }
     cleaned
-}
-
-fn parse_terminal_runouts(value: &str) -> usize {
-    if value.eq_ignore_ascii_case("full") {
-        return usize::MAX;
-    }
-    value.parse::<usize>().unwrap_or_else(|_| {
-        eprintln!("--terminal-runouts must be a positive integer or full: {value}");
-        std::process::exit(2);
-    })
 }
 
 fn format_terminal_runouts(value: usize) -> String {

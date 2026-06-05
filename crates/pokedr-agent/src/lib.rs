@@ -64,7 +64,7 @@ impl Default for PokedrAgentConfig {
             },
             max_raises_per_street: 1,
             max_depth: 5,
-            max_showdown_runouts: 128,
+            max_showdown_runouts: usize::MAX,
         }
     }
 }
