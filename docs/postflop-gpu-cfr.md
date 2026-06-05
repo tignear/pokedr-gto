@@ -901,8 +901,7 @@ depth 5, WSL/DZN profiling showed reduce dropping from about `381ms` to
 `135ms` of the stage-profile run. Card aggregate can target that cost, but it
 does not remove prefix construction or board iteration by itself.
 
-An experimental per-card prefix path was implemented behind
-`POKEDR_GPU_TERMINAL_CARD_PREFIX=1`:
+An experimental per-card prefix path was tried and then removed:
 
 ```text
 card_prefix[z,b,card,position] =
@@ -939,12 +938,13 @@ card prefix, per-card workgroup and group-boundary writes:
   terminal    ~1430ms
 ```
 
-So the formula is useful, but materializing all 52 card prefix lanes is too
-much work. Writing only group boundaries helps, but every card lane still scans
-the full combo order. The next viable version needs to avoid the `52 *
-combo_count` scan itself, not just reduce writes. That likely means fusing card
-mass accumulation into the existing total-prefix scan or building a compact
-per-group summary without a separate per-card pass.
+So the formula is useful, but materializing all 52 card prefix lanes was too
+much work, and the runtime switch was deleted. Writing only group boundaries
+helped, but every card lane still scanned the full combo order. The next viable
+version needs to avoid the `52 * combo_count` scan itself, not just reduce
+writes. That likely means fusing card mass accumulation into the existing
+total-prefix scan or building a compact per-group summary without a separate
+per-card pass.
 
 ### Terminal CFV Rewrite Ideas
 

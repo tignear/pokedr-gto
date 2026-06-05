@@ -46,10 +46,6 @@ pub struct GpuDenseCfrBackend {
     public_tree_terminal_partial_bind_group_layout: wgpu::BindGroupLayout,
     public_tree_terminal_reduce_pipeline: wgpu::ComputePipeline,
     public_tree_terminal_reduce_bind_group_layout: wgpu::BindGroupLayout,
-    public_tree_terminal_card_prefix_pipeline: Option<wgpu::ComputePipeline>,
-    public_tree_terminal_card_prefix_bind_group_layout: Option<wgpu::BindGroupLayout>,
-    public_tree_terminal_card_aggregate_reduce_pipeline: Option<wgpu::ComputePipeline>,
-    public_tree_terminal_card_aggregate_reduce_bind_group_layout: Option<wgpu::BindGroupLayout>,
     public_tree_fold_aggregate_pipeline: wgpu::ComputePipeline,
     public_tree_fold_aggregate_bind_group_layout: wgpu::BindGroupLayout,
     public_tree_fold_value_pipeline: wgpu::ComputePipeline,
@@ -209,8 +205,6 @@ struct GpuPublicTreeIterationContext {
     terminal_blocker_neighbor_stride: usize,
     terminal_prefix_pair_budget: usize,
     terminal_prefix_pairs_buffer: wgpu::Buffer,
-    terminal_card_prefix_pair_budget: usize,
-    terminal_card_prefix_pairs_buffer: wgpu::Buffer,
     hero_decision_aggregates_buffer: wgpu::Buffer,
     villain_decision_aggregates_buffer: wgpu::Buffer,
     fused_public_infoset_mask_buffer: wgpu::Buffer,
@@ -582,18 +576,6 @@ fn trace_pipeline_step(step: &str) {
     if std::env::var_os("POKEDR_GPU_PIPELINE_TRACE").is_some() {
         eprintln!("pokedr: gpu pipeline {step}");
     }
-}
-
-fn terminal_card_prefix_requested() -> bool {
-    std::env::var("POKEDR_GPU_TERMINAL_CARD_PREFIX")
-        .ok()
-        .map(|value| {
-            matches!(
-                value.to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-        .unwrap_or(false)
 }
 
 async fn request_gpu_adapter() -> Result<wgpu::Adapter, GpuCfrError> {
@@ -1004,98 +986,6 @@ impl GpuDenseCfrBackend {
                 cache: None,
             });
         trace_pipeline_step("public_tree_terminal_reduce:done");
-        let (
-            public_tree_terminal_card_prefix_pipeline,
-            public_tree_terminal_card_prefix_bind_group_layout,
-            public_tree_terminal_card_aggregate_reduce_pipeline,
-            public_tree_terminal_card_aggregate_reduce_bind_group_layout,
-        ) = if terminal_card_prefix_requested() {
-            trace_pipeline_step("public_tree_terminal_card_prefix:start");
-            let card_prefix_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("public tree terminal card prefix shader"),
-                source: wgpu::ShaderSource::Wgsl(PUBLIC_TREE_TERMINAL_CARD_PREFIX_SHADER.into()),
-            });
-            let card_prefix_bind_group_layout =
-                device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                    label: Some("public tree terminal card prefix bind group layout"),
-                    entries: &[
-                        storage_entry(0, true),
-                        storage_entry(1, true),
-                        storage_entry(2, true),
-                        storage_entry(3, true),
-                        storage_entry(4, true),
-                        storage_entry(5, true),
-                        storage_entry(6, true),
-                        storage_entry(7, false),
-                        uniform_entry(8),
-                    ],
-                });
-            let card_prefix_pipeline_layout =
-                device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                    label: Some("public tree terminal card prefix pipeline layout"),
-                    bind_group_layouts: &[Some(&card_prefix_bind_group_layout)],
-                    immediate_size: 0,
-                });
-            let card_prefix_pipeline =
-                device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                    label: Some("public tree terminal card prefix pipeline"),
-                    layout: Some(&card_prefix_pipeline_layout),
-                    module: &card_prefix_shader,
-                    entry_point: Some("terminal_card_prefix"),
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                    cache: None,
-                });
-            trace_pipeline_step("public_tree_terminal_card_prefix:done");
-
-            trace_pipeline_step("public_tree_terminal_card_aggregate_reduce:start");
-            let card_reduce_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("public tree terminal card aggregate reduce shader"),
-                source: wgpu::ShaderSource::Wgsl(
-                    PUBLIC_TREE_TERMINAL_CARD_AGGREGATE_REDUCE_SHADER.into(),
-                ),
-            });
-            let card_reduce_bind_group_layout =
-                device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                    label: Some("public tree terminal card aggregate reduce bind group layout"),
-                    entries: &[
-                        storage_entry(0, true),
-                        storage_entry(1, true),
-                        storage_entry(2, true),
-                        storage_entry(3, true),
-                        storage_entry(4, true),
-                        storage_entry(5, true),
-                        storage_entry(6, true),
-                        storage_entry(7, true),
-                        storage_entry(8, false),
-                        storage_entry(9, false),
-                        uniform_entry(10),
-                    ],
-                });
-            let card_reduce_pipeline_layout =
-                device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                    label: Some("public tree terminal card aggregate reduce pipeline layout"),
-                    bind_group_layouts: &[Some(&card_reduce_bind_group_layout)],
-                    immediate_size: 0,
-                });
-            let card_reduce_pipeline =
-                device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                    label: Some("public tree terminal card aggregate reduce pipeline"),
-                    layout: Some(&card_reduce_pipeline_layout),
-                    module: &card_reduce_shader,
-                    entry_point: Some("terminal_reduce"),
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                    cache: None,
-                });
-            trace_pipeline_step("public_tree_terminal_card_aggregate_reduce:done");
-            (
-                Some(card_prefix_pipeline),
-                Some(card_prefix_bind_group_layout),
-                Some(card_reduce_pipeline),
-                Some(card_reduce_bind_group_layout),
-            )
-        } else {
-            (None, None, None, None)
-        };
         let public_tree_fold_aggregate_shader =
             device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("public tree fold aggregate shader"),
@@ -1358,10 +1248,6 @@ impl GpuDenseCfrBackend {
             public_tree_terminal_partial_bind_group_layout,
             public_tree_terminal_reduce_pipeline,
             public_tree_terminal_reduce_bind_group_layout,
-            public_tree_terminal_card_prefix_pipeline,
-            public_tree_terminal_card_prefix_bind_group_layout,
-            public_tree_terminal_card_aggregate_reduce_pipeline,
-            public_tree_terminal_card_aggregate_reduce_bind_group_layout,
             public_tree_fold_aggregate_pipeline,
             public_tree_fold_aggregate_bind_group_layout,
             public_tree_fold_value_pipeline,
@@ -1821,31 +1707,26 @@ impl GpuDenseCfrBackend {
     }
 
     #[allow(clippy::too_many_arguments)]
+    // Default exact terminal CFV path. It uses rank-prefix sums plus explicit
+    // blocker correction and remains the validation baseline for approximate
+    // terminal evaluators.
     fn fill_terminal_values_streaming(
         &self,
         node_buffer: &wgpu::Buffer,
         terminal_groups: &[GpuTerminalGroupCache],
-        combo_buffer: &wgpu::Buffer,
         blocker_neighbors_buffer: &wgpu::Buffer,
         hero_reaches_buffer: &wgpu::Buffer,
         villain_reaches_buffer: &wgpu::Buffer,
         hero_values_buffer: &wgpu::Buffer,
         villain_values_buffer: &wgpu::Buffer,
         terminal_prefix_pairs_buffer: &wgpu::Buffer,
-        terminal_card_prefix_pairs_buffer: &wgpu::Buffer,
         combo_count: usize,
         blocker_neighbor_stride: usize,
         max_terminal_prefix_pairs: usize,
-        max_terminal_card_prefix_pairs: usize,
     ) -> Result<(), GpuCfrError> {
         if terminal_groups.is_empty() || combo_count == 0 {
             return Ok(());
         }
-        let use_card_prefix = terminal_card_prefix_requested()
-            && self.public_tree_terminal_card_prefix_pipeline.is_some()
-            && self
-                .public_tree_terminal_card_aggregate_reduce_pipeline
-                .is_some();
         let submit_batch = std::env::var("POKEDR_GPU_TERMINAL_SUBMIT_BATCH")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
@@ -1853,7 +1734,6 @@ impl GpuDenseCfrBackend {
             .max(1);
         let stage_profile = std::env::var_os("POKEDR_GPU_TERMINAL_STAGE_PROFILE").is_some();
         let mut partial_elapsed = Duration::ZERO;
-        let mut card_prefix_elapsed = Duration::ZERO;
         let mut reduce_elapsed = Duration::ZERO;
         let mut profiled_chunks = 0usize;
         let mut encoder = self
@@ -1926,19 +1806,8 @@ impl GpuDenseCfrBackend {
                 ],
             });
             let prefix_pairs_per_terminal = group.board_count * (combo_count + 1);
-            let card_prefix_pairs_per_terminal = group.board_count * 52 * (combo_count + 1);
             let prefix_chunk_size = max_terminal_prefix_pairs / prefix_pairs_per_terminal;
-            let card_prefix_chunk_size = if use_card_prefix {
-                max_terminal_card_prefix_pairs / card_prefix_pairs_per_terminal
-            } else {
-                usize::MAX
-            };
-            let terminal_chunk_size = prefix_chunk_size
-                .min(card_prefix_chunk_size)
-                .max(1)
-                .min(group.terminal_count.max(1));
-            let chunk_use_card_prefix =
-                use_card_prefix && card_prefix_pairs_per_terminal <= max_terminal_card_prefix_pairs;
+            let terminal_chunk_size = prefix_chunk_size.max(1).min(group.terminal_count.max(1));
             for terminal_start in (0..group.terminal_count).step_by(terminal_chunk_size) {
                 let terminal_count = terminal_chunk_size.min(group.terminal_count - terminal_start);
                 let partial_workgroups = (terminal_count * group.board_count) as u32;
@@ -1960,92 +1829,6 @@ impl GpuDenseCfrBackend {
                     terminal_start: terminal_start as u32,
                     _pad0: 0,
                 };
-                let card_prefix_workgroups = (terminal_count * group.board_count) as u32;
-                let card_prefix_x_groups = card_prefix_workgroups.min(65_535).max(1);
-                let card_prefix_y_groups = card_prefix_workgroups.div_ceil(card_prefix_x_groups);
-                let card_prefix_params = chunk_use_card_prefix.then(|| {
-                    uniform_buffer(
-                        &self.device,
-                        "public tree streamed terminal card prefix params",
-                        &[GpuPublicTreeParams {
-                            combo_count: combo_count as u32,
-                            node_count: terminal_count as u32,
-                            max_actions: group.board_count as u32,
-                            output_len: (combo_count + 1) as u32,
-                            pair_start: (combo_count + 1) as u32,
-                            chunk_pairs: card_prefix_x_groups,
-                            _pad0: 0,
-                            _pad1: terminal_start as u32,
-                            _pad2: 0,
-                            _pad3: 0,
-                        }],
-                    )
-                });
-                let card_reduce_params = chunk_use_card_prefix.then(|| {
-                    uniform_buffer(
-                        &self.device,
-                        "public tree streamed terminal card aggregate reduce params",
-                        &[GpuPublicTreeParams {
-                            combo_count: combo_count as u32,
-                            node_count: terminal_count as u32,
-                            max_actions: group.board_count as u32,
-                            output_len: (combo_count + 1) as u32,
-                            pair_start: (combo_count + 1) as u32,
-                            chunk_pairs: reduce_x_invocations,
-                            _pad0: 0,
-                            _pad1: terminal_start as u32,
-                            _pad2: 0,
-                            _pad3: 0,
-                        }],
-                    )
-                });
-                let card_prefix_bind_group =
-                    card_prefix_params.as_ref().map(|card_prefix_params| {
-                        self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                            label: Some("public tree streamed terminal card prefix bind group"),
-                            layout: self
-                                .public_tree_terminal_card_prefix_bind_group_layout
-                                .as_ref()
-                                .expect(
-                                    "card prefix layout must exist when card prefix is enabled",
-                                ),
-                            entries: &[
-                                bind_entry(0, node_buffer),
-                                bind_entry(1, &group.terminal_refs_buffer),
-                                bind_entry(2, &group.combo_order_buffer),
-                                bind_entry(3, &group.combo_bounds_buffer),
-                                bind_entry(4, combo_buffer),
-                                bind_entry(5, hero_reaches_buffer),
-                                bind_entry(6, villain_reaches_buffer),
-                                bind_entry(7, terminal_card_prefix_pairs_buffer),
-                                bind_entry(8, card_prefix_params),
-                            ],
-                        })
-                    });
-                let card_reduce_bind_group = card_reduce_params.as_ref().map(|card_reduce_params| {
-                    self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                        label: Some("public tree streamed terminal card aggregate reduce bind group"),
-                        layout: self
-                            .public_tree_terminal_card_aggregate_reduce_bind_group_layout
-                            .as_ref()
-                            .expect(
-                                "card aggregate reduce layout must exist when card prefix is enabled",
-                            ),
-                        entries: &[
-                            bind_entry(0, node_buffer),
-                            bind_entry(1, &group.terminal_refs_buffer),
-                            bind_entry(2, &group.combo_bounds_buffer),
-                            bind_entry(3, combo_buffer),
-                            bind_entry(4, hero_reaches_buffer),
-                            bind_entry(5, villain_reaches_buffer),
-                            bind_entry(6, terminal_prefix_pairs_buffer),
-                            bind_entry(7, terminal_card_prefix_pairs_buffer),
-                            bind_entry(8, hero_values_buffer),
-                            bind_entry(9, villain_values_buffer),
-                            bind_entry(10, card_reduce_params),
-                        ],
-                    })
-                });
                 if stage_profile {
                     let mut partial_encoder =
                         self.device
@@ -2068,39 +1851,6 @@ impl GpuDenseCfrBackend {
                     self.profile_poll()?;
                     partial_elapsed += start.elapsed();
 
-                    if chunk_use_card_prefix {
-                        let mut card_prefix_encoder =
-                            self.device
-                                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                                    label: Some("public tree terminal card prefix profile encoder"),
-                                });
-                        {
-                            let mut pass = card_prefix_encoder.begin_compute_pass(
-                                &wgpu::ComputePassDescriptor {
-                                    label: Some("public tree streamed terminal card prefix pass"),
-                                    timestamp_writes: None,
-                                },
-                            );
-                            pass.set_pipeline(
-                                self.public_tree_terminal_card_prefix_pipeline
-                                    .as_ref()
-                                    .expect("card prefix pipeline must exist when enabled"),
-                            );
-                            pass.set_bind_group(
-                                0,
-                                card_prefix_bind_group
-                                    .as_ref()
-                                    .expect("card prefix bind group must exist when enabled"),
-                                &[],
-                            );
-                            pass.dispatch_workgroups(card_prefix_x_groups, card_prefix_y_groups, 1);
-                        }
-                        let start = Instant::now();
-                        self.queue.submit(Some(card_prefix_encoder.finish()));
-                        self.profile_poll()?;
-                        card_prefix_elapsed += start.elapsed();
-                    }
-
                     let mut reduce_encoder =
                         self.device
                             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -2112,26 +1862,9 @@ impl GpuDenseCfrBackend {
                                 label: Some("public tree streamed terminal reduce pass"),
                                 timestamp_writes: None,
                             });
-                        if chunk_use_card_prefix {
-                            pass.set_pipeline(
-                                self.public_tree_terminal_card_aggregate_reduce_pipeline
-                                    .as_ref()
-                                    .expect(
-                                        "card aggregate reduce pipeline must exist when enabled",
-                                    ),
-                            );
-                            pass.set_bind_group(
-                                0,
-                                card_reduce_bind_group.as_ref().expect(
-                                    "card aggregate reduce bind group must exist when enabled",
-                                ),
-                                &[],
-                            );
-                        } else {
-                            pass.set_pipeline(&self.public_tree_terminal_reduce_pipeline);
-                            pass.set_bind_group(0, &reduce_bind_group, &[]);
-                            pass.set_immediates(0, bytemuck::bytes_of(&reduce_chunk_params));
-                        }
+                        pass.set_pipeline(&self.public_tree_terminal_reduce_pipeline);
+                        pass.set_bind_group(0, &reduce_bind_group, &[]);
+                        pass.set_immediates(0, bytemuck::bytes_of(&reduce_chunk_params));
                         pass.dispatch_workgroups(reduce_x_groups, reduce_y_groups, 1);
                     }
                     let start = Instant::now();
@@ -2152,49 +1885,14 @@ impl GpuDenseCfrBackend {
                     pass.dispatch_workgroups(partial_x_groups, partial_y_groups, 1);
                 }
 
-                if chunk_use_card_prefix {
-                    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                        label: Some("public tree streamed terminal card prefix pass"),
-                        timestamp_writes: None,
-                    });
-                    pass.set_pipeline(
-                        self.public_tree_terminal_card_prefix_pipeline
-                            .as_ref()
-                            .expect("card prefix pipeline must exist when enabled"),
-                    );
-                    pass.set_bind_group(
-                        0,
-                        card_prefix_bind_group
-                            .as_ref()
-                            .expect("card prefix bind group must exist when enabled"),
-                        &[],
-                    );
-                    pass.dispatch_workgroups(card_prefix_x_groups, card_prefix_y_groups, 1);
-                }
-
                 {
                     let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                         label: Some("public tree streamed terminal reduce pass"),
                         timestamp_writes: None,
                     });
-                    if chunk_use_card_prefix {
-                        pass.set_pipeline(
-                            self.public_tree_terminal_card_aggregate_reduce_pipeline
-                                .as_ref()
-                                .expect("card aggregate reduce pipeline must exist when enabled"),
-                        );
-                        pass.set_bind_group(
-                            0,
-                            card_reduce_bind_group
-                                .as_ref()
-                                .expect("card aggregate reduce bind group must exist when enabled"),
-                            &[],
-                        );
-                    } else {
-                        pass.set_pipeline(&self.public_tree_terminal_reduce_pipeline);
-                        pass.set_bind_group(0, &reduce_bind_group, &[]);
-                        pass.set_immediates(0, bytemuck::bytes_of(&reduce_chunk_params));
-                    }
+                    pass.set_pipeline(&self.public_tree_terminal_reduce_pipeline);
+                    pass.set_bind_group(0, &reduce_bind_group, &[]);
+                    pass.set_immediates(0, bytemuck::bytes_of(&reduce_chunk_params));
                     pass.dispatch_workgroups(reduce_x_groups, reduce_y_groups, 1);
                 }
                 pending_chunks += 1;
@@ -2217,11 +1915,6 @@ impl GpuDenseCfrBackend {
             eprintln!(
                 "pokedr: gpu profile phase=cfv_terminal_partial elapsed_ms={:.3} chunks={}",
                 partial_elapsed.as_secs_f64() * 1000.0,
-                profiled_chunks
-            );
-            eprintln!(
-                "pokedr: gpu profile phase=cfv_terminal_card_prefix elapsed_ms={:.3} chunks={}",
-                card_prefix_elapsed.as_secs_f64() * 1000.0,
                 profiled_chunks
             );
             eprintln!(
@@ -3232,20 +2925,6 @@ impl GpuDenseCfrBackend {
             max_terminal_prefix_pairs * 2,
             false,
         );
-        let default_max_terminal_card_prefix_pairs = 8_000_000usize;
-        let min_terminal_card_prefix_pairs = 52 * (combos.len() + 1);
-        let max_terminal_card_prefix_pairs =
-            std::env::var("POKEDR_GPU_MAX_TERMINAL_CARD_PREFIX_PAIRS")
-                .ok()
-                .and_then(|value| value.parse::<usize>().ok())
-                .unwrap_or(default_max_terminal_card_prefix_pairs)
-                .max(min_terminal_card_prefix_pairs);
-        let terminal_card_prefix_pairs_buffer = uninit_storage_buffer(
-            &self.device,
-            "public tree streamed terminal card prefix pairs scratch",
-            max_terminal_card_prefix_pairs * 2,
-            false,
-        );
         const DECISION_AGGREGATE_SLOTS: usize = 53;
         let decision_aggregate_len = public_infoset_count * DECISION_AGGREGATE_SLOTS;
         let hero_decision_aggregates_buffer = uninit_storage_buffer(
@@ -3374,8 +3053,6 @@ impl GpuDenseCfrBackend {
             terminal_blocker_neighbor_stride: blocker_neighbor_stride,
             terminal_prefix_pair_budget: max_terminal_prefix_pairs,
             terminal_prefix_pairs_buffer,
-            terminal_card_prefix_pair_budget: max_terminal_card_prefix_pairs,
-            terminal_card_prefix_pairs_buffer,
             hero_decision_aggregates_buffer,
             villain_decision_aggregates_buffer,
             fused_public_infoset_mask_buffer,
@@ -3536,18 +3213,15 @@ impl GpuDenseCfrBackend {
                 self.fill_terminal_values_streaming(
                     &tile.node_buffer,
                     &tile.showdown_terminal_groups,
-                    &ctx.combo_buffer,
                     &ctx.terminal_blocker_neighbors_buffer,
                     &tile.hero_reaches_buffer,
                     &tile.villain_reaches_buffer,
                     &tile.hero_values_buffer,
                     &tile.villain_values_buffer,
                     &ctx.terminal_prefix_pairs_buffer,
-                    &ctx.terminal_card_prefix_pairs_buffer,
                     ctx.combos_len,
                     ctx.terminal_blocker_neighbor_stride,
                     ctx.terminal_prefix_pair_budget,
-                    ctx.terminal_card_prefix_pair_budget,
                 )?;
             }
         }
