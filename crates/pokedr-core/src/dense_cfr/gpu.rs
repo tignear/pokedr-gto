@@ -311,6 +311,7 @@ unsafe impl bytemuck::Pod for GpuPublicTreeFusedUpdateParams {}
 struct GpuTerminalGroupCache {
     board_count: usize,
     terminal_count: usize,
+    table_count: usize,
     terminal_refs_buffer: wgpu::Buffer,
     combo_order_buffer: wgpu::Buffer,
     combo_bounds_buffer: wgpu::Buffer,
@@ -318,6 +319,7 @@ struct GpuTerminalGroupCache {
 
 struct GpuTerminalGroupData {
     board_count: usize,
+    table_count: usize,
     terminal_refs: Vec<GpuTerminalRef>,
     combo_order: Vec<u32>,
     combo_bounds: Vec<u32>,
@@ -519,6 +521,7 @@ fn terminal_group_data(
             }
             caches.push(GpuTerminalGroupData {
                 board_count,
+                table_count: table_slots.len(),
                 terminal_refs,
                 combo_order,
                 combo_bounds,
@@ -2359,6 +2362,7 @@ impl GpuDenseCfrBackend {
                                 GpuTerminalGroupCache {
                                     board_count: group.board_count,
                                     terminal_count,
+                                    table_count: group.table_count,
                                     terminal_refs_buffer: readonly_buffer(
                                         &self.device,
                                         "public tree resident terminal refs",
@@ -3307,6 +3311,38 @@ impl GpuDenseCfrBackend {
             showdown_boards,
             &combo_live_masks,
         );
+        if std::env::var_os("POKEDR_GPU_TERMINAL_GROUP_TRACE").is_some() {
+            let mut groups_by_board_count = BTreeMap::<usize, (usize, usize)>::new();
+            let mut tables_by_board_count = BTreeMap::<usize, usize>::new();
+            for layer in &layer_tiles {
+                for tile in layer {
+                    for group in &tile.showdown_terminal_groups {
+                        let entry = groups_by_board_count
+                            .entry(group.board_count)
+                            .or_insert((0, 0));
+                        entry.0 += 1;
+                        entry.1 += group.terminal_count;
+                        *tables_by_board_count.entry(group.board_count).or_insert(0) +=
+                            group.table_count;
+                    }
+                }
+            }
+            eprintln!("pokedr: gpu terminal groups by board_count:");
+            for (board_count, (group_count, terminal_count)) in groups_by_board_count {
+                let table_count = tables_by_board_count
+                    .get(&board_count)
+                    .copied()
+                    .unwrap_or(0);
+                eprintln!(
+                    "pokedr: gpu terminal group board_count={} groups={} tables={} terminals={} terminals_per_table={:.2}",
+                    board_count,
+                    group_count,
+                    table_count,
+                    terminal_count,
+                    terminal_count as f64 / table_count.max(1) as f64
+                );
+            }
+        }
         let fused_public_infoset_mask_buffer = readonly_buffer(
             &self.device,
             "public tree fused public infoset mask",

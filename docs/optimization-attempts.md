@@ -29,6 +29,41 @@ ideas.
 - Decision: do not retry this shape. If blocker correction is parallelized, it
   needs a different algebraic layout, not per-combo workgroup reduction.
 
+## 2026-06-05: Dense blocker-neighbor fast path
+
+- Tried: detect the full-combo case where every combo has a dense blocker
+  neighbor row and remove the sentinel branch from terminal reduce.
+- Expected: reduce branch work inside the hot blocker-correction loop without
+  changing the math.
+- Result: slightly slower. On `As7h2c`, `depth=5`, `32` lightweight iterations
+  were about `15.43s` with the fast path and `15.33s` with the original
+  sentinel path.
+- Decision: reverted. The sentinel branch is not the meaningful bottleneck;
+  the cost is the repeated `combo_bounds` and reach reads across boards.
+
+## 2026-06-05: Single-board terminal reduce shader
+
+- Tried: add a dedicated terminal reduce entry point for `board_count == 1`
+  terminal groups. On `As7h2c`, almost all showdown terminals are single-board
+  (`122304` terminals versus `294` with `board_count=48`), so this removes the
+  outer board loop from the common path.
+- Expected: reduce control-flow and index arithmetic in terminal CFV without
+  changing the formula.
+- Result: slower. `16` lightweight iterations moved from about `9.96s` to
+  about `10.18s`.
+- Decision: reverted. The hot cost is still the blocker-correction reads and
+  reach reads, not the single-iteration board loop overhead.
+
+## 2026-06-05: Terminal prefix scratch budget sweep
+
+- Tried: sweep `POKEDR_GPU_MAX_TERMINAL_PREFIX_PAIRS` over `2M`, `4M`, `8M`,
+  and `16M`.
+- Expected: find a better chunk-size tradeoff between scratch memory, dispatch
+  count, and cache behavior.
+- Result: no meaningful speed difference. On `As7h2c`, `depth=5`, `16`
+  lightweight iterations stayed around `9.96s` to `10.00s`.
+- Decision: keep the existing default. Scratch budget is not the next lever.
+
 ## 2026-06-05: Resident terminal bind groups
 
 - Tried: create terminal partial/reduce bind groups and uniform buffers once in
@@ -141,3 +176,16 @@ ideas.
   produced finite strategies with root profile values summing to zero.
 - Decision: keep. This is a real tiling/dataflow fix, not just a micro-kernel
   tweak. The next major costs are still reach propagation and terminal CFV.
+
+## 2026-06-05: Reach shader live-mask shortcut
+
+- Tried: use the precomputed child `combo_live` mask in the reach propagation
+  shader, and skip regret/card work when a parent combo is structurally dead.
+- Expected: reduce wasted reach propagation work on dead combos and avoid
+  recomputing chance-card collisions.
+- Result: slower. On `As7h2c`, `depth=5`, `128` lightweight iterations moved
+  from about `46.83s` to about `47.08s`. The extra branch/atomic mask reads
+  were not cheaper than the existing simple card comparisons.
+- Decision: reverted. Do not retry this exact shape; if reach propagation is
+  optimized, change the dispatch/data layout rather than adding per-edge mask
+  checks.
