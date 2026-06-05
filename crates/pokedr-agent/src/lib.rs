@@ -53,7 +53,7 @@ impl Default for PokedrAgentConfig {
     fn default() -> Self {
         Self {
             cfr_iterations: 8,
-            cfr_variant: CfrVariant::dcfr_plus_default(),
+            cfr_variant: CfrVariant::dcfr_schedule_default(),
             action_set: ActionSetConfig {
                 max_aggressive_actions: 4,
                 flop_bet_fractions: vec![0.5, 1.0, 1.5],
