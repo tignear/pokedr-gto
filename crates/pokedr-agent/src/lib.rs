@@ -6355,6 +6355,23 @@ mod tests {
                 &cpu_state,
             )
             .expect("GPU public tree values should run");
+        let profile_zero_sum = root_exploitability_from_recursive_values(
+            &combos,
+            &combo_legal,
+            &hero_weights,
+            &villain_weights,
+            &gpu_initial_values,
+            &gpu_initial_values,
+            &gpu_initial_values,
+        );
+        assert!(
+            (profile_zero_sum.hero_profile_value + profile_zero_sum.villain_profile_value).abs()
+                < 1e-3,
+            "GPU profile root values are not zero-sum: hero={} villain={} sum={}",
+            profile_zero_sum.hero_profile_value,
+            profile_zero_sum.villain_profile_value,
+            profile_zero_sum.hero_profile_value + profile_zero_sum.villain_profile_value,
+        );
         let gpu_state = try_solve_gpu_public_tree_resident(
             &tree,
             &layout,
@@ -6450,7 +6467,10 @@ mod tests {
                 + villain_same_combo_mass;
         assert!(
             max_regret_delta < 1e-3 && max_strategy_sum_delta < 1e-3,
-            "GPU/CPU first update mismatch: max_regret_delta={max_regret_delta} index={max_regret_index} infoset={regret_infoset} action={regret_action} legal={} reach={} strategy_weight={} gpu_initial_strategy_weight={} action_value={} cpu_regret={} gpu_regret={}, max_strategy_sum_delta={max_strategy_sum_delta} index={max_strategy_sum_index} infoset={strategy_infoset} combo={strategy_combo} cards={:?} action={strategy_action} legal={} reach={} strategy_weight={} gpu_initial_strategy_weight={} compatible_villain_mass={} compatible_villain_mass_by_aggregate={} total={} card0={} card1={} same={} action_value={} cpu_strategy_sum={} gpu_strategy_sum={}",
+            "GPU/CPU first update mismatch: profile_hero={} profile_villain={} profile_sum={} max_regret_delta={max_regret_delta} index={max_regret_index} infoset={regret_infoset} action={regret_action} legal={} reach={} strategy_weight={} gpu_initial_strategy_weight={} action_value={} cpu_regret={} gpu_regret={}, max_strategy_sum_delta={max_strategy_sum_delta} index={max_strategy_sum_index} infoset={strategy_infoset} combo={strategy_combo} cards={:?} action={strategy_action} legal={} reach={} strategy_weight={} gpu_initial_strategy_weight={} compatible_villain_mass={} compatible_villain_mass_by_aggregate={} total={} card0={} card1={} same={} action_value={} cpu_strategy_sum={} gpu_strategy_sum={}",
+            profile_zero_sum.hero_profile_value,
+            profile_zero_sum.villain_profile_value,
+            profile_zero_sum.hero_profile_value + profile_zero_sum.villain_profile_value,
             private_legal_actions(&layout)[max_regret_index],
             cpu_batch.reach_weights[regret_infoset],
             cpu_batch.strategy_weights[regret_infoset],
@@ -6636,6 +6656,14 @@ mod tests {
             false,
         )
         .expect("GPU recursive BR metric should run");
+        assert!(
+            (gpu_metrics.hero_root_profile_value + gpu_metrics.villain_root_profile_value).abs()
+                < 1e-3,
+            "GPU resident average profile values are not zero-sum: hero={} villain={} sum={}",
+            gpu_metrics.hero_root_profile_value,
+            gpu_metrics.villain_root_profile_value,
+            gpu_metrics.hero_root_profile_value + gpu_metrics.villain_root_profile_value,
+        );
 
         backend.wait_idle().ok();
         std::mem::forget(backend);
@@ -6643,6 +6671,135 @@ mod tests {
             gpu_metrics.root_exploitability * 100.0 < 10.0,
             "GPU limited fixed-flop depth3 exploitability stayed at {:.3} bb/100",
             gpu_metrics.root_exploitability * 100.0
+        );
+    }
+
+    #[test]
+    fn fixed_flop_tree_terminals_preserve_pot_investment_sum_at_depth_five() {
+        let flop = [
+            PokedrCard::new(PokedrRank::Ace, PokedrSuit::Spades),
+            PokedrCard::new(PokedrRank::Seven, PokedrSuit::Hearts),
+            PokedrCard::new(PokedrRank::Two, PokedrSuit::Clubs),
+        ];
+        let config = PokedrAgentConfig {
+            action_set: ActionSetConfig {
+                max_aggressive_actions: 1,
+                flop_bet_fractions: vec![1.0],
+                turn_bet_fractions: vec![1.0],
+                river_bet_fractions: vec![1.0],
+                raise_fractions: vec![1.0],
+                ..ActionSetConfig::default()
+            },
+            max_raises_per_street: 1,
+            max_depth: 5,
+            max_showdown_runouts: usize::MAX,
+            ..PokedrAgentConfig::default()
+        };
+        let (tree, _) = fixed_flop_tree_and_layout(flop, config);
+        for (node_index, node) in tree.nodes().iter().enumerate() {
+            let PublicNodeKind::Terminal {
+                pot,
+                hero_invested,
+                villain_invested,
+                ..
+            } = &node.kind
+            else {
+                continue;
+            };
+            assert_eq!(
+                *pot,
+                hero_invested + villain_invested,
+                "terminal node {node_index} violates pot investment invariant"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a working local GPU backend"]
+    fn gpu_depth_five_average_profile_values_remain_zero_sum() {
+        let flop = [
+            PokedrCard::new(PokedrRank::Ace, PokedrSuit::Spades),
+            PokedrCard::new(PokedrRank::Seven, PokedrSuit::Hearts),
+            PokedrCard::new(PokedrRank::Two, PokedrSuit::Clubs),
+        ];
+        let config = PokedrAgentConfig {
+            cfr_iterations: 8,
+            cfr_variant: CfrVariant::dcfr_plus_default(),
+            action_set: ActionSetConfig {
+                max_aggressive_actions: 1,
+                flop_bet_fractions: vec![1.0],
+                turn_bet_fractions: vec![1.0],
+                river_bet_fractions: vec![1.0],
+                raise_fractions: vec![1.0],
+                ..ActionSetConfig::default()
+            },
+            max_raises_per_street: 1,
+            max_depth: 5,
+            max_showdown_runouts: usize::MAX,
+        };
+        let (tree, layout) = fixed_flop_tree_and_layout(flop, config.clone());
+        let indexer = ComboIndexer::new();
+        let root_dead = root_board(&tree).deck_mask();
+        let (mut hero_weights, mut villain_weights) = fixed_flop_root_weights(&indexer, root_dead);
+        limit_nonzero_weights(&mut hero_weights, 32);
+        limit_nonzero_weights(&mut villain_weights, 32);
+        let mut dense_config = layout.dense_config(config.cfr_variant);
+        dense_config.infosets *= PRIVATE_INFOS_PER_PUBLIC;
+        let matrix_cache = RefCell::new(ShowdownMatrixCache::new(1));
+        let backend = GpuDenseCfrBackend::new().expect("GPU backend should initialize");
+        let state = try_solve_gpu_public_tree_resident(
+            &tree,
+            &layout,
+            &indexer,
+            &backend,
+            &dense_config,
+            &config,
+            &hero_weights,
+            &villain_weights,
+            &matrix_cache,
+        )
+        .expect("GPU resident solve should run");
+        let linearized =
+            linearize_gpu_public_tree(&tree, &layout, &backend, &config, &matrix_cache)
+                .expect("tree should linearize");
+        let combos = gpu_private_combos();
+        let combo_legal = indexer
+            .combos()
+            .iter()
+            .map(|combo| (!combo.collides_with(root_dead)) as u32)
+            .collect::<Vec<_>>();
+        let profile = state.average_strategy_profile_state();
+        let values = backend
+            .public_tree_iteration_values(
+                &linearized.nodes,
+                &linearized.children,
+                &linearized.child_cards,
+                &combos,
+                &combo_legal,
+                &hero_weights,
+                &villain_weights,
+                &linearized.showdown_boards,
+                &profile,
+            )
+            .expect("GPU profile values should run");
+        let metrics = root_exploitability_from_recursive_values(
+            &combos,
+            &combo_legal,
+            &hero_weights,
+            &villain_weights,
+            &values,
+            &values,
+            &values,
+        );
+
+        backend.wait_idle().ok();
+        std::mem::forget(backend);
+        assert!(
+            (metrics.hero_profile_value + metrics.villain_profile_value).abs() < 1e-3,
+            "GPU depth5 average profile values are not zero-sum: hero={} villain={} sum={}",
+            metrics.hero_profile_value,
+            metrics.villain_profile_value,
+            metrics.hero_profile_value + metrics.villain_profile_value,
         );
     }
 

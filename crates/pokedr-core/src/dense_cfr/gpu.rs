@@ -4445,15 +4445,17 @@ impl GpuDenseCfrBackend {
             let child_tile = &ctx.layer_tiles[edge_tile.child_layer][child_tile_index];
             let parent_layer_nodes = &ctx.layered.layers[edge_tile.parent_layer].nodes
                 [parent_tile.node_start..parent_tile.node_end];
-            let Some((public_base, public_end)) =
-                public_infoset_range_for_edges(parent_layer_nodes, &edge_tile.edges)
-            else {
-                continue;
+            // Chance-only edge tiles still have to propagate reach/live state. They do not need
+            // strategy buffers, so bind a dummy range instead of skipping the tile.
+            let public_range = public_infoset_range_for_edges(parent_layer_nodes, &edge_tile.edges);
+            let (public_base, public_end) = public_range.unwrap_or((0, 0));
+            let (action_base, action_len) = if public_range.is_some() {
+                let infoset_base = public_base * ctx.combos_len;
+                let infoset_len = (public_end - public_base) * ctx.combos_len;
+                (infoset_base * ctx.actions, infoset_len * ctx.actions)
+            } else {
+                (0, 0)
             };
-            let infoset_base = public_base * ctx.combos_len;
-            let infoset_len = (public_end - public_base) * ctx.combos_len;
-            let action_base = infoset_base * ctx.actions;
-            let action_len = infoset_len * ctx.actions;
             let edge_buffer = readonly_buffer(
                 &self.device,
                 "public tree layer reach edges",
@@ -4485,24 +4487,32 @@ impl GpuDenseCfrBackend {
                     bind_entry(1, &edge_buffer),
                     bind_entry(2, &ctx.combo_buffer),
                     bind_entry(3, &ctx.root_weights_buffer),
-                    bind_entry_range(
-                        4,
-                        regrets_buffer,
-                        f32_range_byte_offset(action_base),
-                        f32_range_byte_size(action_len),
-                    ),
+                    if action_len > 0 {
+                        bind_entry_range(
+                            4,
+                            regrets_buffer,
+                            f32_range_byte_offset(action_base),
+                            f32_range_byte_size(action_len),
+                        )
+                    } else {
+                        bind_entry(4, &ctx.dummy_buffer)
+                    },
                     bind_entry(5, &parent_tile.hero_reaches_buffer),
                     bind_entry(6, &parent_tile.villain_reaches_buffer),
                     bind_entry(7, &parent_tile.combo_live_buffer),
                     bind_entry(8, &child_tile.hero_reaches_buffer),
                     bind_entry(9, &child_tile.villain_reaches_buffer),
                     bind_entry(10, &child_tile.combo_live_buffer),
-                    bind_entry_range(
-                        11,
-                        prediction_buffer,
-                        f32_range_byte_offset(action_base),
-                        f32_range_byte_size(action_len),
-                    ),
+                    if action_len > 0 {
+                        bind_entry_range(
+                            11,
+                            prediction_buffer,
+                            f32_range_byte_offset(action_base),
+                            f32_range_byte_size(action_len),
+                        )
+                    } else {
+                        bind_entry(11, &ctx.dummy_buffer)
+                    },
                     bind_entry(12, &params),
                 ],
             });
