@@ -3726,7 +3726,7 @@ impl GpuDenseCfrBackend {
         let flush_interval = std::env::var("POKEDR_GPU_ITERATION_FLUSH")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(4)
+            .unwrap_or(64)
             .max(1);
         for iteration in first_iteration..first_iteration + iterations {
             self.public_tree_update_state_with_context(&context, state, iteration)?;
@@ -3800,7 +3800,7 @@ impl GpuDenseCfrBackend {
         let flush_interval = std::env::var("POKEDR_GPU_ITERATION_FLUSH")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(4)
+            .unwrap_or(64)
             .max(1);
         let mut checkpoint_index = 0usize;
         let mut states = Vec::with_capacity(checkpoints.len());
