@@ -10,6 +10,8 @@ pub const DEFAULT_PDCFR_PLUS_GAMMA: f32 = 32.0;
 pub const DEFAULT_PDCFR_PLUS_ETA_START: f32 = 1.0;
 pub const DEFAULT_PDCFR_PLUS_ETA: f32 = 0.0;
 pub const DEFAULT_PDCFR_PLUS_ETA_HORIZON: usize = 128;
+const AVERAGE_STRATEGY_DELAY_ENV: &str = "POKEDR_AVG_DELAY";
+const AVERAGE_STRATEGY_POWER_ENV: &str = "POKEDR_AVG_POWER";
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum CfrVariant {
@@ -296,7 +298,8 @@ impl DenseCfrState {
             }
             self.strategy_sum[offset + action] *=
                 average_strategy_discount(self.variant, iteration);
-            self.strategy_sum[offset + action] += strategy_weight * strategy[action];
+            self.strategy_sum[offset + action] +=
+                strategy_weight * average_strategy_weight_multiplier(iteration) * strategy[action];
         }
     }
 
@@ -448,6 +451,32 @@ fn average_strategy_discount(variant: CfrVariant, iteration: usize) -> f32 {
         }
         _ => 1.0,
     }
+}
+
+pub(super) fn average_strategy_delay() -> usize {
+    std::env::var(AVERAGE_STRATEGY_DELAY_ENV)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(0)
+}
+
+pub(super) fn average_strategy_power() -> f32 {
+    std::env::var(AVERAGE_STRATEGY_POWER_ENV)
+        .ok()
+        .and_then(|value| value.parse::<f32>().ok())
+        .filter(|value| value.is_finite() && *value >= 0.0)
+        .unwrap_or(0.0)
+}
+
+fn average_strategy_weight_multiplier(iteration: usize) -> f32 {
+    let delay = average_strategy_delay();
+    if delay == 0 && average_strategy_power() == 0.0 {
+        return 1.0;
+    }
+    if iteration <= delay {
+        return 0.0;
+    }
+    ((iteration - delay) as f32).powf(average_strategy_power())
 }
 
 fn dcfr_alpha(variant: CfrVariant, iteration: usize) -> f32 {

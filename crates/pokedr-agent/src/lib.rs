@@ -53,7 +53,7 @@ impl Default for PokedrAgentConfig {
     fn default() -> Self {
         Self {
             cfr_iterations: 8,
-            cfr_variant: CfrVariant::pdcfr_plus_default(),
+            cfr_variant: CfrVariant::dcfr_plus_default(),
             action_set: ActionSetConfig {
                 max_aggressive_actions: 4,
                 flop_bet_fractions: vec![0.5, 1.0, 1.5],
@@ -120,10 +120,22 @@ pub struct FixedFlopMetricRow {
     pub cpu_gpu_root_exploitability_delta: Option<f32>,
     pub hero_root_br_value: Option<f32>,
     pub villain_root_br_value: Option<f32>,
+    pub hero_root_profile_value: Option<f32>,
+    pub villain_root_profile_value: Option<f32>,
+    pub hero_root_br_improvement: Option<f32>,
+    pub villain_root_br_improvement: Option<f32>,
     pub cpu_hero_root_br_value: Option<f32>,
     pub cpu_villain_root_br_value: Option<f32>,
+    pub cpu_hero_root_profile_value: Option<f32>,
+    pub cpu_villain_root_profile_value: Option<f32>,
+    pub cpu_hero_root_br_improvement: Option<f32>,
+    pub cpu_villain_root_br_improvement: Option<f32>,
     pub current_hero_root_br_value: Option<f32>,
     pub current_villain_root_br_value: Option<f32>,
+    pub current_hero_root_profile_value: Option<f32>,
+    pub current_villain_root_profile_value: Option<f32>,
+    pub current_hero_root_br_improvement: Option<f32>,
+    pub current_villain_root_br_improvement: Option<f32>,
     pub root_br_gap: Option<f32>,
     pub local_br_gap: Option<f32>,
     pub recursive_root_br_gap: Option<f32>,
@@ -162,6 +174,7 @@ pub struct FixedFlopTreeDump {
     pub actions: Vec<TreeActionRecord>,
     pub solver_nodes: Vec<SolverNodeRecord>,
     pub solver_combos: Vec<SolverComboRecord>,
+    pub root_br_combos: Vec<RootBrComboRecord>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -171,8 +184,16 @@ pub struct FixedFlopTreeMetrics {
     pub current_root_exploitability: Option<f32>,
     pub hero_root_br_value: Option<f32>,
     pub villain_root_br_value: Option<f32>,
+    pub hero_root_profile_value: Option<f32>,
+    pub villain_root_profile_value: Option<f32>,
+    pub hero_root_br_improvement: Option<f32>,
+    pub villain_root_br_improvement: Option<f32>,
     pub current_hero_root_br_value: Option<f32>,
     pub current_villain_root_br_value: Option<f32>,
+    pub current_hero_root_profile_value: Option<f32>,
+    pub current_villain_root_profile_value: Option<f32>,
+    pub current_hero_root_br_improvement: Option<f32>,
+    pub current_villain_root_br_improvement: Option<f32>,
     pub recursive_root_br_gap: Option<f32>,
     pub current_recursive_root_br_gap: Option<f32>,
 }
@@ -249,6 +270,19 @@ pub struct SolverComboRecord {
     pub current_strategy: Vec<f32>,
     pub regrets: Vec<f32>,
     pub strategy_sum: Vec<f32>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RootBrComboRecord {
+    pub profile: String,
+    pub player: String,
+    pub combo_index: usize,
+    pub combo: String,
+    pub root_weight: f32,
+    pub opponent_nonblocking_weight: f32,
+    pub root_value: f32,
+    pub contribution: f32,
+    pub contribution_bb100: f32,
 }
 
 impl Default for PokedrAgent {
@@ -636,10 +670,22 @@ where
             cpu_gpu_root_exploitability_delta: None,
             hero_root_br_value: None,
             villain_root_br_value: None,
+            hero_root_profile_value: None,
+            villain_root_profile_value: None,
+            hero_root_br_improvement: None,
+            villain_root_br_improvement: None,
             cpu_hero_root_br_value: None,
             cpu_villain_root_br_value: None,
+            cpu_hero_root_profile_value: None,
+            cpu_villain_root_profile_value: None,
+            cpu_hero_root_br_improvement: None,
+            cpu_villain_root_br_improvement: None,
             current_hero_root_br_value: None,
             current_villain_root_br_value: None,
+            current_hero_root_profile_value: None,
+            current_villain_root_profile_value: None,
+            current_hero_root_br_improvement: None,
+            current_villain_root_br_improvement: None,
             root_br_gap: None,
             local_br_gap: None,
             recursive_root_br_gap: None,
@@ -747,6 +793,10 @@ pub fn build_fixed_flop_tree_dump_with_combo_limit(
         actions,
         solver_nodes,
         solver_combos,
+        root_br_combos: solver_dump
+            .as_ref()
+            .map(DumpSolverContext::root_br_combo_records)
+            .unwrap_or_default(),
     }
 }
 
@@ -937,18 +987,54 @@ fn try_solve_fixed_flop_metrics_gpu(
             villain_root_br_value: recursive_br_gap
                 .as_ref()
                 .map(|metrics| metrics.villain_root_br_value),
+            hero_root_profile_value: recursive_br_gap
+                .as_ref()
+                .map(|metrics| metrics.hero_root_profile_value),
+            villain_root_profile_value: recursive_br_gap
+                .as_ref()
+                .map(|metrics| metrics.villain_root_profile_value),
+            hero_root_br_improvement: recursive_br_gap
+                .as_ref()
+                .map(|metrics| metrics.hero_root_br_improvement),
+            villain_root_br_improvement: recursive_br_gap
+                .as_ref()
+                .map(|metrics| metrics.villain_root_br_improvement),
             cpu_hero_root_br_value: cpu_exploitability
                 .as_ref()
                 .map(|metrics| metrics.hero_br_value),
             cpu_villain_root_br_value: cpu_exploitability
                 .as_ref()
                 .map(|metrics| metrics.villain_br_value),
+            cpu_hero_root_profile_value: cpu_exploitability
+                .as_ref()
+                .map(|metrics| metrics.hero_profile_value),
+            cpu_villain_root_profile_value: cpu_exploitability
+                .as_ref()
+                .map(|metrics| metrics.villain_profile_value),
+            cpu_hero_root_br_improvement: cpu_exploitability
+                .as_ref()
+                .map(|metrics| metrics.hero_improvement),
+            cpu_villain_root_br_improvement: cpu_exploitability
+                .as_ref()
+                .map(|metrics| metrics.villain_improvement),
             current_hero_root_br_value: current_recursive_br_gap
                 .as_ref()
                 .map(|metrics| metrics.hero_root_br_value),
             current_villain_root_br_value: current_recursive_br_gap
                 .as_ref()
                 .map(|metrics| metrics.villain_root_br_value),
+            current_hero_root_profile_value: current_recursive_br_gap
+                .as_ref()
+                .map(|metrics| metrics.hero_root_profile_value),
+            current_villain_root_profile_value: current_recursive_br_gap
+                .as_ref()
+                .map(|metrics| metrics.villain_root_profile_value),
+            current_hero_root_br_improvement: current_recursive_br_gap
+                .as_ref()
+                .map(|metrics| metrics.hero_root_br_improvement),
+            current_villain_root_br_improvement: current_recursive_br_gap
+                .as_ref()
+                .map(|metrics| metrics.villain_root_br_improvement),
             root_br_gap: br_gap.as_ref().map(|metrics| metrics.root_br_gap),
             local_br_gap: br_gap.as_ref().map(|metrics| metrics.local_br_gap),
             recursive_root_br_gap: recursive_br_gap.as_ref().map(|metrics| metrics.root_br_gap),
@@ -1024,6 +1110,10 @@ struct BrGapMetrics {
     root_exploitability: f32,
     hero_root_br_value: f32,
     villain_root_br_value: f32,
+    hero_root_profile_value: f32,
+    villain_root_profile_value: f32,
+    hero_root_br_improvement: f32,
+    villain_root_br_improvement: f32,
     local_gap_detail: Option<LocalGapDetail>,
 }
 
@@ -1127,6 +1217,20 @@ fn recursive_br_gap_metrics_gpu_for_profile(
     profile: &DenseCfrState,
     include_local_gaps: bool,
 ) -> Option<BrGapMetrics> {
+    let profile_values = backend
+        .public_tree_iteration_values(
+            &linearized.nodes,
+            &linearized.children,
+            &linearized.child_cards,
+            combos,
+            combo_legal,
+            hero_weights,
+            villain_weights,
+            &linearized.showdown_boards,
+            profile,
+        )
+        .ok()?;
+    backend.wait_idle().ok()?;
     let hero_values = backend
         .public_tree_best_response_values(
             &linearized.nodes,
@@ -1168,6 +1272,7 @@ fn recursive_br_gap_metrics_gpu_for_profile(
         villain_weights,
         &hero_values,
         &villain_values,
+        &profile_values,
         include_local_gaps,
     ))
 }
@@ -1252,6 +1357,10 @@ fn br_gap_metrics_from_values(
         root_exploitability: 0.0,
         hero_root_br_value: 0.0,
         villain_root_br_value: 0.0,
+        hero_root_profile_value: 0.0,
+        villain_root_profile_value: 0.0,
+        hero_root_br_improvement: 0.0,
+        villain_root_br_improvement: 0.0,
         local_gap_detail,
     }
 }
@@ -1267,6 +1376,7 @@ fn recursive_br_gap_metrics_from_values(
     villain_weights: &[f32],
     hero_values: &GpuRootTerminalValues,
     villain_values: &GpuRootTerminalValues,
+    profile_values: &GpuRootTerminalValues,
     include_local_gaps: bool,
 ) -> BrGapMetrics {
     let mut strategy = vec![0.0; layout.max_actions()];
@@ -1349,6 +1459,7 @@ fn recursive_br_gap_metrics_from_values(
         villain_weights,
         hero_values,
         villain_values,
+        profile_values,
     );
 
     BrGapMetrics {
@@ -1365,6 +1476,10 @@ fn recursive_br_gap_metrics_from_values(
         root_exploitability: root_exploitability.exploitability,
         hero_root_br_value: root_exploitability.hero_br_value,
         villain_root_br_value: root_exploitability.villain_br_value,
+        hero_root_profile_value: root_exploitability.hero_profile_value,
+        villain_root_profile_value: root_exploitability.villain_profile_value,
+        hero_root_br_improvement: root_exploitability.hero_improvement,
+        villain_root_br_improvement: root_exploitability.villain_improvement,
         local_gap_detail,
     }
 }
@@ -1374,6 +1489,10 @@ struct RootExploitability {
     exploitability: f32,
     hero_br_value: f32,
     villain_br_value: f32,
+    hero_profile_value: f32,
+    villain_profile_value: f32,
+    hero_improvement: f32,
+    villain_improvement: f32,
 }
 
 fn root_exploitability_from_recursive_values(
@@ -1383,9 +1502,12 @@ fn root_exploitability_from_recursive_values(
     villain_weights: &[f32],
     hero_values: &GpuRootTerminalValues,
     villain_values: &GpuRootTerminalValues,
+    profile_values: &GpuRootTerminalValues,
 ) -> RootExploitability {
     let mut hero_br_sum = 0.0;
     let mut villain_br_sum = 0.0;
+    let mut hero_profile_sum = 0.0;
+    let mut villain_profile_sum = 0.0;
     let mut joint_weight_sum = 0.0;
 
     for (combo_index, combo) in combos.iter().enumerate() {
@@ -1419,6 +1541,14 @@ fn root_exploitability_from_recursive_values(
             if hero_value.is_finite() {
                 hero_br_sum += hero_value * hero_weight;
             }
+            let hero_profile_value = profile_values
+                .root_hero_values
+                .get(combo_index)
+                .copied()
+                .unwrap_or(0.0);
+            if hero_profile_value.is_finite() {
+                hero_profile_sum += hero_profile_value * hero_weight;
+            }
         }
 
         let villain_weight = villain_weights.get(combo_index).copied().unwrap_or(0.0);
@@ -1431,6 +1561,14 @@ fn root_exploitability_from_recursive_values(
             if villain_value.is_finite() {
                 villain_br_sum += villain_value * villain_weight;
             }
+            let villain_profile_value = profile_values
+                .root_villain_values
+                .get(combo_index)
+                .copied()
+                .unwrap_or(0.0);
+            if villain_profile_value.is_finite() {
+                villain_profile_sum += villain_profile_value * villain_weight;
+            }
         }
     }
 
@@ -1439,15 +1577,27 @@ fn root_exploitability_from_recursive_values(
             exploitability: 0.0,
             hero_br_value: 0.0,
             villain_br_value: 0.0,
+            hero_profile_value: 0.0,
+            villain_profile_value: 0.0,
+            hero_improvement: 0.0,
+            villain_improvement: 0.0,
         };
     }
 
     let hero_br_value = hero_br_sum / joint_weight_sum;
     let villain_br_value = villain_br_sum / joint_weight_sum;
+    let hero_profile_value = hero_profile_sum / joint_weight_sum;
+    let villain_profile_value = villain_profile_sum / joint_weight_sum;
+    let hero_improvement = (hero_br_value - hero_profile_value).max(0.0);
+    let villain_improvement = (villain_br_value - villain_profile_value).max(0.0);
     RootExploitability {
-        exploitability: (hero_br_value + villain_br_value).max(0.0),
+        exploitability: hero_improvement + villain_improvement,
         hero_br_value,
         villain_br_value,
+        hero_profile_value,
+        villain_profile_value,
+        hero_improvement,
+        villain_improvement,
     }
 }
 
@@ -1498,6 +1648,10 @@ fn cpu_infoset_root_exploitability(
             exploitability: 0.0,
             hero_br_value: 0.0,
             villain_br_value: 0.0,
+            hero_profile_value: 0.0,
+            villain_profile_value: 0.0,
+            hero_improvement: 0.0,
+            villain_improvement: 0.0,
         };
     }
 
@@ -1529,9 +1683,22 @@ fn cpu_infoset_root_exploitability(
         max_showdown_runouts,
         &villain_reach,
     );
+    let profile_values = cpu_infoset_profile_hero_payoff_matrix(
+        tree,
+        layout,
+        0,
+        None,
+        None,
+        &heroes,
+        &villains,
+        state,
+        &matrix_cache,
+        max_showdown_runouts,
+    );
 
     let mut hero_br_sum = 0.0;
     let mut villain_br_sum = 0.0;
+    let mut profile_hero_sum = 0.0;
     for (h, hero) in heroes.iter().enumerate() {
         for (v, villain) in villains.iter().enumerate() {
             if hero.mask & villain.mask != 0 {
@@ -1541,15 +1708,24 @@ fn cpu_infoset_root_exploitability(
             let joint = hero.weight * villain.weight;
             hero_br_sum += joint * hero_values[pair];
             villain_br_sum += joint * -villain_values[pair];
+            profile_hero_sum += joint * profile_values[pair];
         }
     }
 
     let hero_br_value = hero_br_sum / joint_weight_sum;
     let villain_br_value = villain_br_sum / joint_weight_sum;
+    let hero_profile_value = profile_hero_sum / joint_weight_sum;
+    let villain_profile_value = -hero_profile_value;
+    let hero_improvement = (hero_br_value - hero_profile_value).max(0.0);
+    let villain_improvement = (villain_br_value - villain_profile_value).max(0.0);
     RootExploitability {
-        exploitability: (hero_br_value + villain_br_value).max(0.0),
+        exploitability: hero_improvement + villain_improvement,
         hero_br_value,
         villain_br_value,
+        hero_profile_value,
+        villain_profile_value,
+        hero_improvement,
+        villain_improvement,
     }
 }
 
@@ -1714,6 +1890,147 @@ fn cpu_infoset_br_hero_payoff_matrix(
                 );
                 for pair in 0..pair_count {
                     if card_mask & pair_dead[pair] == 0 {
+                        result[pair] += child_values[pair];
+                    }
+                }
+            }
+            for pair in 0..pair_count {
+                if valid_counts[pair] > 0 {
+                    result[pair] /= valid_counts[pair] as f32;
+                }
+            }
+            result
+        }
+        PublicNodeKind::Terminal {
+            kind,
+            board,
+            pot,
+            hero_invested,
+            ..
+        } => {
+            let mut result = vec![0.0; pair_count];
+            for (h, hero) in heroes.iter().enumerate() {
+                for (v, villain) in villains.iter().enumerate() {
+                    let pair = h * villains.len() + v;
+                    if hero.mask & villain.mask != 0 {
+                        continue;
+                    }
+                    result[pair] = match kind {
+                        TerminalKind::Fold => fold_utility(
+                            parent_state.expect("fold terminal must have a parent decision"),
+                            parent_action.expect("fold terminal must have a parent action"),
+                            *pot,
+                            *hero_invested,
+                        ),
+                        TerminalKind::Showdown => {
+                            let mut ctx = PostflopEvaluationContext {
+                                hero_cards: hero.cards,
+                                villain_cards: villain.cards,
+                                hero_combo: hero.index,
+                                villain_combo: villain.index,
+                                gpu_backend: None,
+                                matrix_cache,
+                                max_showdown_runouts,
+                                equity_cache: HashMap::new(),
+                            };
+                            showdown_utility(*pot, *hero_invested, board, &mut ctx)
+                        }
+                    };
+                }
+            }
+            result
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cpu_infoset_profile_hero_payoff_matrix(
+    tree: &SubgameTree,
+    layout: &PostflopDenseLayout,
+    node_index: usize,
+    parent_state: Option<&PublicState>,
+    parent_action: Option<PlayerAction>,
+    heroes: &[ActiveCombo],
+    villains: &[ActiveCombo],
+    state: &DenseCfrState,
+    matrix_cache: &RefCell<ShowdownMatrixCache>,
+    max_showdown_runouts: usize,
+) -> Vec<f32> {
+    let pair_count = heroes.len() * villains.len();
+    match &tree.nodes()[node_index].kind {
+        PublicNodeKind::Decision {
+            state: public_state,
+            actions,
+        } => {
+            let public_infoset = layout
+                .node_infoset(node_index)
+                .expect("decision nodes have infosets");
+            let action_count = actions.len();
+            let mut child_values = Vec::with_capacity(action_count);
+            for action_index in 0..action_count {
+                let child = layout
+                    .child_for_action(public_infoset, action_index)
+                    .expect("legal action must have a child");
+                child_values.push(cpu_infoset_profile_hero_payoff_matrix(
+                    tree,
+                    layout,
+                    child,
+                    Some(public_state),
+                    Some(actions[action_index].action),
+                    heroes,
+                    villains,
+                    state,
+                    matrix_cache,
+                    max_showdown_runouts,
+                ));
+            }
+
+            let mut result = vec![0.0; pair_count];
+            let mut strategy = vec![0.0; layout.max_actions()];
+            for (action_index, child) in child_values.iter().enumerate() {
+                for (h, hero) in heroes.iter().enumerate() {
+                    for (v, villain) in villains.iter().enumerate() {
+                        let pair = h * villains.len() + v;
+                        if hero.mask & villain.mask != 0 {
+                            continue;
+                        }
+                        let acting_combo = match public_state.acting_player {
+                            Player::Hero => hero.index,
+                            Player::Villain => villain.index,
+                        };
+                        let infoset = private_infoset(
+                            public_infoset,
+                            public_state.acting_player,
+                            acting_combo,
+                        );
+                        state.average_strategy_for(infoset, &mut strategy);
+                        result[pair] += strategy[action_index] * child[pair];
+                    }
+                }
+            }
+            result
+        }
+        PublicNodeKind::Chance { cards, .. } => {
+            let mut result = vec![0.0; pair_count];
+            let mut valid_counts = vec![0usize; pair_count];
+            let pair_dead = pair_dead_masks(heroes, villains);
+            for (card, child) in cards.iter().zip(&tree.nodes()[node_index].children) {
+                let card_mask = card.deck_mask();
+                let child_values = cpu_infoset_profile_hero_payoff_matrix(
+                    tree,
+                    layout,
+                    *child,
+                    None,
+                    None,
+                    heroes,
+                    villains,
+                    state,
+                    matrix_cache,
+                    max_showdown_runouts,
+                );
+                for pair in 0..pair_count {
+                    if card_mask & pair_dead[pair] == 0 {
+                        valid_counts[pair] += 1;
                         result[pair] += child_values[pair];
                     }
                 }
@@ -3511,6 +3828,7 @@ impl DumpSolverContext {
                     &villain_weights,
                     &average_recursive_hero_values,
                     &average_recursive_villain_values,
+                    &average_values,
                     false,
                 );
                 let current_recursive_br_gap = recursive_br_gap_metrics_from_values(
@@ -3524,6 +3842,7 @@ impl DumpSolverContext {
                     &villain_weights,
                     &current_recursive_hero_values,
                     &current_recursive_villain_values,
+                    &current_values,
                     false,
                 );
                 Some((
@@ -3575,6 +3894,22 @@ impl DumpSolverContext {
                 .recursive_br_gap
                 .as_ref()
                 .map(|metrics| metrics.villain_root_br_value),
+            hero_root_profile_value: self
+                .recursive_br_gap
+                .as_ref()
+                .map(|metrics| metrics.hero_root_profile_value),
+            villain_root_profile_value: self
+                .recursive_br_gap
+                .as_ref()
+                .map(|metrics| metrics.villain_root_profile_value),
+            hero_root_br_improvement: self
+                .recursive_br_gap
+                .as_ref()
+                .map(|metrics| metrics.hero_root_br_improvement),
+            villain_root_br_improvement: self
+                .recursive_br_gap
+                .as_ref()
+                .map(|metrics| metrics.villain_root_br_improvement),
             current_hero_root_br_value: self
                 .current_recursive_br_gap
                 .as_ref()
@@ -3583,6 +3918,22 @@ impl DumpSolverContext {
                 .current_recursive_br_gap
                 .as_ref()
                 .map(|metrics| metrics.villain_root_br_value),
+            current_hero_root_profile_value: self
+                .current_recursive_br_gap
+                .as_ref()
+                .map(|metrics| metrics.hero_root_profile_value),
+            current_villain_root_profile_value: self
+                .current_recursive_br_gap
+                .as_ref()
+                .map(|metrics| metrics.villain_root_profile_value),
+            current_hero_root_br_improvement: self
+                .current_recursive_br_gap
+                .as_ref()
+                .map(|metrics| metrics.hero_root_br_improvement),
+            current_villain_root_br_improvement: self
+                .current_recursive_br_gap
+                .as_ref()
+                .map(|metrics| metrics.villain_root_br_improvement),
             recursive_root_br_gap: self
                 .recursive_br_gap
                 .as_ref()
@@ -3593,6 +3944,173 @@ impl DumpSolverContext {
                 .map(|metrics| metrics.root_br_gap),
         }
     }
+
+    fn root_br_combo_records(&self) -> Vec<RootBrComboRecord> {
+        let (hero_weights, villain_weights) =
+            fixed_flop_root_weights(&self.indexer, self.root_dead);
+        let joint_weight_sum = root_joint_weight_sum(
+            self.indexer.combos(),
+            self.root_dead,
+            &hero_weights,
+            &villain_weights,
+        );
+        if joint_weight_sum <= 0.0 {
+            return Vec::new();
+        }
+
+        let mut records = Vec::new();
+        if let (Some(hero_values), Some(villain_values)) = (
+            self.average_recursive_hero_values.as_ref(),
+            self.average_recursive_villain_values.as_ref(),
+        ) {
+            push_root_br_combo_records(
+                &mut records,
+                "average",
+                self.indexer.combos(),
+                self.root_dead,
+                &hero_weights,
+                &villain_weights,
+                hero_values,
+                villain_values,
+                joint_weight_sum,
+            );
+        }
+        if let (Some(hero_values), Some(villain_values)) = (
+            self.current_recursive_hero_values.as_ref(),
+            self.current_recursive_villain_values.as_ref(),
+        ) {
+            push_root_br_combo_records(
+                &mut records,
+                "current",
+                self.indexer.combos(),
+                self.root_dead,
+                &hero_weights,
+                &villain_weights,
+                hero_values,
+                villain_values,
+                joint_weight_sum,
+            );
+        }
+        records
+    }
+}
+
+fn root_joint_weight_sum(
+    combos: &[Combo],
+    root_dead: u64,
+    hero_weights: &[f32],
+    villain_weights: &[f32],
+) -> f32 {
+    let mut joint_weight_sum = 0.0;
+    for (combo_index, combo) in combos.iter().enumerate() {
+        if combo.collides_with(root_dead) {
+            continue;
+        }
+        let hero_weight = hero_weights.get(combo_index).copied().unwrap_or(0.0);
+        if hero_weight <= 0.0 {
+            continue;
+        }
+        joint_weight_sum += hero_weight
+            * opponent_nonblocking_weight(combos, root_dead, villain_weights, combo_index);
+    }
+    joint_weight_sum
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_root_br_combo_records(
+    records: &mut Vec<RootBrComboRecord>,
+    profile: &str,
+    combos: &[Combo],
+    root_dead: u64,
+    hero_weights: &[f32],
+    villain_weights: &[f32],
+    hero_values: &GpuRootTerminalValues,
+    villain_values: &GpuRootTerminalValues,
+    joint_weight_sum: f32,
+) {
+    for (combo_index, combo) in combos.iter().enumerate() {
+        if combo.collides_with(root_dead) {
+            continue;
+        }
+        let hero_weight = hero_weights.get(combo_index).copied().unwrap_or(0.0);
+        if hero_weight > 0.0 {
+            let root_value = hero_values
+                .root_hero_values
+                .get(combo_index)
+                .copied()
+                .unwrap_or(0.0);
+            if root_value.is_finite() {
+                let contribution = root_value * hero_weight / joint_weight_sum;
+                records.push(RootBrComboRecord {
+                    profile: profile.to_string(),
+                    player: "Hero".to_string(),
+                    combo_index,
+                    combo: format_pokedr_cards(&[combo.first, combo.second]),
+                    root_weight: hero_weight,
+                    opponent_nonblocking_weight: opponent_nonblocking_weight(
+                        combos,
+                        root_dead,
+                        villain_weights,
+                        combo_index,
+                    ),
+                    root_value,
+                    contribution,
+                    contribution_bb100: contribution * 100.0,
+                });
+            }
+        }
+
+        let villain_weight = villain_weights.get(combo_index).copied().unwrap_or(0.0);
+        if villain_weight > 0.0 {
+            let root_value = villain_values
+                .root_villain_values
+                .get(combo_index)
+                .copied()
+                .unwrap_or(0.0);
+            if root_value.is_finite() {
+                let contribution = root_value * villain_weight / joint_weight_sum;
+                records.push(RootBrComboRecord {
+                    profile: profile.to_string(),
+                    player: "Villain".to_string(),
+                    combo_index,
+                    combo: format_pokedr_cards(&[combo.first, combo.second]),
+                    root_weight: villain_weight,
+                    opponent_nonblocking_weight: opponent_nonblocking_weight(
+                        combos,
+                        root_dead,
+                        hero_weights,
+                        combo_index,
+                    ),
+                    root_value,
+                    contribution,
+                    contribution_bb100: contribution * 100.0,
+                });
+            }
+        }
+    }
+}
+
+fn opponent_nonblocking_weight(
+    combos: &[Combo],
+    root_dead: u64,
+    weights: &[f32],
+    combo_index: usize,
+) -> f32 {
+    let combo = &combos[combo_index];
+    let mut total = 0.0;
+    for (opponent_index, opponent) in combos.iter().enumerate() {
+        if opponent_index == combo_index
+            || opponent.collides_with(root_dead)
+            || combo.first == opponent.first
+            || combo.first == opponent.second
+            || combo.second == opponent.first
+            || combo.second == opponent.second
+        {
+            continue;
+        }
+        total += weights.get(opponent_index).copied().unwrap_or(0.0);
+    }
+    total
 }
 
 fn dump_solver_mode() -> Option<DumpSolverMode> {

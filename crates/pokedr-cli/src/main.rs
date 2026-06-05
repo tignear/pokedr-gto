@@ -689,10 +689,11 @@ fn run_tree_db(mut args: impl Iterator<Item = String>) {
         Some("analyze") => run_tree_db_analyze(args),
         Some("check-line") => run_tree_db_check_line(args),
         Some("top-combos") => run_tree_db_top_combos(args),
+        Some("root-br") => run_tree_db_root_br(args),
         Some("node") => run_tree_db_node(args),
         _ => {
             eprintln!(
-                "usage: pokedr-cli tree-db <build|analyze|check-line|top-combos|node>\n  pokedr-cli tree-db build <tree.sqlite> [flop] [--config path.yml]\n  pokedr-cli tree-db analyze <tree.sqlite>\n  pokedr-cli tree-db check-line <tree.sqlite> [--limit n]\n  pokedr-cli tree-db top-combos <tree.sqlite>\n  pokedr-cli tree-db node <tree.sqlite> <node_id>"
+                "usage: pokedr-cli tree-db <build|analyze|check-line|top-combos|root-br|node>\n  pokedr-cli tree-db build <tree.sqlite> [flop] [--config path.yml]\n  pokedr-cli tree-db analyze <tree.sqlite>\n  pokedr-cli tree-db check-line <tree.sqlite> [--limit n]\n  pokedr-cli tree-db top-combos <tree.sqlite>\n  pokedr-cli tree-db root-br <tree.sqlite> [--limit n]\n  pokedr-cli tree-db node <tree.sqlite> <node_id>"
             );
             std::process::exit(2);
         }
@@ -746,6 +747,41 @@ fn run_tree_db_top_combos(mut args: impl Iterator<Item = String>) {
         "{}",
         serde_json::to_string_pretty(&db_top_combo_gaps(&conn))
             .expect("combo gap JSON must serialize")
+    );
+}
+
+fn run_tree_db_root_br(mut args: impl Iterator<Item = String>) {
+    let Some(db_path) = args.next() else {
+        eprintln!("usage: pokedr-cli tree-db root-br <tree.sqlite> [--limit n]");
+        std::process::exit(2);
+    };
+    let mut limit = 12usize;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--limit" => {
+                let value = args.next().unwrap_or_else(|| {
+                    eprintln!("--limit requires a number");
+                    std::process::exit(2);
+                });
+                limit = value.parse().unwrap_or_else(|_| {
+                    eprintln!("--limit must be a number: {value}");
+                    std::process::exit(2);
+                });
+            }
+            extra => {
+                eprintln!("unexpected argument: {extra}");
+                std::process::exit(2);
+            }
+        }
+    }
+    let conn = Connection::open(&db_path).unwrap_or_else(|error| {
+        eprintln!("failed to open tree DB {db_path}: {error}");
+        std::process::exit(2);
+    });
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&db_root_br_report(&conn, limit))
+            .expect("root BR JSON must serialize")
     );
 }
 
@@ -928,9 +964,22 @@ fn write_tree_db(path: &str, dump: &pokedr_agent::FixedFlopTreeDump) {
             strategy_sum TEXT NOT NULL,
             PRIMARY KEY (node_id, combo_index)
         );
+        CREATE TABLE root_br_combos (
+            profile TEXT NOT NULL,
+            player TEXT NOT NULL,
+            combo_index INTEGER NOT NULL,
+            combo TEXT NOT NULL,
+            root_weight REAL NOT NULL,
+            opponent_nonblocking_weight REAL NOT NULL,
+            root_value REAL NOT NULL,
+            contribution REAL NOT NULL,
+            contribution_bb100 REAL NOT NULL,
+            PRIMARY KEY (profile, player, combo_index)
+        );
         CREATE INDEX nodes_parent_idx ON nodes(parent_id);
         CREATE INDEX solver_nodes_avg_gap_idx ON solver_nodes(avg_gap DESC);
         CREATE INDEX solver_nodes_current_gap_idx ON solver_nodes(current_gap DESC);
+        CREATE INDEX root_br_combos_contribution_idx ON root_br_combos(profile, player, contribution DESC);
         "#,
     )
     .unwrap_or_else(|error| {
@@ -964,6 +1013,24 @@ fn write_tree_db(path: &str, dump: &pokedr_agent::FixedFlopTreeDump) {
         );
         insert_metric("hero_root_br_value", metrics.hero_root_br_value);
         insert_metric("villain_root_br_value", metrics.villain_root_br_value);
+        insert_metric("hero_root_profile_value", metrics.hero_root_profile_value);
+        insert_metric(
+            "villain_root_profile_value",
+            metrics.villain_root_profile_value,
+        );
+        insert_metric("hero_root_br_improvement", metrics.hero_root_br_improvement);
+        insert_metric(
+            "villain_root_br_improvement",
+            metrics.villain_root_br_improvement,
+        );
+        insert_metric(
+            "hero_root_br_improvement_bb100",
+            metrics.hero_root_br_improvement.map(|v| v * 100.0),
+        );
+        insert_metric(
+            "villain_root_br_improvement_bb100",
+            metrics.villain_root_br_improvement.map(|v| v * 100.0),
+        );
         insert_metric(
             "current_hero_root_br_value",
             metrics.current_hero_root_br_value,
@@ -971,6 +1038,32 @@ fn write_tree_db(path: &str, dump: &pokedr_agent::FixedFlopTreeDump) {
         insert_metric(
             "current_villain_root_br_value",
             metrics.current_villain_root_br_value,
+        );
+        insert_metric(
+            "current_hero_root_profile_value",
+            metrics.current_hero_root_profile_value,
+        );
+        insert_metric(
+            "current_villain_root_profile_value",
+            metrics.current_villain_root_profile_value,
+        );
+        insert_metric(
+            "current_hero_root_br_improvement",
+            metrics.current_hero_root_br_improvement,
+        );
+        insert_metric(
+            "current_villain_root_br_improvement",
+            metrics.current_villain_root_br_improvement,
+        );
+        insert_metric(
+            "current_hero_root_br_improvement_bb100",
+            metrics.current_hero_root_br_improvement.map(|v| v * 100.0),
+        );
+        insert_metric(
+            "current_villain_root_br_improvement_bb100",
+            metrics
+                .current_villain_root_br_improvement
+                .map(|v| v * 100.0),
         );
         insert_metric("recursive_root_br_gap", metrics.recursive_root_br_gap);
         insert_metric(
@@ -1084,6 +1177,26 @@ fn write_tree_db(path: &str, dump: &pokedr_agent::FixedFlopTreeDump) {
                 .unwrap();
         }
     }
+    {
+        let mut statement = tx
+            .prepare("INSERT INTO root_br_combos VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)")
+            .unwrap();
+        for combo in &dump.root_br_combos {
+            statement
+                .execute(params![
+                    combo.profile,
+                    combo.player,
+                    db_usize(combo.combo_index),
+                    combo.combo,
+                    combo.root_weight,
+                    combo.opponent_nonblocking_weight,
+                    combo.root_value,
+                    combo.contribution,
+                    combo.contribution_bb100,
+                ])
+                .unwrap();
+        }
+    }
     tx.commit().unwrap();
 }
 
@@ -1102,8 +1215,81 @@ fn analyze_tree_db(conn: &Connection) -> Value {
         "top_recursive_current_gaps": db_top_gaps(conn, "current_recursive_gap", "current_recursive_action_ev", "current_recursive_policy_ev"),
         "top_reached_recursive_current_gaps": db_top_reached_gaps(conn, "current_recursive_gap", "current_recursive_action_ev", "current_recursive_policy_ev", "current_strategy_weight_sum"),
         "top_combo_gaps": db_top_combo_gaps(conn),
+        "root_br_contributors": db_root_br_contributors(conn),
         "root_action_subtrees": db_root_action_subtrees(conn),
     })
+}
+
+fn db_root_br_contributors(conn: &Connection) -> Value {
+    db_root_br_contributors_with_limit(conn, 40)
+}
+
+fn db_root_br_report(conn: &Connection, limit: usize) -> Value {
+    json!({
+        "metrics": db_tree_metrics(conn),
+        "sums": db_root_br_sums(conn),
+        "top": db_root_br_contributors_with_limit(conn, limit),
+    })
+}
+
+fn db_root_br_sums(conn: &Connection) -> Value {
+    let mut statement = conn
+        .prepare(
+            "SELECT profile,
+                    player,
+                    SUM(contribution),
+                    SUM(contribution_bb100)
+             FROM root_br_combos
+             GROUP BY profile, player
+             ORDER BY profile, player",
+        )
+        .unwrap();
+    let rows = statement
+        .query_map([], |row| {
+            Ok(json!({
+                "profile": row.get::<_, String>(0)?,
+                "player": row.get::<_, String>(1)?,
+                "contribution": row.get::<_, f64>(2)?,
+                "contribution_bb100": row.get::<_, f64>(3)?,
+            }))
+        })
+        .unwrap();
+    Value::Array(rows.map(Result::unwrap).collect())
+}
+
+fn db_root_br_contributors_with_limit(conn: &Connection, limit: usize) -> Value {
+    let mut statement = conn
+        .prepare(
+            "SELECT profile,
+                    player,
+                    combo_index,
+                    combo,
+                    root_weight,
+                    opponent_nonblocking_weight,
+                    root_value,
+                    contribution,
+                    contribution_bb100
+             FROM root_br_combos
+             ORDER BY contribution DESC
+             LIMIT ?1",
+        )
+        .unwrap();
+    let rows = statement
+        .query_map([db_usize(limit)], |row| {
+            Ok(json!({
+                "profile": row.get::<_, String>(0)?,
+                "player": row.get::<_, String>(1)?,
+                "combo_index": row.get::<_, i64>(2)?,
+                "combo": row.get::<_, String>(3)?,
+                "root_weight": row.get::<_, f64>(4)?,
+                "opponent_nonblocking_weight": row.get::<_, f64>(5)?,
+                "root_value": row.get::<_, f64>(6)?,
+                "contribution": row.get::<_, f64>(7)?,
+                "contribution_bb100": row.get::<_, f64>(8)?,
+            }))
+        })
+        .unwrap();
+    Value::Array(rows.map(Result::unwrap).collect())
 }
 
 fn db_tree_metrics(conn: &Connection) -> Value {

@@ -1,5 +1,5 @@
 cfr_iterations: 256
-cfr_variant: cfr-plus
+cfr_variant: dcfr-plus
 max_depth: 5
 max_showdown_runouts: 128
 metric_iterations: [64, 128, 256]

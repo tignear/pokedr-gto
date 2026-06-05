@@ -70,6 +70,18 @@ fn average_strategy_discount(variant: u32, iteration: u32, gamma: f32) -> f32 {
     return 1.0;
 }
 
+fn average_strategy_weight_multiplier(iteration: u32) -> f32 {
+    let delay = params[7];
+    let power = bitcast<f32>(params[8]);
+    if delay == 0u && power == 0.0 {
+        return 1.0;
+    }
+    if iteration <= delay {
+        return 0.0;
+    }
+    return pow(f32(iteration - delay), power);
+}
+
 @compute @workgroup_size(64)
 fn update(@builtin(global_invocation_id) id: vec3<u32>) {
     let infoset = id.x;
@@ -132,7 +144,7 @@ fn update(@builtin(global_invocation_id) id: vec3<u32>) {
         if variant == 3u {
             prediction[offset + action] = regret;
         }
-        strategy_sum[offset + action] = strategy_sum[offset + action] * average_discount + strategy_weights[infoset] * strategy;
+        strategy_sum[offset + action] = strategy_sum[offset + action] * average_discount + strategy_weights[infoset] * average_strategy_weight_multiplier(iteration) * strategy;
     }
 }
 "#;
@@ -202,6 +214,18 @@ fn average_strategy_discount(variant: u32, iteration: u32, gamma: f32) -> f32 {
     return 1.0;
 }
 
+fn average_strategy_weight_multiplier(iteration: u32) -> f32 {
+    let delay = params[7];
+    let power = bitcast<f32>(params[8]);
+    if delay == 0u && power == 0.0 {
+        return 1.0;
+    }
+    if iteration <= delay {
+        return 0.0;
+    }
+    return pow(f32(iteration - delay), power);
+}
+
 @compute @workgroup_size(64)
 fn update(@builtin(global_invocation_id) id: vec3<u32>) {
     let infoset = id.x;
@@ -246,6 +270,9 @@ fn update(@builtin(global_invocation_id) id: vec3<u32>) {
     var strategy_weight = raw_strategy_weight * f32(iteration);
     if variant == 2u || variant == 3u || variant == 4u {
         strategy_weight = raw_strategy_weight;
+    }
+    if params[7] != 0u || bitcast<f32>(params[8]) != 0.0 {
+        strategy_weight = raw_strategy_weight * average_strategy_weight_multiplier(iteration);
     }
     for (var action = 0u; action < actions; action = action + 1u) {
         if legal_actions[offset + action] == 0u {
@@ -1773,6 +1800,7 @@ struct Params {
     child_tile_end: u32,
     public_infoset_end: u32,
     public_infoset_base: u32,
+    eta_bits: u32,
 };
 
 @group(0) @binding(0) var<storage, read> parent_nodes: array<TreeNode>;
@@ -1791,7 +1819,7 @@ struct Params {
 
 fn effective_regret(index: u32) -> f32 {
     if variant() == 3u {
-        return regrets[index] + prediction[index];
+        return regrets[index] + bitcast<f32>(params.eta_bits) * prediction[index];
     }
     return regrets[index];
 }
@@ -2344,6 +2372,7 @@ struct GpuPublicTreeParams {
     _pad0: u32,
     _pad1: u32,
     _pad2: u32,
+    _pad3: u32,
 }
 
 unsafe impl bytemuck::Zeroable for GpuPublicTreeParams {}
@@ -3423,6 +3452,8 @@ impl GpuDenseCfrBackend {
             variant_dcfr_alpha(state.variant, iteration).to_bits(),
             variant_dcfr_gamma(state.variant, iteration).to_bits(),
             variant_prediction_eta(state.variant, iteration).to_bits(),
+            super::average_strategy_delay() as u32,
+            super::average_strategy_power().to_bits(),
         ];
         let regrets = storage_buffer(&self.device, "regrets", &state.regrets);
         let prediction = storage_buffer(&self.device, "prediction", &state.prediction);
@@ -3693,6 +3724,7 @@ impl GpuDenseCfrBackend {
                 _pad0: 0,
                 _pad1: 0,
                 _pad2: 0,
+                _pad3: 0,
             }],
         );
         let aggregate_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -3724,6 +3756,7 @@ impl GpuDenseCfrBackend {
                 _pad0: 0,
                 _pad1: 0,
                 _pad2: 0,
+                _pad3: 0,
             }],
         );
         let value_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -3839,6 +3872,7 @@ impl GpuDenseCfrBackend {
                     _pad0: 0,
                     _pad1: 0,
                     _pad2: 0,
+                    _pad3: 0,
                 }],
             );
             let partial_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -3868,6 +3902,7 @@ impl GpuDenseCfrBackend {
                     _pad0: 0,
                     _pad1: 0,
                     _pad2: 0,
+                    _pad3: 0,
                 }],
             );
             let reduce_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -3939,6 +3974,7 @@ impl GpuDenseCfrBackend {
                             _pad0: 0,
                             _pad1: terminal_start as u32,
                             _pad2: 0,
+                            _pad3: 0,
                         }],
                     )
                 });
@@ -3956,6 +3992,7 @@ impl GpuDenseCfrBackend {
                             _pad0: 0,
                             _pad1: terminal_start as u32,
                             _pad2: 0,
+                            _pad3: 0,
                         }],
                     )
                 });
@@ -4377,6 +4414,7 @@ impl GpuDenseCfrBackend {
                         _pad0: tile.node_start as u32,
                         _pad1: variant_prediction_eta(variant, iteration).to_bits(),
                         _pad2: 0,
+                        _pad3: 0,
                     }],
                 );
                 let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -4436,6 +4474,7 @@ impl GpuDenseCfrBackend {
                     _pad0: br_player,
                     _pad1: variant_prediction_eta(variant, iteration).to_bits(),
                     _pad2: 0,
+                    _pad3: 0,
                 }],
             );
             let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -4485,6 +4524,7 @@ impl GpuDenseCfrBackend {
         prediction_buffer: &wgpu::Buffer,
         variant: super::CfrVariant,
         br_player: u32,
+        iteration: usize,
     ) {
         for parent_layer_index in (0..ctx.layer_tiles.len().saturating_sub(1)).rev() {
             let child_layer_index = parent_layer_index + 1;
@@ -4507,6 +4547,7 @@ impl GpuDenseCfrBackend {
                         _pad0: 0,
                         _pad1: 0,
                         _pad2: 0,
+                        _pad3: 0,
                     }],
                 );
                 let init_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -4568,6 +4609,7 @@ impl GpuDenseCfrBackend {
                                     _pad0: child_tile.node_end as u32,
                                     _pad1: chunk_public_end as u32,
                                     _pad2: chunk_public_base as u32,
+                                    _pad3: variant_prediction_eta(variant, iteration).to_bits(),
                                 }],
                             );
                             let bind_group =
@@ -4624,6 +4666,7 @@ impl GpuDenseCfrBackend {
                                 _pad0: child_tile.node_end as u32,
                                 _pad1: 0,
                                 _pad2: 0,
+                                _pad3: variant_prediction_eta(variant, iteration).to_bits(),
                             }],
                         );
                         let bind_group =
@@ -4701,6 +4744,7 @@ impl GpuDenseCfrBackend {
                         _pad0: 0,
                         _pad1: 0,
                         _pad2: 0,
+                        _pad3: 0,
                     }],
                 );
                 let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -4772,6 +4816,7 @@ impl GpuDenseCfrBackend {
                                 _pad0: chunk_public_end as u32,
                                 _pad1: 0,
                                 _pad2: 0,
+                                _pad3: 0,
                             }],
                         );
                         let bind_group =
@@ -4839,6 +4884,7 @@ impl GpuDenseCfrBackend {
                         _pad0: 0,
                         _pad1: 0,
                         _pad2: 0,
+                        _pad3: 0,
                     }],
                 );
                 let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -4909,6 +4955,7 @@ impl GpuDenseCfrBackend {
                         _pad0: 0,
                         _pad1: 0,
                         _pad2: 0,
+                        _pad3: 0,
                     }],
                 );
                 let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -5251,6 +5298,7 @@ impl GpuDenseCfrBackend {
             prediction_buffer,
             variant,
             br_player,
+            iteration,
         );
         encoder = self.finish_profile_phase(encoder, "cfv_backup", phase_start)?;
         phase_start = profile.then(Instant::now);
@@ -5543,6 +5591,8 @@ impl GpuDenseCfrBackend {
                     variant_dcfr_alpha(state.variant, iteration).to_bits(),
                     variant_dcfr_gamma(state.variant, iteration).to_bits(),
                     variant_prediction_eta(state.variant, iteration).to_bits(),
+                    super::average_strategy_delay() as u32,
+                    super::average_strategy_power().to_bits(),
                 ],
             );
             let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -5870,6 +5920,8 @@ impl GpuDenseCfrState {
             variant_dcfr_alpha(self.variant, iteration).to_bits(),
             variant_dcfr_gamma(self.variant, iteration).to_bits(),
             variant_prediction_eta(self.variant, iteration).to_bits(),
+            super::average_strategy_delay() as u32,
+            super::average_strategy_power().to_bits(),
         ];
         let action_values =
             readonly_buffer(&backend.device, "resident action values", action_values);
