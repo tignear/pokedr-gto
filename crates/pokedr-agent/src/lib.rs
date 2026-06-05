@@ -153,10 +153,24 @@ pub struct LocalGapDetail {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct FixedFlopTreeDump {
+    pub metrics: Option<FixedFlopTreeMetrics>,
     pub nodes: Vec<TreeNodeRecord>,
     pub actions: Vec<TreeActionRecord>,
     pub solver_nodes: Vec<SolverNodeRecord>,
     pub solver_combos: Vec<SolverComboRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct FixedFlopTreeMetrics {
+    pub iterations: usize,
+    pub root_exploitability: Option<f32>,
+    pub current_root_exploitability: Option<f32>,
+    pub hero_root_br_value: Option<f32>,
+    pub villain_root_br_value: Option<f32>,
+    pub current_hero_root_br_value: Option<f32>,
+    pub current_villain_root_br_value: Option<f32>,
+    pub recursive_root_br_gap: Option<f32>,
+    pub current_recursive_root_br_gap: Option<f32>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -204,6 +218,12 @@ pub struct SolverNodeRecord {
     pub current_policy_ev: Option<f32>,
     pub avg_gap: Option<f32>,
     pub current_gap: Option<f32>,
+    pub avg_recursive_action_ev: Option<Vec<f32>>,
+    pub current_recursive_action_ev: Option<Vec<f32>>,
+    pub avg_recursive_policy_ev: Option<f32>,
+    pub current_recursive_policy_ev: Option<f32>,
+    pub avg_recursive_gap: Option<f32>,
+    pub current_recursive_gap: Option<f32>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -213,10 +233,14 @@ pub struct SolverComboRecord {
     pub combo: String,
     pub reach: f32,
     pub weighted_gap: f32,
+    pub recursive_weighted_gap: f32,
+    pub current_recursive_weighted_gap: f32,
     pub avg_strategy_weight: f32,
     pub current_strategy_weight: f32,
     pub avg_action_values: Option<Vec<f32>>,
     pub current_action_values: Option<Vec<f32>>,
+    pub avg_recursive_action_values: Option<Vec<f32>>,
+    pub current_recursive_action_values: Option<Vec<f32>>,
     pub avg_strategy: Vec<f32>,
     pub current_strategy: Vec<f32>,
     pub regrets: Vec<f32>,
@@ -503,8 +527,9 @@ pub fn solve_fixed_flop_once(
         },
     );
     let layout = PostflopDenseLayout::from_tree(&tree);
-    let hero_weights = vec![1.0; COMBO_COUNT];
-    let villain_weights = vec![1.0; COMBO_COUNT];
+    let indexer = ComboIndexer::new();
+    let root_dead = root_board(&tree).deck_mask();
+    let (hero_weights, villain_weights) = fixed_flop_root_weights(&indexer, root_dead);
     let state = solve_public_tree_cfr(&tree, &layout, &config, &hero_weights, &villain_weights);
     FixedFlopSolveSummary {
         board: format_pokedr_cards(&flop),
@@ -558,10 +583,9 @@ where
         },
     );
     let layout = PostflopDenseLayout::from_tree(&tree);
-    let hero_weights = vec![1.0; COMBO_COUNT];
-    let villain_weights = vec![1.0; COMBO_COUNT];
     let indexer = ComboIndexer::new();
     let root_dead = root_board(&tree).deck_mask();
+    let (hero_weights, villain_weights) = fixed_flop_root_weights(&indexer, root_dead);
     if let Some(rows) = try_solve_fixed_flop_metrics_gpu(
         &tree,
         &layout,
@@ -708,6 +732,9 @@ pub fn build_fixed_flop_tree_dump_with_combo_limit(
     }
 
     FixedFlopTreeDump {
+        metrics: solver_dump
+            .as_ref()
+            .map(|context| context.fixed_flop_tree_metrics()),
         nodes,
         actions,
         solver_nodes,
@@ -1324,9 +1351,8 @@ fn root_exploitability_from_recursive_values(
     villain_values: &GpuRootTerminalValues,
 ) -> RootExploitability {
     let mut hero_br_sum = 0.0;
-    let mut hero_weight_sum = 0.0;
     let mut villain_br_sum = 0.0;
-    let mut villain_weight_sum = 0.0;
+    let mut joint_weight_sum = 0.0;
 
     for (combo_index, combo) in combos.iter().enumerate() {
         if combo_legal.get(combo_index).copied().unwrap_or(0) == 0 {
@@ -1334,7 +1360,6 @@ fn root_exploitability_from_recursive_values(
         }
 
         let mut villain_nonblocking_weight = 0.0;
-        let mut hero_nonblocking_weight = 0.0;
         for (opponent_index, opponent) in combos.iter().enumerate() {
             if opponent_index == combo_index
                 || combo_legal.get(opponent_index).copied().unwrap_or(0) == 0
@@ -1347,39 +1372,35 @@ fn root_exploitability_from_recursive_values(
             }
             villain_nonblocking_weight +=
                 villain_weights.get(opponent_index).copied().unwrap_or(0.0);
-            hero_nonblocking_weight += hero_weights.get(opponent_index).copied().unwrap_or(0.0);
         }
 
         let hero_weight = hero_weights.get(combo_index).copied().unwrap_or(0.0);
-        if hero_weight > 0.0 && villain_nonblocking_weight > 0.0 {
+        if hero_weight > 0.0 {
+            joint_weight_sum += hero_weight * villain_nonblocking_weight;
             let hero_value = hero_values
                 .root_hero_values
                 .get(combo_index)
                 .copied()
-                .unwrap_or(0.0)
-                / villain_nonblocking_weight;
+                .unwrap_or(0.0);
             if hero_value.is_finite() {
                 hero_br_sum += hero_value * hero_weight;
-                hero_weight_sum += hero_weight;
             }
         }
 
         let villain_weight = villain_weights.get(combo_index).copied().unwrap_or(0.0);
-        if villain_weight > 0.0 && hero_nonblocking_weight > 0.0 {
+        if villain_weight > 0.0 {
             let villain_value = villain_values
                 .root_villain_values
                 .get(combo_index)
                 .copied()
-                .unwrap_or(0.0)
-                / hero_nonblocking_weight;
+                .unwrap_or(0.0);
             if villain_value.is_finite() {
                 villain_br_sum += villain_value * villain_weight;
-                villain_weight_sum += villain_weight;
             }
         }
     }
 
-    if hero_weight_sum <= 0.0 || villain_weight_sum <= 0.0 {
+    if joint_weight_sum <= 0.0 {
         return RootExploitability {
             exploitability: 0.0,
             hero_br_value: 0.0,
@@ -1387,8 +1408,8 @@ fn root_exploitability_from_recursive_values(
         };
     }
 
-    let hero_br_value = hero_br_sum / hero_weight_sum;
-    let villain_br_value = villain_br_sum / villain_weight_sum;
+    let hero_br_value = hero_br_sum / joint_weight_sum;
+    let villain_br_value = villain_br_sum / joint_weight_sum;
     RootExploitability {
         exploitability: (hero_br_value + villain_br_value).max(0.0),
         hero_br_value,
@@ -2454,6 +2475,34 @@ fn observed_hero_range_weights(game_state: &GameState, indexer: &ComboIndexer) -
     simple_preflop_range_weights(indexer, PreflopClass::Playable, board_mask)
 }
 
+fn fixed_flop_root_weights(indexer: &ComboIndexer, root_dead: u64) -> (Vec<f32>, Vec<f32>) {
+    let mut hero_weights = simple_preflop_range_weights(indexer, PreflopClass::Playable, root_dead);
+    let mut villain_weights =
+        simple_preflop_range_weights(indexer, PreflopClass::Speculative, root_dead);
+    apply_env_range_limit("POKEDR_HERO_RANGE_LIMIT", &mut hero_weights);
+    apply_env_range_limit("POKEDR_VILLAIN_RANGE_LIMIT", &mut villain_weights);
+    (hero_weights, villain_weights)
+}
+
+fn apply_env_range_limit(name: &str, weights: &mut [f32]) {
+    let Some(limit) = std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+    else {
+        return;
+    };
+    let mut kept = 0usize;
+    for weight in weights {
+        if *weight <= 0.0 {
+            continue;
+        }
+        kept += 1;
+        if kept > limit {
+            *weight = 0.0;
+        }
+    }
+}
+
 fn simple_preflop_range_weights(
     indexer: &ComboIndexer,
     minimum_class: PreflopClass,
@@ -2882,6 +2931,12 @@ struct DumpSolverContext {
     state: DenseCfrState,
     average_values: Option<GpuRootTerminalValues>,
     current_values: Option<GpuRootTerminalValues>,
+    average_recursive_hero_values: Option<GpuRootTerminalValues>,
+    average_recursive_villain_values: Option<GpuRootTerminalValues>,
+    current_recursive_hero_values: Option<GpuRootTerminalValues>,
+    current_recursive_villain_values: Option<GpuRootTerminalValues>,
+    recursive_br_gap: Option<BrGapMetrics>,
+    current_recursive_br_gap: Option<BrGapMetrics>,
     indexer: ComboIndexer,
     root_dead: u64,
     iterations: usize,
@@ -2914,12 +2969,18 @@ impl DumpSolverContext {
     ) -> Self {
         let indexer = ComboIndexer::new();
         let root_dead = root_board(tree).deck_mask();
-        let hero_weights =
-            simple_preflop_range_weights(&indexer, PreflopClass::Playable, root_dead);
-        let villain_weights =
-            simple_preflop_range_weights(&indexer, PreflopClass::Speculative, root_dead);
+        let (hero_weights, villain_weights) = fixed_flop_root_weights(&indexer, root_dead);
         let state = solve_public_tree_cfr(tree, layout, config, &hero_weights, &villain_weights);
-        let (average_values, current_values) = cfr_gpu_backend()
+        let (
+            average_values,
+            current_values,
+            average_recursive_hero_values,
+            average_recursive_villain_values,
+            current_recursive_hero_values,
+            current_recursive_villain_values,
+            recursive_br_gap,
+            current_recursive_br_gap,
+        ) = cfr_gpu_backend()
             .and_then(|backend| {
                 let matrix_cache =
                     RefCell::new(ShowdownMatrixCache::new(showdown_matrix_cache_capacity()));
@@ -2959,18 +3020,158 @@ impl DumpSolverContext {
                         &state,
                     )
                     .ok()?;
-                Some((Some(average_values), Some(current_values)))
+                backend.wait_idle().ok()?;
+                let average_recursive_hero_values = backend
+                    .public_tree_best_response_values(
+                        &linearized.nodes,
+                        &linearized.children,
+                        &linearized.child_cards,
+                        &combos,
+                        &combo_legal,
+                        &hero_weights,
+                        &villain_weights,
+                        &linearized.showdown_boards,
+                        &profile,
+                        0,
+                    )
+                    .ok()?;
+                backend.wait_idle().ok()?;
+                let average_recursive_villain_values = backend
+                    .public_tree_best_response_values(
+                        &linearized.nodes,
+                        &linearized.children,
+                        &linearized.child_cards,
+                        &combos,
+                        &combo_legal,
+                        &hero_weights,
+                        &villain_weights,
+                        &linearized.showdown_boards,
+                        &profile,
+                        1,
+                    )
+                    .ok()?;
+                backend.wait_idle().ok()?;
+                let current_recursive_hero_values = backend
+                    .public_tree_best_response_values(
+                        &linearized.nodes,
+                        &linearized.children,
+                        &linearized.child_cards,
+                        &combos,
+                        &combo_legal,
+                        &hero_weights,
+                        &villain_weights,
+                        &linearized.showdown_boards,
+                        &state,
+                        0,
+                    )
+                    .ok()?;
+                backend.wait_idle().ok()?;
+                let current_recursive_villain_values = backend
+                    .public_tree_best_response_values(
+                        &linearized.nodes,
+                        &linearized.children,
+                        &linearized.child_cards,
+                        &combos,
+                        &combo_legal,
+                        &hero_weights,
+                        &villain_weights,
+                        &linearized.showdown_boards,
+                        &state,
+                        1,
+                    )
+                    .ok()?;
+                backend.wait_idle().ok()?;
+                let recursive_br_gap = recursive_br_gap_metrics_from_values(
+                    tree,
+                    layout,
+                    &state,
+                    &profile,
+                    &combos,
+                    &combo_legal,
+                    &hero_weights,
+                    &villain_weights,
+                    &average_recursive_hero_values,
+                    &average_recursive_villain_values,
+                    false,
+                );
+                let current_recursive_br_gap = recursive_br_gap_metrics_from_values(
+                    tree,
+                    layout,
+                    &state,
+                    &state,
+                    &combos,
+                    &combo_legal,
+                    &hero_weights,
+                    &villain_weights,
+                    &current_recursive_hero_values,
+                    &current_recursive_villain_values,
+                    false,
+                );
+                Some((
+                    Some(average_values),
+                    Some(current_values),
+                    Some(average_recursive_hero_values),
+                    Some(average_recursive_villain_values),
+                    Some(current_recursive_hero_values),
+                    Some(current_recursive_villain_values),
+                    Some(recursive_br_gap),
+                    Some(current_recursive_br_gap),
+                ))
             })
-            .unwrap_or((None, None));
+            .unwrap_or((None, None, None, None, None, None, None, None));
         Self {
             state,
             average_values,
             current_values,
+            average_recursive_hero_values,
+            average_recursive_villain_values,
+            current_recursive_hero_values,
+            current_recursive_villain_values,
+            recursive_br_gap,
+            current_recursive_br_gap,
             indexer,
             root_dead,
             iterations: config.cfr_iterations.max(1),
             mode,
             combo_limit,
+        }
+    }
+
+    fn fixed_flop_tree_metrics(&self) -> FixedFlopTreeMetrics {
+        FixedFlopTreeMetrics {
+            iterations: self.iterations,
+            root_exploitability: self
+                .recursive_br_gap
+                .as_ref()
+                .map(|metrics| metrics.root_exploitability),
+            current_root_exploitability: self
+                .current_recursive_br_gap
+                .as_ref()
+                .map(|metrics| metrics.root_exploitability),
+            hero_root_br_value: self
+                .recursive_br_gap
+                .as_ref()
+                .map(|metrics| metrics.hero_root_br_value),
+            villain_root_br_value: self
+                .recursive_br_gap
+                .as_ref()
+                .map(|metrics| metrics.villain_root_br_value),
+            current_hero_root_br_value: self
+                .current_recursive_br_gap
+                .as_ref()
+                .map(|metrics| metrics.hero_root_br_value),
+            current_villain_root_br_value: self
+                .current_recursive_br_gap
+                .as_ref()
+                .map(|metrics| metrics.villain_root_br_value),
+            recursive_root_br_gap: self
+                .recursive_br_gap
+                .as_ref()
+                .map(|metrics| metrics.root_br_gap),
+            current_recursive_root_br_gap: self
+                .current_recursive_br_gap
+                .as_ref()
+                .map(|metrics| metrics.root_br_gap),
         }
     }
 }
@@ -3097,6 +3298,8 @@ fn dump_solver_node_json(
     let mut avg_policy_value_sum = 0.0;
     let mut current_policy_value_sum = 0.0;
     let mut action_value_weight_sum = 0.0;
+    let mut avg_strategy_weight_sum = 0.0;
+    let mut current_strategy_weight_sum = 0.0;
     let mut legal_combo_count = 0usize;
     let mut gap_rows = Vec::new();
 
@@ -3111,19 +3314,22 @@ fn dump_solver_node_json(
         context
             .state
             .average_strategy_for(infoset, &mut average_strategy);
-        for action in 0..action_count {
-            average_sum[action] += average_strategy[action];
-            current_sum[action] += current_strategy[action];
-        }
         let row = dump_solver_combo_row(
             context,
+            state.acting_player,
             combo_index,
             offset,
             action_count,
             &average_strategy,
             &current_strategy,
         );
-        if row.reach_weight > 0.0 {
+        for action in 0..action_count {
+            average_sum[action] += average_strategy[action] * row.avg_strategy_weight;
+            current_sum[action] += current_strategy[action] * row.current_strategy_weight;
+        }
+        avg_strategy_weight_sum += row.avg_strategy_weight;
+        current_strategy_weight_sum += row.current_strategy_weight;
+        if row.reach_weight > 0.0 && row.avg_strategy_weight > 0.0 {
             let value_weight = row.reach_weight;
             if let Some(values) = &row.avg_action_values {
                 for action in 0..action_count {
@@ -3144,9 +3350,21 @@ fn dump_solver_node_json(
         gap_rows.push(row);
     }
 
-    if legal_combo_count > 0 {
+    if avg_strategy_weight_sum > 0.0 {
+        for action in 0..action_count {
+            average_sum[action] /= avg_strategy_weight_sum;
+        }
+    } else if legal_combo_count > 0 {
         for action in 0..action_count {
             average_sum[action] /= legal_combo_count as f32;
+        }
+    }
+    if current_strategy_weight_sum > 0.0 {
+        for action in 0..action_count {
+            current_sum[action] /= current_strategy_weight_sum;
+        }
+    } else if legal_combo_count > 0 {
+        for action in 0..action_count {
             current_sum[action] /= legal_combo_count as f32;
         }
     }
@@ -3216,12 +3434,16 @@ struct DumpSolverComboRow {
     reach_weight: f32,
     gap: f32,
     weighted_gap: f32,
+    recursive_weighted_gap: f32,
+    current_recursive_weighted_gap: f32,
     avg_strategy_weight: f32,
     current_strategy_weight: f32,
     best_action: Option<usize>,
     policy_value: Option<f32>,
     avg_action_values: Option<Vec<f32>>,
     current_action_values: Option<Vec<f32>>,
+    avg_recursive_action_values: Option<Vec<f32>>,
+    current_recursive_action_values: Option<Vec<f32>>,
     average_strategy: Vec<f32>,
     current_strategy: Vec<f32>,
     regrets: Vec<f32>,
@@ -3263,6 +3485,7 @@ impl DumpSolverComboRow {
 
 fn dump_solver_combo_row(
     context: &DumpSolverContext,
+    player: Player,
     combo_index: usize,
     offset: usize,
     action_count: usize,
@@ -3280,6 +3503,28 @@ fn dump_solver_combo_row(
         .current_values
         .as_ref()
         .map(|values| values.action_values[offset..offset + action_count].to_vec());
+    let avg_recursive_values = match context
+        .average_recursive_hero_values
+        .as_ref()
+        .zip(context.average_recursive_villain_values.as_ref())
+    {
+        Some((hero_values, villain_values)) => Some(match player {
+            Player::Hero => hero_values.action_values[offset..offset + action_count].to_vec(),
+            Player::Villain => villain_values.action_values[offset..offset + action_count].to_vec(),
+        }),
+        None => None,
+    };
+    let current_recursive_values = match context
+        .current_recursive_hero_values
+        .as_ref()
+        .zip(context.current_recursive_villain_values.as_ref())
+    {
+        Some((hero_values, villain_values)) => Some(match player {
+            Player::Hero => hero_values.action_values[offset..offset + action_count].to_vec(),
+            Player::Villain => villain_values.action_values[offset..offset + action_count].to_vec(),
+        }),
+        None => None,
+    };
     let reach_weight = context
         .average_values
         .as_ref()
@@ -3306,6 +3551,12 @@ fn dump_solver_combo_row(
         })
         .copied()
         .unwrap_or(0.0);
+    let current_reach_weight = context
+        .current_values
+        .as_ref()
+        .and_then(|values| values.reach_weights.get(offset / context.state.actions()))
+        .copied()
+        .unwrap_or(0.0);
     let (best_action, gap, policy_value) = avg_action_values
         .as_ref()
         .map(|values| {
@@ -3330,23 +3581,55 @@ fn dump_solver_combo_row(
             )
         })
         .unwrap_or((None, 0.0, None));
+    let recursive_weighted_gap = avg_recursive_values
+        .as_ref()
+        .map(|values| combo_gap(values, average_strategy, action_count).max(0.0) * reach_weight)
+        .unwrap_or(0.0);
+    let current_recursive_weighted_gap = current_recursive_values
+        .as_ref()
+        .map(|values| {
+            combo_gap(values, current_strategy, action_count).max(0.0) * current_reach_weight
+        })
+        .unwrap_or(0.0);
     DumpSolverComboRow {
         combo_index,
         combo: format_pokedr_cards(&[combo.first, combo.second]),
         reach_weight,
         gap,
         weighted_gap: gap * reach_weight,
+        recursive_weighted_gap,
+        current_recursive_weighted_gap,
         avg_strategy_weight,
         current_strategy_weight,
         best_action,
         policy_value,
         avg_action_values,
         current_action_values,
+        avg_recursive_action_values: avg_recursive_values,
+        current_recursive_action_values: current_recursive_values,
         average_strategy: average_strategy[..action_count].to_vec(),
         current_strategy: current_strategy[..action_count].to_vec(),
         regrets,
         strategy_sum,
     }
+}
+
+fn combo_gap(values: &[f32], strategy: &[f32], action_count: usize) -> f32 {
+    let best = values
+        .iter()
+        .take(action_count)
+        .copied()
+        .fold(f32::NEG_INFINITY, f32::max);
+    if !best.is_finite() {
+        return 0.0;
+    }
+    let policy = values
+        .iter()
+        .zip(strategy)
+        .take(action_count)
+        .map(|(value, probability)| value * probability)
+        .sum::<f32>();
+    best - policy
 }
 
 fn tree_node_record(
@@ -3430,7 +3713,18 @@ fn solver_node_records(
     let mut current_action_value_sum = vec![0.0; action_count];
     let mut avg_policy_value_sum = 0.0;
     let mut current_policy_value_sum = 0.0;
-    let mut action_value_weight_sum = 0.0;
+    let mut avg_recursive_action_value_sum = vec![0.0; action_count];
+    let mut current_recursive_action_value_sum = vec![0.0; action_count];
+    let mut avg_recursive_policy_value_sum = 0.0;
+    let mut current_recursive_policy_value_sum = 0.0;
+    let mut avg_recursive_value_weight_sum = 0.0;
+    let mut current_recursive_value_weight_sum = 0.0;
+    let mut avg_recursive_combo_gap_weighted_sum = 0.0;
+    let mut current_recursive_combo_gap_weighted_sum = 0.0;
+    let mut avg_action_value_weight_sum = 0.0;
+    let mut current_action_value_weight_sum = 0.0;
+    let mut avg_combo_gap_weighted_sum = 0.0;
+    let mut current_combo_gap_weighted_sum = 0.0;
     let mut avg_strategy_weight_sum = 0.0;
     let mut current_strategy_weight_sum = 0.0;
     let mut legal_combo_count = 0usize;
@@ -3447,18 +3741,19 @@ fn solver_node_records(
         context
             .state
             .average_strategy_for(infoset, &mut average_strategy);
-        for action in 0..action_count {
-            average_sum[action] += average_strategy[action];
-            current_sum[action] += current_strategy[action];
-        }
         let row = dump_solver_combo_row(
             context,
+            state.acting_player,
             combo_index,
             offset,
             action_count,
             &average_strategy,
             &current_strategy,
         );
+        for action in 0..action_count {
+            average_sum[action] += average_strategy[action] * row.avg_strategy_weight;
+            current_sum[action] += current_strategy[action] * row.current_strategy_weight;
+        }
         avg_strategy_weight_sum += row.avg_strategy_weight;
         current_strategy_weight_sum += row.current_strategy_weight;
         if row.reach_weight > 0.0 {
@@ -3470,48 +3765,136 @@ fn solver_node_records(
                         values[action] * average_strategy[action] * value_weight;
                 }
             }
+            avg_combo_gap_weighted_sum += row.weighted_gap;
+            avg_action_value_weight_sum += value_weight;
+        }
+        let current_value_weight = context
+            .current_values
+            .as_ref()
+            .and_then(|values| values.reach_weights.get(offset / context.state.actions()))
+            .copied()
+            .unwrap_or(0.0);
+        if current_value_weight > 0.0 && row.current_strategy_weight > 0.0 {
             if let Some(values) = &row.current_action_values {
                 for action in 0..action_count {
-                    current_action_value_sum[action] += values[action] * value_weight;
+                    current_action_value_sum[action] += values[action] * current_value_weight;
                     current_policy_value_sum +=
-                        values[action] * current_strategy[action] * value_weight;
+                        values[action] * current_strategy[action] * current_value_weight;
                 }
+                let best_value = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let policy_value = values
+                    .iter()
+                    .zip(&current_strategy)
+                    .take(action_count)
+                    .map(|(value, probability)| value * probability)
+                    .sum::<f32>();
+                current_combo_gap_weighted_sum +=
+                    (best_value - policy_value).max(0.0) * current_value_weight;
             }
-            action_value_weight_sum += value_weight;
+            current_action_value_weight_sum += current_value_weight;
+        }
+        let avg_recursive_values = match state.acting_player {
+            Player::Hero => context.average_recursive_hero_values.as_ref(),
+            Player::Villain => context.average_recursive_villain_values.as_ref(),
+        };
+        if let Some(values) = avg_recursive_values {
+            let value_weight = values
+                .reach_weights
+                .get(offset / context.state.actions())
+                .copied()
+                .unwrap_or(0.0);
+            if value_weight > 0.0 {
+                for action in 0..action_count {
+                    let value = values.action_values[offset + action];
+                    avg_recursive_action_value_sum[action] += value * value_weight;
+                    avg_recursive_policy_value_sum +=
+                        value * average_strategy[action] * value_weight;
+                }
+                avg_recursive_combo_gap_weighted_sum += row.recursive_weighted_gap;
+                avg_recursive_value_weight_sum += value_weight;
+            }
+        }
+        let current_recursive_values = match state.acting_player {
+            Player::Hero => context.current_recursive_hero_values.as_ref(),
+            Player::Villain => context.current_recursive_villain_values.as_ref(),
+        };
+        if let Some(values) = current_recursive_values {
+            let value_weight = values
+                .reach_weights
+                .get(offset / context.state.actions())
+                .copied()
+                .unwrap_or(0.0);
+            if value_weight > 0.0 {
+                for action in 0..action_count {
+                    let value = values.action_values[offset + action];
+                    current_recursive_action_value_sum[action] += value * value_weight;
+                    current_recursive_policy_value_sum +=
+                        value * current_strategy[action] * value_weight;
+                }
+                if let Some(values) = &row.current_recursive_action_values {
+                    current_recursive_combo_gap_weighted_sum +=
+                        combo_gap(values, &current_strategy, action_count).max(0.0) * value_weight;
+                }
+                current_recursive_value_weight_sum += value_weight;
+            }
         }
         combo_rows.push(row);
     }
 
-    if legal_combo_count > 0 {
+    if avg_strategy_weight_sum > 0.0 {
+        for action in 0..action_count {
+            average_sum[action] /= avg_strategy_weight_sum;
+        }
+    } else if legal_combo_count > 0 {
         for action in 0..action_count {
             average_sum[action] /= legal_combo_count as f32;
+        }
+    }
+    if current_strategy_weight_sum > 0.0 {
+        for action in 0..action_count {
+            current_sum[action] /= current_strategy_weight_sum;
+        }
+    } else if legal_combo_count > 0 {
+        for action in 0..action_count {
             current_sum[action] /= legal_combo_count as f32;
         }
     }
-    let has_ev = action_value_weight_sum > 0.0;
-    if has_ev {
+    let has_avg_ev = avg_action_value_weight_sum > 0.0;
+    if has_avg_ev {
         for action in 0..action_count {
-            avg_action_value_sum[action] /= action_value_weight_sum;
-            current_action_value_sum[action] /= action_value_weight_sum;
+            avg_action_value_sum[action] /= avg_action_value_weight_sum;
         }
-        avg_policy_value_sum /= action_value_weight_sum;
-        current_policy_value_sum /= action_value_weight_sum;
+        avg_policy_value_sum /= avg_action_value_weight_sum;
+    }
+    let has_current_ev = current_action_value_weight_sum > 0.0;
+    if has_current_ev {
+        for action in 0..action_count {
+            current_action_value_sum[action] /= current_action_value_weight_sum;
+        }
+        current_policy_value_sum /= current_action_value_weight_sum;
+    }
+    let has_avg_recursive_ev = avg_recursive_value_weight_sum > 0.0;
+    if has_avg_recursive_ev {
+        for action in 0..action_count {
+            avg_recursive_action_value_sum[action] /= avg_recursive_value_weight_sum;
+        }
+        avg_recursive_policy_value_sum /= avg_recursive_value_weight_sum;
+    }
+    let has_current_recursive_ev = current_recursive_value_weight_sum > 0.0;
+    if has_current_recursive_ev {
+        for action in 0..action_count {
+            current_recursive_action_value_sum[action] /= current_recursive_value_weight_sum;
+        }
+        current_recursive_policy_value_sum /= current_recursive_value_weight_sum;
     }
 
-    let avg_gap = has_ev.then(|| {
-        avg_action_value_sum
-            .iter()
-            .copied()
-            .fold(f32::NEG_INFINITY, f32::max)
-            - avg_policy_value_sum
-    });
-    let current_gap = has_ev.then(|| {
-        current_action_value_sum
-            .iter()
-            .copied()
-            .fold(f32::NEG_INFINITY, f32::max)
-            - current_policy_value_sum
-    });
+    let avg_gap = has_avg_ev.then(|| avg_combo_gap_weighted_sum / avg_action_value_weight_sum);
+    let current_gap =
+        has_current_ev.then(|| current_combo_gap_weighted_sum / current_action_value_weight_sum);
+    let avg_recursive_gap = has_avg_recursive_ev
+        .then(|| avg_recursive_combo_gap_weighted_sum / avg_recursive_value_weight_sum);
+    let current_recursive_gap = has_current_recursive_ev
+        .then(|| current_recursive_combo_gap_weighted_sum / current_recursive_value_weight_sum);
     combo_rows.sort_by(|left, right| {
         right
             .weighted_gap
@@ -3520,6 +3903,7 @@ fn solver_node_records(
     });
     let combo_records = combo_rows
         .iter()
+        .filter(|row| row.avg_strategy_weight > 0.0 || row.current_strategy_weight > 0.0)
         .take(context.combo_limit)
         .map(|row| SolverComboRecord {
             node_id,
@@ -3527,10 +3911,14 @@ fn solver_node_records(
             combo: row.combo.clone(),
             reach: row.reach_weight,
             weighted_gap: row.weighted_gap,
+            recursive_weighted_gap: row.recursive_weighted_gap,
+            current_recursive_weighted_gap: row.current_recursive_weighted_gap,
             avg_strategy_weight: row.avg_strategy_weight,
             current_strategy_weight: row.current_strategy_weight,
             avg_action_values: row.avg_action_values.clone(),
             current_action_values: row.current_action_values.clone(),
+            avg_recursive_action_values: row.avg_recursive_action_values.clone(),
+            current_recursive_action_values: row.current_recursive_action_values.clone(),
             avg_strategy: row.average_strategy.clone(),
             current_strategy: row.current_strategy.clone(),
             regrets: row.regrets.clone(),
@@ -3546,17 +3934,25 @@ fn solver_node_records(
             acting_player: format!("{:?}", state.acting_player),
             action_count,
             legal_combo_count,
-            value_reach_sum: action_value_weight_sum,
+            value_reach_sum: avg_action_value_weight_sum,
             avg_strategy_weight_sum,
             current_strategy_weight_sum,
             avg_strategy: average_sum,
             current_strategy: current_sum,
-            avg_action_ev: has_ev.then_some(avg_action_value_sum),
-            current_action_ev: has_ev.then_some(current_action_value_sum),
-            avg_policy_ev: has_ev.then_some(avg_policy_value_sum),
-            current_policy_ev: has_ev.then_some(current_policy_value_sum),
+            avg_action_ev: has_avg_ev.then_some(avg_action_value_sum),
+            current_action_ev: has_current_ev.then_some(current_action_value_sum),
+            avg_policy_ev: has_avg_ev.then_some(avg_policy_value_sum),
+            current_policy_ev: has_current_ev.then_some(current_policy_value_sum),
             avg_gap: avg_gap.map(|value| value.max(0.0)),
             current_gap: current_gap.map(|value| value.max(0.0)),
+            avg_recursive_action_ev: has_avg_recursive_ev.then_some(avg_recursive_action_value_sum),
+            current_recursive_action_ev: has_current_recursive_ev
+                .then_some(current_recursive_action_value_sum),
+            avg_recursive_policy_ev: has_avg_recursive_ev.then_some(avg_recursive_policy_value_sum),
+            current_recursive_policy_ev: has_current_recursive_ev
+                .then_some(current_recursive_policy_value_sum),
+            avg_recursive_gap: avg_recursive_gap.map(|value| value.max(0.0)),
+            current_recursive_gap: current_recursive_gap.map(|value| value.max(0.0)),
         },
         combo_records,
     ))
@@ -4285,6 +4681,1406 @@ mod tests {
             state.infosets(),
             layout.infoset_count() * PRIVATE_INFOS_PER_PUBLIC
         );
+    }
+
+    #[test]
+    fn cpu_depth_three_chance_game_converges_on_sparse_ranges() {
+        let flop = [
+            PokedrCard::new(PokedrRank::Ace, PokedrSuit::Spades),
+            PokedrCard::new(PokedrRank::Seven, PokedrSuit::Hearts),
+            PokedrCard::new(PokedrRank::Two, PokedrSuit::Clubs),
+        ];
+        let config = PokedrAgentConfig {
+            cfr_iterations: 256,
+            cfr_variant: CfrVariant::CfrPlus,
+            action_set: ActionSetConfig {
+                max_aggressive_actions: 1,
+                flop_bet_fractions: vec![1.0],
+                turn_bet_fractions: vec![1.0],
+                river_bet_fractions: vec![1.0],
+                raise_fractions: vec![1.0],
+                ..ActionSetConfig::default()
+            },
+            max_raises_per_street: 1,
+            max_depth: 3,
+            max_showdown_runouts: usize::MAX,
+        };
+        let (tree, layout) = fixed_flop_tree_and_layout(flop, config.clone());
+        let indexer = ComboIndexer::new();
+        let mut hero_weights = vec![0.0; COMBO_COUNT];
+        let mut villain_weights = vec![0.0; COMBO_COUNT];
+        for combo in [
+            [
+                PokedrCard::new(PokedrRank::Ace, PokedrSuit::Clubs),
+                PokedrCard::new(PokedrRank::Ace, PokedrSuit::Diamonds),
+            ],
+            [
+                PokedrCard::new(PokedrRank::King, PokedrSuit::Clubs),
+                PokedrCard::new(PokedrRank::King, PokedrSuit::Diamonds),
+            ],
+        ] {
+            hero_weights[hero_combo_index(&indexer, combo)] = 1.0;
+        }
+        for combo in [
+            [
+                PokedrCard::new(PokedrRank::Queen, PokedrSuit::Clubs),
+                PokedrCard::new(PokedrRank::Queen, PokedrSuit::Diamonds),
+            ],
+            [
+                PokedrCard::new(PokedrRank::Jack, PokedrSuit::Clubs),
+                PokedrCard::new(PokedrRank::Jack, PokedrSuit::Diamonds),
+            ],
+        ] {
+            villain_weights[hero_combo_index(&indexer, combo)] = 1.0;
+        }
+        let state = solve_public_tree_cfr(&tree, &layout, &config, &hero_weights, &villain_weights);
+        let exploitability = cpu_recursive_root_exploitability(
+            &tree,
+            &layout,
+            &state,
+            &indexer,
+            &hero_weights,
+            &villain_weights,
+            config.max_showdown_runouts,
+        );
+
+        assert!(
+            exploitability * 100.0 < 1.0,
+            "sparse depth3 exploitability stayed at {:.3} bb/100",
+            exploitability * 100.0
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a working local GPU backend"]
+    fn gpu_public_tree_iteration_matches_cpu_on_sparse_depth_three() {
+        let flop = [
+            PokedrCard::new(PokedrRank::Ace, PokedrSuit::Spades),
+            PokedrCard::new(PokedrRank::Seven, PokedrSuit::Hearts),
+            PokedrCard::new(PokedrRank::Two, PokedrSuit::Clubs),
+        ];
+        let config = PokedrAgentConfig {
+            cfr_iterations: 32,
+            cfr_variant: CfrVariant::CfrPlus,
+            action_set: ActionSetConfig {
+                max_aggressive_actions: 1,
+                flop_bet_fractions: vec![1.0],
+                turn_bet_fractions: vec![1.0],
+                river_bet_fractions: vec![1.0],
+                raise_fractions: vec![1.0],
+                ..ActionSetConfig::default()
+            },
+            max_raises_per_street: 1,
+            max_depth: 3,
+            max_showdown_runouts: usize::MAX,
+        };
+        let (tree, layout) = fixed_flop_tree_and_layout(flop, config.clone());
+        let indexer = ComboIndexer::new();
+        let (hero_weights, villain_weights) = sparse_test_ranges(&indexer);
+        let mut dense_config = layout.dense_config(config.cfr_variant);
+        dense_config.infosets *= PRIVATE_INFOS_PER_PUBLIC;
+        let state = DenseCfrState::new_with_legal_actions(
+            dense_config.clone(),
+            private_legal_actions(&layout),
+        );
+        let mut cpu_batch = DenseCfrIteration::new(&dense_config);
+        let matrix_cache = RefCell::new(ShowdownMatrixCache::new(1));
+        fill_public_tree_iteration(
+            &tree,
+            &layout,
+            &indexer,
+            None,
+            &state,
+            &config,
+            &hero_weights,
+            &villain_weights,
+            &matrix_cache,
+            &mut cpu_batch,
+        );
+
+        let backend = GpuDenseCfrBackend::new().expect("GPU backend should initialize");
+        let linearized =
+            linearize_gpu_public_tree(&tree, &layout, &backend, &config, &matrix_cache)
+                .expect("tree should linearize");
+        let combos = gpu_private_combos();
+        let root_dead = root_board(&tree).deck_mask();
+        let combo_legal = indexer
+            .combos()
+            .iter()
+            .map(|combo| (!combo.collides_with(root_dead)) as u32)
+            .collect::<Vec<_>>();
+        let gpu_values = backend
+            .public_tree_iteration_values(
+                &linearized.nodes,
+                &linearized.children,
+                &linearized.child_cards,
+                &combos,
+                &combo_legal,
+                &hero_weights,
+                &villain_weights,
+                &linearized.showdown_boards,
+                &state,
+            )
+            .expect("GPU public tree values should run");
+
+        let mut max_action_delta = 0.0f32;
+        let mut max_action_site = None;
+        let mut max_reach_delta = 0.0f32;
+        let mut max_reach_site = None;
+        for public_infoset in 0..layout.infoset_count() {
+            let action_count = layout.action_count(public_infoset);
+            let player = infoset_acting_player(&tree, &layout, public_infoset);
+            for combo_index in 0..COMBO_COUNT {
+                let infoset = private_infoset(public_infoset, player, combo_index);
+                if cpu_batch.strategy_weights[infoset] <= 1e-6
+                    && gpu_values.strategy_weights[infoset] <= 1e-6
+                {
+                    continue;
+                }
+                let reach_delta =
+                    (cpu_batch.reach_weights[infoset] - gpu_values.reach_weights[infoset]).abs();
+                if reach_delta > max_reach_delta {
+                    max_reach_delta = reach_delta;
+                    max_reach_site = Some((
+                        public_infoset,
+                        combo_index,
+                        cpu_batch.reach_weights[infoset],
+                        gpu_values.reach_weights[infoset],
+                    ));
+                }
+                let offset = infoset * layout.max_actions();
+                for action in 0..action_count {
+                    let action_delta = (cpu_batch.action_values[offset + action]
+                        - gpu_values.action_values[offset + action])
+                        .abs();
+                    if action_delta > max_action_delta {
+                        max_action_delta = action_delta;
+                        max_action_site = Some((
+                            public_infoset,
+                            combo_index,
+                            action,
+                            cpu_batch.action_values[offset + action],
+                            gpu_values.action_values[offset + action],
+                        ));
+                    }
+                }
+            }
+        }
+
+        assert!(
+            max_reach_delta < 1e-3 && max_action_delta < 1e-3,
+            "GPU/CPU iteration mismatch: max_reach_delta={max_reach_delta} site={max_reach_site:?}, max_action_delta={max_action_delta} site={max_action_site:?}"
+        );
+        backend.wait_idle().ok();
+        std::mem::forget(backend);
+    }
+
+    #[test]
+    #[ignore = "requires a working local GPU backend"]
+    fn gpu_public_tree_iteration_matches_cpu_on_blocker_range_depth_three() {
+        let flop = [
+            PokedrCard::new(PokedrRank::Ace, PokedrSuit::Spades),
+            PokedrCard::new(PokedrRank::Seven, PokedrSuit::Hearts),
+            PokedrCard::new(PokedrRank::Two, PokedrSuit::Clubs),
+        ];
+        let config = PokedrAgentConfig {
+            cfr_iterations: 1,
+            cfr_variant: CfrVariant::CfrPlus,
+            action_set: ActionSetConfig {
+                max_aggressive_actions: 1,
+                flop_bet_fractions: vec![1.0],
+                turn_bet_fractions: vec![1.0],
+                river_bet_fractions: vec![1.0],
+                raise_fractions: vec![1.0],
+                ..ActionSetConfig::default()
+            },
+            max_raises_per_street: 1,
+            max_depth: 3,
+            max_showdown_runouts: usize::MAX,
+        };
+        let (tree, layout) = fixed_flop_tree_and_layout(flop, config.clone());
+        let indexer = ComboIndexer::new();
+        let root_dead = root_board(&tree).deck_mask();
+        let mut hero_weights = vec![0.0; COMBO_COUNT];
+        let mut villain_weights = vec![0.0; COMBO_COUNT];
+        for combo_index in legal_private_combos(&indexer, root_dead).take(64) {
+            hero_weights[combo_index] = 1.0;
+            villain_weights[combo_index] = 1.0;
+        }
+        let mut dense_config = layout.dense_config(config.cfr_variant);
+        dense_config.infosets *= PRIVATE_INFOS_PER_PUBLIC;
+        let state = DenseCfrState::new_with_legal_actions(
+            dense_config.clone(),
+            private_legal_actions(&layout),
+        );
+        let mut cpu_batch = DenseCfrIteration::new(&dense_config);
+        let matrix_cache = RefCell::new(ShowdownMatrixCache::new(1));
+        fill_public_tree_iteration(
+            &tree,
+            &layout,
+            &indexer,
+            None,
+            &state,
+            &config,
+            &hero_weights,
+            &villain_weights,
+            &matrix_cache,
+            &mut cpu_batch,
+        );
+
+        let backend = GpuDenseCfrBackend::new().expect("GPU backend should initialize");
+        let linearized =
+            linearize_gpu_public_tree(&tree, &layout, &backend, &config, &matrix_cache)
+                .expect("tree should linearize");
+        let combos = gpu_private_combos();
+        let combo_legal = indexer
+            .combos()
+            .iter()
+            .map(|combo| (!combo.collides_with(root_dead)) as u32)
+            .collect::<Vec<_>>();
+        let gpu_values = backend
+            .public_tree_iteration_values(
+                &linearized.nodes,
+                &linearized.children,
+                &linearized.child_cards,
+                &combos,
+                &combo_legal,
+                &hero_weights,
+                &villain_weights,
+                &linearized.showdown_boards,
+                &state,
+            )
+            .expect("GPU public tree values should run");
+
+        let mut max_action_delta = 0.0f32;
+        let mut max_action_site = None;
+        let mut max_reach_delta = 0.0f32;
+        let mut max_reach_site = None;
+        for public_infoset in 0..layout.infoset_count() {
+            let action_count = layout.action_count(public_infoset);
+            let player = infoset_acting_player(&tree, &layout, public_infoset);
+            for combo_index in 0..COMBO_COUNT {
+                let own_weight = match player {
+                    Player::Hero => hero_weights[combo_index],
+                    Player::Villain => villain_weights[combo_index],
+                };
+                if own_weight <= 0.0 {
+                    continue;
+                }
+                let infoset = private_infoset(public_infoset, player, combo_index);
+                if cpu_batch.reach_weights[infoset] <= 1e-6
+                    && gpu_values.reach_weights[infoset] <= 1e-6
+                {
+                    continue;
+                }
+                let reach_delta =
+                    (cpu_batch.reach_weights[infoset] - gpu_values.reach_weights[infoset]).abs();
+                if reach_delta > max_reach_delta {
+                    max_reach_delta = reach_delta;
+                    max_reach_site = Some((
+                        public_infoset,
+                        combo_index,
+                        cpu_batch.reach_weights[infoset],
+                        gpu_values.reach_weights[infoset],
+                    ));
+                }
+                let offset = infoset * layout.max_actions();
+                for action in 0..action_count {
+                    let action_delta = (cpu_batch.action_values[offset + action]
+                        - gpu_values.action_values[offset + action])
+                        .abs();
+                    if action_delta > max_action_delta {
+                        max_action_delta = action_delta;
+                        max_action_site = Some((
+                            public_infoset,
+                            combo_index,
+                            action,
+                            cpu_batch.action_values[offset + action],
+                            gpu_values.action_values[offset + action],
+                        ));
+                    }
+                }
+            }
+        }
+
+        backend.wait_idle().ok();
+        std::mem::forget(backend);
+        assert!(
+            max_reach_delta < 1e-3 && max_action_delta < 1e-3,
+            "GPU/CPU full-range iteration mismatch: max_reach_delta={max_reach_delta} site={max_reach_site:?}, max_action_delta={max_action_delta} site={max_action_site:?}"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a working local GPU backend"]
+    fn gpu_public_tree_iteration_matches_cpu_on_limited_fixed_flop_ranges_depth_three() {
+        let flop = [
+            PokedrCard::new(PokedrRank::Ace, PokedrSuit::Spades),
+            PokedrCard::new(PokedrRank::Seven, PokedrSuit::Hearts),
+            PokedrCard::new(PokedrRank::Two, PokedrSuit::Clubs),
+        ];
+        let config = PokedrAgentConfig {
+            cfr_iterations: 8,
+            cfr_variant: CfrVariant::CfrPlus,
+            action_set: ActionSetConfig {
+                max_aggressive_actions: 1,
+                flop_bet_fractions: vec![1.0],
+                turn_bet_fractions: vec![1.0],
+                river_bet_fractions: vec![1.0],
+                raise_fractions: vec![1.0],
+                ..ActionSetConfig::default()
+            },
+            max_raises_per_street: 1,
+            max_depth: 3,
+            max_showdown_runouts: usize::MAX,
+        };
+        let (tree, layout) = fixed_flop_tree_and_layout(flop, config.clone());
+        let indexer = ComboIndexer::new();
+        let root_dead = root_board(&tree).deck_mask();
+        let (mut hero_weights, mut villain_weights) = fixed_flop_root_weights(&indexer, root_dead);
+        limit_nonzero_weights(&mut hero_weights, 32);
+        limit_nonzero_weights(&mut villain_weights, 32);
+        let mut dense_config = layout.dense_config(config.cfr_variant);
+        dense_config.infosets *= PRIVATE_INFOS_PER_PUBLIC;
+        let matrix_cache = RefCell::new(ShowdownMatrixCache::new(1));
+        let backend = GpuDenseCfrBackend::new().expect("GPU backend should initialize");
+        let state = try_solve_gpu_public_tree_resident(
+            &tree,
+            &layout,
+            &indexer,
+            &backend,
+            &dense_config,
+            &config,
+            &hero_weights,
+            &villain_weights,
+            &matrix_cache,
+        )
+        .expect("GPU resident solve should run");
+
+        let mut cpu_batch = DenseCfrIteration::new(&dense_config);
+        fill_public_tree_iteration(
+            &tree,
+            &layout,
+            &indexer,
+            None,
+            &state,
+            &config,
+            &hero_weights,
+            &villain_weights,
+            &matrix_cache,
+            &mut cpu_batch,
+        );
+
+        let linearized =
+            linearize_gpu_public_tree(&tree, &layout, &backend, &config, &matrix_cache)
+                .expect("tree should linearize");
+        let combos = gpu_private_combos();
+        let combo_legal = indexer
+            .combos()
+            .iter()
+            .map(|combo| (!combo.collides_with(root_dead)) as u32)
+            .collect::<Vec<_>>();
+        let gpu_values = backend
+            .public_tree_iteration_values(
+                &linearized.nodes,
+                &linearized.children,
+                &linearized.child_cards,
+                &combos,
+                &combo_legal,
+                &hero_weights,
+                &villain_weights,
+                &linearized.showdown_boards,
+                &state,
+            )
+            .expect("GPU public tree values should run");
+
+        let mut max_action_delta = 0.0f32;
+        let mut max_action_site = None;
+        let mut max_reach_delta = 0.0f32;
+        let mut max_reach_site = None;
+        for public_infoset in 0..layout.infoset_count() {
+            let action_count = layout.action_count(public_infoset);
+            let player = infoset_acting_player(&tree, &layout, public_infoset);
+            for combo_index in 0..COMBO_COUNT {
+                let own_weight = match player {
+                    Player::Hero => hero_weights[combo_index],
+                    Player::Villain => villain_weights[combo_index],
+                };
+                if own_weight <= 0.0 {
+                    continue;
+                }
+                let infoset = private_infoset(public_infoset, player, combo_index);
+                if cpu_batch.reach_weights[infoset] <= 1e-6
+                    && gpu_values.reach_weights[infoset] <= 1e-6
+                {
+                    continue;
+                }
+                let reach_delta =
+                    (cpu_batch.reach_weights[infoset] - gpu_values.reach_weights[infoset]).abs();
+                if reach_delta > max_reach_delta {
+                    max_reach_delta = reach_delta;
+                    max_reach_site = Some((
+                        public_infoset,
+                        combo_index,
+                        cpu_batch.reach_weights[infoset],
+                        gpu_values.reach_weights[infoset],
+                    ));
+                }
+                let offset = infoset * layout.max_actions();
+                for action in 0..action_count {
+                    let action_delta = (cpu_batch.action_values[offset + action]
+                        - gpu_values.action_values[offset + action])
+                        .abs();
+                    if action_delta > max_action_delta {
+                        max_action_delta = action_delta;
+                        max_action_site = Some((
+                            public_infoset,
+                            combo_index,
+                            action,
+                            cpu_batch.action_values[offset + action],
+                            gpu_values.action_values[offset + action],
+                        ));
+                    }
+                }
+            }
+        }
+
+        backend.wait_idle().ok();
+        std::mem::forget(backend);
+        let max_reach_detail = max_reach_site.map(|(public_infoset, combo_index, _, _)| {
+            let node_index = layout.infoset_node(public_infoset);
+            let board_mask = match &tree.nodes()[node_index].kind {
+                PublicNodeKind::Decision { state, .. } => state.board.deck_mask(),
+                _ => 0,
+            };
+            let combo = indexer.combo(combo_index);
+            (
+                node_index,
+                combo_cards(combo),
+                combo.collides_with(board_mask),
+                board_mask,
+            )
+        });
+        assert!(
+            max_reach_delta < 1e-3 && max_action_delta < 1e-3,
+            "GPU/CPU limited fixed-flop-range iteration mismatch: max_reach_delta={max_reach_delta} site={max_reach_site:?} detail={max_reach_detail:?}, max_action_delta={max_action_delta} site={max_action_site:?}"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a working local GPU backend"]
+    fn gpu_public_tree_initial_iteration_matches_cpu_on_limited_fixed_flop_ranges_depth_three() {
+        let flop = [
+            PokedrCard::new(PokedrRank::Ace, PokedrSuit::Spades),
+            PokedrCard::new(PokedrRank::Seven, PokedrSuit::Hearts),
+            PokedrCard::new(PokedrRank::Two, PokedrSuit::Clubs),
+        ];
+        let config = PokedrAgentConfig {
+            cfr_iterations: 1,
+            cfr_variant: CfrVariant::CfrPlus,
+            action_set: ActionSetConfig {
+                max_aggressive_actions: 1,
+                flop_bet_fractions: vec![1.0],
+                turn_bet_fractions: vec![1.0],
+                river_bet_fractions: vec![1.0],
+                raise_fractions: vec![1.0],
+                ..ActionSetConfig::default()
+            },
+            max_raises_per_street: 1,
+            max_depth: 3,
+            max_showdown_runouts: usize::MAX,
+        };
+        let (tree, layout) = fixed_flop_tree_and_layout(flop, config.clone());
+        let indexer = ComboIndexer::new();
+        let root_dead = root_board(&tree).deck_mask();
+        let (mut hero_weights, mut villain_weights) = fixed_flop_root_weights(&indexer, root_dead);
+        limit_nonzero_weights(&mut hero_weights, 32);
+        limit_nonzero_weights(&mut villain_weights, 32);
+        let mut dense_config = layout.dense_config(config.cfr_variant);
+        dense_config.infosets *= PRIVATE_INFOS_PER_PUBLIC;
+        let state = DenseCfrState::new_with_legal_actions(
+            dense_config.clone(),
+            private_legal_actions(&layout),
+        );
+        let mut cpu_batch = DenseCfrIteration::new(&dense_config);
+        let matrix_cache = RefCell::new(ShowdownMatrixCache::new(1));
+        fill_public_tree_iteration(
+            &tree,
+            &layout,
+            &indexer,
+            None,
+            &state,
+            &config,
+            &hero_weights,
+            &villain_weights,
+            &matrix_cache,
+            &mut cpu_batch,
+        );
+
+        let backend = GpuDenseCfrBackend::new().expect("GPU backend should initialize");
+        let linearized =
+            linearize_gpu_public_tree(&tree, &layout, &backend, &config, &matrix_cache)
+                .expect("tree should linearize");
+        let combos = gpu_private_combos();
+        let combo_legal = indexer
+            .combos()
+            .iter()
+            .map(|combo| (!combo.collides_with(root_dead)) as u32)
+            .collect::<Vec<_>>();
+        let gpu_values = backend
+            .public_tree_iteration_values(
+                &linearized.nodes,
+                &linearized.children,
+                &linearized.child_cards,
+                &combos,
+                &combo_legal,
+                &hero_weights,
+                &villain_weights,
+                &linearized.showdown_boards,
+                &state,
+            )
+            .expect("GPU public tree values should run");
+
+        let mut max_action_delta = 0.0f32;
+        let mut max_action_site = None;
+        for public_infoset in 0..layout.infoset_count() {
+            let action_count = layout.action_count(public_infoset);
+            let player = infoset_acting_player(&tree, &layout, public_infoset);
+            for combo_index in 0..COMBO_COUNT {
+                let own_weight = match player {
+                    Player::Hero => hero_weights[combo_index],
+                    Player::Villain => villain_weights[combo_index],
+                };
+                if own_weight <= 0.0 {
+                    continue;
+                }
+                let infoset = private_infoset(public_infoset, player, combo_index);
+                let offset = infoset * layout.max_actions();
+                for action in 0..action_count {
+                    let action_delta = (cpu_batch.action_values[offset + action]
+                        - gpu_values.action_values[offset + action])
+                        .abs();
+                    if action_delta > max_action_delta {
+                        max_action_delta = action_delta;
+                        max_action_site = Some((
+                            public_infoset,
+                            combo_index,
+                            action,
+                            cpu_batch.action_values[offset + action],
+                            gpu_values.action_values[offset + action],
+                        ));
+                    }
+                }
+            }
+        }
+
+        backend.wait_idle().ok();
+        std::mem::forget(backend);
+        assert!(
+            max_action_delta < 1e-3,
+            "GPU/CPU initial limited fixed-flop iteration mismatch: max_action_delta={max_action_delta} site={max_action_site:?}"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a working local GPU backend"]
+    fn gpu_public_tree_first_update_matches_cpu_on_limited_fixed_flop_ranges_depth_three() {
+        let flop = [
+            PokedrCard::new(PokedrRank::Ace, PokedrSuit::Spades),
+            PokedrCard::new(PokedrRank::Seven, PokedrSuit::Hearts),
+            PokedrCard::new(PokedrRank::Two, PokedrSuit::Clubs),
+        ];
+        let config = PokedrAgentConfig {
+            cfr_iterations: 1,
+            cfr_variant: CfrVariant::CfrPlus,
+            action_set: ActionSetConfig {
+                max_aggressive_actions: 1,
+                flop_bet_fractions: vec![1.0],
+                turn_bet_fractions: vec![1.0],
+                river_bet_fractions: vec![1.0],
+                raise_fractions: vec![1.0],
+                ..ActionSetConfig::default()
+            },
+            max_raises_per_street: 1,
+            max_depth: 3,
+            max_showdown_runouts: usize::MAX,
+        };
+        let (tree, layout) = fixed_flop_tree_and_layout(flop, config.clone());
+        let indexer = ComboIndexer::new();
+        let root_dead = root_board(&tree).deck_mask();
+        let (mut hero_weights, mut villain_weights) = fixed_flop_root_weights(&indexer, root_dead);
+        limit_nonzero_weights(&mut hero_weights, 32);
+        limit_nonzero_weights(&mut villain_weights, 32);
+        let mut dense_config = layout.dense_config(config.cfr_variant);
+        dense_config.infosets *= PRIVATE_INFOS_PER_PUBLIC;
+        let matrix_cache = RefCell::new(ShowdownMatrixCache::new(1));
+        let mut cpu_state = DenseCfrState::new_with_legal_actions(
+            dense_config.clone(),
+            private_legal_actions(&layout),
+        );
+        let mut cpu_batch = DenseCfrIteration::new(&dense_config);
+        fill_public_tree_iteration(
+            &tree,
+            &layout,
+            &indexer,
+            None,
+            &cpu_state,
+            &config,
+            &hero_weights,
+            &villain_weights,
+            &matrix_cache,
+            &mut cpu_batch,
+        );
+        cpu_state.update_all_infosets(
+            &cpu_batch.action_values,
+            &cpu_batch.reach_weights,
+            &cpu_batch.strategy_weights,
+            1,
+        );
+
+        let backend = GpuDenseCfrBackend::new().expect("GPU backend should initialize");
+        let linearized =
+            linearize_gpu_public_tree(&tree, &layout, &backend, &config, &matrix_cache)
+                .expect("tree should linearize");
+        let combos = gpu_private_combos();
+        let combo_legal = indexer
+            .combos()
+            .iter()
+            .map(|combo| (!combo.collides_with(root_dead)) as u32)
+            .collect::<Vec<_>>();
+        let gpu_initial_values = backend
+            .public_tree_iteration_values(
+                &linearized.nodes,
+                &linearized.children,
+                &linearized.child_cards,
+                &combos,
+                &combo_legal,
+                &hero_weights,
+                &villain_weights,
+                &linearized.showdown_boards,
+                &cpu_state,
+            )
+            .expect("GPU public tree values should run");
+        let gpu_state = try_solve_gpu_public_tree_resident(
+            &tree,
+            &layout,
+            &indexer,
+            &backend,
+            &dense_config,
+            &config,
+            &hero_weights,
+            &villain_weights,
+            &matrix_cache,
+        )
+        .expect("GPU resident solve should run");
+
+        let mut max_regret_delta = 0.0f32;
+        let mut max_regret_index = 0usize;
+        for (index, (cpu, gpu)) in cpu_state
+            .regrets()
+            .iter()
+            .zip(gpu_state.regrets())
+            .enumerate()
+        {
+            let delta = (cpu - gpu).abs();
+            if delta > max_regret_delta {
+                max_regret_delta = delta;
+                max_regret_index = index;
+            }
+        }
+        let mut max_strategy_sum_delta = 0.0f32;
+        let mut max_strategy_sum_index = 0usize;
+        for (index, (cpu, gpu)) in cpu_state
+            .strategy_sum()
+            .iter()
+            .zip(gpu_state.strategy_sum())
+            .enumerate()
+        {
+            let delta = (cpu - gpu).abs();
+            if delta > max_strategy_sum_delta {
+                max_strategy_sum_delta = delta;
+                max_strategy_sum_index = index;
+            }
+        }
+
+        backend.wait_idle().ok();
+        std::mem::forget(backend);
+        let regret_infoset = max_regret_index / layout.max_actions();
+        let regret_action = max_regret_index % layout.max_actions();
+        let strategy_infoset = max_strategy_sum_index / layout.max_actions();
+        let strategy_action = max_strategy_sum_index % layout.max_actions();
+        let strategy_combo = strategy_infoset % PRIVATE_INFOS_PER_PUBLIC;
+        let strategy_cards = combo_cards(indexer.combo(strategy_combo));
+        let strategy_mask = hero_mask(strategy_cards);
+        let compatible_villain_mass: f32 = indexer
+            .combos()
+            .iter()
+            .enumerate()
+            .filter(|(combo_index, combo)| {
+                villain_weights[*combo_index] > 0.0
+                    && !combo.collides_with(root_dead)
+                    && hero_mask(combo_cards(**combo)) & strategy_mask == 0
+            })
+            .map(|(combo_index, _)| villain_weights[combo_index])
+            .sum();
+        let villain_total_mass: f32 = indexer
+            .combos()
+            .iter()
+            .enumerate()
+            .filter(|(_, combo)| !combo.collides_with(root_dead))
+            .map(|(combo_index, _)| villain_weights[combo_index])
+            .sum();
+        let villain_first_card_mass: f32 = indexer
+            .combos()
+            .iter()
+            .enumerate()
+            .filter(|(_, combo)| {
+                !combo.collides_with(root_dead)
+                    && (combo.first == strategy_cards[0] || combo.second == strategy_cards[0])
+            })
+            .map(|(combo_index, _)| villain_weights[combo_index])
+            .sum();
+        let villain_second_card_mass: f32 = indexer
+            .combos()
+            .iter()
+            .enumerate()
+            .filter(|(_, combo)| {
+                !combo.collides_with(root_dead)
+                    && (combo.first == strategy_cards[1] || combo.second == strategy_cards[1])
+            })
+            .map(|(combo_index, _)| villain_weights[combo_index])
+            .sum();
+        let villain_same_combo_mass = villain_weights[strategy_combo];
+        let compatible_villain_mass_by_aggregate =
+            villain_total_mass - villain_first_card_mass - villain_second_card_mass
+                + villain_same_combo_mass;
+        assert!(
+            max_regret_delta < 1e-3 && max_strategy_sum_delta < 1e-3,
+            "GPU/CPU first update mismatch: max_regret_delta={max_regret_delta} index={max_regret_index} infoset={regret_infoset} action={regret_action} legal={} reach={} strategy_weight={} gpu_initial_strategy_weight={} action_value={} cpu_regret={} gpu_regret={}, max_strategy_sum_delta={max_strategy_sum_delta} index={max_strategy_sum_index} infoset={strategy_infoset} combo={strategy_combo} cards={:?} action={strategy_action} legal={} reach={} strategy_weight={} gpu_initial_strategy_weight={} compatible_villain_mass={} compatible_villain_mass_by_aggregate={} total={} card0={} card1={} same={} action_value={} cpu_strategy_sum={} gpu_strategy_sum={}",
+            private_legal_actions(&layout)[max_regret_index],
+            cpu_batch.reach_weights[regret_infoset],
+            cpu_batch.strategy_weights[regret_infoset],
+            gpu_initial_values.strategy_weights[regret_infoset],
+            cpu_batch.action_values[max_regret_index],
+            cpu_state.regrets()[max_regret_index],
+            gpu_state.regrets()[max_regret_index],
+            strategy_cards,
+            private_legal_actions(&layout)[max_strategy_sum_index],
+            cpu_batch.reach_weights[strategy_infoset],
+            cpu_batch.strategy_weights[strategy_infoset],
+            gpu_initial_values.strategy_weights[strategy_infoset],
+            compatible_villain_mass,
+            compatible_villain_mass_by_aggregate,
+            villain_total_mass,
+            villain_first_card_mass,
+            villain_second_card_mass,
+            villain_same_combo_mass,
+            cpu_batch.action_values[max_strategy_sum_index],
+            cpu_state.strategy_sum()[max_strategy_sum_index],
+            gpu_state.strategy_sum()[max_strategy_sum_index],
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a working local GPU backend"]
+    fn gpu_depth_three_chance_game_converges_on_sparse_ranges() {
+        let flop = [
+            PokedrCard::new(PokedrRank::Ace, PokedrSuit::Spades),
+            PokedrCard::new(PokedrRank::Seven, PokedrSuit::Hearts),
+            PokedrCard::new(PokedrRank::Two, PokedrSuit::Clubs),
+        ];
+        let config = PokedrAgentConfig {
+            cfr_iterations: 256,
+            cfr_variant: CfrVariant::CfrPlus,
+            action_set: ActionSetConfig {
+                max_aggressive_actions: 1,
+                flop_bet_fractions: vec![1.0],
+                turn_bet_fractions: vec![1.0],
+                river_bet_fractions: vec![1.0],
+                raise_fractions: vec![1.0],
+                ..ActionSetConfig::default()
+            },
+            max_raises_per_street: 0,
+            max_depth: 3,
+            max_showdown_runouts: usize::MAX,
+        };
+        let (tree, layout) = fixed_flop_tree_and_layout(flop, config.clone());
+        let indexer = ComboIndexer::new();
+        let (hero_weights, villain_weights) = sparse_test_ranges(&indexer);
+        let mut dense_config = layout.dense_config(config.cfr_variant);
+        dense_config.infosets *= PRIVATE_INFOS_PER_PUBLIC;
+        let matrix_cache = RefCell::new(ShowdownMatrixCache::new(1));
+        let backend = GpuDenseCfrBackend::new().expect("GPU backend should initialize");
+        let state = try_solve_gpu_public_tree_resident(
+            &tree,
+            &layout,
+            &indexer,
+            &backend,
+            &dense_config,
+            &config,
+            &hero_weights,
+            &villain_weights,
+            &matrix_cache,
+        )
+        .expect("GPU resident solve should run");
+        let linearized =
+            linearize_gpu_public_tree(&tree, &layout, &backend, &config, &matrix_cache)
+                .expect("tree should linearize");
+        let combos = gpu_private_combos();
+        let root_dead = root_board(&tree).deck_mask();
+        let combo_legal = indexer
+            .combos()
+            .iter()
+            .map(|combo| (!combo.collides_with(root_dead)) as u32)
+            .collect::<Vec<_>>();
+        let profile = state.average_strategy_profile_state();
+        let gpu_metrics = recursive_br_gap_metrics_gpu_for_profile(
+            &backend,
+            &tree,
+            &linearized,
+            &combos,
+            &combo_legal,
+            &hero_weights,
+            &villain_weights,
+            &layout,
+            &state,
+            &profile,
+            false,
+        )
+        .expect("GPU recursive BR metric should run");
+        let exploitability = cpu_recursive_root_exploitability(
+            &tree,
+            &layout,
+            &state,
+            &indexer,
+            &hero_weights,
+            &villain_weights,
+            config.max_showdown_runouts,
+        );
+
+        backend.wait_idle().ok();
+        std::mem::forget(backend);
+        assert!(
+            exploitability * 100.0 < 1.0,
+            "GPU sparse depth3 exploitability stayed at {:.3} bb/100",
+            exploitability * 100.0
+        );
+        assert!(
+            (gpu_metrics.root_exploitability - exploitability).abs() < 1e-3,
+            "GPU metric exploitability {:.6} differs from CPU exploitability {:.6}",
+            gpu_metrics.root_exploitability,
+            exploitability
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a working local GPU backend"]
+    fn gpu_depth_three_chance_game_converges_on_limited_fixed_flop_ranges() {
+        let flop = [
+            PokedrCard::new(PokedrRank::Ace, PokedrSuit::Spades),
+            PokedrCard::new(PokedrRank::Seven, PokedrSuit::Hearts),
+            PokedrCard::new(PokedrRank::Two, PokedrSuit::Clubs),
+        ];
+        let config = PokedrAgentConfig {
+            cfr_iterations: 256,
+            cfr_variant: CfrVariant::dcfr_plus_default(),
+            action_set: ActionSetConfig {
+                max_aggressive_actions: 1,
+                flop_bet_fractions: vec![1.0],
+                turn_bet_fractions: vec![1.0],
+                river_bet_fractions: vec![1.0],
+                raise_fractions: vec![1.0],
+                ..ActionSetConfig::default()
+            },
+            max_raises_per_street: 1,
+            max_depth: 3,
+            max_showdown_runouts: usize::MAX,
+        };
+        let (tree, layout) = fixed_flop_tree_and_layout(flop, config.clone());
+        let indexer = ComboIndexer::new();
+        let root_dead = root_board(&tree).deck_mask();
+        let (mut hero_weights, mut villain_weights) = fixed_flop_root_weights(&indexer, root_dead);
+        limit_nonzero_weights(&mut hero_weights, 32);
+        limit_nonzero_weights(&mut villain_weights, 32);
+        let mut dense_config = layout.dense_config(config.cfr_variant);
+        dense_config.infosets *= PRIVATE_INFOS_PER_PUBLIC;
+        let matrix_cache = RefCell::new(ShowdownMatrixCache::new(1));
+        let backend = GpuDenseCfrBackend::new().expect("GPU backend should initialize");
+        let state = try_solve_gpu_public_tree_resident(
+            &tree,
+            &layout,
+            &indexer,
+            &backend,
+            &dense_config,
+            &config,
+            &hero_weights,
+            &villain_weights,
+            &matrix_cache,
+        )
+        .expect("GPU resident solve should run");
+        let linearized =
+            linearize_gpu_public_tree(&tree, &layout, &backend, &config, &matrix_cache)
+                .expect("tree should linearize");
+        let combos = gpu_private_combos();
+        let combo_legal = indexer
+            .combos()
+            .iter()
+            .map(|combo| (!combo.collides_with(root_dead)) as u32)
+            .collect::<Vec<_>>();
+        let profile = state.average_strategy_profile_state();
+        let gpu_metrics = recursive_br_gap_metrics_gpu_for_profile(
+            &backend,
+            &tree,
+            &linearized,
+            &combos,
+            &combo_legal,
+            &hero_weights,
+            &villain_weights,
+            &layout,
+            &state,
+            &profile,
+            false,
+        )
+        .expect("GPU recursive BR metric should run");
+
+        backend.wait_idle().ok();
+        std::mem::forget(backend);
+        assert!(
+            gpu_metrics.root_exploitability * 100.0 < 10.0,
+            "GPU limited fixed-flop depth3 exploitability stayed at {:.3} bb/100",
+            gpu_metrics.root_exploitability * 100.0
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a working local GPU backend"]
+    fn gpu_recursive_br_matches_cpu_on_blocker_range_depth_three() {
+        let flop = [
+            PokedrCard::new(PokedrRank::Ace, PokedrSuit::Spades),
+            PokedrCard::new(PokedrRank::Seven, PokedrSuit::Hearts),
+            PokedrCard::new(PokedrRank::Two, PokedrSuit::Clubs),
+        ];
+        let config = PokedrAgentConfig {
+            cfr_iterations: 1,
+            cfr_variant: CfrVariant::CfrPlus,
+            action_set: ActionSetConfig {
+                max_aggressive_actions: 1,
+                flop_bet_fractions: vec![1.0],
+                turn_bet_fractions: vec![1.0],
+                river_bet_fractions: vec![1.0],
+                raise_fractions: vec![1.0],
+                ..ActionSetConfig::default()
+            },
+            max_raises_per_street: 0,
+            max_depth: 3,
+            max_showdown_runouts: usize::MAX,
+        };
+        let (tree, layout) = fixed_flop_tree_and_layout(flop, config.clone());
+        let indexer = ComboIndexer::new();
+        let root_dead = root_board(&tree).deck_mask();
+        let mut hero_weights = vec![0.0; COMBO_COUNT];
+        let mut villain_weights = vec![0.0; COMBO_COUNT];
+        for combo_index in legal_private_combos(&indexer, root_dead).take(64) {
+            hero_weights[combo_index] = 1.0;
+            villain_weights[combo_index] = 1.0;
+        }
+
+        let matrix_cache = RefCell::new(ShowdownMatrixCache::new(1));
+        let backend = GpuDenseCfrBackend::new().expect("GPU backend should initialize");
+        let mut dense_config = layout.dense_config(config.cfr_variant);
+        dense_config.infosets *= PRIVATE_INFOS_PER_PUBLIC;
+        let state = try_solve_gpu_public_tree_resident(
+            &tree,
+            &layout,
+            &indexer,
+            &backend,
+            &dense_config,
+            &config,
+            &hero_weights,
+            &villain_weights,
+            &matrix_cache,
+        )
+        .expect("GPU resident solve should run");
+        let cpu_exploitability = cpu_recursive_root_exploitability(
+            &tree,
+            &layout,
+            &state,
+            &indexer,
+            &hero_weights,
+            &villain_weights,
+            config.max_showdown_runouts,
+        );
+
+        let linearized =
+            linearize_gpu_public_tree(&tree, &layout, &backend, &config, &matrix_cache)
+                .expect("tree should linearize");
+        let combos = gpu_private_combos();
+        let combo_legal = indexer
+            .combos()
+            .iter()
+            .map(|combo| (!combo.collides_with(root_dead)) as u32)
+            .collect::<Vec<_>>();
+        let gpu_metrics = recursive_br_gap_metrics_gpu(
+            &backend,
+            &tree,
+            &linearized,
+            &combos,
+            &combo_legal,
+            &hero_weights,
+            &villain_weights,
+            &layout,
+            &state,
+            false,
+        )
+        .expect("GPU recursive BR metrics should run");
+
+        backend.wait_idle().ok();
+        std::mem::forget(backend);
+        assert!(
+            (gpu_metrics.root_exploitability - cpu_exploitability).abs() < 1e-3,
+            "GPU recursive exploitability mismatch: gpu={} cpu={}",
+            gpu_metrics.root_exploitability,
+            cpu_exploitability
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a working local GPU backend"]
+    fn gpu_recursive_br_matches_cpu_on_limited_fixed_flop_ranges_depth_three() {
+        let flop = [
+            PokedrCard::new(PokedrRank::Ace, PokedrSuit::Spades),
+            PokedrCard::new(PokedrRank::Seven, PokedrSuit::Hearts),
+            PokedrCard::new(PokedrRank::Two, PokedrSuit::Clubs),
+        ];
+        let config = PokedrAgentConfig {
+            cfr_iterations: 8,
+            cfr_variant: CfrVariant::CfrPlus,
+            action_set: ActionSetConfig {
+                max_aggressive_actions: 1,
+                flop_bet_fractions: vec![1.0],
+                turn_bet_fractions: vec![1.0],
+                river_bet_fractions: vec![1.0],
+                raise_fractions: vec![1.0],
+                ..ActionSetConfig::default()
+            },
+            max_raises_per_street: 1,
+            max_depth: 3,
+            max_showdown_runouts: usize::MAX,
+        };
+        let (tree, layout) = fixed_flop_tree_and_layout(flop, config.clone());
+        let indexer = ComboIndexer::new();
+        let root_dead = root_board(&tree).deck_mask();
+        let (mut hero_weights, mut villain_weights) = fixed_flop_root_weights(&indexer, root_dead);
+        limit_nonzero_weights(&mut hero_weights, 32);
+        limit_nonzero_weights(&mut villain_weights, 32);
+
+        let matrix_cache = RefCell::new(ShowdownMatrixCache::new(1));
+        let backend = GpuDenseCfrBackend::new().expect("GPU backend should initialize");
+        let mut dense_config = layout.dense_config(config.cfr_variant);
+        dense_config.infosets *= PRIVATE_INFOS_PER_PUBLIC;
+        let state = try_solve_gpu_public_tree_resident(
+            &tree,
+            &layout,
+            &indexer,
+            &backend,
+            &dense_config,
+            &config,
+            &hero_weights,
+            &villain_weights,
+            &matrix_cache,
+        )
+        .expect("GPU resident solve should run");
+        let cpu_exploitability = cpu_recursive_root_exploitability(
+            &tree,
+            &layout,
+            &state,
+            &indexer,
+            &hero_weights,
+            &villain_weights,
+            config.max_showdown_runouts,
+        );
+
+        let linearized =
+            linearize_gpu_public_tree(&tree, &layout, &backend, &config, &matrix_cache)
+                .expect("tree should linearize");
+        let combos = gpu_private_combos();
+        let combo_legal = indexer
+            .combos()
+            .iter()
+            .map(|combo| (!combo.collides_with(root_dead)) as u32)
+            .collect::<Vec<_>>();
+        let gpu_metrics = recursive_br_gap_metrics_gpu(
+            &backend,
+            &tree,
+            &linearized,
+            &combos,
+            &combo_legal,
+            &hero_weights,
+            &villain_weights,
+            &layout,
+            &state,
+            false,
+        )
+        .expect("GPU recursive BR metrics should run");
+
+        backend.wait_idle().ok();
+        std::mem::forget(backend);
+        assert!(
+            (gpu_metrics.root_exploitability - cpu_exploitability).abs() < 1e-3,
+            "GPU limited fixed-flop-range recursive exploitability mismatch: gpu={} cpu={}",
+            gpu_metrics.root_exploitability,
+            cpu_exploitability
+        );
+    }
+
+    fn limit_nonzero_weights(weights: &mut [f32], max_nonzero: usize) {
+        let mut kept = 0usize;
+        for weight in weights {
+            if *weight <= 0.0 {
+                continue;
+            }
+            kept += 1;
+            if kept > max_nonzero {
+                *weight = 0.0;
+            }
+        }
+    }
+
+    fn sparse_test_ranges(indexer: &ComboIndexer) -> (Vec<f32>, Vec<f32>) {
+        let mut hero_weights = vec![0.0; COMBO_COUNT];
+        let mut villain_weights = vec![0.0; COMBO_COUNT];
+        for combo in [
+            [
+                PokedrCard::new(PokedrRank::Ace, PokedrSuit::Clubs),
+                PokedrCard::new(PokedrRank::Ace, PokedrSuit::Diamonds),
+            ],
+            [
+                PokedrCard::new(PokedrRank::King, PokedrSuit::Clubs),
+                PokedrCard::new(PokedrRank::King, PokedrSuit::Diamonds),
+            ],
+        ] {
+            hero_weights[hero_combo_index(indexer, combo)] = 1.0;
+        }
+        for combo in [
+            [
+                PokedrCard::new(PokedrRank::Queen, PokedrSuit::Clubs),
+                PokedrCard::new(PokedrRank::Queen, PokedrSuit::Diamonds),
+            ],
+            [
+                PokedrCard::new(PokedrRank::Jack, PokedrSuit::Clubs),
+                PokedrCard::new(PokedrRank::Jack, PokedrSuit::Diamonds),
+            ],
+        ] {
+            villain_weights[hero_combo_index(indexer, combo)] = 1.0;
+        }
+        (hero_weights, villain_weights)
+    }
+
+    fn cpu_recursive_root_exploitability(
+        tree: &SubgameTree,
+        layout: &PostflopDenseLayout,
+        state: &DenseCfrState,
+        indexer: &ComboIndexer,
+        hero_weights: &[f32],
+        villain_weights: &[f32],
+        max_showdown_runouts: usize,
+    ) -> f32 {
+        let legal_combos = legal_private_combos(indexer, root_board(tree).deck_mask())
+            .map(|combo_index| {
+                let cards = combo_cards(indexer.combo(combo_index));
+                (combo_index, cards, hero_mask(cards))
+            })
+            .collect::<Vec<_>>();
+        let matrix_cache = RefCell::new(ShowdownMatrixCache::new(1));
+        let mut hero_br_sum = 0.0;
+        let mut villain_br_sum = 0.0;
+        let mut joint_weight_sum = 0.0;
+
+        for (hero_combo, hero_cards, hero_dead) in &legal_combos {
+            let hero_weight = hero_weights[*hero_combo];
+            if hero_weight > 0.0 {
+                for (villain_combo, villain_cards, villain_dead) in &legal_combos {
+                    let villain_weight = villain_weights[*villain_combo];
+                    if villain_weight <= 0.0 || hero_dead & villain_dead != 0 {
+                        continue;
+                    }
+                    let joint_weight = hero_weight * villain_weight;
+                    joint_weight_sum += joint_weight;
+                    let mut ctx = PostflopEvaluationContext {
+                        hero_cards: *hero_cards,
+                        villain_cards: *villain_cards,
+                        hero_combo: *hero_combo,
+                        villain_combo: *villain_combo,
+                        gpu_backend: None,
+                        matrix_cache: &matrix_cache,
+                        max_showdown_runouts,
+                        equity_cache: HashMap::new(),
+                    };
+                    hero_br_sum += joint_weight
+                        * cpu_recursive_br_hero_payoff(
+                            tree,
+                            layout,
+                            0,
+                            None,
+                            None,
+                            *hero_combo,
+                            *villain_combo,
+                            Player::Hero,
+                            state,
+                            &mut ctx,
+                        );
+                }
+            }
+
+            let villain_weight = villain_weights[*hero_combo];
+            if villain_weight <= 0.0 {
+                continue;
+            }
+            let mut weighted_value = 0.0;
+            for (opponent_combo, opponent_cards, opponent_dead) in &legal_combos {
+                let hero_opponent_weight = hero_weights[*opponent_combo];
+                if hero_opponent_weight <= 0.0 || hero_dead & opponent_dead != 0 {
+                    continue;
+                }
+                let joint_weight = villain_weight * hero_opponent_weight;
+                let mut ctx = PostflopEvaluationContext {
+                    hero_cards: *opponent_cards,
+                    villain_cards: *hero_cards,
+                    hero_combo: *opponent_combo,
+                    villain_combo: *hero_combo,
+                    gpu_backend: None,
+                    matrix_cache: &matrix_cache,
+                    max_showdown_runouts,
+                    equity_cache: HashMap::new(),
+                };
+                weighted_value += joint_weight
+                    * -cpu_recursive_br_hero_payoff(
+                        tree,
+                        layout,
+                        0,
+                        None,
+                        None,
+                        *opponent_combo,
+                        *hero_combo,
+                        Player::Villain,
+                        state,
+                        &mut ctx,
+                    );
+            }
+            villain_br_sum += weighted_value;
+        }
+
+        if joint_weight_sum == 0.0 {
+            return 0.0;
+        }
+        (hero_br_sum / joint_weight_sum + villain_br_sum / joint_weight_sum).max(0.0)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn cpu_recursive_br_hero_payoff(
+        tree: &SubgameTree,
+        layout: &PostflopDenseLayout,
+        node_index: usize,
+        parent_state: Option<&PublicState>,
+        parent_action: Option<PlayerAction>,
+        hero_combo: usize,
+        villain_combo: usize,
+        br_player: Player,
+        state: &DenseCfrState,
+        ctx: &mut PostflopEvaluationContext,
+    ) -> f32 {
+        match &tree.nodes()[node_index].kind {
+            PublicNodeKind::Decision {
+                state: public_state,
+                actions,
+            } => {
+                let public_infoset = layout
+                    .node_infoset(node_index)
+                    .expect("decision nodes have infosets");
+                let acting_combo = match public_state.acting_player {
+                    Player::Hero => hero_combo,
+                    Player::Villain => villain_combo,
+                };
+                let private_infoset =
+                    private_infoset(public_infoset, public_state.acting_player, acting_combo);
+                let mut strategy = vec![0.0; layout.max_actions()];
+                state.average_strategy_for(private_infoset, &mut strategy);
+                let mut values = Vec::with_capacity(actions.len());
+                for (action_index, action) in actions.iter().enumerate() {
+                    let child = layout
+                        .child_for_action(public_infoset, action_index)
+                        .expect("legal action must have a child");
+                    values.push(cpu_recursive_br_hero_payoff(
+                        tree,
+                        layout,
+                        child,
+                        Some(public_state),
+                        Some(action.action),
+                        hero_combo,
+                        villain_combo,
+                        br_player,
+                        state,
+                        ctx,
+                    ));
+                }
+                if public_state.acting_player == br_player {
+                    if br_player == Player::Hero {
+                        values.into_iter().fold(f32::NEG_INFINITY, f32::max)
+                    } else {
+                        values.into_iter().fold(f32::INFINITY, f32::min)
+                    }
+                } else {
+                    values
+                        .iter()
+                        .zip(strategy)
+                        .map(|(value, probability)| value * probability)
+                        .sum()
+                }
+            }
+            PublicNodeKind::Chance { cards, .. } => {
+                let valid_count = cards
+                    .iter()
+                    .filter(|card| card.deck_mask() & private_dead_mask(ctx) == 0)
+                    .count();
+                if valid_count == 0 {
+                    return 0.0;
+                }
+                let mut sum = 0.0;
+                for (card, child) in cards.iter().zip(&tree.nodes()[node_index].children) {
+                    if card.deck_mask() & private_dead_mask(ctx) != 0 {
+                        continue;
+                    }
+                    sum += cpu_recursive_br_hero_payoff(
+                        tree,
+                        layout,
+                        *child,
+                        None,
+                        None,
+                        hero_combo,
+                        villain_combo,
+                        br_player,
+                        state,
+                        ctx,
+                    );
+                }
+                sum / valid_count as f32
+            }
+            PublicNodeKind::Terminal {
+                kind,
+                board,
+                pot,
+                hero_invested,
+                ..
+            } => match kind {
+                TerminalKind::Fold => fold_utility(
+                    parent_state.expect("fold terminal must have a parent decision"),
+                    parent_action.expect("fold terminal must have a parent action"),
+                    *pot,
+                    *hero_invested,
+                ),
+                TerminalKind::Showdown => showdown_utility(*pot, *hero_invested, board, ctx),
+            },
+        }
     }
 
     #[test]

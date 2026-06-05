@@ -55,6 +55,7 @@ struct CliConfigFile {
     cfr_iterations: Option<usize>,
     cfr_variant: Option<String>,
     max_depth: Option<usize>,
+    max_raises_per_street: Option<u8>,
     max_showdown_runouts: Option<usize>,
     metric_iterations: Option<Vec<usize>>,
     action_set: Option<CliActionSetConfig>,
@@ -856,6 +857,10 @@ fn write_tree_db(path: &str, dump: &pokedr_agent::FixedFlopTreeDump) {
             source TEXT NOT NULL,
             PRIMARY KEY (node_id, action_index)
         );
+        CREATE TABLE tree_metrics (
+            metric TEXT PRIMARY KEY,
+            value REAL
+        );
         CREATE TABLE solver_nodes (
             node_id INTEGER PRIMARY KEY,
             infoset INTEGER NOT NULL,
@@ -873,7 +878,13 @@ fn write_tree_db(path: &str, dump: &pokedr_agent::FixedFlopTreeDump) {
             avg_policy_ev REAL,
             current_policy_ev REAL,
             avg_gap REAL,
-            current_gap REAL
+            current_gap REAL,
+            avg_recursive_action_ev TEXT,
+            current_recursive_action_ev TEXT,
+            avg_recursive_policy_ev REAL,
+            current_recursive_policy_ev REAL,
+            avg_recursive_gap REAL,
+            current_recursive_gap REAL
         );
         CREATE TABLE solver_combos (
             node_id INTEGER NOT NULL,
@@ -881,10 +892,14 @@ fn write_tree_db(path: &str, dump: &pokedr_agent::FixedFlopTreeDump) {
             combo TEXT NOT NULL,
             reach REAL NOT NULL,
             weighted_gap REAL NOT NULL,
+            recursive_weighted_gap REAL NOT NULL,
+            current_recursive_weighted_gap REAL NOT NULL,
             avg_strategy_weight REAL NOT NULL,
             current_strategy_weight REAL NOT NULL,
             avg_action_values TEXT,
             current_action_values TEXT,
+            avg_recursive_action_values TEXT,
+            current_recursive_action_values TEXT,
             avg_strategy TEXT NOT NULL,
             current_strategy TEXT NOT NULL,
             regrets TEXT NOT NULL,
@@ -902,6 +917,45 @@ fn write_tree_db(path: &str, dump: &pokedr_agent::FixedFlopTreeDump) {
     });
 
     let tx = conn.transaction().unwrap();
+    if let Some(metrics) = &dump.metrics {
+        let mut statement = tx
+            .prepare("INSERT INTO tree_metrics VALUES (?1, ?2)")
+            .unwrap();
+        let mut insert_metric = |metric: &str, value: Option<f32>| {
+            statement
+                .execute(params![metric, value])
+                .expect("tree metric insert must succeed");
+        };
+        insert_metric("iterations", Some(metrics.iterations as f32));
+        insert_metric("root_exploitability", metrics.root_exploitability);
+        insert_metric(
+            "current_root_exploitability",
+            metrics.current_root_exploitability,
+        );
+        insert_metric(
+            "root_exploitability_bb100",
+            metrics.root_exploitability.map(|v| v * 100.0),
+        );
+        insert_metric(
+            "current_root_exploitability_bb100",
+            metrics.current_root_exploitability.map(|v| v * 100.0),
+        );
+        insert_metric("hero_root_br_value", metrics.hero_root_br_value);
+        insert_metric("villain_root_br_value", metrics.villain_root_br_value);
+        insert_metric(
+            "current_hero_root_br_value",
+            metrics.current_hero_root_br_value,
+        );
+        insert_metric(
+            "current_villain_root_br_value",
+            metrics.current_villain_root_br_value,
+        );
+        insert_metric("recursive_root_br_gap", metrics.recursive_root_br_gap);
+        insert_metric(
+            "current_recursive_root_br_gap",
+            metrics.current_recursive_root_br_gap,
+        );
+    }
     {
         let mut statement = tx
             .prepare(
@@ -946,7 +1000,7 @@ fn write_tree_db(path: &str, dump: &pokedr_agent::FixedFlopTreeDump) {
     }
     {
         let mut statement = tx.prepare(
-            "INSERT INTO solver_nodes VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+            "INSERT INTO solver_nodes VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)",
         ).unwrap();
         for node in &dump.solver_nodes {
             statement
@@ -968,6 +1022,12 @@ fn write_tree_db(path: &str, dump: &pokedr_agent::FixedFlopTreeDump) {
                     node.current_policy_ev,
                     node.avg_gap,
                     node.current_gap,
+                    opt_vec_json(&node.avg_recursive_action_ev),
+                    opt_vec_json(&node.current_recursive_action_ev),
+                    node.avg_recursive_policy_ev,
+                    node.current_recursive_policy_ev,
+                    node.avg_recursive_gap,
+                    node.current_recursive_gap,
                 ])
                 .unwrap();
         }
@@ -975,7 +1035,7 @@ fn write_tree_db(path: &str, dump: &pokedr_agent::FixedFlopTreeDump) {
     {
         let mut statement = tx
             .prepare(
-                "INSERT INTO solver_combos VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                "INSERT INTO solver_combos VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
             )
             .unwrap();
         for combo in &dump.solver_combos {
@@ -986,10 +1046,14 @@ fn write_tree_db(path: &str, dump: &pokedr_agent::FixedFlopTreeDump) {
                     combo.combo,
                     combo.reach,
                     combo.weighted_gap,
+                    combo.recursive_weighted_gap,
+                    combo.current_recursive_weighted_gap,
                     combo.avg_strategy_weight,
                     combo.current_strategy_weight,
                     opt_vec_json(&combo.avg_action_values),
                     opt_vec_json(&combo.current_action_values),
+                    opt_vec_json(&combo.avg_recursive_action_values),
+                    opt_vec_json(&combo.current_recursive_action_values),
                     vec_json(&combo.avg_strategy),
                     vec_json(&combo.current_strategy),
                     vec_json(&combo.regrets),
@@ -1003,15 +1067,52 @@ fn write_tree_db(path: &str, dump: &pokedr_agent::FixedFlopTreeDump) {
 
 fn analyze_tree_db(conn: &Connection) -> Value {
     json!({
+        "metrics": db_tree_metrics(conn),
         "counts": db_counts(conn),
         "gap_breakdown": db_gap_breakdown(conn),
+        "recursive_gap_breakdown": db_recursive_gap_breakdown(conn),
         "top_avg_gaps": db_top_gaps(conn, "avg_gap", "avg_action_ev", "avg_policy_ev"),
         "top_reached_avg_gaps": db_top_reached_gaps(conn, "avg_gap", "avg_action_ev", "avg_policy_ev", "avg_strategy_weight_sum"),
         "top_current_gaps": db_top_gaps(conn, "current_gap", "current_action_ev", "current_policy_ev"),
         "top_reached_current_gaps": db_top_reached_gaps(conn, "current_gap", "current_action_ev", "current_policy_ev", "current_strategy_weight_sum"),
+        "top_recursive_avg_gaps": db_top_gaps(conn, "avg_recursive_gap", "avg_recursive_action_ev", "avg_recursive_policy_ev"),
+        "top_reached_recursive_avg_gaps": db_top_reached_gaps(conn, "avg_recursive_gap", "avg_recursive_action_ev", "avg_recursive_policy_ev", "avg_strategy_weight_sum"),
+        "top_recursive_current_gaps": db_top_gaps(conn, "current_recursive_gap", "current_recursive_action_ev", "current_recursive_policy_ev"),
+        "top_reached_recursive_current_gaps": db_top_reached_gaps(conn, "current_recursive_gap", "current_recursive_action_ev", "current_recursive_policy_ev", "current_strategy_weight_sum"),
         "top_combo_gaps": db_top_combo_gaps(conn),
         "root_action_subtrees": db_root_action_subtrees(conn),
     })
+}
+
+fn db_tree_metrics(conn: &Connection) -> Value {
+    let exists = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'tree_metrics'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or(0)
+        > 0;
+    if !exists {
+        return Value::Null;
+    }
+    let mut statement = conn
+        .prepare("SELECT metric, value FROM tree_metrics ORDER BY metric")
+        .unwrap();
+    let rows = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<f64>>(1)?))
+        })
+        .unwrap();
+    let mut object = serde_json::Map::new();
+    for row in rows {
+        let (metric, value) = row.unwrap();
+        object.insert(
+            metric,
+            value.map(|value| json!(value)).unwrap_or(Value::Null),
+        );
+    }
+    Value::Object(object)
 }
 
 fn db_counts(conn: &Connection) -> Value {
@@ -1060,6 +1161,43 @@ fn db_gap_breakdown(conn: &Connection) -> Value {
                 "max_avg_gap": row.get::<_, Option<f64>>(6)?.unwrap_or(0.0),
                 "mean_current_gap": row.get::<_, Option<f64>>(7)?.unwrap_or(0.0),
                 "max_current_gap": row.get::<_, Option<f64>>(8)?.unwrap_or(0.0),
+            }))
+        })
+        .unwrap();
+    Value::Array(rows.map(Result::unwrap).collect())
+}
+
+fn db_recursive_gap_breakdown(conn: &Connection) -> Value {
+    let mut statement = conn
+        .prepare(
+            "SELECT n.street,
+                    n.acting_player,
+                    n.to_call,
+                    s.action_count,
+                    COUNT(*),
+                    AVG(s.avg_recursive_gap),
+                    MAX(s.avg_recursive_gap),
+                    AVG(s.current_recursive_gap),
+                    MAX(s.current_recursive_gap)
+             FROM solver_nodes s JOIN nodes n ON n.node_id = s.node_id
+             WHERE s.avg_recursive_gap IS NOT NULL OR s.current_recursive_gap IS NOT NULL
+             GROUP BY n.street, n.acting_player, n.to_call, s.action_count
+             ORDER BY MAX(s.avg_recursive_gap) DESC
+             LIMIT 40",
+        )
+        .unwrap();
+    let rows = statement
+        .query_map([], |row| {
+            Ok(json!({
+                "street": row.get::<_, Option<String>>(0)?,
+                "acting_player": row.get::<_, Option<String>>(1)?,
+                "to_call": row.get::<_, Option<i64>>(2)?,
+                "action_count": row.get::<_, i64>(3)?,
+                "nodes": row.get::<_, i64>(4)?,
+                "mean_avg_recursive_gap": row.get::<_, Option<f64>>(5)?.unwrap_or(0.0),
+                "max_avg_recursive_gap": row.get::<_, Option<f64>>(6)?.unwrap_or(0.0),
+                "mean_current_recursive_gap": row.get::<_, Option<f64>>(7)?.unwrap_or(0.0),
+                "max_current_recursive_gap": row.get::<_, Option<f64>>(8)?.unwrap_or(0.0),
             }))
         })
         .unwrap();
@@ -1156,10 +1294,14 @@ fn db_top_combo_gaps(conn: &Connection) -> Value {
                     c.combo,
                     c.reach,
                     c.weighted_gap,
+                    c.recursive_weighted_gap,
+                    c.current_recursive_weighted_gap,
                     c.avg_strategy_weight,
                     c.current_strategy_weight,
                     c.avg_action_values,
                     c.current_action_values,
+                    c.avg_recursive_action_values,
+                    c.current_recursive_action_values,
                     c.avg_strategy,
                     c.current_strategy,
                     c.regrets
@@ -1183,13 +1325,19 @@ fn db_top_combo_gaps(conn: &Connection) -> Value {
                 "reach": row.get::<_, f64>(8)?,
                 "weighted_gap": row.get::<_, f64>(9)?,
                 "local_gap": local_gap(row.get::<_, f64>(8)?, row.get::<_, f64>(9)?),
-                "avg_strategy_weight": row.get::<_, f64>(10)?,
-                "current_strategy_weight": row.get::<_, f64>(11)?,
-                "avg_action_values": row.get::<_, Option<String>>(12)?.map(json_text_value),
-                "current_action_values": row.get::<_, Option<String>>(13)?.map(json_text_value),
-                "avg_strategy": json_text_value(row.get::<_, String>(14)?),
-                "current_strategy": json_text_value(row.get::<_, String>(15)?),
-                "regrets": json_text_value(row.get::<_, String>(16)?),
+                "recursive_weighted_gap": row.get::<_, f64>(10)?,
+                "recursive_local_gap": local_gap(row.get::<_, f64>(8)?, row.get::<_, f64>(10)?),
+                "current_recursive_weighted_gap": row.get::<_, f64>(11)?,
+                "current_recursive_local_gap": local_gap(row.get::<_, f64>(8)?, row.get::<_, f64>(11)?),
+                "avg_strategy_weight": row.get::<_, f64>(12)?,
+                "current_strategy_weight": row.get::<_, f64>(13)?,
+                "avg_action_values": row.get::<_, Option<String>>(14)?.map(json_text_value),
+                "current_action_values": row.get::<_, Option<String>>(15)?.map(json_text_value),
+                "avg_recursive_action_values": row.get::<_, Option<String>>(16)?.map(json_text_value),
+                "current_recursive_action_values": row.get::<_, Option<String>>(17)?.map(json_text_value),
+                "avg_strategy": json_text_value(row.get::<_, String>(18)?),
+                "current_strategy": json_text_value(row.get::<_, String>(19)?),
+                "regrets": json_text_value(row.get::<_, String>(20)?),
                 "actions": db_node_actions(conn, node_id),
             }))
         })
@@ -1374,6 +1522,10 @@ fn db_node_detail(conn: &Connection, node_id: i64, combo_limit: usize) -> Value 
         "solver": db_solver_node(conn, node_id),
         "top_combos_by_local_gap": db_node_combos(conn, node_id, "local", combo_limit),
         "top_combos_by_weighted_gap": db_node_combos(conn, node_id, "weighted", combo_limit),
+        "top_combos_by_recursive_local_gap": db_node_combos(conn, node_id, "recursive_local", combo_limit),
+        "top_combos_by_recursive_weighted_gap": db_node_combos(conn, node_id, "recursive_weighted", combo_limit),
+        "top_combos_by_current_recursive_local_gap": db_node_combos(conn, node_id, "current_recursive_local", combo_limit),
+        "top_combos_by_current_recursive_weighted_gap": db_node_combos(conn, node_id, "current_recursive_weighted", combo_limit),
     })
 }
 
@@ -1394,7 +1546,13 @@ fn db_solver_node(conn: &Connection, node_id: i64) -> Value {
                 avg_policy_ev,
                 current_policy_ev,
                 avg_gap,
-                current_gap
+                current_gap,
+                avg_recursive_action_ev,
+                current_recursive_action_ev,
+                avg_recursive_policy_ev,
+                current_recursive_policy_ev,
+                avg_recursive_gap,
+                current_recursive_gap
          FROM solver_nodes
          WHERE node_id = ?1",
         [node_id],
@@ -1416,6 +1574,12 @@ fn db_solver_node(conn: &Connection, node_id: i64) -> Value {
                 "current_policy_ev": row.get::<_, Option<f64>>(13)?,
                 "avg_gap": row.get::<_, Option<f64>>(14)?,
                 "current_gap": row.get::<_, Option<f64>>(15)?,
+                "avg_recursive_action_ev": row.get::<_, Option<String>>(16)?.map(json_text_value),
+                "current_recursive_action_ev": row.get::<_, Option<String>>(17)?.map(json_text_value),
+                "avg_recursive_policy_ev": row.get::<_, Option<f64>>(18)?,
+                "current_recursive_policy_ev": row.get::<_, Option<f64>>(19)?,
+                "avg_recursive_gap": row.get::<_, Option<f64>>(20)?,
+                "current_recursive_gap": row.get::<_, Option<f64>>(21)?,
             }))
         },
     )
@@ -1426,6 +1590,14 @@ fn db_node_combos(conn: &Connection, node_id: i64, order: &str, limit: usize) ->
     let order_sql = match order {
         "local" => "CASE WHEN reach > 0.0 THEN weighted_gap / reach ELSE 0.0 END DESC",
         "weighted" => "weighted_gap DESC",
+        "recursive_local" => {
+            "CASE WHEN reach > 0.0 THEN recursive_weighted_gap / reach ELSE 0.0 END DESC"
+        }
+        "recursive_weighted" => "recursive_weighted_gap DESC",
+        "current_recursive_local" => {
+            "CASE WHEN reach > 0.0 THEN current_recursive_weighted_gap / reach ELSE 0.0 END DESC"
+        }
+        "current_recursive_weighted" => "current_recursive_weighted_gap DESC",
         _ => unreachable!("unknown combo order"),
     };
     let sql = format!(
@@ -1433,10 +1605,14 @@ fn db_node_combos(conn: &Connection, node_id: i64, order: &str, limit: usize) ->
                 combo,
                 reach,
                 weighted_gap,
+                recursive_weighted_gap,
+                current_recursive_weighted_gap,
                 avg_strategy_weight,
                 current_strategy_weight,
                 avg_action_values,
                 current_action_values,
+                avg_recursive_action_values,
+                current_recursive_action_values,
                 avg_strategy,
                 current_strategy,
                 regrets,
@@ -1451,16 +1627,24 @@ fn db_node_combos(conn: &Connection, node_id: i64, order: &str, limit: usize) ->
         .query_map(params![node_id, db_usize(limit)], |row| {
             let reach = row.get::<_, f64>(2)?;
             let weighted_gap = row.get::<_, f64>(3)?;
-            let avg_strategy_weight = row.get::<_, f64>(4)?;
-            let current_strategy_weight = row.get::<_, f64>(5)?;
-            let avg_action_values = row.get::<_, Option<String>>(6)?;
-            let current_action_values = row.get::<_, Option<String>>(7)?;
-            let avg_strategy = row.get::<_, String>(8)?;
-            let current_strategy = row.get::<_, String>(9)?;
-            let regrets = row.get::<_, String>(10)?;
-            let strategy_sum = row.get::<_, String>(11)?;
+            let recursive_weighted_gap = row.get::<_, f64>(4)?;
+            let current_recursive_weighted_gap = row.get::<_, f64>(5)?;
+            let avg_strategy_weight = row.get::<_, f64>(6)?;
+            let current_strategy_weight = row.get::<_, f64>(7)?;
+            let avg_action_values = row.get::<_, Option<String>>(8)?;
+            let current_action_values = row.get::<_, Option<String>>(9)?;
+            let avg_recursive_action_values = row.get::<_, Option<String>>(10)?;
+            let current_recursive_action_values = row.get::<_, Option<String>>(11)?;
+            let avg_strategy = row.get::<_, String>(12)?;
+            let current_strategy = row.get::<_, String>(13)?;
+            let regrets = row.get::<_, String>(14)?;
+            let strategy_sum = row.get::<_, String>(15)?;
             let avg_action_values_json = avg_action_values.clone().map(json_text_value);
             let current_action_values_json = current_action_values.clone().map(json_text_value);
+            let avg_recursive_action_values_json =
+                avg_recursive_action_values.clone().map(json_text_value);
+            let current_recursive_action_values_json =
+                current_recursive_action_values.clone().map(json_text_value);
             let avg_strategy_json = json_text_value(avg_strategy.clone());
             let current_strategy_json = json_text_value(current_strategy.clone());
             let regrets_json = json_text_value(regrets.clone());
@@ -1471,12 +1655,20 @@ fn db_node_combos(conn: &Connection, node_id: i64, order: &str, limit: usize) ->
                 "reach": reach,
                 "weighted_gap": weighted_gap,
                 "local_gap": local_gap(reach, weighted_gap),
+                "recursive_weighted_gap": recursive_weighted_gap,
+                "recursive_local_gap": local_gap(reach, recursive_weighted_gap),
+                "current_recursive_weighted_gap": current_recursive_weighted_gap,
+                "current_recursive_local_gap": local_gap(reach, current_recursive_weighted_gap),
                 "avg_strategy_weight": avg_strategy_weight,
                 "current_strategy_weight": current_strategy_weight,
                 "avg_best": avg_action_values.as_deref().and_then(best_action_summary),
                 "current_best": current_action_values.as_deref().and_then(best_action_summary),
+                "avg_recursive_best": avg_recursive_action_values.as_deref().and_then(best_action_summary),
+                "current_recursive_best": current_recursive_action_values.as_deref().and_then(best_action_summary),
                 "avg_action_values": avg_action_values_json,
                 "current_action_values": current_action_values_json,
+                "avg_recursive_action_values": avg_recursive_action_values_json,
+                "current_recursive_action_values": current_recursive_action_values_json,
                 "avg_strategy": avg_strategy_json,
                 "current_strategy": current_strategy_json,
                 "regrets": regrets_json,
@@ -1548,6 +1740,8 @@ fn db_root_action_subtrees(conn: &Connection) -> Value {
                 "solver_summary": db_subtree_solver_summary(conn, child_id),
                 "top_avg_gaps": db_subtree_top_gaps(conn, child_id, "avg_gap", "avg_action_ev", "avg_policy_ev"),
                 "top_current_gaps": db_subtree_top_gaps(conn, child_id, "current_gap", "current_action_ev", "current_policy_ev"),
+                "top_recursive_avg_gaps": db_subtree_top_gaps(conn, child_id, "avg_recursive_gap", "avg_recursive_action_ev", "avg_recursive_policy_ev"),
+                "top_recursive_current_gaps": db_subtree_top_gaps(conn, child_id, "current_recursive_gap", "current_recursive_action_ev", "current_recursive_policy_ev"),
             }))
         })
         .unwrap();
@@ -1565,7 +1759,11 @@ fn db_subtree_solver_summary(conn: &Connection, root: i64) -> Value {
                 AVG(avg_gap),
                 AVG(current_gap),
                 MAX(avg_gap),
-                MAX(current_gap)
+                MAX(current_gap),
+                AVG(avg_recursive_gap),
+                AVG(current_recursive_gap),
+                MAX(avg_recursive_gap),
+                MAX(current_recursive_gap)
          FROM subtree LEFT JOIN solver_nodes ON solver_nodes.node_id = subtree.node_id",
         [root],
         |row| {
@@ -1575,6 +1773,10 @@ fn db_subtree_solver_summary(conn: &Connection, root: i64) -> Value {
                 "mean_current_gap": row.get::<_, Option<f64>>(2)?.unwrap_or(0.0),
                 "max_avg_gap": row.get::<_, Option<f64>>(3)?.unwrap_or(0.0),
                 "max_current_gap": row.get::<_, Option<f64>>(4)?.unwrap_or(0.0),
+                "mean_avg_recursive_gap": row.get::<_, Option<f64>>(5)?.unwrap_or(0.0),
+                "mean_current_recursive_gap": row.get::<_, Option<f64>>(6)?.unwrap_or(0.0),
+                "max_avg_recursive_gap": row.get::<_, Option<f64>>(7)?.unwrap_or(0.0),
+                "max_current_recursive_gap": row.get::<_, Option<f64>>(8)?.unwrap_or(0.0),
             }))
         },
     )
@@ -2013,6 +2215,9 @@ fn match_config(cli_config: Option<&CliConfigFile>) -> pokedr_agent::PokedrAgent
     config.cfr_iterations = env_usize("POKEDR_CFR_ITERATIONS").unwrap_or(config.cfr_iterations);
     config.cfr_variant = env_cfr_variant("POKEDR_CFR_VARIANT").unwrap_or(config.cfr_variant);
     config.max_depth = env_usize("POKEDR_MAX_DEPTH").unwrap_or(config.max_depth);
+    if let Some(value) = env_usize("POKEDR_MAX_RAISES_PER_STREET") {
+        config.max_raises_per_street = value.min(u8::MAX as usize) as u8;
+    }
     config.max_showdown_runouts =
         env_usize("POKEDR_MAX_SHOWDOWN_RUNOUTS").unwrap_or(config.max_showdown_runouts);
     config
@@ -2031,6 +2236,9 @@ fn apply_cli_config(config: &mut pokedr_agent::PokedrAgentConfig, file: &CliConf
     }
     if let Some(value) = file.max_depth {
         config.max_depth = value;
+    }
+    if let Some(value) = file.max_raises_per_street {
+        config.max_raises_per_street = value;
     }
     if let Some(value) = file.max_showdown_runouts {
         config.max_showdown_runouts = value;

@@ -848,7 +848,7 @@ fn effective_regret(index: u32) -> f32 {
 }
 
 fn strategy_probability(node: TreeNode, private_combo: u32, action: u32) -> f32 {
-    let private_infoset = (node.public_infoset - params.node_count) * params.combo_count + private_combo;
+    let private_infoset = node.public_infoset * params.combo_count + private_combo;
     let offset = private_infoset * params.max_actions;
     var normalizer = 0.0;
     for (var i = 0u; i < node.child_count; i = i + 1u) {
@@ -1713,7 +1713,8 @@ struct Params {
     value_player: u32,
     child_tile_start: u32,
     child_tile_end: u32,
-    _pad0: u32,
+    variant: u32,
+    public_infoset_base: u32,
 };
 
 @group(0) @binding(0) var<storage, read> parent_nodes: array<TreeNode>;
@@ -1769,7 +1770,8 @@ struct Params {
     value_player: u32,
     child_tile_start: u32,
     child_tile_end: u32,
-    _pad0: u32,
+    variant: u32,
+    public_infoset_base: u32,
 };
 
 @group(0) @binding(0) var<storage, read> parent_nodes: array<TreeNode>;
@@ -1782,21 +1784,28 @@ struct Params {
 @group(0) @binding(7) var<storage, read> child_villain_reaches: array<f32>;
 @group(0) @binding(8) var<storage, read_write> parent_hero_values: array<f32>;
 @group(0) @binding(9) var<storage, read_write> parent_villain_values: array<f32>;
-@group(0) @binding(10) var<uniform> params: Params;
+@group(0) @binding(10) var<storage, read> regrets: array<f32>;
+@group(0) @binding(11) var<storage, read> prediction: array<f32>;
+@group(0) @binding(12) var<uniform> params: Params;
 
-fn strategy_from_reach(parent_offset: u32, child_offset: u32, acting_player: u32) -> f32 {
-    if acting_player == 0u {
-        let parent = parent_hero_reaches[parent_offset];
-        if parent > 0.0 {
-            return child_hero_reaches[child_offset] / parent;
-        }
-    } else {
-        let parent = parent_villain_reaches[parent_offset];
-        if parent > 0.0 {
-            return child_villain_reaches[child_offset] / parent;
-        }
+fn effective_regret(index: u32) -> f32 {
+    if params.variant == 3u {
+        return regrets[index] + prediction[index];
     }
-    return 0.0;
+    return regrets[index];
+}
+
+fn strategy_probability(node: TreeNode, private_combo: u32, action: u32) -> f32 {
+    let private_infoset = node.public_infoset * params.combo_count + private_combo;
+    let offset = private_infoset * params.max_actions;
+    var normalizer = 0.0;
+    for (var i = 0u; i < node.child_count; i = i + 1u) {
+        normalizer = normalizer + max(effective_regret(offset + i), 0.0);
+    }
+    if normalizer > 0.0 {
+        return max(effective_regret(offset + action), 0.0) / normalizer;
+    }
+    return 1.0 / f32(max(node.child_count, 1u));
 }
 
 @compute @workgroup_size(64)
@@ -1828,7 +1837,7 @@ fn backup_child_tile(@builtin(global_invocation_id) id: vec3<u32>) {
             hero_value = hero_value + hero_child_value;
             villain_value = villain_value + villain_child_value;
         } else if node.acting_player == 0u {
-            let probability = strategy_from_reach(index, child_offset, 0u);
+            let probability = strategy_probability(node, combo, action);
             if params.value_player == 0u {
                 hero_value = max(hero_value, hero_child_value);
             } else {
@@ -1836,7 +1845,7 @@ fn backup_child_tile(@builtin(global_invocation_id) id: vec3<u32>) {
             }
             villain_value = villain_value + villain_child_value;
         } else {
-            let probability = strategy_from_reach(index, child_offset, 1u);
+            let probability = strategy_probability(node, combo, action);
             hero_value = hero_value + hero_child_value;
             if params.value_player == 1u {
                 villain_value = max(villain_value, villain_child_value);
@@ -1894,7 +1903,7 @@ struct Params {
 @group(0) @binding(8) var<storage, read> edges: array<Edge>;
 @group(0) @binding(9) var<storage, read> child_hero_values: array<f32>;
 @group(0) @binding(10) var<storage, read> child_villain_values: array<f32>;
-@group(0) @binding(11) var<storage, read_write> _unused_action_weights: array<f32>;
+@group(0) @binding(11) var<storage, read> root_reach_weights: array<f32>;
 @group(0) @binding(12) var<storage, read_write> reach_weights: array<f32>;
 @group(0) @binding(13) var<storage, read_write> strategy_weights: array<f32>;
 @group(0) @binding(14) var<uniform> params: Params;
@@ -1918,8 +1927,17 @@ fn decision_aggregate_tile(@builtin(global_invocation_id) id: vec3<u32>) {
     if slot == 0u {
         for (var combo = 0u; combo < params.combo_count; combo = combo + 1u) {
             let offset = node_slot * params.combo_count + combo;
-            hero_sum = hero_sum + hero_reaches[offset];
-            villain_sum = villain_sum + villain_reaches[offset];
+            let live_word = offset >> 5u;
+            let live_mask = 1u << (offset & 31u);
+            if (combo_live[live_word] & live_mask) != 0u {
+                if params.value_player == 2u {
+                    hero_sum = hero_sum + max(root_reach_weights[combo], 0.0);
+                    villain_sum = villain_sum + max(root_reach_weights[params.combo_count + combo], 0.0);
+                } else {
+                    hero_sum = hero_sum + hero_reaches[offset];
+                    villain_sum = villain_sum + villain_reaches[offset];
+                }
+            }
         }
     } else {
         let card = slot - 1u;
@@ -1927,8 +1945,17 @@ fn decision_aggregate_tile(@builtin(global_invocation_id) id: vec3<u32>) {
             let private_combo = combos[combo];
             if private_combo.cards[0] == card || private_combo.cards[1] == card {
                 let offset = node_slot * params.combo_count + combo;
-                hero_sum = hero_sum + hero_reaches[offset];
-                villain_sum = villain_sum + villain_reaches[offset];
+                let live_word = offset >> 5u;
+                let live_mask = 1u << (offset & 31u);
+                if (combo_live[live_word] & live_mask) != 0u {
+                    if params.value_player == 2u {
+                        hero_sum = hero_sum + max(root_reach_weights[combo], 0.0);
+                        villain_sum = villain_sum + max(root_reach_weights[params.combo_count + combo], 0.0);
+                    } else {
+                        hero_sum = hero_sum + hero_reaches[offset];
+                        villain_sum = villain_sum + villain_reaches[offset];
+                    }
+                }
             }
         }
     }
@@ -1962,6 +1989,7 @@ fn denominator_tile(@builtin(global_invocation_id) id: vec3<u32>) {
     }
     let private_combo = combos[combo];
     let aggregate_base = node.public_infoset * 53u;
+    var own_root_weight = root_reach_weights[combo];
     var value_weight = 0.0;
     if node.acting_player == 0u {
         let self_reach = villain_reaches[index];
@@ -1970,6 +1998,7 @@ fn denominator_tile(@builtin(global_invocation_id) id: vec3<u32>) {
             - villain_aggregates[aggregate_base + private_combo.cards[1] + 1u]
             + self_reach;
     } else {
+        own_root_weight = root_reach_weights[params.combo_count + combo];
         let self_reach = hero_reaches[index];
         value_weight = hero_aggregates[aggregate_base]
             - hero_aggregates[aggregate_base + private_combo.cards[0] + 1u]
@@ -1977,6 +2006,10 @@ fn denominator_tile(@builtin(global_invocation_id) id: vec3<u32>) {
             + self_reach;
     }
     let private_infoset = node.public_infoset * params.combo_count + combo;
+    if own_root_weight <= 0.0 || value_weight <= 0.0 {
+        reach_weights[private_infoset - params.public_infoset_count * params.combo_count] = 0.0;
+        return;
+    }
     reach_weights[private_infoset - params.public_infoset_count * params.combo_count] = node._pad1 * value_weight;
 }
 
@@ -1995,6 +2028,12 @@ fn action_edge_tile(@builtin(global_invocation_id) id: vec3<u32>) {
     if node.kind != 0u || node.acting_player != params.value_player {
         return;
     }
+    let parent_combo_index = edge.parent * params.combo_count + combo;
+    let live_word = parent_combo_index >> 5u;
+    let live_mask = 1u << (parent_combo_index & 31u);
+    if (combo_live[live_word] & live_mask) == 0u {
+        return;
+    }
     let private_infoset = node.public_infoset * params.combo_count + combo;
     let local_private_infoset = private_infoset - params.public_infoset_count * params.combo_count;
     let action_index = local_private_infoset * params.max_actions + edge.action;
@@ -2007,11 +2046,25 @@ fn action_edge_tile(@builtin(global_invocation_id) id: vec3<u32>) {
     );
     action_values[action_index] = action_value;
     if edge.action == 0u {
-        var strategy_weight = node._pad1 * hero_reaches[edge.parent * params.combo_count + combo];
+        let private_combo = combos[combo];
+        let aggregate_base = node.public_infoset * 53u;
+        var own_reach = hero_reaches[parent_combo_index];
+        var opponent_weight = villain_aggregates[aggregate_base]
+            - villain_aggregates[aggregate_base + private_combo.cards[0] + 1u]
+            - villain_aggregates[aggregate_base + private_combo.cards[1] + 1u]
+            + max(root_reach_weights[params.combo_count + combo], 0.0);
         if node.acting_player == 1u {
-            strategy_weight = node._pad1 * villain_reaches[edge.parent * params.combo_count + combo];
+            own_reach = villain_reaches[parent_combo_index];
+            opponent_weight = hero_aggregates[aggregate_base]
+                - hero_aggregates[aggregate_base + private_combo.cards[0] + 1u]
+                - hero_aggregates[aggregate_base + private_combo.cards[1] + 1u]
+                + max(root_reach_weights[combo], 0.0);
         }
-        strategy_weights[local_private_infoset] = strategy_weight;
+        if own_reach <= 0.0 || opponent_weight <= 0.0 {
+            strategy_weights[local_private_infoset] = 0.0;
+        } else {
+            strategy_weights[local_private_infoset] = node._pad1 * own_reach * opponent_weight;
+        }
     }
 }
 "#;
@@ -2269,6 +2322,7 @@ struct GpuPublicTreeParams {
     chunk_pairs: u32,
     _pad0: u32,
     _pad1: u32,
+    _pad2: u32,
 }
 
 unsafe impl bytemuck::Zeroable for GpuPublicTreeParams {}
@@ -3119,7 +3173,9 @@ impl GpuDenseCfrBackend {
                     storage_entry(7, true),
                     storage_entry(8, false),
                     storage_entry(9, false),
-                    uniform_entry(10),
+                    storage_entry(10, true),
+                    storage_entry(11, true),
+                    uniform_entry(12),
                 ],
             });
         let public_tree_layer_backup_init_pipeline_layout =
@@ -3172,7 +3228,7 @@ impl GpuDenseCfrBackend {
                     storage_entry(8, true),
                     storage_entry(9, true),
                     storage_entry(10, true),
-                    storage_entry(11, false),
+                    storage_entry(11, true),
                     storage_entry(12, false),
                     storage_entry(13, false),
                     uniform_entry(14),
@@ -3615,6 +3671,7 @@ impl GpuDenseCfrBackend {
                 chunk_pairs: 0,
                 _pad0: 0,
                 _pad1: 0,
+                _pad2: 0,
             }],
         );
         let aggregate_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -3645,6 +3702,7 @@ impl GpuDenseCfrBackend {
                 chunk_pairs: 0,
                 _pad0: 0,
                 _pad1: 0,
+                _pad2: 0,
             }],
         );
         let value_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -3759,6 +3817,7 @@ impl GpuDenseCfrBackend {
                     chunk_pairs: 0,
                     _pad0: 0,
                     _pad1: 0,
+                    _pad2: 0,
                 }],
             );
             let partial_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -3787,6 +3846,7 @@ impl GpuDenseCfrBackend {
                     chunk_pairs: 0,
                     _pad0: 0,
                     _pad1: 0,
+                    _pad2: 0,
                 }],
             );
             let reduce_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -3857,6 +3917,7 @@ impl GpuDenseCfrBackend {
                             chunk_pairs: card_prefix_x_groups,
                             _pad0: 0,
                             _pad1: terminal_start as u32,
+                            _pad2: 0,
                         }],
                     )
                 });
@@ -3873,6 +3934,7 @@ impl GpuDenseCfrBackend {
                             chunk_pairs: reduce_x_invocations,
                             _pad0: 0,
                             _pad1: terminal_start as u32,
+                            _pad2: 0,
                         }],
                     )
                 });
@@ -4293,6 +4355,7 @@ impl GpuDenseCfrBackend {
                         chunk_pairs: 0,
                         _pad0: tile.node_start as u32,
                         _pad1: variant_prediction_eta(variant, iteration).to_bits(),
+                        _pad2: 0,
                     }],
                 );
                 let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -4326,14 +4389,6 @@ impl GpuDenseCfrBackend {
                 "public tree layer reach edges",
                 &edge_tile.edges,
             );
-            let parent_layer_nodes = &ctx.layered.layers[edge_tile.parent_layer].nodes
-                [parent_tile.node_start..parent_tile.node_end];
-            let (state_public_base, state_public_end) =
-                public_infoset_range_for_edges(parent_layer_nodes, &edge_tile.edges)
-                    .unwrap_or((0, 1));
-            let state_action_base = state_public_base * ctx.combos_len * ctx.actions;
-            let state_action_len =
-                (state_public_end - state_public_base) * ctx.combos_len * ctx.actions;
             let invocation_count = edge_tile.edges.len() * ctx.combos_len;
             let (x_groups, y_groups, x_invocations) = dispatch_grid(invocation_count);
             let params = uniform_buffer(
@@ -4341,13 +4396,14 @@ impl GpuDenseCfrBackend {
                 "public tree layer reach edge params",
                 &[GpuPublicTreeParams {
                     combo_count: ctx.combos_len as u32,
-                    node_count: state_public_base as u32,
+                    node_count: 0,
                     max_actions: ctx.actions as u32,
                     output_len: x_invocations,
                     pair_start: variant_code(variant),
                     chunk_pairs: edge_tile.edges.len() as u32,
                     _pad0: br_player,
                     _pad1: variant_prediction_eta(variant, iteration).to_bits(),
+                    _pad2: 0,
                 }],
             );
             let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -4358,24 +4414,14 @@ impl GpuDenseCfrBackend {
                     bind_entry(1, &edge_buffer),
                     bind_entry(2, &ctx.combo_buffer),
                     bind_entry(3, &ctx.root_weights_buffer),
-                    bind_entry_range(
-                        4,
-                        regrets_buffer,
-                        f32_range_byte_offset(state_action_base),
-                        f32_range_byte_size(state_action_len),
-                    ),
+                    bind_entry(4, regrets_buffer),
                     bind_entry(5, &parent_tile.hero_reaches_buffer),
                     bind_entry(6, &parent_tile.villain_reaches_buffer),
                     bind_entry(7, &parent_tile.combo_live_buffer),
                     bind_entry(8, &child_tile.hero_reaches_buffer),
                     bind_entry(9, &child_tile.villain_reaches_buffer),
                     bind_entry(10, &child_tile.combo_live_buffer),
-                    bind_entry_range(
-                        11,
-                        prediction_buffer,
-                        f32_range_byte_offset(state_action_base),
-                        f32_range_byte_size(state_action_len),
-                    ),
+                    bind_entry(11, prediction_buffer),
                     bind_entry(12, &params),
                 ],
             });
@@ -4393,6 +4439,9 @@ impl GpuDenseCfrBackend {
         &self,
         encoder: &mut wgpu::CommandEncoder,
         ctx: &GpuPublicTreeIterationContext,
+        regrets_buffer: &wgpu::Buffer,
+        prediction_buffer: &wgpu::Buffer,
+        variant: super::CfrVariant,
         br_player: u32,
     ) {
         for parent_layer_index in (0..ctx.layer_tiles.len().saturating_sub(1)).rev() {
@@ -4415,6 +4464,7 @@ impl GpuDenseCfrBackend {
                         chunk_pairs: 0,
                         _pad0: 0,
                         _pad1: 0,
+                        _pad2: 0,
                     }],
                 );
                 let init_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -4449,7 +4499,11 @@ impl GpuDenseCfrBackend {
                             pair_start: br_player,
                             chunk_pairs: child_tile.node_start as u32,
                             _pad0: child_tile.node_end as u32,
-                            _pad1: 0,
+                            _pad1: variant_code(variant),
+                            _pad2: public_infoset_base_for_tile(
+                                &ctx.layered.layers[parent_layer_index].nodes
+                                    [parent_tile.node_start..parent_tile.node_end],
+                            ) as u32,
                         }],
                     );
                     let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -4466,7 +4520,9 @@ impl GpuDenseCfrBackend {
                             bind_entry(7, &child_tile.villain_reaches_buffer),
                             bind_entry(8, &parent_tile.hero_values_buffer),
                             bind_entry(9, &parent_tile.villain_values_buffer),
-                            bind_entry(10, &params),
+                            bind_entry(10, regrets_buffer),
+                            bind_entry(11, prediction_buffer),
+                            bind_entry(12, &params),
                         ],
                     });
                     let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -4522,6 +4578,7 @@ impl GpuDenseCfrBackend {
                         chunk_pairs: public_base as u32,
                         _pad0: 0,
                         _pad1: 0,
+                        _pad2: 0,
                     }],
                 );
                 let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -4539,7 +4596,7 @@ impl GpuDenseCfrBackend {
                         bind_entry(8, &empty_edge_buffer),
                         bind_entry(9, &tile.hero_values_buffer),
                         bind_entry(10, &tile.villain_values_buffer),
-                        bind_entry(11, &ctx.dummy_buffer),
+                        bind_entry(11, &ctx.root_weights_buffer),
                         bind_entry(12, &ctx.dummy_buffer),
                         bind_entry(13, &ctx.dummy_buffer),
                         bind_entry(14, &params),
@@ -4569,7 +4626,7 @@ impl GpuDenseCfrBackend {
                     if invocations == 0 {
                         continue;
                     }
-                    let (x_groups, y_groups, _) = dispatch_grid(invocations);
+                    let (x_groups, y_groups, x_invocations) = dispatch_grid(invocations);
                     let max_binding_f32 =
                         (self.device.limits().max_storage_buffer_binding_size as usize / 4).max(1);
                     let max_chunk_publics = (max_binding_f32 / ctx.combos_len.max(1)).max(1);
@@ -4587,11 +4644,12 @@ impl GpuDenseCfrBackend {
                                 combo_count: ctx.combos_len as u32,
                                 node_count: (tile.node_end - tile.node_start) as u32,
                                 max_actions: ctx.actions as u32,
-                                output_len: ctx.action_len as u32,
+                                output_len: x_invocations,
                                 pair_start: value_player,
                                 chunk_pairs: chunk_public_base as u32,
                                 _pad0: chunk_public_end as u32,
                                 _pad1: 0,
+                                _pad2: 0,
                             }],
                         );
                         let bind_group =
@@ -4610,7 +4668,7 @@ impl GpuDenseCfrBackend {
                                     bind_entry(8, &empty_edge_buffer),
                                     bind_entry(9, &tile.hero_values_buffer),
                                     bind_entry(10, &tile.villain_values_buffer),
-                                    bind_entry(11, &ctx.dummy_buffer),
+                                    bind_entry(11, &ctx.root_weights_buffer),
                                     bind_entry_range(
                                         12,
                                         &ctx.reach_weights_buffer,
@@ -4630,6 +4688,65 @@ impl GpuDenseCfrBackend {
                         pass.dispatch_workgroups(x_groups, y_groups, 1);
                     }
                 }
+            }
+        }
+
+        for (layer_index, layer_tiles) in ctx.layer_tiles.iter().enumerate() {
+            for tile in layer_tiles {
+                let tile_nodes =
+                    &ctx.layered.layers[layer_index].nodes[tile.node_start..tile.node_end];
+                let Some((public_base, _public_end)) = public_infoset_range_for_nodes(tile_nodes)
+                else {
+                    continue;
+                };
+                let decision_invocations = (tile.node_end - tile.node_start) * 53usize;
+                if decision_invocations == 0 {
+                    continue;
+                }
+                let (x_groups, y_groups, x_invocations) = dispatch_grid(decision_invocations);
+                let params = uniform_buffer(
+                    &self.device,
+                    "public tree layer strategy aggregate params",
+                    &[GpuPublicTreeParams {
+                        combo_count: ctx.combos_len as u32,
+                        node_count: (tile.node_end - tile.node_start) as u32,
+                        max_actions: ctx.actions as u32,
+                        output_len: x_invocations,
+                        pair_start: 2,
+                        chunk_pairs: public_base as u32,
+                        _pad0: 0,
+                        _pad1: 0,
+                        _pad2: 0,
+                    }],
+                );
+                let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("public tree layer strategy aggregate bind group"),
+                    layout: &self.public_tree_layer_output_bind_group_layout,
+                    entries: &[
+                        bind_entry(0, &tile.node_buffer),
+                        bind_entry(1, &ctx.combo_buffer),
+                        bind_entry(2, &tile.hero_reaches_buffer),
+                        bind_entry(3, &tile.villain_reaches_buffer),
+                        bind_entry(4, &ctx.hero_decision_aggregates_buffer),
+                        bind_entry(5, &ctx.villain_decision_aggregates_buffer),
+                        bind_entry(6, &ctx.dummy_buffer),
+                        bind_entry(7, &tile.combo_live_buffer),
+                        bind_entry(8, &empty_edge_buffer),
+                        bind_entry(9, &tile.hero_values_buffer),
+                        bind_entry(10, &tile.villain_values_buffer),
+                        bind_entry(11, &ctx.root_weights_buffer),
+                        bind_entry(12, &ctx.dummy_buffer),
+                        bind_entry(13, &ctx.dummy_buffer),
+                        bind_entry(14, &params),
+                    ],
+                });
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("public tree layer strategy aggregate pass"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.public_tree_layer_decision_aggregate_pipeline);
+                pass.set_bind_group(0, &bind_group, &[]);
+                pass.dispatch_workgroups(x_groups, y_groups, 1);
             }
         }
 
@@ -4655,7 +4772,7 @@ impl GpuDenseCfrBackend {
             let action_base = infoset_base * ctx.actions;
             let action_len = infoset_len * ctx.actions;
             let invocations = edge_tile.edges.len() * ctx.combos_len;
-            let (x_groups, y_groups, _) = dispatch_grid(invocations);
+            let (x_groups, y_groups, x_invocations) = dispatch_grid(invocations);
             for value_player in [0u32, 1u32] {
                 let params = uniform_buffer(
                     &self.device,
@@ -4664,11 +4781,12 @@ impl GpuDenseCfrBackend {
                         combo_count: ctx.combos_len as u32,
                         node_count: edge_tile.edges.len() as u32,
                         max_actions: ctx.actions as u32,
-                        output_len: ctx.action_len as u32,
+                        output_len: x_invocations,
                         pair_start: value_player,
                         chunk_pairs: public_base as u32,
                         _pad0: 0,
                         _pad1: 0,
+                        _pad2: 0,
                     }],
                 );
                 let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -4691,7 +4809,7 @@ impl GpuDenseCfrBackend {
                         bind_entry(8, &edge_buffer),
                         bind_entry(9, &child_tile.hero_values_buffer),
                         bind_entry(10, &child_tile.villain_values_buffer),
-                        bind_entry_range(11, &ctx.dummy_buffer, 0, f32_range_byte_size(1)),
+                        bind_entry(11, &ctx.root_weights_buffer),
                         bind_entry_range(
                             12,
                             &ctx.reach_weights_buffer,
@@ -5004,7 +5122,14 @@ impl GpuDenseCfrBackend {
             });
         phase_start = profile.then(Instant::now);
 
-        self.backup_layer_values(&mut encoder, ctx, br_player);
+        self.backup_layer_values(
+            &mut encoder,
+            ctx,
+            regrets_buffer,
+            prediction_buffer,
+            variant,
+            br_player,
+        );
         encoder = self.finish_profile_phase(encoder, "cfv_backup", phase_start)?;
         phase_start = profile.then(Instant::now);
 
@@ -6005,6 +6130,12 @@ fn public_infoset_range_for_nodes(nodes: &[GpuPublicTreeNode]) -> Option<(usize,
         found = true;
     }
     found.then_some((public_infoset_bind_base(min_infoset), max_infoset + 1))
+}
+
+fn public_infoset_base_for_tile(nodes: &[GpuPublicTreeNode]) -> usize {
+    public_infoset_range_for_nodes(nodes)
+        .map(|(base, _)| base)
+        .unwrap_or(0)
 }
 
 fn public_infoset_range_for_edges(
