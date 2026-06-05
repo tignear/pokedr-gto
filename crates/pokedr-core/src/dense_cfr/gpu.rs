@@ -2697,9 +2697,12 @@ impl GpuDenseCfrBackend {
 
     fn write_layer_outputs(
         &self,
-        encoder: &mut wgpu::CommandEncoder,
+        mut encoder: wgpu::CommandEncoder,
         ctx: &GpuPublicTreeIterationContext,
-    ) {
+    ) -> Result<wgpu::CommandEncoder, GpuCfrError> {
+        let stage_profile = Self::gpu_profile_enabled()
+            && std::env::var_os("POKEDR_GPU_OUTPUT_STAGE_PROFILE").is_some();
+        let mut stage_start = stage_profile.then(Instant::now);
         for (layer_index, layer_tiles) in ctx.layer_tiles.iter().enumerate() {
             for tile in layer_tiles {
                 let tile_nodes =
@@ -2758,6 +2761,11 @@ impl GpuDenseCfrBackend {
                 pass.set_bind_group(0, &bind_group, &[]);
                 pass.dispatch_workgroups(x_groups, y_groups, 1);
             }
+        }
+        if stage_profile {
+            encoder =
+                self.finish_profile_phase(encoder, "cfv_output_decision_aggregate", stage_start)?;
+            stage_start = Some(Instant::now());
         }
 
         for (layer_index, layer_tiles) in ctx.layer_tiles.iter().enumerate() {
@@ -2833,6 +2841,10 @@ impl GpuDenseCfrBackend {
                 }
             }
         }
+        if stage_profile {
+            encoder = self.finish_profile_phase(encoder, "cfv_output_denominator", stage_start)?;
+            stage_start = Some(Instant::now());
+        }
 
         for (layer_index, layer_tiles) in ctx.layer_tiles.iter().enumerate() {
             for tile in layer_tiles {
@@ -2892,6 +2904,11 @@ impl GpuDenseCfrBackend {
                 pass.set_bind_group(0, &bind_group, &[]);
                 pass.dispatch_workgroups(x_groups, y_groups, 1);
             }
+        }
+        if stage_profile {
+            encoder =
+                self.finish_profile_phase(encoder, "cfv_output_strategy_aggregate", stage_start)?;
+            stage_start = Some(Instant::now());
         }
 
         for (edge_tile, reach_buffers) in ctx
@@ -2977,6 +2994,10 @@ impl GpuDenseCfrBackend {
             pass.set_bind_group(0, &bind_group, &[]);
             pass.dispatch_workgroups(x_groups, y_groups, 1);
         }
+        if stage_profile {
+            encoder = self.finish_profile_phase(encoder, "cfv_output_action_edge", stage_start)?;
+        }
+        Ok(encoder)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3343,7 +3364,7 @@ impl GpuDenseCfrBackend {
         encoder = self.finish_profile_phase(encoder, "cfv_backup", phase_start)?;
         phase_start = profile.then(Instant::now);
 
-        self.write_layer_outputs(&mut encoder, ctx);
+        encoder = self.write_layer_outputs(encoder, ctx)?;
         encoder = self.finish_profile_phase(encoder, "cfv_decision_denominator", phase_start)?;
         phase_start = profile.then(Instant::now);
         self.submit_final_profile_phase(encoder, "cfv_action_aggregate", phase_start)?;
@@ -4626,7 +4647,7 @@ fn public_tree_layer_edge_tiles(
                     }
                 }
                 for edges in edges_by_bucket.into_values() {
-                    let groups = public_tree_edge_groups(&edges);
+                    let groups = public_tree_edge_groups(&edges, parent, parent_start);
                     tiles.push(GpuPublicTreeLayerEdgeTile {
                         parent_layer,
                         child_layer,
@@ -4646,15 +4667,22 @@ fn public_tree_layer_edge_tiles(
     tiles
 }
 
-fn public_tree_edge_groups(edges: &[GpuPublicTreeEdge]) -> Vec<GpuPublicTreeEdgeGroup> {
+fn public_tree_edge_groups(
+    edges: &[GpuPublicTreeEdge],
+    parent_layer: &GpuPublicTreeLayer,
+    parent_start: usize,
+) -> Vec<GpuPublicTreeEdgeGroup> {
     let mut groups = Vec::new();
     let mut index = 0usize;
     while index < edges.len() {
         let parent = edges[index].parent;
         let first_edge = index;
         index += 1;
-        while index < edges.len() && edges[index].parent == parent {
-            index += 1;
+        let node = parent_layer.nodes[parent_start + parent as usize];
+        if node.kind == 0 {
+            while index < edges.len() && edges[index].parent == parent {
+                index += 1;
+            }
         }
         groups.push(GpuPublicTreeEdgeGroup {
             parent,

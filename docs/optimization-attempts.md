@@ -67,6 +67,18 @@ ideas.
   revisited, split decision nodes and chance nodes so only decision reach uses
   parent-group normalization.
 
+## 2026-06-05: Decision-only parent-group reach propagation
+
+- Tried: keep chance reach effectively edge-major while grouping only decision
+  edges by parent. This preserves card-edge parallelism for chance nodes and
+  keeps regret normalization reuse for decision nodes.
+- Expected: recover any lost chance parallelism from parent-group reach.
+- Result: no material change. On `As7h2c`, `depth=5`, one-iteration
+  `cfv_reach_edges` stayed around `1063ms`.
+- Decision: keep only because it is the right algebraic shape for reach, not
+  because it is a major speedup. The reach bottleneck is now more likely memory
+  traffic/dispatch over tiled tree state than sibling regret normalization.
+
 ## 2026-06-05: Single-pass acting-player outputs
 
 - Tried: remove the value-player double dispatch in `denominator_tile` and
