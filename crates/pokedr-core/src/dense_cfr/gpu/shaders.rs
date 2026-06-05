@@ -1933,8 +1933,9 @@ fn decision_aggregate_tile(@builtin(global_invocation_id) id: vec3<u32>) {
     if index >= value_count {
         return;
     }
-    let node_slot = index / slots;
+    let decision_slot = index / slots;
     let slot = index % slots;
+    let node_slot = edges[decision_slot].parent;
     let node = nodes[node_slot];
     if node.kind != 0u {
         return;
@@ -1989,7 +1990,8 @@ fn denominator_tile(@builtin(global_invocation_id) id: vec3<u32>) {
         return;
     }
     let combo = index % params.combo_count;
-    let node_slot = index / params.combo_count;
+    let decision_slot = index / params.combo_count;
+    let node_slot = edges[decision_slot].parent;
     let node = nodes[node_slot];
     if node.kind != 0u || node.acting_player != params.value_player {
         return;
@@ -1997,8 +1999,9 @@ fn denominator_tile(@builtin(global_invocation_id) id: vec3<u32>) {
     if node.public_infoset < params.public_infoset_count || node.public_infoset >= params._pad0 {
         return;
     }
-    let live_word = index >> 5u;
-    let live_mask = 1u << (index & 31u);
+    let parent_combo_index = node_slot * params.combo_count + combo;
+    let live_word = parent_combo_index >> 5u;
+    let live_mask = 1u << (parent_combo_index & 31u);
     if (combo_live[live_word] & live_mask) == 0u {
         let private_infoset = node.public_infoset * params.combo_count + combo;
         reach_weights[private_infoset - params.public_infoset_count * params.combo_count] = 0.0;
@@ -2009,14 +2012,14 @@ fn denominator_tile(@builtin(global_invocation_id) id: vec3<u32>) {
     var own_root_weight = root_reach_weights[combo];
     var value_weight = 0.0;
     if node.acting_player == 0u {
-        let self_reach = villain_reaches[index];
+        let self_reach = villain_reaches[parent_combo_index];
         value_weight = villain_aggregates[aggregate_base]
             - villain_aggregates[aggregate_base + private_combo.cards[0] + 1u]
             - villain_aggregates[aggregate_base + private_combo.cards[1] + 1u]
             + self_reach;
     } else {
         own_root_weight = root_reach_weights[params.combo_count + combo];
-        let self_reach = hero_reaches[index];
+        let self_reach = hero_reaches[parent_combo_index];
         value_weight = hero_aggregates[aggregate_base]
             - hero_aggregates[aggregate_base + private_combo.cards[0] + 1u]
             - hero_aggregates[aggregate_base + private_combo.cards[1] + 1u]

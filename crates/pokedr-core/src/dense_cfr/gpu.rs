@@ -206,6 +206,8 @@ struct GpuPublicTreeLayerTileBuffers {
     node_end: usize,
     node_buffer: wgpu::Buffer,
     child_buffer: wgpu::Buffer,
+    decision_node_buffer: wgpu::Buffer,
+    decision_node_count: usize,
     fold_terminal_nodes: Vec<u32>,
     showdown_terminal_groups: Vec<GpuTerminalGroupCache>,
     hero_reaches_buffer: wgpu::Buffer,
@@ -2154,12 +2156,21 @@ impl GpuDenseCfrBackend {
                         let mut tile_nodes = Vec::with_capacity(node_end - node_start);
                         let mut tile_children = Vec::new();
                         let mut tile_child_cards = Vec::new();
+                        let mut decision_nodes = Vec::new();
                         let mut fold_terminal_nodes = Vec::new();
                         let mut showdown_terminal_nodes = Vec::new();
 
                         for source_slot in node_start..node_end {
                             let local_slot = (source_slot - node_start) as u32;
                             let source = layer.nodes[source_slot];
+                            if source.kind == 0 {
+                                decision_nodes.push(GpuPublicTreeEdge {
+                                    parent: local_slot,
+                                    child: 0,
+                                    action: 0,
+                                    card: u32::MAX,
+                                });
+                            }
                             if source.kind != 0 && source.kind != 1 {
                                 if source.terminal_kind == 2 {
                                     showdown_terminal_nodes.push(local_slot);
@@ -2204,6 +2215,20 @@ impl GpuDenseCfrBackend {
                             &self.device,
                             "public tree layer tile children",
                             &tile_children,
+                        );
+                        let decision_node_buffer = readonly_buffer(
+                            &self.device,
+                            "public tree layer tile decision nodes",
+                            if decision_nodes.is_empty() {
+                                &[GpuPublicTreeEdge {
+                                    parent: 0,
+                                    child: 0,
+                                    action: 0,
+                                    card: u32::MAX,
+                                }]
+                            } else {
+                                &decision_nodes
+                            },
                         );
                         let hero_reaches_buffer = uninit_storage_buffer(
                             &self.device,
@@ -2265,6 +2290,8 @@ impl GpuDenseCfrBackend {
                             node_end,
                             node_buffer,
                             child_buffer,
+                            decision_node_buffer,
+                            decision_node_count: decision_nodes.len(),
                             fold_terminal_nodes,
                             showdown_terminal_groups,
                             hero_reaches_buffer,
@@ -2653,17 +2680,6 @@ impl GpuDenseCfrBackend {
         encoder: &mut wgpu::CommandEncoder,
         ctx: &GpuPublicTreeIterationContext,
     ) {
-        let empty_edge = GpuPublicTreeEdge {
-            parent: 0,
-            child: 0,
-            action: 0,
-            card: u32::MAX,
-        };
-        let empty_edge_buffer = readonly_buffer(
-            &self.device,
-            "public tree empty layer output edge",
-            &[empty_edge],
-        );
         for (layer_index, layer_tiles) in ctx.layer_tiles.iter().enumerate() {
             for tile in layer_tiles {
                 let tile_nodes =
@@ -2672,7 +2688,7 @@ impl GpuDenseCfrBackend {
                 else {
                     continue;
                 };
-                let decision_invocations = (tile.node_end - tile.node_start) * 53usize;
+                let decision_invocations = tile.decision_node_count * 53usize;
                 if decision_invocations == 0 {
                     continue;
                 }
@@ -2682,7 +2698,7 @@ impl GpuDenseCfrBackend {
                     "public tree layer decision aggregate params",
                     &[GpuPublicTreeParams {
                         combo_count: ctx.combos_len as u32,
-                        node_count: (tile.node_end - tile.node_start) as u32,
+                        node_count: tile.decision_node_count as u32,
                         max_actions: ctx.actions as u32,
                         output_len: x_invocations,
                         pair_start: 0,
@@ -2705,7 +2721,7 @@ impl GpuDenseCfrBackend {
                         bind_entry(5, &ctx.villain_decision_aggregates_buffer),
                         bind_entry(6, &ctx.dummy_buffer),
                         bind_entry(7, &tile.combo_live_buffer),
-                        bind_entry(8, &empty_edge_buffer),
+                        bind_entry(8, &tile.decision_node_buffer),
                         bind_entry(9, &tile.hero_values_buffer),
                         bind_entry(10, &tile.villain_values_buffer),
                         bind_entry(11, &ctx.root_weights_buffer),
@@ -2734,7 +2750,7 @@ impl GpuDenseCfrBackend {
                     else {
                         continue;
                     };
-                    let invocations = (tile.node_end - tile.node_start) * ctx.combos_len;
+                    let invocations = tile.decision_node_count * ctx.combos_len;
                     if invocations == 0 {
                         continue;
                     }
@@ -2754,7 +2770,7 @@ impl GpuDenseCfrBackend {
                             "public tree layer denominator params",
                             &[GpuPublicTreeParams {
                                 combo_count: ctx.combos_len as u32,
-                                node_count: (tile.node_end - tile.node_start) as u32,
+                                node_count: tile.decision_node_count as u32,
                                 max_actions: ctx.actions as u32,
                                 output_len: x_invocations,
                                 pair_start: value_player,
@@ -2778,7 +2794,7 @@ impl GpuDenseCfrBackend {
                                     bind_entry(5, &ctx.villain_decision_aggregates_buffer),
                                     bind_entry(6, &ctx.dummy_buffer),
                                     bind_entry(7, &tile.combo_live_buffer),
-                                    bind_entry(8, &empty_edge_buffer),
+                                    bind_entry(8, &tile.decision_node_buffer),
                                     bind_entry(9, &tile.hero_values_buffer),
                                     bind_entry(10, &tile.villain_values_buffer),
                                     bind_entry(11, &ctx.root_weights_buffer),
@@ -2812,7 +2828,7 @@ impl GpuDenseCfrBackend {
                 else {
                     continue;
                 };
-                let decision_invocations = (tile.node_end - tile.node_start) * 53usize;
+                let decision_invocations = tile.decision_node_count * 53usize;
                 if decision_invocations == 0 {
                     continue;
                 }
@@ -2822,7 +2838,7 @@ impl GpuDenseCfrBackend {
                     "public tree layer strategy aggregate params",
                     &[GpuPublicTreeParams {
                         combo_count: ctx.combos_len as u32,
-                        node_count: (tile.node_end - tile.node_start) as u32,
+                        node_count: tile.decision_node_count as u32,
                         max_actions: ctx.actions as u32,
                         output_len: x_invocations,
                         pair_start: 2,
@@ -2845,7 +2861,7 @@ impl GpuDenseCfrBackend {
                         bind_entry(5, &ctx.villain_decision_aggregates_buffer),
                         bind_entry(6, &ctx.dummy_buffer),
                         bind_entry(7, &tile.combo_live_buffer),
-                        bind_entry(8, &empty_edge_buffer),
+                        bind_entry(8, &tile.decision_node_buffer),
                         bind_entry(9, &tile.hero_values_buffer),
                         bind_entry(10, &tile.villain_values_buffer),
                         bind_entry(11, &ctx.root_weights_buffer),
