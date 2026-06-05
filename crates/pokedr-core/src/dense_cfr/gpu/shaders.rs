@@ -143,6 +143,7 @@ pub(super) const PUBLIC_TREE_CFR_UPDATE_SHADER: &str = r#"
 @group(0) @binding(6) var<storage, read> params: array<u32>;
 @group(0) @binding(7) var<storage, read> legal_actions: array<u32>;
 @group(0) @binding(8) var<storage, read_write> prediction: array<f32>;
+@group(0) @binding(9) var<storage, read> fused_public_infoset_mask: array<u32>;
 
 fn positive(value: f32) -> f32 {
     return max(value, 0.0);
@@ -222,6 +223,12 @@ fn update(@builtin(global_invocation_id) id: vec3<u32>) {
     if infoset >= infosets {
         return;
     }
+    let global_infoset = params[9] + infoset;
+    let combo_count = max(params[10], 1u);
+    let public_infoset = global_infoset / combo_count;
+    if fused_public_infoset_mask[public_infoset] != 0u {
+        return;
+    }
 
     let offset = infoset * actions;
     var normalizer = 0.0;
@@ -282,6 +289,229 @@ fn update(@builtin(global_invocation_id) id: vec3<u32>) {
             prediction[offset + action] = regret;
         }
         strategy_sum[offset + action] = strategy_sum[offset + action] * average_discount + strategy_weight * strategy;
+    }
+}
+"#;
+
+pub(super) const PUBLIC_TREE_LAYER_FUSED_UPDATE_SHADER: &str = r#"
+struct Combo { cards: array<u32, 2>, };
+struct Edge {
+    parent: u32,
+    child: u32,
+    action: u32,
+    card: u32,
+};
+struct EdgeGroup {
+    parent: u32,
+    first_edge: u32,
+    edge_count: u32,
+    _pad0: u32,
+};
+struct TreeNode {
+    kind: u32,
+    acting_player: u32,
+    public_infoset: u32,
+    first_child: u32,
+    child_count: u32,
+    terminal_kind: u32,
+    showdown_offset: u32,
+    _pad0: u32,
+    pot: f32,
+    hero_invested: f32,
+    _pad1: f32,
+    _pad2: f32,
+};
+struct Params {
+    combo_count: u32,
+    group_count: u32,
+    max_actions: u32,
+    output_len: u32,
+    variant: u32,
+    public_infoset_base: u32,
+    iteration: u32,
+    eta_bits: u32,
+    alpha_bits: u32,
+    gamma_bits: u32,
+    avg_delay: u32,
+    avg_power_bits: u32,
+};
+
+@group(0) @binding(0) var<storage, read> nodes: array<TreeNode>;
+@group(0) @binding(1) var<storage, read> combos: array<Combo>;
+@group(0) @binding(2) var<storage, read> hero_reaches: array<f32>;
+@group(0) @binding(3) var<storage, read> villain_reaches: array<f32>;
+@group(0) @binding(4) var<storage, read> hero_aggregates: array<f32>;
+@group(0) @binding(5) var<storage, read> villain_aggregates: array<f32>;
+@group(0) @binding(6) var<storage, read> combo_live: array<u32>;
+@group(0) @binding(7) var<storage, read> edges: array<Edge>;
+@group(0) @binding(8) var<storage, read> groups: array<EdgeGroup>;
+@group(0) @binding(9) var<storage, read> child_hero_values: array<f32>;
+@group(0) @binding(10) var<storage, read> child_villain_values: array<f32>;
+@group(0) @binding(11) var<storage, read> root_reach_weights: array<f32>;
+@group(0) @binding(12) var<storage, read_write> regrets: array<f32>;
+@group(0) @binding(13) var<storage, read_write> strategy_sum: array<f32>;
+@group(0) @binding(14) var<storage, read> legal_actions: array<u32>;
+@group(0) @binding(15) var<storage, read_write> prediction: array<f32>;
+@group(0) @binding(16) var<uniform> params: Params;
+
+fn positive_fused(value: f32) -> f32 {
+    return max(value, 0.0);
+}
+
+fn effective_regret_fused(index: u32) -> f32 {
+    if params.variant == 3u {
+        return regrets[index] + bitcast<f32>(params.eta_bits) * prediction[index];
+    }
+    return regrets[index];
+}
+
+fn strategy_at_fused(offset: u32, action: u32, legal_count: u32, normalizer: f32) -> f32 {
+    if legal_actions[offset + action] == 0u {
+        return 0.0;
+    }
+    if normalizer > 0.0 {
+        return positive_fused(effective_regret_fused(offset + action)) / normalizer;
+    }
+    return 1.0 / f32(max(legal_count, 1u));
+}
+
+fn regret_discount_fused() -> f32 {
+    if params.variant == 1u {
+        let t = f32(max(params.iteration, 1u));
+        return t / (t + 1.0);
+    }
+    if params.variant == 2u || params.variant == 3u || params.variant == 4u {
+        if params.iteration <= 1u {
+            return 0.0;
+        }
+        let weighted = pow(f32(params.iteration - 1u), bitcast<f32>(params.alpha_bits));
+        return weighted / (weighted + 1.5);
+    }
+    return 1.0;
+}
+
+fn average_strategy_discount_fused() -> f32 {
+    if (params.variant == 2u || params.variant == 3u || params.variant == 4u) && params.iteration > 1u {
+        let t = f32(params.iteration);
+        return pow((t - 1.0) / t, bitcast<f32>(params.gamma_bits));
+    }
+    return 1.0;
+}
+
+fn average_strategy_weight_multiplier_fused() -> f32 {
+    let power = bitcast<f32>(params.avg_power_bits);
+    if params.avg_delay == 0u && power == 0.0 {
+        return 1.0;
+    }
+    if params.iteration <= params.avg_delay {
+        return 0.0;
+    }
+    return pow(f32(params.iteration - params.avg_delay), power);
+}
+
+@compute @workgroup_size(64)
+fn fused_update_tile(@builtin(global_invocation_id) id: vec3<u32>) {
+    let index = id.x + id.y * params.output_len;
+    let value_count = params.group_count * params.combo_count;
+    if index >= value_count {
+        return;
+    }
+    let combo = index % params.combo_count;
+    let group_slot = index / params.combo_count;
+    let group = groups[group_slot];
+    let node = nodes[group.parent];
+    if node.kind != 0u || group.edge_count != node.child_count {
+        return;
+    }
+    let parent_combo_index = group.parent * params.combo_count + combo;
+    let live_word = parent_combo_index >> 5u;
+    let live_mask = 1u << (parent_combo_index & 31u);
+    if (combo_live[live_word] & live_mask) == 0u {
+        return;
+    }
+
+    let private_combo = combos[combo];
+    let aggregate_base = node.public_infoset * 53u;
+    var own_root_weight = root_reach_weights[combo];
+    var counterfactual_weight = 0.0;
+    var own_reach = hero_reaches[parent_combo_index];
+    if node.acting_player == 0u {
+        let self_reach = villain_reaches[parent_combo_index];
+        counterfactual_weight = villain_aggregates[aggregate_base]
+            - villain_aggregates[aggregate_base + private_combo.cards[0] + 1u]
+            - villain_aggregates[aggregate_base + private_combo.cards[1] + 1u]
+            + self_reach;
+    } else {
+        own_root_weight = root_reach_weights[params.combo_count + combo];
+        own_reach = villain_reaches[parent_combo_index];
+        let self_reach = hero_reaches[parent_combo_index];
+        counterfactual_weight = hero_aggregates[aggregate_base]
+            - hero_aggregates[aggregate_base + private_combo.cards[0] + 1u]
+            - hero_aggregates[aggregate_base + private_combo.cards[1] + 1u]
+            + self_reach;
+    }
+    if own_root_weight <= 0.0 || counterfactual_weight <= 0.0 {
+        return;
+    }
+
+    let private_infoset = (node.public_infoset - params.public_infoset_base) * params.combo_count + combo;
+    let action_offset = private_infoset * params.max_actions;
+    var normalizer = 0.0;
+    var legal_count = 0u;
+    for (var action = 0u; action < params.max_actions; action = action + 1u) {
+        if legal_actions[action_offset + action] != 0u {
+            legal_count = legal_count + 1u;
+            normalizer = normalizer + positive_fused(effective_regret_fused(action_offset + action));
+        }
+    }
+
+    var q_values: array<f32, 8>;
+    var node_value = 0.0;
+    let reach_weight = node._pad1 * counterfactual_weight;
+    for (var group_edge = 0u; group_edge < group.edge_count; group_edge = group_edge + 1u) {
+        let edge = edges[group.first_edge + group_edge];
+        let child_offset = edge.child * params.combo_count + combo;
+        let raw_action_value = select(
+            child_villain_values[child_offset],
+            child_hero_values[child_offset],
+            node.acting_player == 0u
+        );
+        let q = raw_action_value / reach_weight;
+        q_values[edge.action] = q;
+        let strategy = strategy_at_fused(action_offset, edge.action, legal_count, normalizer);
+        node_value = node_value + strategy * q;
+    }
+
+    let discount = regret_discount_fused();
+    let average_discount = average_strategy_discount_fused();
+    var strategy_weight = node._pad1 * own_reach * f32(params.iteration);
+    if params.variant == 2u || params.variant == 3u || params.variant == 4u {
+        strategy_weight = node._pad1 * own_reach;
+    }
+    if params.avg_delay != 0u || bitcast<f32>(params.avg_power_bits) != 0.0 {
+        strategy_weight = node._pad1 * own_reach * average_strategy_weight_multiplier_fused();
+    }
+
+    for (var action = 0u; action < params.max_actions; action = action + 1u) {
+        if legal_actions[action_offset + action] == 0u {
+            regrets[action_offset + action] = 0.0;
+            if params.variant == 3u {
+                prediction[action_offset + action] = 0.0;
+            }
+            strategy_sum[action_offset + action] = 0.0;
+            continue;
+        }
+        let strategy = strategy_at_fused(action_offset, action, legal_count, normalizer);
+        let regret = (q_values[action] - node_value) * reach_weight;
+        var updated = regrets[action_offset + action] * discount + regret;
+        if params.variant == 0u || params.variant == 2u || params.variant == 3u || params.variant == 4u {
+            updated = max(updated, 0.0);
+        }
+        regrets[action_offset + action] = updated;
+        if params.variant == 3u {
+            prediction[action_offset + action] = regret;
+        }
+        strategy_sum[action_offset + action] = strategy_sum[action_offset + action] * average_discount + strategy_weight * strategy;
     }
 }
 "#;

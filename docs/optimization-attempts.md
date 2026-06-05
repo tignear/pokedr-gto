@@ -104,3 +104,21 @@ ideas.
   global `action_values` materialization surface, not by invocation count or
   repeated parent reads. The next real optimization must remove or bypass that
   table for most infosets.
+
+## 2026-06-05: Fused complete-group CFR update
+
+- Tried: for complete decision groups, skip global `action_values`
+  materialization and update regret/average strategy directly from child CFVs.
+  Only split public infosets keep the old action-value fallback path.
+- Expected: remove most action-value writes and the old full-infoset CFR update
+  pass.
+- Result: directionally correct but modest. On `As7h2c`, `depth=5`,
+  one-iteration profile moved `cfr_update` from about `62ms` after the first
+  fused prototype to about `7ms` once split updates were restricted to aligned
+  split ranges. `cfv_output_action_edge` still costs about `225ms` even though
+  only `33` split decision edges remain. `128` lightweight iterations moved
+  from about `49.41s` to about `48.32s`.
+- Decision: keep because it removes a real full-table update pass and preserves
+  correctness for complete groups, but do not expect this path alone to produce
+  the needed order-of-magnitude gain. The remaining target is eliminating or
+  redesigning the split fallback/global action-value output stage.

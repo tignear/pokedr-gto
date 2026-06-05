@@ -61,7 +61,9 @@ pub struct GpuDenseCfrBackend {
     public_tree_layer_decision_aggregate_pipeline: wgpu::ComputePipeline,
     public_tree_layer_denominator_pipeline: wgpu::ComputePipeline,
     public_tree_layer_action_edge_pipeline: wgpu::ComputePipeline,
+    public_tree_layer_fused_update_pipeline: wgpu::ComputePipeline,
     public_tree_layer_output_bind_group_layout: wgpu::BindGroupLayout,
+    public_tree_layer_fused_update_bind_group_layout: wgpu::BindGroupLayout,
 }
 
 pub struct GpuDenseCfrState {
@@ -211,6 +213,8 @@ struct GpuPublicTreeIterationContext {
     terminal_card_prefix_pairs_buffer: wgpu::Buffer,
     hero_decision_aggregates_buffer: wgpu::Buffer,
     villain_decision_aggregates_buffer: wgpu::Buffer,
+    fused_public_infoset_mask_buffer: wgpu::Buffer,
+    split_public_infosets: Vec<u32>,
 }
 
 struct GpuPublicTreeLayerTileBuffers {
@@ -254,6 +258,8 @@ struct GpuPublicTreeLayerEdgeTile {
     parent_tile: GpuPublicTreeLayerTile,
     child_tile: GpuPublicTreeLayerTile,
     edges: Vec<GpuPublicTreeEdge>,
+    split_edges: Vec<GpuPublicTreeEdge>,
+    complete_decision_groups: Vec<GpuPublicTreeEdgeGroup>,
     groups: Vec<GpuPublicTreeEdgeGroup>,
 }
 
@@ -277,8 +283,30 @@ struct GpuPublicTreeLayered {
 
 struct GpuPublicTreeLayerReachBuffers {
     edges: wgpu::Buffer,
+    split_edges: wgpu::Buffer,
+    complete_decision_groups: wgpu::Buffer,
     groups: wgpu::Buffer,
 }
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct GpuPublicTreeFusedUpdateParams {
+    combo_count: u32,
+    group_count: u32,
+    max_actions: u32,
+    output_len: u32,
+    variant: u32,
+    public_infoset_base: u32,
+    iteration: u32,
+    eta_bits: u32,
+    alpha_bits: u32,
+    gamma_bits: u32,
+    avg_delay: u32,
+    avg_power_bits: u32,
+}
+
+unsafe impl bytemuck::Zeroable for GpuPublicTreeFusedUpdateParams {}
+unsafe impl bytemuck::Pod for GpuPublicTreeFusedUpdateParams {}
 
 struct GpuTerminalGroupCache {
     board_count: usize,
@@ -742,6 +770,7 @@ impl GpuDenseCfrBackend {
                     storage_entry(6, true),
                     storage_entry(7, true),
                     storage_entry(8, false),
+                    storage_entry(9, true),
                 ],
             });
         let public_tree_cfr_update_pipeline_layout =
@@ -1208,6 +1237,11 @@ impl GpuDenseCfrBackend {
                 label: Some("public tree layer output shader"),
                 source: wgpu::ShaderSource::Wgsl(PUBLIC_TREE_LAYER_OUTPUT_SHADER.into()),
             });
+        let public_tree_layer_fused_update_shader =
+            device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("public tree layer fused update shader"),
+                source: wgpu::ShaderSource::Wgsl(PUBLIC_TREE_LAYER_FUSED_UPDATE_SHADER.into()),
+            });
         let public_tree_layer_output_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("public tree layer output bind group layout"),
@@ -1235,6 +1269,35 @@ impl GpuDenseCfrBackend {
                 bind_group_layouts: &[Some(&public_tree_layer_output_bind_group_layout)],
                 immediate_size: 0,
             });
+        let public_tree_layer_fused_update_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("public tree layer fused update bind group layout"),
+                entries: &[
+                    storage_entry(0, true),
+                    storage_entry(1, true),
+                    storage_entry(2, true),
+                    storage_entry(3, true),
+                    storage_entry(4, true),
+                    storage_entry(5, true),
+                    storage_entry(6, true),
+                    storage_entry(7, true),
+                    storage_entry(8, true),
+                    storage_entry(9, true),
+                    storage_entry(10, true),
+                    storage_entry(11, true),
+                    storage_entry(12, false),
+                    storage_entry(13, false),
+                    storage_entry(14, true),
+                    storage_entry(15, false),
+                    uniform_entry(16),
+                ],
+            });
+        let public_tree_layer_fused_update_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("public tree layer fused update pipeline layout"),
+                bind_group_layouts: &[Some(&public_tree_layer_fused_update_bind_group_layout)],
+                immediate_size: 0,
+            });
         let public_tree_layer_decision_aggregate_pipeline =
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some("public tree layer decision aggregate pipeline"),
@@ -1259,6 +1322,15 @@ impl GpuDenseCfrBackend {
                 layout: Some(&public_tree_layer_output_pipeline_layout),
                 module: &public_tree_layer_output_shader,
                 entry_point: Some("action_edge_tile"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                cache: None,
+            });
+        let public_tree_layer_fused_update_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("public tree layer fused update pipeline"),
+                layout: Some(&public_tree_layer_fused_update_pipeline_layout),
+                module: &public_tree_layer_fused_update_shader,
+                entry_point: Some("fused_update_tile"),
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
                 cache: None,
             });
@@ -1298,7 +1370,9 @@ impl GpuDenseCfrBackend {
             public_tree_layer_decision_aggregate_pipeline,
             public_tree_layer_denominator_pipeline,
             public_tree_layer_action_edge_pipeline,
+            public_tree_layer_fused_update_pipeline,
             public_tree_layer_output_bind_group_layout,
+            public_tree_layer_fused_update_bind_group_layout,
         })
     }
 
@@ -2699,6 +2773,7 @@ impl GpuDenseCfrBackend {
         &self,
         mut encoder: wgpu::CommandEncoder,
         ctx: &GpuPublicTreeIterationContext,
+        split_only_action_edges: bool,
     ) -> Result<wgpu::CommandEncoder, GpuCfrError> {
         let stage_profile = Self::gpu_profile_enabled()
             && std::env::var_os("POKEDR_GPU_OUTPUT_STAGE_PROFILE").is_some();
@@ -2932,14 +3007,22 @@ impl GpuDenseCfrBackend {
             let infoset_len = (public_end - public_base) * ctx.combos_len;
             let action_base = infoset_base * ctx.actions;
             let action_len = infoset_len * ctx.actions;
-            let invocations = edge_tile.edges.len() * ctx.combos_len;
+            let action_edge_count = if split_only_action_edges {
+                edge_tile.split_edges.len()
+            } else {
+                edge_tile.edges.len()
+            };
+            if action_edge_count == 0 {
+                continue;
+            }
+            let invocations = action_edge_count * ctx.combos_len;
             let (x_groups, y_groups, x_invocations) = dispatch_grid(invocations);
             let params = uniform_buffer(
                 &self.device,
                 "public tree layer action edge params",
                 &[GpuPublicTreeParams {
                     combo_count: ctx.combos_len as u32,
-                    node_count: edge_tile.edges.len() as u32,
+                    node_count: action_edge_count as u32,
                     max_actions: ctx.actions as u32,
                     output_len: x_invocations,
                     pair_start: 0,
@@ -2967,7 +3050,14 @@ impl GpuDenseCfrBackend {
                         f32_range_byte_size(action_len),
                     ),
                     bind_entry(7, &parent_tile.combo_live_buffer),
-                    bind_entry(8, &reach_buffers.edges),
+                    bind_entry(
+                        8,
+                        if split_only_action_edges {
+                            &reach_buffers.split_edges
+                        } else {
+                            &reach_buffers.edges
+                        },
+                    ),
                     bind_entry(9, &child_tile.hero_values_buffer),
                     bind_entry(10, &child_tile.villain_values_buffer),
                     bind_entry(11, &ctx.root_weights_buffer),
@@ -3023,7 +3113,7 @@ impl GpuDenseCfrBackend {
         let action_len = infosets * actions;
         let output_len = action_len * 2 + infosets * 2;
         let node_combo_len = nodes.len() * combos.len();
-        let layered = public_tree_layered(
+        let mut layered = public_tree_layered(
             nodes,
             children,
             child_cards,
@@ -3043,6 +3133,11 @@ impl GpuDenseCfrBackend {
                 node_combo_len,
             );
         }
+        let (fused_public_infoset_mask, split_public_infosets) =
+            public_tree_partition_fused_public_infosets(
+                &mut layered,
+                nodes_public_infoset_count(nodes),
+            );
 
         let combo_buffer = readonly_buffer(&self.device, "public tree combos", combos);
         let mut root_weights = Vec::with_capacity(combos.len() * 2);
@@ -3167,6 +3262,34 @@ impl GpuDenseCfrBackend {
                     "public tree layer resident edges",
                     &edge_tile.edges,
                 ),
+                split_edges: readonly_buffer(
+                    &self.device,
+                    "public tree layer resident split edges",
+                    if edge_tile.split_edges.is_empty() {
+                        &[GpuPublicTreeEdge {
+                            parent: 0,
+                            child: 0,
+                            action: 0,
+                            card: u32::MAX,
+                        }]
+                    } else {
+                        &edge_tile.split_edges
+                    },
+                ),
+                complete_decision_groups: readonly_buffer(
+                    &self.device,
+                    "public tree layer resident complete decision groups",
+                    if edge_tile.complete_decision_groups.is_empty() {
+                        &[GpuPublicTreeEdgeGroup {
+                            parent: 0,
+                            first_edge: 0,
+                            edge_count: 0,
+                            _pad0: 0,
+                        }]
+                    } else {
+                        &edge_tile.complete_decision_groups
+                    },
+                ),
                 groups: readonly_buffer(
                     &self.device,
                     "public tree layer resident edge groups",
@@ -3180,6 +3303,11 @@ impl GpuDenseCfrBackend {
             combos,
             showdown_boards,
             &combo_live_masks,
+        );
+        let fused_public_infoset_mask_buffer = readonly_buffer(
+            &self.device,
+            "public tree fused public infoset mask",
+            &fused_public_infoset_mask,
         );
 
         GpuPublicTreeIterationContext {
@@ -3211,6 +3339,8 @@ impl GpuDenseCfrBackend {
             terminal_card_prefix_pairs_buffer,
             hero_decision_aggregates_buffer,
             villain_decision_aggregates_buffer,
+            fused_public_infoset_mask_buffer,
+            split_public_infosets,
         }
     }
 
@@ -3222,6 +3352,7 @@ impl GpuDenseCfrBackend {
         variant: super::CfrVariant,
         br_player: u32,
         iteration: usize,
+        split_only_action_edges: bool,
     ) -> Result<(GpuPublicTreeOutputBuffers, usize, usize), GpuCfrError> {
         if std::env::var_os("POKEDR_SOLVER_PROGRESS_OFF").is_none() {
             eprintln!(
@@ -3249,7 +3380,9 @@ impl GpuDenseCfrBackend {
             let mut chance_edges = 0usize;
             let mut chance_only_tiles = 0usize;
             let mut complete_decision_groups = 0usize;
+            let mut complete_decision_edges = 0usize;
             let mut split_decision_groups = 0usize;
+            let mut split_decision_edges = 0usize;
             for edge_tile in &ctx.layered.reach_edge_tiles {
                 let parent = &ctx.layered.layers[edge_tile.parent_layer];
                 let mut tile_decision_edges = 0usize;
@@ -3269,8 +3402,10 @@ impl GpuDenseCfrBackend {
                     if node.kind == 0 {
                         if group.edge_count == node.child_count {
                             complete_decision_groups += 1;
+                            complete_decision_edges += group.edge_count as usize;
                         } else {
                             split_decision_groups += 1;
+                            split_decision_edges += group.edge_count as usize;
                         }
                     }
                 }
@@ -3281,13 +3416,15 @@ impl GpuDenseCfrBackend {
                 chance_edges += tile_chance_edges;
             }
             eprintln!(
-                "pokedr: gpu profile reach edge_tiles={} chance_only_tiles={} decision_edges={} chance_edges={} complete_decision_groups={} split_decision_groups={}",
+                "pokedr: gpu profile reach edge_tiles={} chance_only_tiles={} decision_edges={} chance_edges={} complete_decision_groups={} complete_decision_edges={} split_decision_groups={} split_decision_edges={}",
                 ctx.layered.reach_edge_tiles.len(),
                 chance_only_tiles,
                 decision_edges,
                 chance_edges,
                 complete_decision_groups,
+                complete_decision_edges,
                 split_decision_groups,
+                split_decision_edges,
             );
             self.propagate_layer_reach_inits(&mut encoder, ctx, variant, iteration);
             encoder = self.finish_profile_phase(encoder, "cfv_reach_init", phase_start)?;
@@ -3379,7 +3516,7 @@ impl GpuDenseCfrBackend {
         encoder = self.finish_profile_phase(encoder, "cfv_backup", phase_start)?;
         phase_start = profile.then(Instant::now);
 
-        encoder = self.write_layer_outputs(encoder, ctx)?;
+        encoder = self.write_layer_outputs(encoder, ctx, split_only_action_edges)?;
         encoder = self.finish_profile_phase(encoder, "cfv_decision_denominator", phase_start)?;
         phase_start = profile.then(Instant::now);
         self.submit_final_profile_phase(encoder, "cfv_action_aggregate", phase_start)?;
@@ -3495,6 +3632,7 @@ impl GpuDenseCfrBackend {
                 state.variant,
                 br_player,
                 usize::MAX,
+                false,
             )?;
         let action_values_readback = readback_buffer(&self.device, action_len);
         let reach_weights_readback = readback_buffer(&self.device, state.infosets);
@@ -3629,6 +3767,7 @@ impl GpuDenseCfrBackend {
                 state.variant,
                 2,
                 iteration,
+                true,
             )?;
         if let Some(start) = cfv_start {
             self.profile_poll()?;
@@ -3644,16 +3783,33 @@ impl GpuDenseCfrBackend {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("public tree CFR update encoder"),
             });
-        let max_binding_f32 =
-            (self.device.limits().max_storage_buffer_binding_size as usize / 4).max(1);
-        let max_chunk_infosets = (max_binding_f32 / state.actions.max(1))
-            .max(1)
-            .min(state.infosets);
-        let max_dispatch_infosets = 65_535usize * WORKGROUP_SIZE as usize;
-        let max_chunk_infosets = (max_chunk_infosets / 64).max(1) * 64;
-        let max_chunk_infosets = max_chunk_infosets.min(max_dispatch_infosets);
-        for infoset_start in (0..state.infosets).step_by(max_chunk_infosets) {
-            let infoset_count = max_chunk_infosets.min(state.infosets - infoset_start);
+        self.fused_complete_group_updates(&mut encoder, context, state, iteration);
+        let mut split_update_ranges = Vec::with_capacity(context.split_public_infosets.len());
+        for &public_infoset in &context.split_public_infosets {
+            let target_start = public_infoset as usize * context.combos_len;
+            if target_start >= state.infosets {
+                continue;
+            }
+            let aligned_start = (target_start / 8) * 8;
+            let target_end = (target_start + context.combos_len).min(state.infosets);
+            split_update_ranges.push((aligned_start, target_end));
+        }
+        split_update_ranges.sort_unstable();
+        let mut merged_split_update_ranges: Vec<(usize, usize)> = Vec::new();
+        for (start, end) in split_update_ranges {
+            if let Some((_, last_end)) = merged_split_update_ranges.last_mut() {
+                if start <= *last_end {
+                    *last_end = (*last_end).max(end);
+                    continue;
+                }
+            }
+            merged_split_update_ranges.push((start, end));
+        }
+        for (infoset_start, infoset_end) in merged_split_update_ranges {
+            let infoset_count = infoset_end - infoset_start;
+            if infoset_count == 0 {
+                continue;
+            }
             let action_start = infoset_start * state.actions;
             let action_len = infoset_count * state.actions;
             let params = readonly_buffer(
@@ -3669,6 +3825,8 @@ impl GpuDenseCfrBackend {
                     variant_prediction_eta(state.variant, iteration).to_bits(),
                     super::average_strategy_delay() as u32,
                     super::average_strategy_power().to_bits(),
+                    infoset_start as u32,
+                    context.combos_len as u32,
                 ],
             );
             let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -3719,6 +3877,7 @@ impl GpuDenseCfrBackend {
                         f32_range_byte_offset(action_start),
                         f32_range_byte_size(action_len),
                     ),
+                    bind_entry(9, &context.fused_public_infoset_mask_buffer),
                 ],
             });
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -3740,6 +3899,113 @@ impl GpuDenseCfrBackend {
             );
         }
         Ok(())
+    }
+
+    fn fused_complete_group_updates(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        ctx: &GpuPublicTreeIterationContext,
+        state: &GpuDenseCfrState,
+        iteration: usize,
+    ) {
+        for (edge_tile, reach_buffers) in ctx
+            .layered
+            .reach_edge_tiles
+            .iter()
+            .zip(&ctx.reach_edge_buffers)
+        {
+            if edge_tile.complete_decision_groups.is_empty() {
+                continue;
+            }
+            let parent_tile_index = edge_tile.parent_tile.node_start / ctx.layered.node_tile_size;
+            let child_tile_index = edge_tile.child_tile.node_start / ctx.layered.node_tile_size;
+            let parent_tile = &ctx.layer_tiles[edge_tile.parent_layer][parent_tile_index];
+            let child_tile = &ctx.layer_tiles[edge_tile.child_layer][child_tile_index];
+            let parent_layer_nodes = &ctx.layered.layers[edge_tile.parent_layer].nodes
+                [parent_tile.node_start..parent_tile.node_end];
+            let Some((public_base, public_end)) =
+                public_infoset_range_for_edges(parent_layer_nodes, &edge_tile.edges)
+            else {
+                continue;
+            };
+            let infoset_base = public_base * ctx.combos_len;
+            let infoset_len = (public_end - public_base) * ctx.combos_len;
+            let action_base = infoset_base * ctx.actions;
+            let action_len = infoset_len * ctx.actions;
+            let invocation_count = edge_tile.complete_decision_groups.len() * ctx.combos_len;
+            if invocation_count == 0 {
+                continue;
+            }
+            let (x_groups, y_groups, x_invocations) = dispatch_grid(invocation_count);
+            let params = uniform_buffer(
+                &self.device,
+                "public tree fused update params",
+                &[GpuPublicTreeFusedUpdateParams {
+                    combo_count: ctx.combos_len as u32,
+                    group_count: edge_tile.complete_decision_groups.len() as u32,
+                    max_actions: ctx.actions as u32,
+                    output_len: x_invocations,
+                    variant: variant_code(state.variant),
+                    public_infoset_base: public_base as u32,
+                    iteration: iteration as u32,
+                    eta_bits: variant_prediction_eta(state.variant, iteration).to_bits(),
+                    alpha_bits: variant_dcfr_alpha(state.variant, iteration).to_bits(),
+                    gamma_bits: variant_dcfr_gamma(state.variant, iteration).to_bits(),
+                    avg_delay: super::average_strategy_delay() as u32,
+                    avg_power_bits: super::average_strategy_power().to_bits(),
+                }],
+            );
+            let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("public tree fused update bind group"),
+                layout: &self.public_tree_layer_fused_update_bind_group_layout,
+                entries: &[
+                    bind_entry(0, &parent_tile.node_buffer),
+                    bind_entry(1, &ctx.combo_buffer),
+                    bind_entry(2, &parent_tile.hero_reaches_buffer),
+                    bind_entry(3, &parent_tile.villain_reaches_buffer),
+                    bind_entry(4, &ctx.hero_decision_aggregates_buffer),
+                    bind_entry(5, &ctx.villain_decision_aggregates_buffer),
+                    bind_entry(6, &parent_tile.combo_live_buffer),
+                    bind_entry(7, &reach_buffers.edges),
+                    bind_entry(8, &reach_buffers.complete_decision_groups),
+                    bind_entry(9, &child_tile.hero_values_buffer),
+                    bind_entry(10, &child_tile.villain_values_buffer),
+                    bind_entry(11, &ctx.root_weights_buffer),
+                    bind_entry_range(
+                        12,
+                        &state.regrets,
+                        f32_range_byte_offset(action_base),
+                        f32_range_byte_size(action_len),
+                    ),
+                    bind_entry_range(
+                        13,
+                        &state.strategy_sum,
+                        f32_range_byte_offset(action_base),
+                        f32_range_byte_size(action_len),
+                    ),
+                    bind_entry_range(
+                        14,
+                        &state.legal_actions_buffer,
+                        (action_base * std::mem::size_of::<u32>()) as u64,
+                        (action_len.max(1) * std::mem::size_of::<u32>()) as u64,
+                    ),
+                    bind_entry_range(
+                        15,
+                        &state.prediction,
+                        f32_range_byte_offset(action_base),
+                        f32_range_byte_size(action_len),
+                    ),
+                    bind_entry(16, &params),
+                ],
+            });
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("public tree fused update pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.public_tree_layer_fused_update_pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.dispatch_workgroups(x_groups, y_groups, 1);
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4663,6 +4929,10 @@ fn public_tree_layer_edge_tiles(
                 }
                 for edges in edges_by_bucket.into_values() {
                     let groups = public_tree_edge_groups(&edges, parent, parent_start);
+                    let split_edges =
+                        public_tree_split_decision_edges(&edges, &groups, parent, parent_start);
+                    let complete_decision_groups =
+                        public_tree_complete_decision_groups(&groups, parent, parent_start);
                     tiles.push(GpuPublicTreeLayerEdgeTile {
                         parent_layer,
                         child_layer,
@@ -4673,6 +4943,8 @@ fn public_tree_layer_edge_tiles(
                             node_start: child_start,
                         },
                         edges,
+                        split_edges,
+                        complete_decision_groups,
                         groups,
                     });
                 }
@@ -4680,6 +4952,40 @@ fn public_tree_layer_edge_tiles(
         }
     }
     tiles
+}
+
+fn public_tree_complete_decision_groups(
+    groups: &[GpuPublicTreeEdgeGroup],
+    parent_layer: &GpuPublicTreeLayer,
+    parent_start: usize,
+) -> Vec<GpuPublicTreeEdgeGroup> {
+    groups
+        .iter()
+        .copied()
+        .filter(|group| {
+            let node = parent_layer.nodes[parent_start + group.parent as usize];
+            node.kind == 0 && group.edge_count == node.child_count
+        })
+        .collect()
+}
+
+fn public_tree_split_decision_edges(
+    edges: &[GpuPublicTreeEdge],
+    groups: &[GpuPublicTreeEdgeGroup],
+    parent_layer: &GpuPublicTreeLayer,
+    parent_start: usize,
+) -> Vec<GpuPublicTreeEdge> {
+    let mut split_edges = Vec::new();
+    for group in groups {
+        let node = parent_layer.nodes[parent_start + group.parent as usize];
+        if node.kind != 0 || group.edge_count == node.child_count {
+            continue;
+        }
+        let start = group.first_edge as usize;
+        let end = start + group.edge_count as usize;
+        split_edges.extend_from_slice(&edges[start..end]);
+    }
+    split_edges
 }
 
 fn public_tree_edge_groups(
@@ -4707,6 +5013,54 @@ fn public_tree_edge_groups(
         });
     }
     groups
+}
+
+fn public_tree_partition_fused_public_infosets(
+    layered: &mut GpuPublicTreeLayered,
+    public_infoset_count: usize,
+) -> (Vec<u32>, Vec<u32>) {
+    let mut mask = vec![0u32; public_infoset_count.max(1)];
+    let mut split = vec![false; public_infoset_count.max(1)];
+    for edge_tile in &layered.reach_edge_tiles {
+        let parent_layer = &layered.layers[edge_tile.parent_layer];
+        for group in &edge_tile.groups {
+            let node = parent_layer.nodes[edge_tile.parent_tile.node_start + group.parent as usize];
+            if node.kind != 0 || (node.public_infoset as usize) >= public_infoset_count {
+                continue;
+            }
+            let public_infoset = node.public_infoset as usize;
+            if group.edge_count == node.child_count {
+                mask[public_infoset] = 1;
+            } else {
+                split[public_infoset] = true;
+            }
+        }
+    }
+    let split_public_infosets = split
+        .iter()
+        .enumerate()
+        .filter_map(|(public_infoset, &has_split)| {
+            if public_infoset < public_infoset_count && has_split {
+                Some(public_infoset as u32)
+            } else {
+                None
+            }
+        })
+        .collect();
+    for (slot, has_split) in split.into_iter().enumerate() {
+        if has_split {
+            mask[slot] = 0;
+        }
+    }
+    for edge_tile in &mut layered.reach_edge_tiles {
+        let parent_layer = &layered.layers[edge_tile.parent_layer];
+        edge_tile.complete_decision_groups.retain(|group| {
+            let node = parent_layer.nodes[edge_tile.parent_tile.node_start + group.parent as usize];
+            (node.public_infoset as usize) < public_infoset_count
+                && mask[node.public_infoset as usize] != 0
+        });
+    }
+    (mask, split_public_infosets)
 }
 
 fn public_tree_layer_tile_pairs(
