@@ -243,12 +243,21 @@ struct GpuPublicTreeLayerEdgeTile {
 }
 
 #[derive(Debug, Clone)]
+struct GpuPublicTreeLayerTilePair {
+    parent_layer: usize,
+    child_layer: usize,
+    parent_tile: GpuPublicTreeLayerTile,
+    child_tile: GpuPublicTreeLayerTile,
+}
+
+#[derive(Debug, Clone)]
 struct GpuPublicTreeLayered {
     layers: Vec<GpuPublicTreeLayer>,
     max_layer_nodes: usize,
     node_tile_size: usize,
     max_layer_tiles: usize,
     reach_edge_tiles: Vec<GpuPublicTreeLayerEdgeTile>,
+    backup_tile_pairs: Vec<GpuPublicTreeLayerTilePair>,
 }
 
 struct GpuTerminalGroupCache {
@@ -2500,7 +2509,14 @@ impl GpuDenseCfrBackend {
                     pass.dispatch_workgroups(x_groups, y_groups, 1);
                 }
 
-                for child_tile in &ctx.layer_tiles[child_layer_index] {
+                for tile_pair in ctx.layered.backup_tile_pairs.iter().filter(|tile_pair| {
+                    tile_pair.parent_layer == parent_layer_index
+                        && tile_pair.parent_tile.node_start == parent_tile.node_start
+                }) {
+                    debug_assert_eq!(tile_pair.child_layer, child_layer_index);
+                    let child_tile_index =
+                        tile_pair.child_tile.node_start / ctx.layered.node_tile_size;
+                    let child_tile = &ctx.layer_tiles[child_layer_index][child_tile_index];
                     let parent_layer_nodes = &ctx.layered.layers[parent_layer_index].nodes
                         [parent_tile.node_start..parent_tile.node_end];
                     let public_range = public_infoset_range_for_nodes(parent_layer_nodes);
@@ -2967,12 +2983,13 @@ impl GpuDenseCfrBackend {
         );
         if std::env::var_os("POKEDR_GPU_LAYER_TRACE").is_some() {
             eprintln!(
-                "pokedr: gpu public tree layers={} max_layer_nodes={} node_tile_size={} max_layer_tiles={} reach_edge_tiles={} max_layer_node_combos={} full_node_combos={}",
+                "pokedr: gpu public tree layers={} max_layer_nodes={} node_tile_size={} max_layer_tiles={} reach_edge_tiles={} backup_tile_pairs={} max_layer_node_combos={} full_node_combos={}",
                 layered.layers.len(),
                 layered.max_layer_nodes,
                 layered.node_tile_size,
                 layered.max_layer_tiles,
                 layered.reach_edge_tiles.len(),
+                layered.backup_tile_pairs.len(),
                 layered.max_layer_nodes * combos.len(),
                 node_combo_len,
             );
@@ -4479,11 +4496,13 @@ fn public_tree_layered(
         .max()
         .unwrap_or(0);
     let reach_edge_tiles = public_tree_layer_edge_tiles(&layers, node_tile_size);
+    let backup_tile_pairs = public_tree_layer_tile_pairs(&reach_edge_tiles);
 
     GpuPublicTreeLayered {
         node_tile_size,
         max_layer_tiles,
         reach_edge_tiles,
+        backup_tile_pairs,
         layers,
         max_layer_nodes,
     }
@@ -4566,6 +4585,37 @@ fn public_tree_layer_edge_tiles(
         }
     }
     tiles
+}
+
+fn public_tree_layer_tile_pairs(
+    edge_tiles: &[GpuPublicTreeLayerEdgeTile],
+) -> Vec<GpuPublicTreeLayerTilePair> {
+    let mut keys = BTreeMap::new();
+    for edge_tile in edge_tiles {
+        keys.entry((
+            edge_tile.parent_layer,
+            edge_tile.child_layer,
+            edge_tile.parent_tile.node_start,
+            edge_tile.child_tile.node_start,
+        ))
+        .or_insert(());
+    }
+    keys.into_keys()
+        .map(
+            |(parent_layer, child_layer, parent_node_start, child_node_start)| {
+                GpuPublicTreeLayerTilePair {
+                    parent_layer,
+                    child_layer,
+                    parent_tile: GpuPublicTreeLayerTile {
+                        node_start: parent_node_start,
+                    },
+                    child_tile: GpuPublicTreeLayerTile {
+                        node_start: child_node_start,
+                    },
+                }
+            },
+        )
+        .collect()
 }
 
 #[cfg(test)]
