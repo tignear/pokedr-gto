@@ -520,6 +520,159 @@ value_h[z, h] =
     (p(z) * W[b(z), h, v] - i_h(z))
 ```
 
+## Terminal CFV Reduce Audit
+
+This section describes the current terminal implementation, not the desired
+end state. It exists to prevent local shader edits that preserve the same
+wrong work shape.
+
+For a terminal public node `z`, a private combo `h`, and a final board `B`, the
+current kernel computes opponent masses from two pieces:
+
+1. `prefix_pairs[z, B, k]`: board-local cumulative reach mass ordered by
+   hand strength.
+2. `blocker_neighbors[h]`: all opponent combos that share either private card
+   with `h`.
+
+Let:
+
+```text
+R_v(z, v) = villain_reach[z, v]
+R_h(z, h) = hero_reach[z, h]
+L_B(c)    = 1 if c does not collide with final board B, else 0
+N(h)      = { v : v intersects h }
+g_B(c)    = strength group of combo c on board B
+```
+
+The raw board-local villain prefix gives:
+
+```text
+TotalRaw_v(z, B) =
+  sum_v L_B(v) * R_v(z, v)
+
+WinRaw_v(z, B, h) =
+  sum_v L_B(v) * 1[g_B(v) < g_B(h)] * R_v(z, v)
+
+TieRaw_v(z, B, h) =
+  sum_v L_B(v) * 1[g_B(v) = g_B(h)] * R_v(z, v)
+```
+
+Those values still include private-card collisions with `h`, so the current
+reduce subtracts:
+
+```text
+BlockTotal_v(z, B, h) =
+  sum_{v in N(h)} L_B(v) * R_v(z, v)
+
+BlockWin_v(z, B, h) =
+  sum_{v in N(h)} L_B(v) * 1[g_B(v) < g_B(h)] * R_v(z, v)
+
+BlockTie_v(z, B, h) =
+  sum_{v in N(h)} L_B(v) * 1[g_B(v) = g_B(h)] * R_v(z, v)
+```
+
+and uses:
+
+```text
+Win_v   = WinRaw_v   - BlockWin_v
+Tie_v   = TieRaw_v   - BlockTie_v
+Total_v = TotalRaw_v - BlockTotal_v
+```
+
+Hero terminal value for `h` is:
+
+```text
+V_H(z, h) =
+  chance_scale(z) *
+  sum_{B in runouts(z), L_B(h)=1}
+    [ pot(z) * (Win_v + 0.5 * Tie_v)
+      - invested_H(z) * Total_v ]
+    / showdown_denominator(z)
+```
+
+Villain value is the symmetric expression with hero reach mass and villain
+investment:
+
+```text
+V_V(z, v) =
+  chance_scale(z) *
+  sum_{B in runouts(z), L_B(v)=1}
+    [ pot(z) * (Win_h + 0.5 * Tie_h)
+      - invested_V(z) * Total_h ]
+    / showdown_denominator(z)
+```
+
+The current GPU work shape for the non-card-prefix path is:
+
+```text
+terminal_partial:
+  one thread per (terminal, final_board)
+  serial loop over combo order
+  writes prefix_pairs[terminal, final_board, combo_rank]
+
+terminal_reduce:
+  one thread per (terminal, private_combo)
+  serial loop over final boards
+  serial loop over blocker_neighbors[private_combo]
+  writes value[terminal_node, private_combo]
+```
+
+For `As7h2c`, depth 5, full terminal runouts, the warm profile is:
+
+```text
+cfv ~= 393 ms / iteration
+cfv_terminal ~= 347 ms / iteration
+cfr_update ~= 8 ms / iteration
+```
+
+So further regret-update work is not the primary speed path. The hot operation
+is terminal CFV generation, especially the `terminal_reduce` loop nest.
+
+The attempted `card_prefix` path replaces the neighbor loop with
+`prefix_by_card[52]` lookups, but in the current implementation it is slower:
+
+```text
+normal terminal ~= 347 ms warm
+card-prefix terminal ~= 918 ms warm
+```
+
+That path materializes too much card-prefix data and increases memory traffic.
+It should not become the default without a different storage layout.
+
+The next viable implementation must change the terminal reduce shape. A local
+cleanup inside the existing `(terminal, combo)` thread is unlikely to produce
+an order-of-magnitude improvement because the same thread still performs the
+board loop and the blocker-neighbor loop with scattered reads.
+
+Candidate replacement:
+
+```text
+board-blocker terminal CFV:
+  work item block = (terminal group, final board tile, combo tile)
+
+  1. Build board-local raw prefix as today.
+  2. For each final board, compute blocker-corrected contributions for a tile
+     of private combos.
+  3. Accumulate partial values into per-terminal combo output across board
+     tiles.
+```
+
+The important change is that final-board work becomes the parallel dimension.
+The current implementation sums all boards inside a single `(terminal, combo)`
+thread, which serializes exactly the dimension that should provide parallelism
+on flop and turn terminals.
+
+Correctness guard for any replacement:
+
+```text
+For a deterministic small public tree:
+  normal_terminal_reduce(z,c) == replacement_terminal_reduce(z,c)
+```
+
+The comparison must be against the current mathematical expression above, not
+against exploitability convergence. Convergence is too indirect to debug this
+kernel.
+
 Villain terminal vector:
 
 ```text
