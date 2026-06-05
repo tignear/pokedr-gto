@@ -193,13 +193,11 @@ struct GpuPublicTreeIterationContext {
     action_values_buffer: wgpu::Buffer,
     reach_weights_buffer: wgpu::Buffer,
     strategy_weights_buffer: wgpu::Buffer,
-    dummy_buffer: wgpu::Buffer,
+    empty_storage_buffer: wgpu::Buffer,
     layer_tiles: Vec<Vec<GpuPublicTreeLayerTileBuffers>>,
     reach_edge_buffers: Vec<GpuPublicTreeLayerReachBuffers>,
     fold_terminal_nodes: Vec<u32>,
     showdown_terminal_nodes: Vec<u32>,
-    terminal_tile_count: usize,
-    terminal_board_tile_count: usize,
     terminal_chunk_size: usize,
     terminal_blocker_neighbors_buffer: wgpu::Buffer,
     terminal_blocker_neighbor_stride: usize,
@@ -2197,7 +2195,7 @@ impl GpuDenseCfrBackend {
             let parent_layer_nodes = &ctx.layered.layers[edge_tile.parent_layer].nodes
                 [parent_tile.node_start..parent_tile.node_end];
             // Chance-only edge tiles still have to propagate reach/live state. They do not need
-            // strategy buffers, so bind a dummy range instead of skipping the tile.
+            // strategy buffers, so bind a one-float placeholder instead of skipping the tile.
             let public_range = public_infoset_range_for_edges(parent_layer_nodes, &edge_tile.edges);
             let (public_base, public_end) = public_range.unwrap_or((0, 0));
             let (action_base, action_len) = if public_range.is_some() {
@@ -2242,7 +2240,7 @@ impl GpuDenseCfrBackend {
                             f32_range_byte_size(action_len),
                         )
                     } else {
-                        bind_entry(5, &ctx.dummy_buffer)
+                        bind_entry(5, &ctx.empty_storage_buffer)
                     },
                     bind_entry(6, &parent_tile.hero_reaches_buffer),
                     bind_entry(7, &parent_tile.villain_reaches_buffer),
@@ -2258,7 +2256,7 @@ impl GpuDenseCfrBackend {
                             f32_range_byte_size(action_len),
                         )
                     } else {
-                        bind_entry(12, &ctx.dummy_buffer)
+                        bind_entry(12, &ctx.empty_storage_buffer)
                     },
                     bind_entry(13, &params),
                 ],
@@ -2448,8 +2446,8 @@ impl GpuDenseCfrBackend {
                                     bind_entry(7, &child_tile.villain_reaches_buffer),
                                     bind_entry(8, &parent_tile.hero_values_buffer),
                                     bind_entry(9, &parent_tile.villain_values_buffer),
-                                    bind_entry(10, &ctx.dummy_buffer),
-                                    bind_entry(11, &ctx.dummy_buffer),
+                                    bind_entry(10, &ctx.empty_storage_buffer),
+                                    bind_entry(11, &ctx.empty_storage_buffer),
                                     bind_entry(12, &params),
                                 ],
                             });
@@ -2514,14 +2512,14 @@ impl GpuDenseCfrBackend {
                         bind_entry(3, &tile.villain_reaches_buffer),
                         bind_entry(4, &ctx.hero_decision_aggregates_buffer),
                         bind_entry(5, &ctx.villain_decision_aggregates_buffer),
-                        bind_entry(6, &ctx.dummy_buffer),
+                        bind_entry(6, &ctx.empty_storage_buffer),
                         bind_entry(7, &tile.combo_live_buffer),
                         bind_entry(8, &tile.decision_node_buffer),
                         bind_entry(9, &tile.hero_values_buffer),
                         bind_entry(10, &tile.villain_values_buffer),
                         bind_entry(11, &ctx.root_weights_buffer),
-                        bind_entry(12, &ctx.dummy_buffer),
-                        bind_entry(13, &ctx.dummy_buffer),
+                        bind_entry(12, &ctx.empty_storage_buffer),
+                        bind_entry(13, &ctx.empty_storage_buffer),
                         bind_entry(14, &params),
                     ],
                 });
@@ -2590,7 +2588,7 @@ impl GpuDenseCfrBackend {
                             bind_entry(3, &tile.villain_reaches_buffer),
                             bind_entry(4, &ctx.hero_decision_aggregates_buffer),
                             bind_entry(5, &ctx.villain_decision_aggregates_buffer),
-                            bind_entry(6, &ctx.dummy_buffer),
+                            bind_entry(6, &ctx.empty_storage_buffer),
                             bind_entry(7, &tile.combo_live_buffer),
                             bind_entry(8, &tile.decision_node_buffer),
                             bind_entry(9, &tile.hero_values_buffer),
@@ -2602,7 +2600,7 @@ impl GpuDenseCfrBackend {
                                 f32_range_byte_offset(chunk_infoset_base),
                                 f32_range_byte_size(chunk_infoset_len),
                             ),
-                            bind_entry(13, &ctx.dummy_buffer),
+                            bind_entry(13, &ctx.empty_storage_buffer),
                             bind_entry(14, &params),
                         ],
                     });
@@ -2660,14 +2658,14 @@ impl GpuDenseCfrBackend {
                         bind_entry(3, &tile.villain_reaches_buffer),
                         bind_entry(4, &ctx.hero_decision_aggregates_buffer),
                         bind_entry(5, &ctx.villain_decision_aggregates_buffer),
-                        bind_entry(6, &ctx.dummy_buffer),
+                        bind_entry(6, &ctx.empty_storage_buffer),
                         bind_entry(7, &tile.combo_live_buffer),
                         bind_entry(8, &tile.decision_node_buffer),
                         bind_entry(9, &tile.hero_values_buffer),
                         bind_entry(10, &tile.villain_values_buffer),
                         bind_entry(11, &ctx.root_weights_buffer),
-                        bind_entry(12, &ctx.dummy_buffer),
-                        bind_entry(13, &ctx.dummy_buffer),
+                        bind_entry(12, &ctx.empty_storage_buffer),
+                        bind_entry(13, &ctx.empty_storage_buffer),
                         bind_entry(14, &params),
                     ],
                 });
@@ -2876,8 +2874,12 @@ impl GpuDenseCfrBackend {
             infosets,
             true,
         );
-        let dummy_buffer =
-            uninit_storage_buffer(&self.device, "public tree dummy output", 1, false);
+        let empty_storage_buffer = uninit_storage_buffer(
+            &self.device,
+            "public tree empty storage placeholder",
+            1,
+            false,
+        );
         let fold_terminal_nodes: Vec<_> = nodes
             .iter()
             .enumerate()
@@ -2895,16 +2897,12 @@ impl GpuDenseCfrBackend {
             })
             .collect();
         let public_infoset_count = nodes_public_infoset_count(nodes);
-        let terminal_tile_count = 1;
-        let _terminal_tile_size = combos.len().max(1);
         let max_showdown_boards = showdown_terminal_nodes
             .iter()
             .map(|node_index| nodes[*node_index as usize]._pad0 as usize)
             .max()
             .unwrap_or(1)
             .max(1);
-        let terminal_board_tile_count = 1;
-        let _terminal_board_tile_size = max_showdown_boards;
         let (blocker_neighbors, blocker_neighbor_stride) = showdown_blocker_neighbors(combos);
         let terminal_blocker_neighbors_buffer = readonly_buffer(
             &self.device,
@@ -3041,13 +3039,11 @@ impl GpuDenseCfrBackend {
             action_values_buffer,
             reach_weights_buffer,
             strategy_weights_buffer,
-            dummy_buffer,
+            empty_storage_buffer,
             layer_tiles,
             reach_edge_buffers,
             fold_terminal_nodes,
             showdown_terminal_nodes,
-            terminal_tile_count,
-            terminal_board_tile_count,
             terminal_chunk_size,
             terminal_blocker_neighbors_buffer,
             terminal_blocker_neighbor_stride: blocker_neighbor_stride,
@@ -3072,14 +3068,12 @@ impl GpuDenseCfrBackend {
     ) -> Result<(GpuPublicTreeOutputBuffers, usize, usize), GpuCfrError> {
         if std::env::var_os("POKEDR_SOLVER_PROGRESS_OFF").is_none() {
             eprintln!(
-                "pokedr: gpu public tree cfv nodes={} combos={} node_combo_values={} folds={} showdowns={} terminal_tiles={} board_tiles={} terminal_chunk={}",
+                "pokedr: gpu public tree cfv nodes={} combos={} node_combo_values={} folds={} showdowns={} terminal_chunk={}",
                 ctx.nodes_len,
                 ctx.combos_len,
                 ctx.node_combo_len,
                 ctx.fold_terminal_nodes.len(),
                 ctx.showdown_terminal_nodes.len(),
-                ctx.terminal_tile_count,
-                ctx.terminal_board_tile_count,
                 ctx.terminal_chunk_size
             );
         }
@@ -3585,7 +3579,7 @@ impl GpuDenseCfrBackend {
                         f32_range_byte_offset(action_start),
                         f32_range_byte_size(action_len),
                     ),
-                    bind_entry_range(3, &context.dummy_buffer, 0, f32_range_byte_size(1)),
+                    bind_entry_range(3, &context.empty_storage_buffer, 0, f32_range_byte_size(1)),
                     bind_entry_range(
                         4,
                         &output_buffers.reach_weights,
