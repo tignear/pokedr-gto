@@ -876,6 +876,9 @@ fn try_solve_fixed_flop_metrics_gpu(
     let started = Instant::now();
     let mut completed_iterations = 0usize;
     let include_local_gaps = std::env::var_os("POKEDR_METRIC_LOCAL_GAPS").is_some();
+    let include_br_metrics = std::env::var_os("POKEDR_METRIC_BR").is_some();
+    let include_current_br = std::env::var_os("POKEDR_METRIC_CURRENT_BR").is_some();
+    let include_diagnostics = std::env::var_os("POKEDR_METRIC_DIAGNOSTICS").is_some();
     for iterations in checkpoints {
         let delta = iterations.saturating_sub(completed_iterations);
         backend
@@ -896,9 +899,25 @@ fn try_solve_fixed_flop_metrics_gpu(
         backend.wait_idle().ok()?;
         completed_iterations = iterations;
 
-        let state = gpu_state.download(&backend).ok()?;
+        let need_full_state = include_br_metrics
+            || include_current_br
+            || include_local_gaps
+            || include_diagnostics
+            || metric_cpu_exploitability_enabled();
+        let state = need_full_state
+            .then(|| gpu_state.download(&backend))
+            .transpose()
+            .ok()?;
         let elapsed_secs = started.elapsed().as_secs_f32();
-        let root_strategy = root_average_strategy(layout, &state, indexer, root_dead);
+        let root_strategy = if let Some(state) = state.as_ref() {
+            root_average_strategy(layout, state, indexer, root_dead)
+        } else {
+            let root_strategy_sum_len = COMBO_COUNT * layout.max_actions();
+            let strategy_sum_prefix = gpu_state
+                .download_strategy_sum_prefix(&backend, root_strategy_sum_len)
+                .ok()?;
+            root_average_strategy_from_sum_prefix(layout, &strategy_sum_prefix, indexer, root_dead)
+        };
         let root_strategy_l1_delta = previous_root_strategy
             .as_ref()
             .map(|previous| mean_l1_delta(previous, &root_strategy));
@@ -920,45 +939,57 @@ fn try_solve_fixed_flop_metrics_gpu(
                     hero_weights,
                     villain_weights,
                     layout,
-                    &state,
+                    state.as_ref()?,
                 )
             })
             .flatten();
-        let recursive_br_gap = recursive_br_gap_metrics_gpu(
-            &backend,
-            tree,
-            &linearized,
-            &combos,
-            &combo_legal,
-            hero_weights,
-            villain_weights,
-            layout,
-            &state,
-            include_local_gaps,
-        );
-        let current_recursive_br_gap = recursive_br_gap_metrics_gpu_with_profile(
-            &backend,
-            tree,
-            &linearized,
-            &combos,
-            &combo_legal,
-            hero_weights,
-            villain_weights,
-            layout,
-            &state,
-            false,
-        );
-        let cpu_exploitability = metric_cpu_exploitability_enabled().then(|| {
-            cpu_infoset_root_exploitability(
-                tree,
-                layout,
-                &state,
-                indexer,
-                hero_weights,
-                villain_weights,
-                base_config.max_showdown_runouts,
-            )
-        });
+        let recursive_br_gap = include_br_metrics
+            .then(|| {
+                recursive_br_gap_metrics_gpu(
+                    &backend,
+                    tree,
+                    &linearized,
+                    &combos,
+                    &combo_legal,
+                    hero_weights,
+                    villain_weights,
+                    layout,
+                    state.as_ref()?,
+                    include_local_gaps,
+                )
+            })
+            .flatten();
+        let current_recursive_br_gap = include_current_br
+            .then(|| {
+                recursive_br_gap_metrics_gpu_with_profile(
+                    &backend,
+                    tree,
+                    &linearized,
+                    &combos,
+                    &combo_legal,
+                    hero_weights,
+                    villain_weights,
+                    layout,
+                    state.as_ref()?,
+                    false,
+                )
+            })
+            .flatten();
+        let cpu_exploitability = if metric_cpu_exploitability_enabled() {
+            state.as_ref().map(|state| {
+                cpu_infoset_root_exploitability(
+                    tree,
+                    layout,
+                    state,
+                    indexer,
+                    hero_weights,
+                    villain_weights,
+                    base_config.max_showdown_runouts,
+                )
+            })
+        } else {
+            None
+        };
         let root_exploitability = recursive_br_gap
             .as_ref()
             .map(|metrics| metrics.root_exploitability);
@@ -968,7 +999,11 @@ fn try_solve_fixed_flop_metrics_gpu(
         let cpu_gpu_root_exploitability_delta = root_exploitability
             .zip(cpu_root_exploitability)
             .map(|(gpu, cpu)| gpu - cpu);
-        let diagnostics = cfr_state_diagnostics(&state);
+        let diagnostics = if let (true, Some(state)) = (include_diagnostics, state.as_ref()) {
+            cfr_state_diagnostics(state)
+        } else {
+            CfrDiagnostics::skipped()
+        };
         rows.push(FixedFlopMetricRow {
             board: format_pokedr_cards(flop),
             iterations,
@@ -1065,6 +1100,18 @@ struct CfrDiagnostics {
     current_strategy_norm_error: f32,
     average_strategy_norm_error: f32,
     finite: bool,
+}
+
+impl CfrDiagnostics {
+    fn skipped() -> Self {
+        Self {
+            positive_regret_mass: f32::NAN,
+            illegal_strategy_mass: f32::NAN,
+            current_strategy_norm_error: 0.0,
+            average_strategy_norm_error: 0.0,
+            finite: true,
+        }
+    }
 }
 
 fn cfr_state_diagnostics(state: &DenseCfrState) -> CfrDiagnostics {
@@ -2230,6 +2277,44 @@ fn root_average_strategy(
         }
         state.average_strategy_for(private_infoset(0, Player::Hero, combo_index), &mut strategy);
         result.extend_from_slice(&strategy);
+    }
+    result
+}
+
+fn root_average_strategy_from_sum_prefix(
+    layout: &PostflopDenseLayout,
+    strategy_sum_prefix: &[f32],
+    indexer: &ComboIndexer,
+    root_dead: u64,
+) -> Vec<f32> {
+    let max_actions = layout.max_actions();
+    let action_count = layout.action_count(0);
+    assert!(strategy_sum_prefix.len() >= COMBO_COUNT * max_actions);
+    let mut result = Vec::with_capacity(COMBO_COUNT * max_actions);
+    for (combo_index, combo) in indexer.combos().iter().enumerate() {
+        let offset = combo_index * max_actions;
+        let sums = &strategy_sum_prefix[offset..offset + max_actions];
+        if combo.collides_with(root_dead) {
+            result.extend(std::iter::repeat_n(0.0, max_actions));
+            continue;
+        }
+        let normalizer: f32 = sums[..action_count].iter().sum();
+        if normalizer > f32::EPSILON {
+            result.extend(sums.iter().enumerate().map(|(action, value)| {
+                if action < action_count {
+                    *value / normalizer
+                } else {
+                    0.0
+                }
+            }));
+        } else {
+            let uniform = 1.0 / action_count as f32;
+            result.extend((0..max_actions).map(
+                |action| {
+                    if action < action_count { uniform } else { 0.0 }
+                },
+            ));
+        }
     }
     result
 }

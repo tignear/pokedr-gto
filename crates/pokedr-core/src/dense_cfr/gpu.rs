@@ -4025,6 +4025,30 @@ impl GpuDenseCfrState {
             strategy_sum: read_f32_buffer(&backend.device, &strategy_readback, len)?,
         })
     }
+
+    pub fn download_strategy_sum_prefix(
+        &self,
+        backend: &GpuDenseCfrBackend,
+        len: usize,
+    ) -> Result<Vec<f32>, GpuCfrError> {
+        assert!(len <= self.infosets * self.actions);
+        let readback = readback_buffer(&backend.device, len);
+        let mut encoder = backend
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("resident dense CFR strategy prefix download encoder"),
+            });
+        copy_buffer(&mut encoder, &self.strategy_sum, &readback, len);
+        let submission = backend.queue.submit(Some(encoder.finish()));
+        backend
+            .device
+            .poll(wgpu::PollType::Wait {
+                submission_index: Some(submission),
+                timeout: None,
+            })
+            .map_err(|error| GpuCfrError::MapFailed(error.to_string()))?;
+        read_f32_buffer(&backend.device, &readback, len)
+    }
 }
 
 impl GpuResidentDenseCfrSolver {

@@ -81,6 +81,15 @@ struct FlopMetricsArgs {
     regression_patience: usize,
     #[arg(long)]
     local_gaps: bool,
+    #[arg(long, help = "Compute root best-response metrics at each checkpoint")]
+    br_metrics: bool,
+    #[arg(long, help = "Also compute current-strategy best-response metrics")]
+    current_br: bool,
+    #[arg(
+        long,
+        help = "Scan the full CFR state for diagnostics at each checkpoint"
+    )]
+    diagnostics: bool,
 }
 
 #[derive(Debug, Args, Clone)]
@@ -434,6 +443,7 @@ fn run_solve_flop_metrics(args: FlopMetricsArgs) {
     });
     let config = match_config(&args.solver);
     let convergence = metric_convergence_settings(&args);
+    let explicit_iterations = explicit_metric_iterations_requested(&args);
     let iterations = convergence
         .as_ref()
         .map(|settings| metric_convergence_iterations(settings))
@@ -451,6 +461,22 @@ fn run_solve_flop_metrics(args: FlopMetricsArgs) {
         target_bb100
     );
     let dump_gap_nodes = args.local_gaps || std::env::var_os("POKEDR_METRIC_LOCAL_GAPS").is_some();
+    let need_br_metrics = args.br_metrics || (convergence.is_some() && !explicit_iterations);
+    if need_br_metrics {
+        unsafe {
+            std::env::set_var("POKEDR_METRIC_BR", "1");
+        }
+    }
+    if args.current_br {
+        unsafe {
+            std::env::set_var("POKEDR_METRIC_CURRENT_BR", "1");
+        }
+    }
+    if args.diagnostics {
+        unsafe {
+            std::env::set_var("POKEDR_METRIC_DIAGNOSTICS", "1");
+        }
+    }
     let mut best_exploitability_bb100 = f32::INFINITY;
     let mut regression_count = 0usize;
     let patience = convergence
