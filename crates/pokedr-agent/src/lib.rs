@@ -146,6 +146,14 @@ pub struct FixedFlopMetricRow {
     pub negative_regret_mass: f32,
     pub negative_regret_count: usize,
     pub deep_negative_regret_count: usize,
+    pub rbp_private_action_slots: usize,
+    pub rbp_prunable_private_action_slots: usize,
+    pub rbp_public_action_edges: usize,
+    pub rbp_fully_prunable_public_action_edges: usize,
+    pub rbp_public_edge_subtree_nodes: usize,
+    pub rbp_fully_prunable_public_edge_subtree_nodes: usize,
+    pub rbp_public_edge_terminal_nodes: usize,
+    pub rbp_fully_prunable_public_edge_terminal_nodes: usize,
     pub illegal_strategy_mass: f32,
     pub current_strategy_norm_error: f32,
     pub average_strategy_norm_error: f32,
@@ -714,7 +722,8 @@ where
             &indexer,
             root_dead,
         );
-        let diagnostics = cfr_state_diagnostics(&state);
+        let diagnostics =
+            cfr_state_diagnostics(&state, Some((&tree, &layout, &indexer, root_dead)));
         rows.push(FixedFlopMetricRow {
             board: format_pokedr_cards(&flop),
             iterations: config.cfr_iterations,
@@ -753,6 +762,17 @@ where
             negative_regret_mass: diagnostics.negative_regret_mass,
             negative_regret_count: diagnostics.negative_regret_count,
             deep_negative_regret_count: diagnostics.deep_negative_regret_count,
+            rbp_private_action_slots: diagnostics.rbp_private_action_slots,
+            rbp_prunable_private_action_slots: diagnostics.rbp_prunable_private_action_slots,
+            rbp_public_action_edges: diagnostics.rbp_public_action_edges,
+            rbp_fully_prunable_public_action_edges: diagnostics
+                .rbp_fully_prunable_public_action_edges,
+            rbp_public_edge_subtree_nodes: diagnostics.rbp_public_edge_subtree_nodes,
+            rbp_fully_prunable_public_edge_subtree_nodes: diagnostics
+                .rbp_fully_prunable_public_edge_subtree_nodes,
+            rbp_public_edge_terminal_nodes: diagnostics.rbp_public_edge_terminal_nodes,
+            rbp_fully_prunable_public_edge_terminal_nodes: diagnostics
+                .rbp_fully_prunable_public_edge_terminal_nodes,
             illegal_strategy_mass: diagnostics.illegal_strategy_mass,
             current_strategy_norm_error: diagnostics.current_strategy_norm_error,
             average_strategy_norm_error: diagnostics.average_strategy_norm_error,
@@ -1074,7 +1094,7 @@ fn try_solve_fixed_flop_metrics_gpu(
             .zip(cpu_root_exploitability)
             .map(|(gpu, cpu)| gpu - cpu);
         let diagnostics = if let (true, Some(state)) = (include_diagnostics, state.as_ref()) {
-            cfr_state_diagnostics(state)
+            cfr_state_diagnostics(state, Some((tree, layout, indexer, root_dead)))
         } else {
             CfrDiagnostics::skipped()
         };
@@ -1157,6 +1177,17 @@ fn try_solve_fixed_flop_metrics_gpu(
             negative_regret_mass: diagnostics.negative_regret_mass,
             negative_regret_count: diagnostics.negative_regret_count,
             deep_negative_regret_count: diagnostics.deep_negative_regret_count,
+            rbp_private_action_slots: diagnostics.rbp_private_action_slots,
+            rbp_prunable_private_action_slots: diagnostics.rbp_prunable_private_action_slots,
+            rbp_public_action_edges: diagnostics.rbp_public_action_edges,
+            rbp_fully_prunable_public_action_edges: diagnostics
+                .rbp_fully_prunable_public_action_edges,
+            rbp_public_edge_subtree_nodes: diagnostics.rbp_public_edge_subtree_nodes,
+            rbp_fully_prunable_public_edge_subtree_nodes: diagnostics
+                .rbp_fully_prunable_public_edge_subtree_nodes,
+            rbp_public_edge_terminal_nodes: diagnostics.rbp_public_edge_terminal_nodes,
+            rbp_fully_prunable_public_edge_terminal_nodes: diagnostics
+                .rbp_fully_prunable_public_edge_terminal_nodes,
             illegal_strategy_mass: diagnostics.illegal_strategy_mass,
             current_strategy_norm_error: diagnostics.current_strategy_norm_error,
             average_strategy_norm_error: diagnostics.average_strategy_norm_error,
@@ -1176,6 +1207,14 @@ struct CfrDiagnostics {
     negative_regret_mass: f32,
     negative_regret_count: usize,
     deep_negative_regret_count: usize,
+    rbp_private_action_slots: usize,
+    rbp_prunable_private_action_slots: usize,
+    rbp_public_action_edges: usize,
+    rbp_fully_prunable_public_action_edges: usize,
+    rbp_public_edge_subtree_nodes: usize,
+    rbp_fully_prunable_public_edge_subtree_nodes: usize,
+    rbp_public_edge_terminal_nodes: usize,
+    rbp_fully_prunable_public_edge_terminal_nodes: usize,
     illegal_strategy_mass: f32,
     current_strategy_norm_error: f32,
     average_strategy_norm_error: f32,
@@ -1189,6 +1228,14 @@ impl CfrDiagnostics {
             negative_regret_mass: f32::NAN,
             negative_regret_count: 0,
             deep_negative_regret_count: 0,
+            rbp_private_action_slots: 0,
+            rbp_prunable_private_action_slots: 0,
+            rbp_public_action_edges: 0,
+            rbp_fully_prunable_public_action_edges: 0,
+            rbp_public_edge_subtree_nodes: 0,
+            rbp_fully_prunable_public_edge_subtree_nodes: 0,
+            rbp_public_edge_terminal_nodes: 0,
+            rbp_fully_prunable_public_edge_terminal_nodes: 0,
             illegal_strategy_mass: f32::NAN,
             current_strategy_norm_error: 0.0,
             average_strategy_norm_error: 0.0,
@@ -1197,7 +1244,10 @@ impl CfrDiagnostics {
     }
 }
 
-fn cfr_state_diagnostics(state: &DenseCfrState) -> CfrDiagnostics {
+fn cfr_state_diagnostics(
+    state: &DenseCfrState,
+    pruning_context: Option<(&SubgameTree, &PostflopDenseLayout, &ComboIndexer, u64)>,
+) -> CfrDiagnostics {
     let positive_regret_mass = state
         .regrets()
         .iter()
@@ -1237,16 +1287,135 @@ fn cfr_state_diagnostics(state: &DenseCfrState) -> CfrDiagnostics {
         average_strategy_norm_error =
             average_strategy_norm_error.max((average.iter().sum::<f32>() - 1.0).abs());
     }
+    let pruning = pruning_context
+        .map(|(tree, layout, indexer, root_dead)| {
+            regret_based_pruning_estimate(state, tree, layout, indexer, root_dead)
+        })
+        .unwrap_or_default();
     CfrDiagnostics {
         positive_regret_mass,
         negative_regret_mass,
         negative_regret_count,
         deep_negative_regret_count,
+        rbp_private_action_slots: pruning.private_action_slots,
+        rbp_prunable_private_action_slots: pruning.prunable_private_action_slots,
+        rbp_public_action_edges: pruning.public_action_edges,
+        rbp_fully_prunable_public_action_edges: pruning.fully_prunable_public_action_edges,
+        rbp_public_edge_subtree_nodes: pruning.public_edge_subtree_nodes,
+        rbp_fully_prunable_public_edge_subtree_nodes: pruning
+            .fully_prunable_public_edge_subtree_nodes,
+        rbp_public_edge_terminal_nodes: pruning.public_edge_terminal_nodes,
+        rbp_fully_prunable_public_edge_terminal_nodes: pruning
+            .fully_prunable_public_edge_terminal_nodes,
         illegal_strategy_mass,
         current_strategy_norm_error,
         average_strategy_norm_error,
         finite,
     }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct RegretBasedPruningEstimate {
+    private_action_slots: usize,
+    prunable_private_action_slots: usize,
+    public_action_edges: usize,
+    fully_prunable_public_action_edges: usize,
+    public_edge_subtree_nodes: usize,
+    fully_prunable_public_edge_subtree_nodes: usize,
+    public_edge_terminal_nodes: usize,
+    fully_prunable_public_edge_terminal_nodes: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct SubtreeSize {
+    nodes: usize,
+    terminals: usize,
+}
+
+fn regret_based_pruning_estimate(
+    state: &DenseCfrState,
+    tree: &SubgameTree,
+    layout: &PostflopDenseLayout,
+    indexer: &ComboIndexer,
+    root_dead: u64,
+) -> RegretBasedPruningEstimate {
+    let threshold = regret_based_pruning_threshold();
+    let legal_combos = legal_private_combos(indexer, root_dead).collect::<Vec<_>>();
+    let subtree_sizes = subtree_sizes(tree);
+    let mut estimate = RegretBasedPruningEstimate::default();
+
+    for (node_index, node) in tree.nodes().iter().enumerate() {
+        let PublicNodeKind::Decision {
+            state: public_state,
+            actions,
+        } = &node.kind
+        else {
+            continue;
+        };
+        let Some(public_infoset) = layout.node_infoset(node_index) else {
+            continue;
+        };
+        for (action_index, _) in actions.iter().enumerate() {
+            let Some(child) = layout.child_for_action(public_infoset, action_index) else {
+                continue;
+            };
+            estimate.public_action_edges += 1;
+            estimate.public_edge_subtree_nodes += subtree_sizes[child].nodes;
+            estimate.public_edge_terminal_nodes += subtree_sizes[child].terminals;
+
+            let mut legal_slots = 0usize;
+            let mut prunable_slots = 0usize;
+            for &combo_index in &legal_combos {
+                let private_infoset =
+                    private_infoset(public_infoset, public_state.acting_player, combo_index);
+                let offset = private_infoset * state.actions() + action_index;
+                if offset >= state.legal_actions().len() || !state.legal_actions()[offset] {
+                    continue;
+                }
+                legal_slots += 1;
+                if state.regrets()[offset] <= threshold {
+                    prunable_slots += 1;
+                }
+            }
+
+            estimate.private_action_slots += legal_slots;
+            estimate.prunable_private_action_slots += prunable_slots;
+            if legal_slots > 0 && legal_slots == prunable_slots {
+                estimate.fully_prunable_public_action_edges += 1;
+                estimate.fully_prunable_public_edge_subtree_nodes += subtree_sizes[child].nodes;
+                estimate.fully_prunable_public_edge_terminal_nodes +=
+                    subtree_sizes[child].terminals;
+            }
+        }
+    }
+
+    estimate
+}
+
+fn regret_based_pruning_threshold() -> f32 {
+    std::env::var("POKEDR_RBP_PRUNE_THRESHOLD")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(-1.0)
+}
+
+fn subtree_sizes(tree: &SubgameTree) -> Vec<SubtreeSize> {
+    let mut sizes = vec![SubtreeSize::default(); tree.nodes().len()];
+    for node_index in (0..tree.nodes().len()).rev() {
+        let mut size = SubtreeSize {
+            nodes: 1,
+            terminals: usize::from(matches!(
+                tree.nodes()[node_index].kind,
+                PublicNodeKind::Terminal { .. }
+            )),
+        };
+        for &child in &tree.nodes()[node_index].children {
+            size.nodes += sizes[child].nodes;
+            size.terminals += sizes[child].terminals;
+        }
+        sizes[node_index] = size;
+    }
+    sizes
 }
 
 struct BrGapMetrics {

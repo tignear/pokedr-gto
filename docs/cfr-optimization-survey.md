@@ -143,6 +143,19 @@ actions as zero-probability is not enough because CFR still needs
 counterfactual action values unless the RBP bound says the action can safely
 skip updates.
 
+Follow-up probe with the diagnostic threshold at `regret <= -1`:
+
+```text
+board   depth  iter  private-action prune  full-public-edge prune  public-subtree prune
+As7h2c  4      64    12.835%               0.000%                  0.000%
+As7h2c  4      256   13.035%               0.000%                  0.000%
+```
+
+This does not support switching to a CPU sparse traversal yet. The negative
+regret signal is spread across private combo/action slots, but no public action
+edge is prunable for every legal private combo. A useful implementation needs
+private-action RBP state on the GPU, not only public-subtree deletion.
+
 Relevant source:
 
 - https://papers.neurips.cc/paper/5910-regret-based-pruning-in-extensive-form-games
