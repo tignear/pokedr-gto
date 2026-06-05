@@ -194,3 +194,16 @@ needed, because it forces full state downloads at every checkpoint.
 
 The practical target for this project is `converged=true` at `target_bb100=1`.
 Runs that are faster but miss that threshold are not acceptable defaults.
+
+Current local WSL/DZN baseline on `As7h2c`, depth 5, full terminal runouts,
+target `1bb/100`:
+
+```text
+variant        iterations  elapsed_s  root_exploitability_bb100  converged
+dcfr-plus      512         175.43     0.700                       true
+dcfr-schedule  512         175.36     0.636                       true
+```
+
+This confirms 512 iterations is enough for this fixed flop/tree, assuming the
+BR/exploitability implementation remains valid. Scheduled DCFR+ is the current
+default candidate to beat.
