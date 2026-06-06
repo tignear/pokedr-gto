@@ -163,6 +163,24 @@ pub struct CompactPrivateCfrConfig {
     pub variant: CfrVariant,
 }
 
+#[derive(Debug, Clone)]
+pub struct BatchedPrivateCfrConfig {
+    pub batches: usize,
+    pub public_infosets: usize,
+    pub combos: usize,
+    pub actions: usize,
+    pub variant: CfrVariant,
+}
+
+#[derive(Debug, Clone)]
+pub struct BatchedPrivateCfrState {
+    config: BatchedPrivateCfrConfig,
+    legal_actions: Vec<bool>,
+    regrets: Vec<f32>,
+    prediction: Vec<f32>,
+    strategy_sum: Vec<f32>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CompactPrivateCfrChunk {
     pub public_start: usize,
@@ -808,6 +826,105 @@ impl DenseCfrState {
 
     fn offset(&self, infoset: usize) -> usize {
         infoset * self.actions
+    }
+}
+
+impl BatchedPrivateCfrConfig {
+    pub fn validate(&self) {
+        assert!(self.batches > 0, "batch count must be non-empty");
+        assert!(
+            self.public_infosets > 0,
+            "public infosets must be non-empty"
+        );
+        assert!(self.combos > 0, "combo count must be non-empty");
+        assert!(self.actions > 0, "actions must be non-empty");
+    }
+
+    pub fn private_infosets_per_batch(&self) -> usize {
+        self.public_infosets * self.combos
+    }
+
+    pub fn private_infosets(&self) -> usize {
+        self.batches * self.private_infosets_per_batch()
+    }
+
+    pub fn action_slots_per_batch(&self) -> usize {
+        self.private_infosets_per_batch() * self.actions
+    }
+
+    pub fn action_slots(&self) -> usize {
+        self.batches * self.action_slots_per_batch()
+    }
+
+    pub fn offset(
+        &self,
+        batch: usize,
+        public_infoset: usize,
+        combo: usize,
+        action: usize,
+    ) -> usize {
+        self.validate_indices(batch, public_infoset, combo, action);
+        (((batch * self.public_infosets + public_infoset) * self.combos + combo) * self.actions)
+            + action
+    }
+
+    fn validate_indices(&self, batch: usize, public_infoset: usize, combo: usize, action: usize) {
+        assert!(batch < self.batches, "batch index out of range");
+        assert!(
+            public_infoset < self.public_infosets,
+            "public infoset index out of range"
+        );
+        assert!(combo < self.combos, "combo index out of range");
+        assert!(action < self.actions, "action index out of range");
+    }
+}
+
+impl BatchedPrivateCfrState {
+    pub fn new(config: BatchedPrivateCfrConfig, legal_actions_per_public: &[bool]) -> Self {
+        config.validate();
+        assert_eq!(
+            legal_actions_per_public.len(),
+            config.public_infosets * config.actions
+        );
+        let mut legal_actions = vec![false; config.action_slots()];
+        for batch in 0..config.batches {
+            for public_infoset in 0..config.public_infosets {
+                let public_offset = public_infoset * config.actions;
+                for combo in 0..config.combos {
+                    for action in 0..config.actions {
+                        let target = config.offset(batch, public_infoset, combo, action);
+                        legal_actions[target] = legal_actions_per_public[public_offset + action];
+                    }
+                }
+            }
+        }
+        Self {
+            regrets: vec![0.0; config.action_slots()],
+            prediction: vec![0.0; config.action_slots()],
+            strategy_sum: vec![0.0; config.action_slots()],
+            legal_actions,
+            config,
+        }
+    }
+
+    pub fn config(&self) -> &BatchedPrivateCfrConfig {
+        &self.config
+    }
+
+    pub fn legal_actions(&self) -> &[bool] {
+        &self.legal_actions
+    }
+
+    pub fn regrets(&self) -> &[f32] {
+        &self.regrets
+    }
+
+    pub fn prediction(&self) -> &[f32] {
+        &self.prediction
+    }
+
+    pub fn strategy_sum(&self) -> &[f32] {
+        &self.strategy_sum
     }
 }
 
@@ -1531,6 +1648,32 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn batched_private_state_uses_batch_major_offsets() {
+        let config = BatchedPrivateCfrConfig {
+            batches: 3,
+            public_infosets: 2,
+            combos: 5,
+            actions: 4,
+            variant: CfrVariant::CfrPlus,
+        };
+        let legal = vec![true, true, false, false, true, false, true, false];
+        let state = BatchedPrivateCfrState::new(config.clone(), &legal);
+
+        assert_eq!(config.private_infosets_per_batch(), 10);
+        assert_eq!(config.private_infosets(), 30);
+        assert_eq!(config.action_slots_per_batch(), 40);
+        assert_eq!(config.action_slots(), 120);
+        assert_eq!(config.offset(2, 1, 4, 3), 119);
+        assert_eq!(state.regrets().len(), 120);
+        assert_eq!(state.prediction().len(), 120);
+        assert_eq!(state.strategy_sum().len(), 120);
+        assert!(state.legal_actions()[config.offset(1, 0, 3, 1)]);
+        assert!(!state.legal_actions()[config.offset(1, 0, 3, 2)]);
+        assert!(state.legal_actions()[config.offset(2, 1, 4, 2)]);
+        assert!(!state.legal_actions()[config.offset(2, 1, 4, 3)]);
     }
 
     #[test]

@@ -2,7 +2,7 @@ use std::{cell::RefCell, collections::HashMap, time::Instant};
 
 use pokedr_core::{
     cards::{Board, Card as PokedrCard},
-    dense_cfr::DenseCfrState,
+    dense_cfr::{BatchedPrivateCfrConfig, BatchedPrivateCfrState, DenseCfrState},
     postflop::{Player, PublicState, Street, SubgameTree, SubgameTreeConfig},
     postflop_dense::PostflopDenseLayout,
     range::{COMBO_COUNT, ComboIndexer},
@@ -32,6 +32,17 @@ pub struct FixedRiverBatchSolveSummary {
     pub boards: Vec<FixedRiverSolveSummary>,
     pub iterations: usize,
     pub total_elapsed_secs: f32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RiverShapeBatchPlanSummary {
+    pub shape_groups: usize,
+    pub total_inputs: usize,
+    pub largest_group: usize,
+    pub public_infosets: usize,
+    pub max_actions: usize,
+    pub combos: usize,
+    pub action_slots: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -115,6 +126,46 @@ impl RiverBatchSolver {
             .into_iter()
             .map(|(_, result)| result)
             .collect()
+    }
+
+    pub fn shape_batch_plan_summary(
+        &self,
+        inputs: &[RiverSubgameInput],
+    ) -> RiverShapeBatchPlanSummary {
+        assert!(!inputs.is_empty(), "river batch inputs must be non-empty");
+        for input in inputs {
+            input.validate();
+        }
+        let mut groups: HashMap<RiverSubgameShapeKey, usize> = HashMap::new();
+        for input in inputs {
+            *groups.entry(input.shape_key()).or_default() += 1;
+        }
+        let largest_group = groups.values().copied().max().unwrap_or(0);
+        let template_tree = SubgameTree::build(
+            inputs[0].public_state.clone(),
+            SubgameTreeConfig {
+                action_set: self.config.action_set.clone(),
+                max_raises_per_street: self.config.max_raises_per_street,
+            },
+        );
+        let layout = PostflopDenseLayout::from_tree(&template_tree);
+        let batch_config = BatchedPrivateCfrConfig {
+            batches: largest_group.max(1),
+            public_infosets: layout.infoset_count(),
+            combos: COMBO_COUNT,
+            actions: layout.max_actions(),
+            variant: self.config.cfr_variant,
+        };
+        let batch_state = BatchedPrivateCfrState::new(batch_config.clone(), layout.legal_actions());
+        RiverShapeBatchPlanSummary {
+            shape_groups: groups.len(),
+            total_inputs: inputs.len(),
+            largest_group,
+            public_infosets: batch_config.public_infosets,
+            max_actions: batch_config.actions,
+            combos: batch_config.combos,
+            action_slots: batch_state.config().action_slots(),
+        }
     }
 
     pub fn solve_subgame(&self, input: RiverSubgameInput) -> RiverSubgameResult {

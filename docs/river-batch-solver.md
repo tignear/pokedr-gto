@@ -44,5 +44,17 @@ with `64` generated river boards, `8` iterations took about `10.4s`
 projects to hundreds of seconds for `49*48` ordered runouts, so the current
 wrapper is not close to a sub-second batched river solver.
 
+The implementation now separates river public shape from board-specific input.
+For same-shape inputs, `RiverBatchSolver` builds the public tree and dense
+layout once, then uses a batch-major CFR state layout:
+
+```text
+offset = (((batch * public_infosets + public_infoset) * combos + combo) * actions) + action
+```
+
+This is the state layout expected by the real GPU batch kernel. The current
+solver still executes each input with the old one-board GPU path; the batch-major
+state exists to remove that next.
+
 The intended next step is grouping identical river tree shapes so one dispatch
 sequence processes multiple `(state, oop_weights, ip_weights)` inputs.

@@ -692,6 +692,7 @@ fn run_solve_river_runouts(args: RiverRunoutSolveArgs) {
         std::process::exit(2);
     }
     let config = fixed_flop_config(&args.solver);
+    let plan = pokedr_agent::fixed_river_shape_batch_plan_summary(&boards, config.clone());
     println!(
         "solving river runouts prefix={} generated={} solving={} iterations={} variant={:?}",
         format_pokedr_cards_for_cli(&prefix),
@@ -700,6 +701,9 @@ fn run_solve_river_runouts(args: RiverRunoutSolveArgs) {
         config.cfr_iterations,
         config.cfr_variant
     );
+    println!("shape_groups: {}", plan.shape_groups);
+    println!("largest_shape_batch: {}", plan.largest_group);
+    println!("batched_action_slots: {}", plan.action_slots);
     let started = Instant::now();
     let summary = pokedr_agent::solve_fixed_river_batch(&boards, config);
     let elapsed = started.elapsed().as_secs_f32();

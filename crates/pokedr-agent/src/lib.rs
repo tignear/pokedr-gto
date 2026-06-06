@@ -2,8 +2,8 @@ pub use pokedr_core::{dense_cfr, postflop, postflop_dense, range};
 
 mod river_batch;
 pub use river_batch::{
-    FixedRiverBatchSolveSummary, FixedRiverSolveSummary, RiverBatchSolver, RiverSubgameInput,
-    RiverSubgameResult,
+    FixedRiverBatchSolveSummary, FixedRiverSolveSummary, RiverBatchSolver,
+    RiverShapeBatchPlanSummary, RiverSubgameInput, RiverSubgameResult,
 };
 
 use std::{
@@ -872,6 +872,18 @@ pub fn solve_fixed_river_batch(
     config: PokedrAgentConfig,
 ) -> FixedRiverBatchSolveSummary {
     RiverBatchSolver::new(config).solve_fixed_boards(boards)
+}
+
+pub fn fixed_river_shape_batch_plan_summary(
+    boards: &[[PokedrCard; 5]],
+    config: PokedrAgentConfig,
+) -> RiverShapeBatchPlanSummary {
+    let inputs = boards
+        .iter()
+        .copied()
+        .map(RiverSubgameInput::with_default_ranges)
+        .collect::<Vec<_>>();
+    RiverBatchSolver::new(config).shape_batch_plan_summary(&inputs)
 }
 
 pub fn solve_fixed_flop_metrics(
