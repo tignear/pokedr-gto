@@ -10,8 +10,8 @@ use wgpu::util::DeviceExt;
 use crate::cards::{Card, evaluate};
 
 use super::{
-    CompactPrivateCfrChunk, CompactPrivateCfrConfig, DenseCfrConfig, DenseCfrIteration,
-    DenseCfrRunStats, DenseCfrState,
+    BatchedPrivateCfrConfig, BatchedPrivateCfrState, CompactPrivateCfrChunk,
+    CompactPrivateCfrConfig, DenseCfrConfig, DenseCfrIteration, DenseCfrRunStats, DenseCfrState,
 };
 
 const WORKGROUP_SIZE: u32 = 64;
@@ -94,6 +94,15 @@ pub struct GpuCompactPrivateCfrChunkState {
     regrets: wgpu::Buffer,
     prediction: Option<wgpu::Buffer>,
     strategy_sum: Option<wgpu::Buffer>,
+}
+
+pub struct GpuBatchedPrivateCfrState {
+    config: BatchedPrivateCfrConfig,
+    legal_actions: Vec<u32>,
+    legal_actions_buffer: wgpu::Buffer,
+    regrets: wgpu::Buffer,
+    prediction: wgpu::Buffer,
+    strategy_sum: wgpu::Buffer,
 }
 
 pub struct GpuResidentDenseCfrSolver {
@@ -4730,6 +4739,33 @@ impl GpuDenseCfrBackend {
         }
     }
 
+    pub fn upload_batched_private_state(
+        &self,
+        state: &BatchedPrivateCfrState,
+    ) -> GpuBatchedPrivateCfrState {
+        let legal_actions = legal_actions_u32(state.legal_actions());
+        GpuBatchedPrivateCfrState {
+            config: state.config().clone(),
+            legal_actions_buffer: readonly_buffer(
+                &self.device,
+                "batched private legal actions",
+                &legal_actions,
+            ),
+            legal_actions,
+            regrets: storage_buffer(&self.device, "batched private regrets", state.regrets()),
+            prediction: storage_buffer(
+                &self.device,
+                "batched private prediction",
+                state.prediction(),
+            ),
+            strategy_sum: storage_buffer(
+                &self.device,
+                "batched private strategy sum",
+                state.strategy_sum(),
+            ),
+        }
+    }
+
     pub fn zeroed_state(&self, config: super::DenseCfrConfig) -> GpuDenseCfrState {
         let state = DenseCfrState::new(config);
         self.upload_state(&state)
@@ -5683,6 +5719,153 @@ impl GpuCompactPrivateCfrChunkState {
 
     pub fn strategy_sum_buffer(&self) -> Option<&wgpu::Buffer> {
         self.strategy_sum.as_ref()
+    }
+}
+
+impl GpuBatchedPrivateCfrState {
+    pub fn config(&self) -> &BatchedPrivateCfrConfig {
+        &self.config
+    }
+
+    pub fn batches(&self) -> usize {
+        self.config.batches
+    }
+
+    pub fn public_infosets(&self) -> usize {
+        self.config.public_infosets
+    }
+
+    pub fn combos(&self) -> usize {
+        self.config.combos
+    }
+
+    pub fn actions(&self) -> usize {
+        self.config.actions
+    }
+
+    pub fn private_infosets(&self) -> usize {
+        self.config.private_infosets()
+    }
+
+    pub fn action_slots(&self) -> usize {
+        self.config.action_slots()
+    }
+
+    pub fn update_all_private_infosets(
+        &mut self,
+        backend: &GpuDenseCfrBackend,
+        action_values: &[f32],
+        reach_weights: &[f32],
+        strategy_weights: &[f32],
+        iteration: usize,
+    ) -> Result<(), GpuCfrError> {
+        let private_infosets = self.config.private_infosets();
+        assert_eq!(action_values.len(), self.config.action_slots());
+        assert_eq!(reach_weights.len(), private_infosets);
+        assert_eq!(strategy_weights.len(), private_infosets);
+
+        let params = [
+            private_infosets as u32,
+            self.config.actions as u32,
+            variant_code(self.config.variant),
+            iteration as u32,
+            variant_dcfr_alpha(self.config.variant, iteration).to_bits(),
+            variant_dcfr_gamma(self.config.variant, iteration).to_bits(),
+            variant_prediction_eta(self.config.variant, iteration).to_bits(),
+            super::average_strategy_delay() as u32,
+            super::average_strategy_power().to_bits(),
+            variant_dcfr_beta(self.config.variant, iteration).to_bits(),
+        ];
+        let action_values = readonly_buffer(
+            &backend.device,
+            "batched private action values",
+            action_values,
+        );
+        let reach_weights = readonly_buffer(
+            &backend.device,
+            "batched private reach weights",
+            reach_weights,
+        );
+        let strategy_weights = readonly_buffer(
+            &backend.device,
+            "batched private strategy weights",
+            strategy_weights,
+        );
+        let params = readonly_buffer(&backend.device, "batched private params", &params);
+        let bind_group = backend
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("batched private CFR bind group"),
+                layout: &backend.bind_group_layout,
+                entries: &[
+                    bind_entry(0, &self.regrets),
+                    bind_entry(1, &self.strategy_sum),
+                    bind_entry(2, &action_values),
+                    bind_entry(3, &reach_weights),
+                    bind_entry(4, &strategy_weights),
+                    bind_entry(5, &params),
+                    bind_entry(6, &self.legal_actions_buffer),
+                    bind_entry(7, &self.prediction),
+                ],
+            });
+
+        let mut encoder = backend
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("batched private CFR update encoder"),
+            });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("batched private CFR update pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&backend.pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            let groups = (private_infosets as u32).div_ceil(WORKGROUP_SIZE);
+            pass.dispatch_workgroups(groups, 1, 1);
+        }
+        let submission = backend.queue.submit(Some(encoder.finish()));
+        backend
+            .device
+            .poll(wgpu::PollType::Wait {
+                submission_index: Some(submission),
+                timeout: None,
+            })
+            .map_err(|error| GpuCfrError::MapFailed(error.to_string()))?;
+        Ok(())
+    }
+
+    pub fn download(
+        &self,
+        backend: &GpuDenseCfrBackend,
+    ) -> Result<BatchedPrivateCfrState, GpuCfrError> {
+        let len = self.config.action_slots();
+        let regret_readback = readback_buffer(&backend.device, len);
+        let prediction_readback = readback_buffer(&backend.device, len);
+        let strategy_readback = readback_buffer(&backend.device, len);
+        let mut encoder = backend
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("batched private CFR download encoder"),
+            });
+        copy_buffer(&mut encoder, &self.regrets, &regret_readback, len);
+        copy_buffer(&mut encoder, &self.prediction, &prediction_readback, len);
+        copy_buffer(&mut encoder, &self.strategy_sum, &strategy_readback, len);
+        let submission = backend.queue.submit(Some(encoder.finish()));
+        backend
+            .device
+            .poll(wgpu::PollType::Wait {
+                submission_index: Some(submission),
+                timeout: None,
+            })
+            .map_err(|error| GpuCfrError::MapFailed(error.to_string()))?;
+        Ok(BatchedPrivateCfrState {
+            config: self.config.clone(),
+            legal_actions: self.legal_actions.iter().map(|value| *value != 0).collect(),
+            regrets: read_f32_buffer(&backend.device, &regret_readback, len)?,
+            prediction: read_f32_buffer(&backend.device, &prediction_readback, len)?,
+            strategy_sum: read_f32_buffer(&backend.device, &strategy_readback, len)?,
+        })
     }
 }
 

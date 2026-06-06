@@ -56,5 +56,13 @@ This is the state layout expected by the real GPU batch kernel. The current
 solver still executes each input with the old one-board GPU path; the batch-major
 state exists to remove that next.
 
+The batch-major state is now uploadable to GPU memory and can run the CFR regret
+and average-strategy update over all `batch * public_infosets * combos` private
+infosets in one dense update dispatch. That means the update half of a batched
+river iteration no longer requires a per-board CFR state object. The remaining
+one-board bottleneck is the public-tree CFV path: reach propagation, terminal
+payoff generation, backup, and action-value aggregation still use a one-board
+iteration context.
+
 The intended next step is grouping identical river tree shapes so one dispatch
 sequence processes multiple `(state, oop_weights, ip_weights)` inputs.

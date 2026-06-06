@@ -1,6 +1,7 @@
 use pokedr_core::cards::{Card, Rank, Suit, evaluate};
 use pokedr_core::dense_cfr::{
-    CfrVariant, DenseCfrConfig, DenseCfrSolver, DenseCfrState,
+    BatchedPrivateCfrConfig, BatchedPrivateCfrState, CfrVariant, DenseCfrConfig, DenseCfrSolver,
+    DenseCfrState,
     gpu::{GpuCfrError, GpuDenseCfrBackend, GpuPublicTreeNode, GpuShowdownTask},
     gpu::{GpuFinalBoard, GpuPrivateCombo},
 };
@@ -24,6 +25,7 @@ fn main() {
     run_one_shot_update(&backend);
     run_masked_one_shot_update(&backend);
     run_resident_updates(&backend);
+    run_batched_private_update(&backend);
     run_showdown_equities(&backend);
     run_showdown_matrix(&backend);
     run_public_tree_terminal_values(&backend);
@@ -170,6 +172,84 @@ fn fill_fixture_iteration_with_state(
     batch: &mut pokedr_core::dense_cfr::DenseCfrIteration,
 ) {
     fill_fixture_iteration(iteration, batch);
+}
+
+fn run_batched_private_update(backend: &GpuDenseCfrBackend) {
+    for variant in [
+        CfrVariant::CfrPlus,
+        CfrVariant::Discounted,
+        CfrVariant::dcfr_plus_default(),
+        CfrVariant::dcfr_schedule_default(),
+        CfrVariant::pdcfr_plus_default(),
+    ] {
+        let batch_config = BatchedPrivateCfrConfig {
+            batches: 3,
+            public_infosets: 5,
+            combos: 7,
+            actions: 4,
+            variant,
+        };
+        let legal_actions_per_public = vec![
+            true, true, false, false, true, false, true, false, true, true, true, false, false,
+            true, true, true, true, false, false, true,
+        ];
+        let batched = BatchedPrivateCfrState::new(batch_config.clone(), &legal_actions_per_public);
+        let dense_config = DenseCfrConfig {
+            infosets: batch_config.private_infosets(),
+            actions: batch_config.actions,
+            variant,
+        };
+        let mut cpu =
+            DenseCfrState::new_with_legal_actions(dense_config, batched.legal_actions().to_vec());
+        let mut gpu = backend.upload_batched_private_state(&batched);
+        let mut action_values = vec![0.0; batch_config.action_slots()];
+        let mut reach_weights = vec![0.0; batch_config.private_infosets()];
+        let mut strategy_weights = vec![0.0; batch_config.private_infosets()];
+        for iteration in 1..=4 {
+            for (index, value) in action_values.iter_mut().enumerate() {
+                *value = ((index + 3 * iteration) as f32 * 0.125).cos();
+            }
+            for (index, value) in reach_weights.iter_mut().enumerate() {
+                *value = 0.25 + ((index + iteration) % 5) as f32 * 0.1;
+            }
+            for (index, value) in strategy_weights.iter_mut().enumerate() {
+                *value = 0.5 + ((index + 2 * iteration) % 7) as f32 * 0.05;
+            }
+            cpu.update_all_infosets(&action_values, &reach_weights, &strategy_weights, iteration);
+            gpu.update_all_private_infosets(
+                backend,
+                &action_values,
+                &reach_weights,
+                &strategy_weights,
+                iteration,
+            )
+            .unwrap_or_else(|error| fail(&format!("GPU batched private update failed: {error:?}")));
+        }
+        let downloaded = gpu.download(backend).unwrap_or_else(|error| {
+            fail(&format!("GPU batched private download failed: {error:?}"))
+        });
+
+        assert_eq!(downloaded.config().batches, batch_config.batches);
+        assert_eq!(
+            downloaded.config().public_infosets,
+            batch_config.public_infosets
+        );
+        assert_close(
+            "batched private regret",
+            cpu.regrets(),
+            downloaded.regrets(),
+        );
+        assert_close(
+            "batched private strategy_sum",
+            cpu.strategy_sum(),
+            downloaded.strategy_sum(),
+        );
+        assert_close(
+            "batched private prediction",
+            cpu.prediction(),
+            downloaded.prediction(),
+        );
+    }
 }
 
 fn run_showdown_equities(backend: &GpuDenseCfrBackend) {
