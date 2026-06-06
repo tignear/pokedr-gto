@@ -52,6 +52,23 @@ terminal-weighted strength groups: 14211160
 max strength groups per board:     185
 ```
 
+Reach-sharing diagnostics after `8` DCFR iterations on the same tree:
+
+```text
+average strategy:
+  showdown terminals:          122598
+  river showdown terminals:    122304
+  board tables:                  1225
+  raw reach signatures:        110654
+  normalized reach signatures: 110655
+  support signatures:            1225
+
+current strategy:
+  raw reach signatures:         90447
+  normalized reach signatures:  89671
+  support signatures:           86237
+```
+
 Implications:
 
 - Board-parallel reduce is not the main lever because almost all terminals are
@@ -59,6 +76,11 @@ Implications:
 - The average batch width per final board table is about `10` terminals, so a
   batched kernel must be careful: it can win by reusing rank/blocker checks and
   coalescing reach reads, but it cannot rely on very wide GEMM columns.
+- Exact or scalar-multiple reach sharing is weak. For average strategy, a board
+  table with `104` river terminals typically still has `~92-96` normalized reach
+  signatures. Support alone is shared by board table, but the actual reach
+  weights are not. A batching design should not assume many terminals can share
+  the same opponent reach vector.
 - Materializing dense `A_b` for every board table is too large. A practical GPU
   kernel should generate `A_b` tiles from combo/card/bounds data on the fly.
 - A fully materialized `(terminal, card, strength_group)` prefix also looks too

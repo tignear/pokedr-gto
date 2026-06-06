@@ -2,7 +2,8 @@ pub use pokedr_core::{dense_cfr, postflop, postflop_dense, range};
 
 use std::{
     cell::RefCell,
-    collections::{HashMap, VecDeque},
+    collections::{BTreeMap, HashMap, VecDeque},
+    hash::{Hash, Hasher},
     rc::Rc,
     time::Instant,
 };
@@ -821,6 +822,75 @@ pub fn dump_fixed_flop_tree_node(
     ))
 }
 
+#[derive(Debug, Clone)]
+pub struct TerminalReachSharingReport {
+    pub board: String,
+    pub iterations: usize,
+    pub use_current_strategy: bool,
+    pub showdown_terminals: usize,
+    pub river_showdown_terminals: usize,
+    pub board_tables: usize,
+    pub raw_unique_signatures: usize,
+    pub normalized_unique_signatures: usize,
+    pub support_unique_signatures: usize,
+    pub rows: Vec<TerminalReachSharingRow>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TerminalReachSharingRow {
+    pub board: String,
+    pub board_cards: usize,
+    pub terminals: usize,
+    pub raw_unique_signatures: usize,
+    pub normalized_unique_signatures: usize,
+    pub support_unique_signatures: usize,
+    pub hero_mass_min: f32,
+    pub hero_mass_max: f32,
+    pub villain_mass_min: f32,
+    pub villain_mass_max: f32,
+    pub hero_support_min: usize,
+    pub hero_support_max: usize,
+    pub villain_support_min: usize,
+    pub villain_support_max: usize,
+}
+
+pub fn analyze_fixed_flop_terminal_reach_sharing(
+    flop: [PokedrCard; 3],
+    mut config: PokedrAgentConfig,
+    use_current_strategy: bool,
+    top_n: usize,
+) -> TerminalReachSharingReport {
+    config.cfr_iterations = config.cfr_iterations.max(1);
+    let (tree, layout) = fixed_flop_tree_and_layout(flop, config.clone());
+    let indexer = ComboIndexer::new();
+    let root_dead = root_board(&tree).deck_mask();
+    let (hero_weights, villain_weights) = fixed_flop_root_weights(&indexer, root_dead);
+    let state = solve_public_tree_cfr(&tree, &layout, &config, &hero_weights, &villain_weights);
+    let combo_masks = indexer
+        .combos()
+        .iter()
+        .map(|combo| combo.deck_mask())
+        .collect::<Vec<_>>();
+    let mut collector = TerminalReachSharingCollector::default();
+    collect_terminal_reach_sharing(
+        &tree,
+        &layout,
+        &state,
+        &combo_masks,
+        0,
+        &hero_weights,
+        &villain_weights,
+        use_current_strategy,
+        &mut collector,
+    );
+    collector.into_report(
+        format_pokedr_cards(&flop),
+        config.cfr_iterations,
+        use_current_strategy,
+        top_n,
+    )
+}
+
 pub fn build_fixed_flop_tree_dump(
     flop: [PokedrCard; 3],
     config: PokedrAgentConfig,
@@ -1336,6 +1406,288 @@ fn cfr_state_diagnostics(
         average_strategy_norm_error,
         finite,
     }
+}
+
+#[derive(Default)]
+struct TerminalReachSharingCollector {
+    showdown_terminals: usize,
+    river_showdown_terminals: usize,
+    raw_signatures: HashMap<ReachSignature, usize>,
+    normalized_signatures: HashMap<ReachSignature, usize>,
+    support_signatures: HashMap<ReachSignature, usize>,
+    boards: BTreeMap<u64, TerminalReachBoardStats>,
+}
+
+#[derive(Default)]
+struct TerminalReachBoardStats {
+    board: String,
+    board_cards: usize,
+    terminals: usize,
+    raw_signatures: HashMap<ReachSignature, usize>,
+    normalized_signatures: HashMap<ReachSignature, usize>,
+    support_signatures: HashMap<ReachSignature, usize>,
+    hero_mass_min: f32,
+    hero_mass_max: f32,
+    villain_mass_min: f32,
+    villain_mass_max: f32,
+    hero_support_min: usize,
+    hero_support_max: usize,
+    villain_support_min: usize,
+    villain_support_max: usize,
+}
+
+type ReachSignature = (u64, u64);
+
+impl TerminalReachSharingCollector {
+    fn record(&mut self, board: &Board, hero_reach: &[f32], villain_reach: &[f32]) {
+        self.showdown_terminals += 1;
+        if board.cards().len() == 5 {
+            self.river_showdown_terminals += 1;
+        }
+
+        let hero_summary = reach_vector_summary(hero_reach);
+        let villain_summary = reach_vector_summary(villain_reach);
+        let raw_signature = (
+            reach_vector_hash(hero_reach, ReachHashMode::Raw),
+            reach_vector_hash(villain_reach, ReachHashMode::Raw),
+        );
+        let normalized_signature = (
+            reach_vector_hash(hero_reach, ReachHashMode::Normalized),
+            reach_vector_hash(villain_reach, ReachHashMode::Normalized),
+        );
+        let support_signature = (
+            reach_vector_hash(hero_reach, ReachHashMode::Support),
+            reach_vector_hash(villain_reach, ReachHashMode::Support),
+        );
+        *self.raw_signatures.entry(raw_signature).or_insert(0) += 1;
+        *self
+            .normalized_signatures
+            .entry(normalized_signature)
+            .or_insert(0) += 1;
+        *self
+            .support_signatures
+            .entry(support_signature)
+            .or_insert(0) += 1;
+
+        let entry =
+            self.boards
+                .entry(board.deck_mask())
+                .or_insert_with(|| TerminalReachBoardStats {
+                    board: format_pokedr_cards(board.cards()),
+                    board_cards: board.cards().len(),
+                    hero_mass_min: f32::INFINITY,
+                    villain_mass_min: f32::INFINITY,
+                    hero_support_min: usize::MAX,
+                    villain_support_min: usize::MAX,
+                    ..TerminalReachBoardStats::default()
+                });
+        entry.terminals += 1;
+        *entry.raw_signatures.entry(raw_signature).or_insert(0) += 1;
+        *entry
+            .normalized_signatures
+            .entry(normalized_signature)
+            .or_insert(0) += 1;
+        *entry
+            .support_signatures
+            .entry(support_signature)
+            .or_insert(0) += 1;
+        entry.hero_mass_min = entry.hero_mass_min.min(hero_summary.mass);
+        entry.hero_mass_max = entry.hero_mass_max.max(hero_summary.mass);
+        entry.villain_mass_min = entry.villain_mass_min.min(villain_summary.mass);
+        entry.villain_mass_max = entry.villain_mass_max.max(villain_summary.mass);
+        entry.hero_support_min = entry.hero_support_min.min(hero_summary.support);
+        entry.hero_support_max = entry.hero_support_max.max(hero_summary.support);
+        entry.villain_support_min = entry.villain_support_min.min(villain_summary.support);
+        entry.villain_support_max = entry.villain_support_max.max(villain_summary.support);
+    }
+
+    fn into_report(
+        self,
+        board: String,
+        iterations: usize,
+        use_current_strategy: bool,
+        top_n: usize,
+    ) -> TerminalReachSharingReport {
+        let board_tables = self.boards.len();
+        let mut rows = self
+            .boards
+            .into_values()
+            .map(|stats| TerminalReachSharingRow {
+                board: stats.board,
+                board_cards: stats.board_cards,
+                terminals: stats.terminals,
+                raw_unique_signatures: stats.raw_signatures.len(),
+                normalized_unique_signatures: stats.normalized_signatures.len(),
+                support_unique_signatures: stats.support_signatures.len(),
+                hero_mass_min: stats.hero_mass_min,
+                hero_mass_max: stats.hero_mass_max,
+                villain_mass_min: stats.villain_mass_min,
+                villain_mass_max: stats.villain_mass_max,
+                hero_support_min: stats.hero_support_min,
+                hero_support_max: stats.hero_support_max,
+                villain_support_min: stats.villain_support_min,
+                villain_support_max: stats.villain_support_max,
+            })
+            .collect::<Vec<_>>();
+        rows.sort_by_key(|row| std::cmp::Reverse(row.terminals));
+        rows.truncate(top_n);
+        TerminalReachSharingReport {
+            board,
+            iterations,
+            use_current_strategy,
+            showdown_terminals: self.showdown_terminals,
+            river_showdown_terminals: self.river_showdown_terminals,
+            board_tables,
+            raw_unique_signatures: self.raw_signatures.len(),
+            normalized_unique_signatures: self.normalized_signatures.len(),
+            support_unique_signatures: self.support_signatures.len(),
+            rows,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ReachVectorSummary {
+    mass: f32,
+    support: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ReachHashMode {
+    Raw,
+    Normalized,
+    Support,
+}
+
+fn collect_terminal_reach_sharing(
+    tree: &SubgameTree,
+    layout: &PostflopDenseLayout,
+    state: &DenseCfrState,
+    combo_masks: &[u64],
+    node_index: usize,
+    hero_reach: &[f32],
+    villain_reach: &[f32],
+    use_current_strategy: bool,
+    collector: &mut TerminalReachSharingCollector,
+) {
+    match &tree.nodes()[node_index].kind {
+        PublicNodeKind::Decision {
+            state: public_state,
+            actions,
+        } => {
+            let Some(public_infoset) = layout.node_infoset(node_index) else {
+                return;
+            };
+            let mut strategy = vec![0.0; state.actions()];
+            for (action_index, _) in actions.iter().enumerate() {
+                let Some(child) = layout.child_for_action(public_infoset, action_index) else {
+                    continue;
+                };
+                let mut next_hero = hero_reach.to_vec();
+                let mut next_villain = villain_reach.to_vec();
+                let actor_reach = match public_state.acting_player {
+                    Player::Hero => &mut next_hero,
+                    Player::Villain => &mut next_villain,
+                };
+                for (combo_index, reach) in actor_reach.iter_mut().enumerate() {
+                    if *reach <= 0.0 {
+                        continue;
+                    }
+                    let private_infoset =
+                        private_infoset(public_infoset, public_state.acting_player, combo_index);
+                    if use_current_strategy {
+                        state.strategy_for(private_infoset, &mut strategy);
+                    } else {
+                        state.average_strategy_for(private_infoset, &mut strategy);
+                    }
+                    *reach *= strategy.get(action_index).copied().unwrap_or(0.0);
+                }
+                collect_terminal_reach_sharing(
+                    tree,
+                    layout,
+                    state,
+                    combo_masks,
+                    child,
+                    &next_hero,
+                    &next_villain,
+                    use_current_strategy,
+                    collector,
+                );
+            }
+        }
+        PublicNodeKind::Chance { cards, .. } => {
+            for (card, child) in cards.iter().zip(&tree.nodes()[node_index].children) {
+                let card_mask = card.deck_mask();
+                let mut next_hero = hero_reach.to_vec();
+                let mut next_villain = villain_reach.to_vec();
+                for (combo_index, combo_mask) in combo_masks.iter().copied().enumerate() {
+                    if combo_mask & card_mask != 0 {
+                        next_hero[combo_index] = 0.0;
+                        next_villain[combo_index] = 0.0;
+                    }
+                }
+                collect_terminal_reach_sharing(
+                    tree,
+                    layout,
+                    state,
+                    combo_masks,
+                    *child,
+                    &next_hero,
+                    &next_villain,
+                    use_current_strategy,
+                    collector,
+                );
+            }
+        }
+        PublicNodeKind::Terminal { kind, board, .. } => {
+            if matches!(kind, TerminalKind::Showdown) {
+                collector.record(board, hero_reach, villain_reach);
+            }
+        }
+    }
+}
+
+fn reach_vector_summary(values: &[f32]) -> ReachVectorSummary {
+    let mut mass = 0.0f32;
+    let mut support = 0usize;
+    for &value in values {
+        if value > 1.0e-9 {
+            mass += value;
+            support += 1;
+        }
+    }
+    ReachVectorSummary { mass, support }
+}
+
+fn reach_vector_hash(values: &[f32], mode: ReachHashMode) -> u64 {
+    let summary = reach_vector_summary(values);
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    match mode {
+        ReachHashMode::Raw => {
+            0x7261_775f_7265_6163u64.hash(&mut hasher);
+            for &value in values {
+                quantize_reach(value).hash(&mut hasher);
+            }
+        }
+        ReachHashMode::Normalized => {
+            0x6e6f_726d_7265_6163u64.hash(&mut hasher);
+            let mass = summary.mass.max(1.0e-12);
+            for &value in values {
+                quantize_reach(value / mass).hash(&mut hasher);
+            }
+        }
+        ReachHashMode::Support => {
+            0x7375_7070_7265_6163u64.hash(&mut hasher);
+            for &value in values {
+                (value > 1.0e-9).hash(&mut hasher);
+            }
+        }
+    }
+    hasher.finish()
+}
+
+fn quantize_reach(value: f32) -> i64 {
+    (value.clamp(-1.0e9, 1.0e9) as f64 * 1_000_000.0).round() as i64
 }
 
 #[derive(Debug, Clone, Copy, Default)]

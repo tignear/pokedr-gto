@@ -18,6 +18,7 @@ fn main() {
         Command::PostflopSmoke => run_postflop_smoke(),
         Command::SolveFlop(args) => run_solve_flop(args),
         Command::SolveFlopMetrics(args) => run_solve_flop_metrics(args),
+        Command::SolveFlopReachSharing(args) => run_solve_flop_reach_sharing(args),
         Command::SolveFlopSweep(args) => run_solve_flop_sweep(args),
         Command::SolveFlopVariantBench(args) => run_solve_flop_variant_bench(args),
         Command::TreeDb { command } => run_tree_db_command(command),
@@ -40,6 +41,7 @@ enum Command {
     PostflopSmoke,
     SolveFlop(FlopSolveArgs),
     SolveFlopMetrics(FlopMetricsArgs),
+    SolveFlopReachSharing(FlopReachSharingArgs),
     SolveFlopSweep(FlopSweepArgs),
     SolveFlopVariantBench(FlopVariantBenchArgs),
     TreeDb {
@@ -102,6 +104,18 @@ struct FlopMetricsArgs {
         help = "Scan the full CFR state for diagnostics at each checkpoint"
     )]
     diagnostics: bool,
+}
+
+#[derive(Debug, Args, Clone)]
+struct FlopReachSharingArgs {
+    #[arg(default_value = "As7h2c")]
+    flop: String,
+    #[command(flatten)]
+    solver: SolverOptions,
+    #[arg(long, default_value_t = 20)]
+    top: usize,
+    #[arg(long, help = "Use current strategy instead of average strategy")]
+    current: bool,
 }
 
 #[derive(Debug, Args, Clone)]
@@ -567,6 +581,67 @@ fn run_solve_flop_metrics(args: FlopMetricsArgs) {
             true
         },
     );
+}
+
+fn run_solve_flop_reach_sharing(args: FlopReachSharingArgs) {
+    let flop = parse_flop(&args.flop).unwrap_or_else(|error| {
+        eprintln!("{error}");
+        std::process::exit(2);
+    });
+    let config = match_config(&args.solver);
+    eprintln!(
+        "analyzing terminal reach sharing board={} variant={:?} depth={} terminal_runouts={} iterations={} strategy={}",
+        format_pokedr_cards_for_cli(&flop),
+        config.cfr_variant,
+        config.max_depth,
+        format_terminal_runouts(config.max_showdown_runouts),
+        config.cfr_iterations.max(1),
+        if args.current { "current" } else { "average" }
+    );
+    let report = pokedr_agent::analyze_fixed_flop_terminal_reach_sharing(
+        flop,
+        config,
+        args.current,
+        args.top,
+    );
+    println!(
+        "board={} iterations={} strategy={} showdown_terminals={} river_showdown_terminals={} board_tables={} raw_unique={} normalized_unique={} support_unique={}",
+        report.board,
+        report.iterations,
+        if report.use_current_strategy {
+            "current"
+        } else {
+            "average"
+        },
+        report.showdown_terminals,
+        report.river_showdown_terminals,
+        report.board_tables,
+        report.raw_unique_signatures,
+        report.normalized_unique_signatures,
+        report.support_unique_signatures,
+    );
+    println!(
+        "board,board_cards,terminals,raw_unique,normalized_unique,support_unique,hero_mass_min,hero_mass_max,villain_mass_min,villain_mass_max,hero_support_min,hero_support_max,villain_support_min,villain_support_max"
+    );
+    for row in &report.rows {
+        println!(
+            "{},{},{},{},{},{},{:.6},{:.6},{:.6},{:.6},{},{},{},{}",
+            row.board.replace(' ', ""),
+            row.board_cards,
+            row.terminals,
+            row.raw_unique_signatures,
+            row.normalized_unique_signatures,
+            row.support_unique_signatures,
+            row.hero_mass_min,
+            row.hero_mass_max,
+            row.villain_mass_min,
+            row.villain_mass_max,
+            row.hero_support_min,
+            row.hero_support_max,
+            row.villain_support_min,
+            row.villain_support_max,
+        );
+    }
 }
 
 fn print_metric_gap_nodes(
