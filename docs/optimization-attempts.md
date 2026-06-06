@@ -4,6 +4,26 @@ This file records optimization attempts that failed, were reverted, or were too
 small to count as a strategic direction. Add entries before retrying similar
 ideas.
 
+## 2026-06-06: Streamed strength-group card-prefix terminal CFV
+
+- Tried: add an optional `board_count == 1` river-terminal path that streams
+  `(terminal, card, strength_group)` prefix pairs through the existing terminal
+  scratch buffer, then consumes those prefixes immediately in reduce. This
+  avoided full materialization and replaced the blocker-neighbor loop with a
+  handful of card-prefix reads.
+- Expected: keep the algebraic blocker-correction win while staying within the
+  existing scratch budget.
+- Result: slower. On `As7h2c`, `depth=5`, `iterations=1`, baseline
+  `cfv_terminal` was about `965ms`; the streamed card/group path was about
+  `1055ms`. GPU smoke passed with the experimental path, so this was a
+  performance failure, not a validation failure. The likely reason is that the
+  partial pass becomes `53` serial scans per terminal and adds more dispatch and
+  scratch traffic than the saved blocker-neighbor reads are worth.
+- Decision: reverted. Do not retry this exact streamed card/group-prefix shape.
+  A viable blocker algebra change needs either better intra-workgroup parallel
+  prefix construction, a smaller set of blocker aggregates, or a different
+  board-table batching formulation.
+
 ## 2026-06-06: Strength-group card-prefix sizing
 
 - Tried: quantify a smaller version of terminal card-prefix blocker correction
