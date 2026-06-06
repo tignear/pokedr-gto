@@ -20,21 +20,23 @@ that reached the river board before calling the river batch solver.
 
 ## Output Contract
 
-The first implementation returns the solved `DenseCfrState` plus summary data.
-The next boundary output should add per-combo root CFVs:
+The implementation returns the solved `DenseCfrState`, summary data, and
+per-combo root CFVs:
 
 - `oop_cfv[COMBO_COUNT]`
 - `ip_cfv[COMBO_COUNT]`
 
 Those CFVs are what the flop/turn trunk should back up through river chance
-edges.
+edges. They are currently produced from the average strategy profile by
+aggregating pairwise profile payoffs against the opponent's boundary reach
+weights.
 
 ## Current Status
 
 `RiverBatchSolver` is a clean wrapper around the existing public-tree CFR path.
 It can solve many fixed river boards in one process and reuses the thread-local
-GPU backend. It is still sequential per board; it is not yet a true batched GPU
-kernel.
+GPU backend. It now exposes the boundary CFVs needed by a trunk solver. It is
+still sequential per board; it is not yet a true batched GPU kernel.
 
 The intended next step is grouping identical river tree shapes so one dispatch
 sequence processes multiple `(state, oop_weights, ip_weights)` inputs.

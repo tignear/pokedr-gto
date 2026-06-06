@@ -2677,11 +2677,11 @@ fn metric_cpu_exploitability_enabled() -> bool {
 }
 
 #[derive(Clone, Copy)]
-struct ActiveCombo {
-    index: usize,
-    cards: [PokedrCard; 2],
-    mask: u64,
-    weight: f32,
+pub(crate) struct ActiveCombo {
+    pub(crate) index: usize,
+    pub(crate) cards: [PokedrCard; 2],
+    pub(crate) mask: u64,
+    pub(crate) weight: f32,
 }
 
 fn cpu_infoset_root_exploitability(
@@ -2800,7 +2800,7 @@ fn cpu_infoset_root_exploitability(
     }
 }
 
-fn active_weighted_combos(
+pub(crate) fn active_weighted_combos(
     indexer: &ComboIndexer,
     root_dead: u64,
     weights: &[f32],
@@ -3015,7 +3015,7 @@ fn cpu_infoset_br_hero_payoff_matrix(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn cpu_infoset_profile_hero_payoff_matrix(
+pub(crate) fn cpu_infoset_profile_hero_payoff_matrix(
     tree: &SubgameTree,
     layout: &PostflopDenseLayout,
     node_index: usize,
@@ -3400,14 +3400,14 @@ struct PostflopEvaluationContext<'a> {
     equity_cache: HashMap<u64, f32>,
 }
 
-struct ShowdownMatrixCache {
+pub(crate) struct ShowdownMatrixCache {
     entries: HashMap<u64, Vec<f32>>,
     order: VecDeque<u64>,
     capacity: usize,
 }
 
 impl ShowdownMatrixCache {
-    fn new(capacity: usize) -> Self {
+    pub(crate) fn new(capacity: usize) -> Self {
         Self {
             entries: HashMap::new(),
             order: VecDeque::new(),
@@ -3757,7 +3757,7 @@ fn cfr_gpu_backend() -> Option<Rc<GpuDenseCfrBackend>> {
     })
 }
 
-fn showdown_matrix_cache_capacity() -> usize {
+pub(crate) fn showdown_matrix_cache_capacity() -> usize {
     std::env::var("POKEDR_SHOWDOWN_MATRIX_CACHE")
         .ok()
         .and_then(|value| value.parse().ok())
@@ -8588,6 +8588,50 @@ mod tests {
         );
 
         assert!(value.is_finite());
+    }
+
+    #[test]
+    fn river_batch_result_exports_zero_sum_root_cfvs() {
+        let board = [
+            PokedrCard::new(PokedrRank::Ace, PokedrSuit::Spades),
+            PokedrCard::new(PokedrRank::Seven, PokedrSuit::Hearts),
+            PokedrCard::new(PokedrRank::Two, PokedrSuit::Clubs),
+            PokedrCard::new(PokedrRank::King, PokedrSuit::Diamonds),
+            PokedrCard::new(PokedrRank::Three, PokedrSuit::Spades),
+        ];
+        let input = RiverSubgameInput::with_default_ranges(board);
+        let result = RiverBatchSolver::new(PokedrAgentConfig {
+            cfr_iterations: 1,
+            max_showdown_runouts: 1,
+            ..PokedrAgentConfig::default()
+        })
+        .solve_subgame(input.clone());
+
+        assert_eq!(result.oop_cfv.len(), COMBO_COUNT);
+        assert_eq!(result.ip_cfv.len(), COMBO_COUNT);
+        assert!(result.oop_cfv.iter().any(|value| value.abs() > 0.0));
+        assert!(result.ip_cfv.iter().any(|value| value.abs() > 0.0));
+
+        let oop_value = input
+            .oop_weights
+            .iter()
+            .zip(&result.oop_cfv)
+            .map(|(weight, value)| weight * value)
+            .sum::<f32>();
+        let ip_value = input
+            .ip_weights
+            .iter()
+            .zip(&result.ip_cfv)
+            .map(|(weight, value)| weight * value)
+            .sum::<f32>();
+        let zero_sum_error = (oop_value + ip_value).abs();
+        let value_scale = oop_value.abs().max(ip_value.abs()).max(1.0);
+        assert!(
+            zero_sum_error / value_scale < 1e-4,
+            "oop_value={oop_value} ip_value={ip_value} sum={} relative_error={}",
+            oop_value + ip_value,
+            zero_sum_error / value_scale
+        );
     }
 
     #[test]
