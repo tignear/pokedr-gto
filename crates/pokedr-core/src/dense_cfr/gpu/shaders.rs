@@ -1268,10 +1268,14 @@ fn reach_init_tile(@builtin(global_invocation_id) id: vec3<u32>) {
     let live_word = index >> 5u;
     let live_mask = 1u << (index & 31u);
     atomicAnd(&combo_live[live_word], 0xffffffffu ^ live_mask);
-    if params.aux0 == 0u && local_node == 0u && root_reach_weights[combo] >= 0.0 {
-        hero_reaches[index] = root_reach_weights[combo];
-        villain_reaches[index] = root_reach_weights[params.combo_count + combo];
-        atomicOr(&combo_live[live_word], live_mask);
+    let root_count = max(params.edge_count, 1u);
+    if params.aux0 == 0u && local_node < root_count {
+        let root_offset = local_node * params.combo_count * 2u;
+        if root_reach_weights[root_offset + combo] >= 0.0 {
+            hero_reaches[index] = root_reach_weights[root_offset + combo];
+            villain_reaches[index] = root_reach_weights[root_offset + params.combo_count + combo];
+            atomicOr(&combo_live[live_word], live_mask);
+        }
     }
 }
 "#;

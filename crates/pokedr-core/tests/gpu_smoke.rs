@@ -1166,11 +1166,12 @@ fn run_public_tree_batched_iterations_match_individual_gpu(backend: &GpuDenseCfr
         batch_config,
         &public_legal_actions,
     ));
+    let forest = public_tree_fixture_forest(&fixture, 2);
     backend
-        .public_tree_run_batched_private_iterations_from(
-            &fixture.nodes,
-            &fixture.children,
-            &fixture.child_cards,
+        .public_tree_run_batched_private_forest_iterations_from(
+            &forest.nodes,
+            &forest.children,
+            &forest.child_cards,
             &fixture.combos,
             &[vec![1; fixture.combos.len()], vec![1; fixture.combos.len()]],
             &[
@@ -1178,7 +1179,7 @@ fn run_public_tree_batched_iterations_match_individual_gpu(backend: &GpuDenseCfr
                 vec![1.0; fixture.combos.len()],
             ],
             &[fixture.villain_weights.clone(), villain_b],
-            &[fixture.boards.clone(), fixture.boards.clone()],
+            &forest.boards,
             &mut batched,
             1,
             4,
@@ -1214,6 +1215,41 @@ fn run_public_tree_batched_iterations_match_individual_gpu(backend: &GpuDenseCfr
         individual_b.strategy_sum(),
         batch_b.strategy_sum(),
     );
+}
+
+fn public_tree_fixture_forest(fixture: &PublicTreeFixture, batches: usize) -> PublicTreeFixture {
+    let mut nodes = Vec::new();
+    let mut children = Vec::new();
+    let mut child_cards = Vec::new();
+    let mut boards = Vec::new();
+    for batch in 0..batches {
+        let node_offset = nodes.len() as u32;
+        let child_offset = children.len() as u32;
+        let board_offset = boards.len() as u32;
+        for node in &fixture.nodes {
+            let mut node = *node;
+            node.first_child += child_offset;
+            if node.kind == 0 {
+                node.public_infoset += (batch * fixture.public_infosets) as u32;
+            }
+            if node.terminal_kind == 2 {
+                node.showdown_offset += board_offset;
+            }
+            nodes.push(node);
+        }
+        children.extend(fixture.children.iter().map(|child| child + node_offset));
+        child_cards.extend_from_slice(&fixture.child_cards);
+        boards.extend_from_slice(&fixture.boards);
+    }
+    PublicTreeFixture {
+        nodes,
+        children,
+        child_cards,
+        combos: fixture.combos.clone(),
+        villain_weights: fixture.villain_weights.clone(),
+        boards,
+        public_infosets: fixture.public_infosets * batches,
+    }
 }
 
 struct PublicTreeFixture {

@@ -31,6 +31,13 @@ edges. They are currently produced from the average strategy profile by
 aggregating pairwise profile payoffs against the opponent's boundary reach
 weights.
 
+The river batch solver is therefore an oracle for the upper trunk, not merely a
+standalone river strategy generator. For each input `(public_state, oop_reach,
+ip_reach)`, the required oracle output is the counterfactual value vector at the
+river root for both players. The trunk solver should treat each returned CFV as
+the value of the corresponding river chance/action path under that path's
+boundary reaches.
+
 ## Current Status
 
 `RiverBatchSolver` is a clean wrapper around the existing public-tree CFR path.
@@ -64,5 +71,14 @@ one-board bottleneck is the public-tree CFV path: reach propagation, terminal
 payoff generation, backup, and action-value aggregation still use a one-board
 iteration context.
 
-The intended next step is grouping identical river tree shapes so one dispatch
-sequence processes multiple `(state, oop_weights, ip_weights)` inputs.
+For identical river public shapes, the GPU path now joins the per-board public
+trees into one disconnected public forest. Each root keeps its own boundary
+reach weights, combo blockers, terminal boards, and public infoset offset, so
+different trunk paths do not share strategy state. The existing public-tree CFV
+pipeline then processes the forest as one larger `node * combo` problem instead
+of issuing one CFV pass per board.
+
+The remaining major oracle bottleneck is root CFV materialization: the solved
+state is resident/batched on GPU, but the final per-combo `oop_cfv`/`ip_cfv`
+vectors are still produced by CPU pair payoff aggregation from the average
+strategy profile.

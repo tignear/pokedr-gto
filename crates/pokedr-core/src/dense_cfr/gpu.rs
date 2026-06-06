@@ -213,6 +213,7 @@ unsafe impl bytemuck::Zeroable for GpuTerminalRef {}
 unsafe impl bytemuck::Pod for GpuTerminalRef {}
 
 struct GpuPublicTreeIterationContext {
+    root_count: usize,
     nodes_len: usize,
     combos_len: usize,
     actions: usize,
@@ -2368,7 +2369,7 @@ impl GpuDenseCfrBackend {
                         max_actions: ctx.actions as u32,
                         output_len: x_invocations,
                         pair_start: variant_code(variant),
-                        chunk_pairs: 0,
+                        chunk_pairs: ctx.root_count as u32,
                         _pad0: tile.node_start as u32,
                         _pad1: variant_prediction_eta(variant, iteration).to_bits(),
                         _pad2: 0,
@@ -3397,10 +3398,48 @@ impl GpuDenseCfrBackend {
         materialize_dense_outputs: bool,
         include_terminal_work: bool,
     ) -> GpuPublicTreeIterationContext {
+        self.public_tree_iteration_context_with_roots(
+            nodes,
+            children,
+            child_cards,
+            combos,
+            &[combo_legal.to_vec()],
+            &[hero_weights.to_vec()],
+            &[villain_weights.to_vec()],
+            showdown_boards,
+            infosets,
+            actions,
+            materialize_dense_outputs,
+            include_terminal_work,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn public_tree_iteration_context_with_roots(
+        &self,
+        nodes: &[GpuPublicTreeNode],
+        children: &[u32],
+        child_cards: &[u32],
+        combos: &[GpuPrivateCombo],
+        combo_legals_by_root: &[Vec<u32>],
+        hero_weights_by_root: &[Vec<f32>],
+        villain_weights_by_root: &[Vec<f32>],
+        showdown_boards: &[GpuFinalBoard],
+        infosets: usize,
+        actions: usize,
+        materialize_dense_outputs: bool,
+        include_terminal_work: bool,
+    ) -> GpuPublicTreeIterationContext {
         assert!(!nodes.is_empty());
-        assert_eq!(combo_legal.len(), combos.len());
-        assert_eq!(hero_weights.len(), combos.len());
-        assert_eq!(villain_weights.len(), combos.len());
+        let root_count = combo_legals_by_root.len();
+        assert!(root_count > 0);
+        assert_eq!(hero_weights_by_root.len(), root_count);
+        assert_eq!(villain_weights_by_root.len(), root_count);
+        for root in 0..root_count {
+            assert_eq!(combo_legals_by_root[root].len(), combos.len());
+            assert_eq!(hero_weights_by_root[root].len(), combos.len());
+            assert_eq!(villain_weights_by_root[root].len(), combos.len());
+        }
         assert_eq!(infosets, nodes_public_infoset_count(nodes) * combos.len());
 
         let action_len = infosets * actions;
@@ -3434,19 +3473,21 @@ impl GpuDenseCfrBackend {
         let public_action_offsets = public_action_offsets_from_nodes(nodes);
 
         let combo_buffer = readonly_buffer(&self.device, "public tree combos", combos);
-        let mut root_weights = Vec::with_capacity(combos.len() * 2);
-        root_weights.extend(
-            combo_legal
-                .iter()
-                .zip(hero_weights)
-                .map(|(is_legal, weight)| if *is_legal != 0 { *weight } else { -1.0 }),
-        );
-        root_weights.extend(
-            combo_legal
-                .iter()
-                .zip(villain_weights)
-                .map(|(is_legal, weight)| if *is_legal != 0 { *weight } else { -1.0 }),
-        );
+        let mut root_weights = Vec::with_capacity(root_count * combos.len() * 2);
+        for root in 0..root_count {
+            root_weights.extend(
+                combo_legals_by_root[root]
+                    .iter()
+                    .zip(&hero_weights_by_root[root])
+                    .map(|(is_legal, weight)| if *is_legal != 0 { *weight } else { -1.0 }),
+            );
+            root_weights.extend(
+                combo_legals_by_root[root]
+                    .iter()
+                    .zip(&villain_weights_by_root[root])
+                    .map(|(is_legal, weight)| if *is_legal != 0 { *weight } else { -1.0 }),
+            );
+        }
         let root_weights_buffer = readonly_buffer(
             &self.device,
             "public tree root reach weights",
@@ -3612,7 +3653,8 @@ impl GpuDenseCfrBackend {
                 ),
             })
             .collect();
-        let combo_live_masks = public_tree_static_combo_live_masks(&layered, combos, combo_legal);
+        let combo_live_masks =
+            public_tree_static_combo_live_masks_by_roots(&layered, combos, combo_legals_by_root);
         let layer_tiles = self.public_tree_layer_tile_buffers(
             &layered,
             combos,
@@ -3697,6 +3739,7 @@ impl GpuDenseCfrBackend {
         );
 
         GpuPublicTreeIterationContext {
+            root_count,
             nodes_len: nodes.len(),
             combos_len: combos.len(),
             actions,
@@ -4846,6 +4889,97 @@ impl GpuDenseCfrBackend {
             if let Some(start) = iteration_start {
                 eprintln!(
                     "pokedr: gpu profile iteration={} phase=batched_public_tree_iteration elapsed_ms={:.3} batches={}",
+                    iteration,
+                    start.elapsed().as_secs_f64() * 1000.0,
+                    batches
+                );
+            }
+        }
+        self.wait_idle()?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn public_tree_run_batched_private_forest_iterations_from(
+        &self,
+        nodes: &[GpuPublicTreeNode],
+        children: &[u32],
+        child_cards: &[u32],
+        combos: &[GpuPrivateCombo],
+        combo_legals_by_root: &[Vec<u32>],
+        hero_weights_by_root: &[Vec<f32>],
+        villain_weights_by_root: &[Vec<f32>],
+        showdown_boards: &[GpuFinalBoard],
+        state: &mut GpuBatchedPrivateCfrState,
+        first_iteration: usize,
+        iterations: usize,
+    ) -> Result<(), GpuCfrError> {
+        if iterations == 0 {
+            return Ok(());
+        }
+        let batches = state.batches();
+        assert_eq!(combo_legals_by_root.len(), batches);
+        assert_eq!(hero_weights_by_root.len(), batches);
+        assert_eq!(villain_weights_by_root.len(), batches);
+        assert_eq!(state.combos(), combos.len());
+        assert_eq!(state.private_infosets(), state.config.private_infosets());
+
+        let profile = Self::gpu_profile_enabled();
+        let setup_start = profile.then(Instant::now);
+        let context = self.public_tree_iteration_context_with_roots(
+            nodes,
+            children,
+            child_cards,
+            combos,
+            combo_legals_by_root,
+            hero_weights_by_root,
+            villain_weights_by_root,
+            showdown_boards,
+            state.private_infosets(),
+            state.actions(),
+            true,
+            true,
+        );
+        if let Some(start) = setup_start {
+            eprintln!(
+                "pokedr: gpu profile phase=batched_forest_cfv_setup elapsed_ms={:.3} roots={} nodes={}",
+                start.elapsed().as_secs_f64() * 1000.0,
+                batches,
+                nodes.len()
+            );
+        }
+
+        let flush_interval = std::env::var("POKEDR_GPU_ITERATION_FLUSH")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(64)
+            .max(1);
+        for iteration in first_iteration..first_iteration + iterations {
+            let iteration_start = profile.then(Instant::now);
+            let (outputs, _output_len, action_len) = self
+                .public_tree_iteration_output_with_context(
+                    &context,
+                    state.regrets_buffer(),
+                    state.prediction_buffer(),
+                    state.config.variant,
+                    2,
+                    iteration,
+                    false,
+                )?;
+            assert_eq!(action_len, state.action_slots());
+            state.update_all_private_infosets_from_weighted_public_buffers(
+                self,
+                &outputs.action_values,
+                &outputs.reach_weights,
+                &outputs.strategy_weights,
+                iteration,
+            )?;
+            if iteration % flush_interval == 0 {
+                self.wait_idle()?;
+            }
+            if let Some(start) = iteration_start {
+                eprintln!(
+                    "pokedr: gpu profile iteration={} phase=batched_forest_public_tree_iteration elapsed_ms={:.3} roots={}",
                     iteration,
                     start.elapsed().as_secs_f64() * 1000.0,
                     batches
@@ -6722,10 +6856,10 @@ fn f32_range_byte_size(elements: usize) -> u64 {
     byte_len::<f32>(elements.max(1))
 }
 
-fn public_tree_static_combo_live_masks(
+fn public_tree_static_combo_live_masks_by_roots(
     layered: &GpuPublicTreeLayered,
     combos: &[GpuPrivateCombo],
-    combo_legal: &[u32],
+    combo_legals_by_root: &[Vec<u32>],
 ) -> Vec<Vec<u32>> {
     let combo_count = combos.len();
     let mut masks = layered
@@ -6737,9 +6871,19 @@ fn public_tree_static_combo_live_masks(
         return masks;
     }
 
-    for combo in 0..combo_count {
-        if combo_legal.get(combo).copied().unwrap_or(0) != 0 {
-            set_combo_live_bit(&mut masks[0], combo);
+    for root_slot in 0..layered.layers[0].nodes.len() {
+        let root_legals = combo_legals_by_root
+            .get(root_slot)
+            .or_else(|| combo_legals_by_root.first());
+        for combo in 0..combo_count {
+            if root_legals
+                .and_then(|legals| legals.get(combo))
+                .copied()
+                .unwrap_or(0)
+                != 0
+            {
+                set_combo_live_bit(&mut masks[0], root_slot * combo_count + combo);
+            }
         }
     }
 

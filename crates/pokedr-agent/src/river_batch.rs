@@ -2,6 +2,7 @@ use std::{cell::RefCell, collections::HashMap, time::Instant};
 
 use pokedr_core::{
     cards::{Board, Card as PokedrCard},
+    dense_cfr::gpu::{GpuFinalBoard, GpuPublicTreeNode},
     dense_cfr::{BatchedPrivateCfrConfig, BatchedPrivateCfrState, DenseCfrState},
     postflop::{Player, PublicState, Street, SubgameTree, SubgameTreeConfig},
     postflop_dense::PostflopDenseLayout,
@@ -238,8 +239,7 @@ impl RiverBatchSolver {
         let combos = gpu_private_combos();
         let indexer = ComboIndexer::new();
         let matrix_cache = RefCell::new(ShowdownMatrixCache::new(showdown_matrix_cache_capacity()));
-        let mut base_linearized: Option<crate::GpuLinearizedPublicTree> = None;
-        let mut showdown_boards_by_batch = Vec::with_capacity(group.len());
+        let mut linears: Vec<crate::GpuLinearizedPublicTree> = Vec::with_capacity(group.len());
         let mut combo_legals_by_batch = Vec::with_capacity(group.len());
         let mut oop_weights_by_batch = Vec::with_capacity(group.len());
         let mut ip_weights_by_batch = Vec::with_capacity(group.len());
@@ -249,32 +249,14 @@ impl RiverBatchSolver {
             let tree = template_tree.with_replaced_board(input.public_state.board.clone());
             let linearized =
                 linearize_gpu_public_tree(&tree, &layout, &backend, &self.config, &matrix_cache)?;
-            if let Some(base) = base_linearized.as_ref() {
+            if let Some(base) = linears.first() {
                 if base.nodes.len() != linearized.nodes.len()
                     || base.children.len() != linearized.children.len()
                     || base.child_cards.len() != linearized.child_cards.len()
                 {
                     return None;
                 }
-            } else {
-                base_linearized = Some(linearized);
-                trees.push(tree);
-                let root_dead = input.public_state.board.deck_mask();
-                combo_legals_by_batch.push(
-                    indexer
-                        .combos()
-                        .iter()
-                        .map(|combo| (!combo.collides_with(root_dead)) as u32)
-                        .collect(),
-                );
-                oop_weights_by_batch.push(input.oop_weights.clone());
-                ip_weights_by_batch.push(input.ip_weights.clone());
-                showdown_boards_by_batch
-                    .push(base_linearized.as_ref().unwrap().showdown_boards.clone());
-                continue;
             }
-            showdown_boards_by_batch.push(linearized.showdown_boards);
-            trees.push(tree);
             let root_dead = input.public_state.board.deck_mask();
             combo_legals_by_batch.push(
                 indexer
@@ -285,18 +267,20 @@ impl RiverBatchSolver {
             );
             oop_weights_by_batch.push(input.oop_weights.clone());
             ip_weights_by_batch.push(input.ip_weights.clone());
+            linears.push(linearized);
+            trees.push(tree);
         }
-        let base = base_linearized?;
+        let forest = forest_linearized_public_tree(&linears, layout.infoset_count())?;
         backend
-            .public_tree_run_batched_private_iterations_from(
-                &base.nodes,
-                &base.children,
-                &base.child_cards,
+            .public_tree_run_batched_private_forest_iterations_from(
+                &forest.nodes,
+                &forest.children,
+                &forest.child_cards,
                 &combos,
                 &combo_legals_by_batch,
                 &oop_weights_by_batch,
                 &ip_weights_by_batch,
-                &showdown_boards_by_batch,
+                &forest.showdown_boards,
                 &mut gpu_state,
                 1,
                 self.config.cfr_iterations.max(1),
@@ -432,6 +416,52 @@ fn default_river_public_state(board_cards: [PokedrCard; 5]) -> PublicState {
         raises_this_street: 0,
         checks_this_street: 0,
     }
+}
+
+fn forest_linearized_public_tree(
+    linears: &[crate::GpuLinearizedPublicTree],
+    public_infosets_per_batch: usize,
+) -> Option<crate::GpuLinearizedPublicTree> {
+    if linears.is_empty() {
+        return None;
+    }
+    let mut nodes = Vec::<GpuPublicTreeNode>::new();
+    let mut children = Vec::<u32>::new();
+    let mut child_cards = Vec::<u32>::new();
+    let mut showdown_boards = Vec::<GpuFinalBoard>::new();
+    for (batch, linear) in linears.iter().enumerate() {
+        let node_offset = nodes.len() as u32;
+        let child_offset = children.len() as u32;
+        let showdown_offset = showdown_boards.len() as u32;
+        for node in &linear.nodes {
+            let mut node = *node;
+            node.first_child = node.first_child.checked_add(child_offset)?;
+            if node.kind == 0 {
+                node.public_infoset = node
+                    .public_infoset
+                    .checked_add((batch * public_infosets_per_batch) as u32)?;
+            }
+            if node.terminal_kind == 2 {
+                node.showdown_offset = node.showdown_offset.checked_add(showdown_offset)?;
+            }
+            nodes.push(node);
+        }
+        children.extend(
+            linear
+                .children
+                .iter()
+                .map(|child| child.checked_add(node_offset))
+                .collect::<Option<Vec<_>>>()?,
+        );
+        child_cards.extend_from_slice(&linear.child_cards);
+        showdown_boards.extend_from_slice(&linear.showdown_boards);
+    }
+    Some(crate::GpuLinearizedPublicTree {
+        nodes,
+        children,
+        child_cards,
+        showdown_boards,
+    })
 }
 
 fn river_root_average_profile_cfvs(
