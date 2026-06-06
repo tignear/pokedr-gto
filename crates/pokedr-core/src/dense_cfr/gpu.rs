@@ -4749,7 +4749,13 @@ impl GpuDenseCfrBackend {
         config: CompactPrivateCfrConfig,
         max_chunk_bytes: usize,
     ) -> GpuCompactPrivateCfrState {
-        self.zeroed_compact_private_state_with_buffers(config, max_chunk_bytes, true, true)
+        let include_prediction = matches!(config.variant, super::CfrVariant::PdcfrPlus { .. });
+        self.zeroed_compact_private_state_with_buffers(
+            config,
+            max_chunk_bytes,
+            include_prediction,
+            true,
+        )
     }
 
     pub fn zeroed_compact_private_regret_state(
@@ -5019,6 +5025,48 @@ impl GpuDenseCfrBackend {
                 })
                 .collect(),
         };
+        self.compact_public_tree_run_iteration_with_state(
+            nodes,
+            children,
+            child_cards,
+            combos,
+            combo_legal,
+            hero_weights,
+            villain_weights,
+            showdown_boards,
+            &state,
+            br_player,
+            iteration,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn compact_public_tree_run_iteration_with_state(
+        &self,
+        nodes: &[GpuPublicTreeNode],
+        children: &[u32],
+        child_cards: &[u32],
+        combos: &[GpuPrivateCombo],
+        combo_legal: &[u32],
+        hero_weights: &[f32],
+        villain_weights: &[f32],
+        showdown_boards: &[GpuFinalBoard],
+        state: &GpuCompactPrivateCfrState,
+        br_player: u32,
+        iteration: usize,
+    ) -> Result<(usize, usize, usize, usize), GpuCfrError> {
+        assert!(
+            state
+                .chunks
+                .iter()
+                .all(|chunk| chunk.strategy_sum.is_some()),
+            "compact public tree iteration requires strategy_sum buffers"
+        );
+        assert!(
+            !matches!(state.variant, super::CfrVariant::PdcfrPlus { .. })
+                || state.chunks.iter().all(|chunk| chunk.prediction.is_some()),
+            "PDCFR+ compact public tree iteration requires prediction buffers"
+        );
         trace_pipeline_step("compact_iteration:context:start");
         let context = self.public_tree_iteration_context(
             nodes,
@@ -5117,6 +5165,40 @@ impl GpuDenseCfrBackend {
             reach_slices,
             update_slices,
         ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn compact_public_tree_run_iterations_with_state(
+        &self,
+        nodes: &[GpuPublicTreeNode],
+        children: &[u32],
+        child_cards: &[u32],
+        combos: &[GpuPrivateCombo],
+        combo_legal: &[u32],
+        hero_weights: &[f32],
+        villain_weights: &[f32],
+        showdown_boards: &[GpuFinalBoard],
+        state: &GpuCompactPrivateCfrState,
+        first_iteration: usize,
+        iterations: usize,
+    ) -> Result<(usize, usize, usize, usize), GpuCfrError> {
+        let mut last = (0, 0, 0, 0);
+        for offset in 0..iterations {
+            last = self.compact_public_tree_run_iteration_with_state(
+                nodes,
+                children,
+                child_cards,
+                combos,
+                combo_legal,
+                hero_weights,
+                villain_weights,
+                showdown_boards,
+                state,
+                2,
+                first_iteration + offset,
+            )?;
+        }
+        Ok(last)
     }
 
     fn zeroed_compact_private_state_with_buffers(
