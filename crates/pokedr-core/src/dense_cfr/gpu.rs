@@ -43,8 +43,10 @@ pub struct GpuDenseCfrBackend {
     showdown_matrix_bind_group_layout: wgpu::BindGroupLayout,
     public_tree_layer_reach_init_pipeline: wgpu::ComputePipeline,
     public_tree_layer_reach_edge_pipeline: wgpu::ComputePipeline,
+    public_tree_compact_reach_edge_pipeline: wgpu::ComputePipeline,
     public_tree_layer_reach_init_bind_group_layout: wgpu::BindGroupLayout,
     public_tree_layer_reach_edge_bind_group_layout: wgpu::BindGroupLayout,
+    public_tree_compact_reach_edge_bind_group_layout: wgpu::BindGroupLayout,
     public_tree_terminal_partial_pipeline: wgpu::ComputePipeline,
     public_tree_terminal_partial_bind_group_layout: wgpu::BindGroupLayout,
     public_tree_terminal_reduce_pipeline: wgpu::ComputePipeline,
@@ -922,6 +924,11 @@ impl GpuDenseCfrBackend {
                 label: Some("public tree layer reach shader"),
                 source: wgpu::ShaderSource::Wgsl(PUBLIC_TREE_LAYER_REACH_SHADER.into()),
             });
+        let public_tree_compact_reach_shader =
+            device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("public tree compact reach shader"),
+                source: wgpu::ShaderSource::Wgsl(PUBLIC_TREE_COMPACT_REACH_SHADER.into()),
+            });
         let public_tree_layer_reach_init_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("public tree layer reach init bind group layout"),
@@ -953,6 +960,27 @@ impl GpuDenseCfrBackend {
                     uniform_entry(13),
                 ],
             });
+        let public_tree_compact_reach_edge_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("public tree compact reach edge bind group layout"),
+                entries: &[
+                    storage_entry(0, true),
+                    storage_entry(1, true),
+                    storage_entry(2, true),
+                    storage_entry(3, true),
+                    storage_entry(4, true),
+                    storage_entry(5, true),
+                    storage_entry(6, true),
+                    storage_entry(7, true),
+                    storage_entry(8, true),
+                    storage_entry(9, false),
+                    storage_entry(10, false),
+                    storage_entry(11, false),
+                    storage_entry(12, true),
+                    uniform_entry(13),
+                    storage_entry(14, true),
+                ],
+            });
         let public_tree_layer_reach_init_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("public tree layer reach init pipeline layout"),
@@ -963,6 +991,12 @@ impl GpuDenseCfrBackend {
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("public tree layer reach edge pipeline layout"),
                 bind_group_layouts: &[Some(&public_tree_layer_reach_edge_bind_group_layout)],
+                immediate_size: 0,
+            });
+        let public_tree_compact_reach_edge_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("public tree compact reach edge pipeline layout"),
+                bind_group_layouts: &[Some(&public_tree_compact_reach_edge_bind_group_layout)],
                 immediate_size: 0,
             });
         let public_tree_layer_reach_init_pipeline =
@@ -979,6 +1013,15 @@ impl GpuDenseCfrBackend {
                 label: Some("public tree layer reach edge pipeline"),
                 layout: Some(&public_tree_layer_reach_edge_pipeline_layout),
                 module: &public_tree_layer_reach_shader,
+                entry_point: Some("reach_edge_tile"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                cache: None,
+            });
+        let public_tree_compact_reach_edge_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("public tree compact reach edge pipeline"),
+                layout: Some(&public_tree_compact_reach_edge_pipeline_layout),
+                module: &public_tree_compact_reach_shader,
                 entry_point: Some("reach_edge_tile"),
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
                 cache: None,
@@ -1325,8 +1368,10 @@ impl GpuDenseCfrBackend {
             showdown_matrix_bind_group_layout,
             public_tree_layer_reach_init_pipeline,
             public_tree_layer_reach_edge_pipeline,
+            public_tree_compact_reach_edge_pipeline,
             public_tree_layer_reach_init_bind_group_layout,
             public_tree_layer_reach_edge_bind_group_layout,
+            public_tree_compact_reach_edge_bind_group_layout,
             public_tree_terminal_partial_pipeline,
             public_tree_terminal_partial_bind_group_layout,
             public_tree_terminal_reduce_pipeline,
@@ -1367,6 +1412,12 @@ impl GpuDenseCfrBackend {
     pub fn supports_shader_float32_atomic(&self) -> bool {
         self.adapter_features
             .contains(wgpu::Features::SHADER_FLOAT32_ATOMIC)
+    }
+
+    pub fn has_compact_reach_pipeline(&self) -> bool {
+        let _ = &self.public_tree_compact_reach_edge_pipeline;
+        let _ = &self.public_tree_compact_reach_edge_bind_group_layout;
+        true
     }
 
     pub fn wait_idle(&self) -> Result<(), GpuCfrError> {

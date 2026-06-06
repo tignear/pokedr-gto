@@ -295,6 +295,13 @@ fn print_gpu_info() {
     println!("vendor: 0x{:x}", info.vendor);
     println!("device: 0x{:x}", info.device);
     println!("shader_float32_atomic: {}", supports_shader_float32_atomic);
+    match GpuDenseCfrBackend::new() {
+        Ok(backend) => println!(
+            "compact_reach_pipeline: {}",
+            backend.has_compact_reach_pipeline()
+        ),
+        Err(error) => println!("compact_reach_pipeline: unavailable ({error:?})"),
+    }
 }
 
 fn run_gpu_compact_state_smoke(args: FlopSolveArgs) {
