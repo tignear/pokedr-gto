@@ -4,6 +4,49 @@ This file records optimization attempts that failed, were reverted, or were too
 small to count as a strategic direction. Add entries before retrying similar
 ideas.
 
+## 2026-06-06: CPU terminal CFV card-prefix blocker correction
+
+- Tried: replace the per-combo blocker-neighbor loop in CPU terminal CFV with
+  per-card strength-order prefixes, so each combo's blocker correction can be
+  read from the two private-card prefix arrays.
+- Expected: remove the random blocker-neighbor reads and make each side's value
+  loop close to `O(combo_count)`.
+- Result: much slower. On `As7h2c` with two-combo ranges,
+  `1608768` terminal CFV calls on `16` threads moved from about `11.5s` to
+  about `37.0s`. The `52 * (combo_count + 1)` prefix construction writes far
+  more data per call than the blocker-neighbor loop reads.
+- Decision: reverted. Do not retry full per-card combo-position prefixes on CPU.
+  Any card-prefix direction needs a smaller strength-group representation or a
+  batched formulation that amortizes prefix construction across many reach
+  columns.
+
+## 2026-06-06: CPU terminal CFV two-side fused pass
+
+- Tried: build hero and villain prefixes together and compute both output sides
+  in one outer combo loop.
+- Expected: reduce duplicated prefix/order passes in
+  `terminal_cfv_prefix_blocker_into`.
+- Result: slower. On `As7h2c` with two-combo ranges,
+  `1608768` terminal CFV calls on `16` threads moved from about `11.5s` to
+  about `19.6s`. The extra prefix buffer and helper-layer shape hurt optimizer
+  and memory behavior more than the saved loop helped.
+- Decision: reverted. Keep the simple two-call side pass unless a fused version
+  also reduces blocker work or batches several terminal columns.
+
+## 2026-06-06: CPU terminal board phase scratch/index reuse
+
+- Tried: precompute final-board cache indices and range-combo indices, reuse one
+  `TerminalCfvScratch` and live reach buffers per worker, and assign contiguous
+  chunks to workers instead of strided tasks.
+- Expected: remove per-task map lookup and allocation overhead around terminal
+  CFV.
+- Result: modest improvement. On `As7h2c` with two-combo ranges,
+  `1608768` terminal board evaluations on `16` threads improved from about
+  `11.2s` to about `9.4s`. Sorting tasks by board cache index was also tried
+  and was slower, around `10.5s`.
+- Decision: keep scratch/index reuse and contiguous chunks. This does not solve
+  terminal CFV throughput; it only removes avoidable scaffolding overhead.
+
 ## 2026-06-06: Resident compact regret plus resident reach context
 
 - Tried: allocate all compact regret chunks for the full `As7h2c` tree and run

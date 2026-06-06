@@ -1,9 +1,11 @@
 use clap::{Parser, Subcommand};
 use pokedr_agent::{FlopTreeRequest, build_flop_tree};
 use pokedr_core::{
-    ActionKind, Board, CfrPlusState, CfrStorageConfig, ChanceExpansion, Player, PublicNodeKind,
-    RangeSpec, Street, TreeTemplate, build_action_slot_layout, dry_run_cfr_plus_iteration,
-    plan_cfr_work, terminal_cfv_parallel_smoke,
+    ActionKind, Board, CfrPlusState, CfrStorageConfig, ChanceExpansion, Player,
+    PreparedTerminalCfvSmoke, PublicNodeKind, RangeSpec, RealCfrConfig, RealCfrSolver, Street,
+    TreeTemplate, analyze_cfr_storage_scenarios, analyze_public_state_duplicates,
+    build_action_slot_layout, dry_run_cfr_plus_iteration, plan_cfr_work,
+    terminal_cfv_parallel_smoke,
 };
 use std::str::FromStr;
 use std::time::Instant;
@@ -51,6 +53,8 @@ enum Command {
         ip_range: String,
         #[arg(long, default_value = "oop")]
         first_player: String,
+        #[arg(long)]
+        enumerate_chance: bool,
         #[arg(long, default_value_t = 1)]
         iterations: u32,
         #[arg(long, default_value_t = 256)]
@@ -63,8 +67,29 @@ enum Command {
         update_slots: usize,
         #[arg(long)]
         update_chunk: Option<u128>,
+        #[arg(long, help = "Run only the CFR state update benchmark")]
+        run_state_iteration: bool,
+        #[arg(
+            long,
+            help = "Run a cost benchmark for terminal CFV smoke plus CFR state update; this is not a solver iteration"
+        )]
+        run_cost_benchmark: bool,
+        #[arg(long, default_value_t = 1)]
+        state_threads: usize,
         #[arg(long)]
         terminal_cfv_smoke: bool,
+        #[arg(long)]
+        terminal_cfv_tree_pass: bool,
+        #[arg(long)]
+        run_real_cfr: bool,
+        #[arg(long)]
+        run_real_cfr_three_phase: bool,
+        #[arg(long, default_value_t = 1)]
+        real_cfr_log_interval: u32,
+        #[arg(long)]
+        run_terminal_board_phase: bool,
+        #[arg(long)]
+        terminal_eval_breakdown: bool,
         #[arg(long)]
         terminal_cfv_calls: Option<usize>,
         #[arg(long, default_value_t = 0)]
@@ -143,6 +168,21 @@ fn main() -> Result<(), String> {
                 estimate.terminal_pair_visits,
                 estimate.memory_regret_strategy_f32_mb
             );
+            let duplicates = analyze_public_state_duplicates(&tree);
+            println!(
+                "duplicate_report decisions={} exact_unique={} exact_duplicates={} boardless_unique={} boardless_duplicates={} action_compatible_unique={} action_compatible_duplicates={} history_exact_unique={} history_exact_duplicates={} history_boardless_unique={} history_boardless_duplicates={}",
+                duplicates.decision_nodes,
+                duplicates.exact_unique,
+                duplicates.exact_duplicates,
+                duplicates.boardless_unique,
+                duplicates.boardless_duplicates,
+                duplicates.action_compatible_unique,
+                duplicates.action_compatible_duplicates,
+                duplicates.history_exact_unique,
+                duplicates.history_exact_duplicates,
+                duplicates.history_boardless_unique,
+                duplicates.history_boardless_duplicates,
+            );
             if !enumerate_chance {
                 let plan = plan_cfr_work(
                     &tree,
@@ -159,6 +199,14 @@ fn main() -> Result<(), String> {
                     plan.total_chunks,
                     plan.max_chunk_mib(),
                 );
+                let layout = build_action_slot_layout(
+                    &tree,
+                    CfrStorageConfig {
+                        chunk_target_bytes: chunk_mib as u128 * 1024 * 1024,
+                        ..CfrStorageConfig::default()
+                    },
+                );
+                print_storage_scenarios(&layout);
                 println!(
                     "cfr_plan_storage regret_f32_strategy_f32_gib={:.2} regret_f32_strategy_u16_gib={:.2} regret_f32_only_gib={:.2}",
                     storage_gib(plan.total_action_slots, 4, 4),
@@ -226,13 +274,23 @@ fn main() -> Result<(), String> {
             oop_range,
             ip_range,
             first_player,
+            enumerate_chance,
             iterations,
             chunk_mib,
             allocate_state,
             dry_run_iteration,
             update_slots,
             update_chunk,
+            run_state_iteration,
+            run_cost_benchmark,
+            state_threads,
             terminal_cfv_smoke,
+            terminal_cfv_tree_pass,
+            run_real_cfr,
+            run_real_cfr_three_phase,
+            real_cfr_log_interval,
+            run_terminal_board_phase,
+            terminal_eval_breakdown,
             terminal_cfv_calls,
             terminal_cfv_threads,
         } => {
@@ -244,7 +302,26 @@ fn main() -> Result<(), String> {
                 &ip_range,
                 &first_player,
             )?;
-            let tree = build_flop_tree(request).map_err(|error| format!("{error:?}"))?;
+            let tree = if enumerate_chance {
+                let template = TreeTemplate {
+                    action_abstraction: pokedr_core::ActionAbstraction::conservative_default(),
+                    chance_expansion: ChanceExpansion::Enumerate,
+                };
+                let spot = pokedr_core::Spot {
+                    board: request.board.clone(),
+                    pot: request.pot,
+                    effective_stack: request.effective_stack,
+                    oop_range: request.oop_range.clone(),
+                    ip_range: request.ip_range.clone(),
+                    first_player: request.first_player,
+                };
+                pokedr_core::TreeBuilder::new(template)
+                    .map_err(|error| format!("{error:?}"))?
+                    .build(spot)
+                    .map_err(|error| format!("{error:?}"))?
+            } else {
+                build_flop_tree(request).map_err(|error| format!("{error:?}"))?
+            };
             let config = CfrStorageConfig {
                 chunk_target_bytes: chunk_mib as u128 * 1024 * 1024,
                 ..CfrStorageConfig::default()
@@ -271,6 +348,7 @@ fn main() -> Result<(), String> {
                 plan.terminals.terminal_cfv_calls,
                 plan.terminals.terminal_private_pair_upper_bound,
             );
+            print_storage_scenarios(&layout);
             if terminal_cfv_smoke {
                 let calls = terminal_cfv_calls.unwrap_or_else(|| {
                     usize::try_from(plan.terminals.terminal_cfv_calls).unwrap_or(usize::MAX)
@@ -288,6 +366,146 @@ fn main() -> Result<(), String> {
                     started.elapsed().as_secs_f64() * 1000.0,
                     smoke.calls_per_second,
                     smoke.checksum,
+                );
+            }
+            if terminal_cfv_tree_pass {
+                let started = Instant::now();
+                let pass = pokedr_core::terminal_cfv_tree_pass(
+                    &tree,
+                    &RangeSpec::from_str(&oop_range)?,
+                    &RangeSpec::from_str(&ip_range)?,
+                    terminal_cfv_threads,
+                )?;
+                println!(
+                    "terminal_cfv_tree_pass terminals={} board_evals={} threads={} prepare_ms={:.3} eval_ms={:.3} total_ms={:.3} checksum={:.6}",
+                    pass.terminals,
+                    pass.board_evals,
+                    pass.threads,
+                    pass.prepare_elapsed_ms,
+                    pass.eval_elapsed_ms,
+                    started.elapsed().as_secs_f64() * 1000.0,
+                    pass.checksum,
+                );
+            }
+            if run_real_cfr {
+                let started = Instant::now();
+                let mut solver = RealCfrSolver::new(
+                    tree.clone(),
+                    RangeSpec::from_str(&oop_range)?,
+                    RangeSpec::from_str(&ip_range)?,
+                )?;
+                let summary = solver.run_with_progress(RealCfrConfig { iterations }, |progress| {
+                    if real_cfr_log_interval > 0
+                        && (progress.iteration == 1
+                            || progress.iteration == iterations
+                            || progress.iteration % real_cfr_log_interval == 0)
+                    {
+                        println!(
+                            "real_cfr_progress iteration={} terminal_evals={} iteration_ms={:.3} root_oop_value={:.6} root_ip_value={:.6} zero_sum_delta={:.6}",
+                            progress.iteration,
+                            progress.terminal_evals,
+                            progress.elapsed_ms,
+                            progress.root_oop_value,
+                            progress.root_ip_value,
+                            progress.root_oop_value + progress.root_ip_value,
+                        );
+                    }
+                })?;
+                println!(
+                    "real_cfr iterations={} decision_nodes={} action_slots={} terminal_evals={} elapsed_ms={:.3} root_oop_value={:.6} root_ip_value={:.6} zero_sum_delta={:.6}",
+                    summary.iterations,
+                    summary.decision_nodes,
+                    summary.action_slots,
+                    summary.terminal_evals,
+                    started.elapsed().as_secs_f64() * 1000.0,
+                    summary.root_oop_value,
+                    summary.root_ip_value,
+                    summary.root_oop_value + summary.root_ip_value,
+                );
+            }
+            if run_real_cfr_three_phase {
+                let started = Instant::now();
+                let mut solver = RealCfrSolver::new(
+                    tree.clone(),
+                    RangeSpec::from_str(&oop_range)?,
+                    RangeSpec::from_str(&ip_range)?,
+                )?;
+                let summary = solver.run_three_phase(
+                    RealCfrConfig { iterations },
+                    state_threads,
+                    |progress| {
+                        if real_cfr_log_interval > 0
+                            && (progress.iteration == 1
+                                || progress.iteration == iterations
+                                || progress.iteration % real_cfr_log_interval == 0)
+                        {
+                            println!(
+                                "real_cfr_three_phase_progress iteration={} terminal_evals={} reach_ms={:.3} terminal_ms={:.3} backup_ms={:.3} root_oop_value={:.6} root_ip_value={:.6} zero_sum_delta={:.6}",
+                                progress.iteration,
+                                progress.terminal_evals,
+                                progress.reach_ms,
+                                progress.terminal_ms,
+                                progress.backup_ms,
+                                progress.root_oop_value,
+                                progress.root_ip_value,
+                                progress.root_oop_value + progress.root_ip_value,
+                            );
+                        }
+                    },
+                )?;
+                println!(
+                    "real_cfr_three_phase iterations={} states={} decision_nodes={} action_slots={} terminal_evals={} elapsed_ms={:.3} reach_ms={:.3} terminal_ms={:.3} backup_ms={:.3} root_oop_value={:.6} root_ip_value={:.6} zero_sum_delta={:.6}",
+                    summary.iterations,
+                    summary.states,
+                    summary.decision_nodes,
+                    summary.action_slots,
+                    summary.terminal_evals,
+                    started.elapsed().as_secs_f64() * 1000.0,
+                    summary.reach_ms,
+                    summary.terminal_ms,
+                    summary.backup_ms,
+                    summary.root_oop_value,
+                    summary.root_ip_value,
+                    summary.root_oop_value + summary.root_ip_value,
+                );
+            }
+            if run_terminal_board_phase {
+                let started = Instant::now();
+                let solver = RealCfrSolver::new(
+                    tree.clone(),
+                    RangeSpec::from_str(&oop_range)?,
+                    RangeSpec::from_str(&ip_range)?,
+                )?;
+                let summary = solver.run_terminal_board_phase(state_threads)?;
+                println!(
+                    "terminal_board_phase threads={} terminal_evals={} elapsed_ms={:.3} total_ms={:.3} checksum={:.6}",
+                    state_threads,
+                    summary.terminal_evals,
+                    summary.elapsed_ms,
+                    started.elapsed().as_secs_f64() * 1000.0,
+                    summary.checksum,
+                );
+            }
+            if terminal_eval_breakdown {
+                let solver = RealCfrSolver::new(
+                    tree.clone(),
+                    RangeSpec::from_str(&oop_range)?,
+                    RangeSpec::from_str(&ip_range)?,
+                )?;
+                let breakdown = solver.terminal_eval_breakdown()?;
+                println!(
+                    "terminal_eval_breakdown fold_terminals={} showdown_terminals={} all_in_terminals={} river_showdown_evals={} flop_all_in_runout_evals={} turn_all_in_runout_evals={} river_all_in_evals={} total_evals={}",
+                    breakdown.fold_terminals,
+                    breakdown.showdown_terminals,
+                    breakdown.all_in_terminals,
+                    breakdown.river_showdown_evals,
+                    breakdown.flop_all_in_runout_evals,
+                    breakdown.turn_all_in_runout_evals,
+                    breakdown.river_all_in_evals,
+                    breakdown.river_showdown_evals
+                        + breakdown.flop_all_in_runout_evals
+                        + breakdown.turn_all_in_runout_evals
+                        + breakdown.river_all_in_evals,
                 );
             }
             if !allocate_state {
@@ -351,6 +569,62 @@ fn main() -> Result<(), String> {
                     summary.strategy_sum_delta,
                     summary.regret_checksum,
                     summary.strategy_sum_checksum,
+                );
+            }
+            if run_state_iteration {
+                let chunk_bytes = chunk_mib as u128 * 1024 * 1024;
+                let started = Instant::now();
+                let summary =
+                    state.apply_regret_matching_iteration_parallel(chunk_bytes, state_threads);
+                println!(
+                    "state_iteration chunks={} threads={} updated_slots={} elapsed_ms={:.3} strategy_sum_delta={:.6} regret_checksum={:.6} strategy_sum_checksum={:.6}",
+                    summary.chunks,
+                    state_threads,
+                    summary.updated_slots,
+                    started.elapsed().as_secs_f64() * 1000.0,
+                    summary.strategy_sum_delta,
+                    summary.regret_checksum,
+                    summary.strategy_sum_checksum,
+                );
+            }
+            if run_cost_benchmark {
+                let chunk_bytes = chunk_mib as u128 * 1024 * 1024;
+                let terminal_calls = terminal_cfv_calls.unwrap_or_else(|| {
+                    usize::try_from(plan.terminals.terminal_cfv_calls).unwrap_or(usize::MAX)
+                });
+                let prepare_started = Instant::now();
+                let prepared_terminal = PreparedTerminalCfvSmoke::new(&tree.spot.board)?;
+                let terminal_prepare_ms = prepare_started.elapsed().as_secs_f64() * 1000.0;
+                println!(
+                    "cost_benchmark_prepare terminal_boards={} terminal_prepare_ms={:.3}",
+                    prepared_terminal.board_count(),
+                    terminal_prepare_ms,
+                );
+                let total_started = Instant::now();
+                for iteration in 1..=iterations {
+                    let iteration_started = Instant::now();
+                    let terminal = prepared_terminal.run(terminal_calls, terminal_cfv_threads)?;
+                    let state_started = Instant::now();
+                    let summary =
+                        state.apply_regret_matching_iteration_parallel(chunk_bytes, state_threads);
+                    let state_elapsed_ms = state_started.elapsed().as_secs_f64() * 1000.0;
+                    println!(
+                        "cost_benchmark iteration={} terminal_cfv_smoke_calls={} terminal_cfv_smoke_threads={} terminal_eval_ms={:.3} state_threads={} state_ms={:.3} total_ms={:.3} updated_slots={} checksum={:.6}",
+                        iteration,
+                        terminal.calls,
+                        terminal.threads,
+                        terminal.eval_elapsed_ms,
+                        state_threads,
+                        state_elapsed_ms,
+                        iteration_started.elapsed().as_secs_f64() * 1000.0,
+                        summary.updated_slots,
+                        terminal.checksum + summary.strategy_sum_checksum,
+                    );
+                }
+                println!(
+                    "cost_benchmark_total iterations={} elapsed_ms={:.3}",
+                    iterations,
+                    total_started.elapsed().as_secs_f64() * 1000.0,
                 );
             }
         }
@@ -421,6 +695,26 @@ fn estimate_tree_work(
 
 fn storage_gib(action_slots: u128, regret_bytes: u128, strategy_sum_bytes: u128) -> f64 {
     action_slots as f64 * (regret_bytes + strategy_sum_bytes) as f64 / (1024.0 * 1024.0 * 1024.0)
+}
+
+fn print_storage_scenarios(layout: &pokedr_core::ActionSlotLayout) {
+    let scenarios = analyze_cfr_storage_scenarios(layout);
+    println!(
+        "storage_scenarios total_slots={} river_slots={} f32_f32_gib={:.2} f32_u16_gib={:.2} regret_only_gib={:.2}",
+        scenarios.total_slots,
+        scenarios.river_slots,
+        scenarios.regret_f32_strategy_f32_gib,
+        scenarios.regret_f32_strategy_u16_gib,
+        scenarios.regret_f32_only_gib,
+    );
+    println!(
+        "storage_scenarios_unordered_river river_ordered_slots={} river_unordered_slots={} f32_f32_gib={:.2} f32_u16_gib={:.2} regret_only_gib={:.2}",
+        scenarios.river_ordered_board_slots,
+        scenarios.river_unordered_board_slots,
+        scenarios.river_unordered_regret_f32_strategy_f32_gib,
+        scenarios.river_unordered_regret_f32_strategy_u16_gib,
+        scenarios.river_unordered_regret_f32_only_gib,
+    );
 }
 
 fn parse_player(value: &str) -> Result<Player, String> {

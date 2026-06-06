@@ -1,5 +1,8 @@
 use crate::cards::{Board, Card};
+use crate::range::RangeSpec;
+use crate::tree::{PublicNodeKind, PublicTree, TerminalReason};
 use std::cmp::Ordering;
+use std::collections::BTreeMap;
 use std::thread;
 use std::time::Instant;
 
@@ -25,6 +28,7 @@ pub struct TerminalCfvOutput {
 #[derive(Debug, Clone)]
 pub struct PreparedTerminalBoard {
     combos: Vec<PrivateCombo>,
+    combo_index_by_key: BTreeMap<u64, usize>,
     strengths: Vec<u64>,
     order: Vec<usize>,
     group_bounds: Vec<(usize, usize)>,
@@ -52,9 +56,36 @@ pub struct TerminalCfvParallelSmoke {
     pub checksum: f64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TerminalCfvTreePass {
+    pub terminals: usize,
+    pub board_evals: usize,
+    pub threads: usize,
+    pub prepare_elapsed_ms: f64,
+    pub eval_elapsed_ms: f64,
+    pub checksum: f64,
+}
+
+#[derive(Debug, Clone)]
+pub struct PreparedTerminalCfvSmoke {
+    prepared: Vec<PreparedTerminalBoard>,
+}
+
+#[derive(Debug, Clone)]
+struct PreparedTerminalCfvItem {
+    prepared: PreparedTerminalBoard,
+    oop_reach: Vec<f32>,
+    ip_reach: Vec<f32>,
+}
+
 impl PreparedTerminalBoard {
     pub fn new(board: &Board) -> Result<Self, String> {
         let combos = live_combos(board)?;
+        let combo_index_by_key = combos
+            .iter()
+            .enumerate()
+            .map(|(index, combo)| (combo.key(), index))
+            .collect::<BTreeMap<_, _>>();
         let strengths = combo_strengths(board, &combos);
         let mut order = (0..combos.len()).collect::<Vec<_>>();
         order.sort_unstable_by_key(|index| strengths[*index]);
@@ -78,6 +109,7 @@ impl PreparedTerminalBoard {
         let split_blockers = split_blocker_tables(&combos, &strengths);
         Ok(Self {
             combos,
+            combo_index_by_key,
             strengths,
             order,
             group_bounds,
@@ -90,6 +122,59 @@ impl PreparedTerminalBoard {
 
     pub fn combos(&self) -> &[PrivateCombo] {
         &self.combos
+    }
+
+    pub fn combo_index(&self, first: Card, second: Card) -> Option<usize> {
+        self.combo_index_by_key
+            .get(&private_combo_key(first, second))
+            .copied()
+    }
+
+    pub fn reach_from_range(&self, range: &RangeSpec) -> Vec<f32> {
+        let mut reach = vec![0.0f32; self.combos.len()];
+        for combo in range.combos() {
+            if let Some(index) = self
+                .combo_index_by_key
+                .get(&private_combo_key(combo.first, combo.second))
+            {
+                reach[*index] += combo.weight;
+            }
+        }
+        reach
+    }
+}
+
+impl PreparedTerminalCfvSmoke {
+    pub fn new(flop: &Board) -> Result<Self, String> {
+        if flop.cards().len() != 3 {
+            return Err("terminal CFV smoke requires a three-card flop".to_string());
+        }
+        let boards = river_boards_from_flop(flop)?;
+        let prepared = boards
+            .iter()
+            .map(PreparedTerminalBoard::new)
+            .collect::<Result<Vec<_>, _>>()?;
+        if prepared.is_empty() {
+            return Err("no terminal boards generated".to_string());
+        }
+        Ok(Self { prepared })
+    }
+
+    pub fn board_count(&self) -> usize {
+        self.prepared.len()
+    }
+
+    pub fn run(
+        &self,
+        calls: usize,
+        requested_threads: usize,
+    ) -> Result<TerminalCfvParallelSmoke, String> {
+        let eval =
+            run_terminal_cfv_parallel_smoke_prepared(&self.prepared, calls, requested_threads)?;
+        Ok(TerminalCfvParallelSmoke {
+            prepare_elapsed_ms: 0.0,
+            ..eval
+        })
     }
 }
 
@@ -111,6 +196,134 @@ pub fn terminal_cfv_parallel_smoke(
     if prepared.is_empty() {
         return Err("no terminal boards generated".to_string());
     }
+    let mut eval = run_terminal_cfv_parallel_smoke_prepared(&prepared, calls, requested_threads)?;
+    eval.prepare_elapsed_ms = prepare_elapsed_ms;
+    Ok(eval)
+}
+
+pub fn terminal_cfv_tree_pass(
+    tree: &PublicTree,
+    oop_range: &RangeSpec,
+    ip_range: &RangeSpec,
+    requested_threads: usize,
+) -> Result<TerminalCfvTreePass, String> {
+    let started_prepare = Instant::now();
+    let river_boards = river_boards_from_flop(&tree.spot.board)?;
+    let mut board_index_by_key = BTreeMap::new();
+    let mut prepared = Vec::with_capacity(river_boards.len());
+    for (index, board) in river_boards.iter().enumerate() {
+        let prepared_board = PreparedTerminalBoard::new(board)?;
+        let oop_reach = prepared_board.reach_from_range(oop_range);
+        let ip_reach = prepared_board.reach_from_range(ip_range);
+        board_index_by_key.insert(board_key(board), index);
+        prepared.push(PreparedTerminalCfvItem {
+            prepared: prepared_board,
+            oop_reach,
+            ip_reach,
+        });
+    }
+    let mut board_indices = Vec::new();
+    for node in &tree.nodes {
+        let PublicNodeKind::Terminal { reason } = node.kind else {
+            continue;
+        };
+        if !matches!(reason, TerminalReason::Showdown | TerminalReason::AllIn) {
+            continue;
+        }
+        for board in terminal_boards(&node.state.board)? {
+            let key = board_key(&board);
+            let Some(index) = board_index_by_key.get(&key) else {
+                return Err("terminal board is outside the flop river board cache".to_string());
+            };
+            board_indices.push(*index);
+        }
+    }
+    let prepare_elapsed_ms = started_prepare.elapsed().as_secs_f64() * 1000.0;
+    let board_evals = board_indices.len();
+    if board_indices.is_empty() {
+        return Ok(TerminalCfvTreePass {
+            terminals: 0,
+            board_evals: 0,
+            threads: 0,
+            prepare_elapsed_ms,
+            eval_elapsed_ms: 0.0,
+            checksum: 0.0,
+        });
+    }
+
+    let available_threads = thread::available_parallelism().map_or(1, usize::from);
+    let threads = if requested_threads == 0 {
+        available_threads
+    } else {
+        requested_threads.min(available_threads)
+    }
+    .max(1)
+    .min(board_indices.len());
+
+    let started_eval = Instant::now();
+    let checksum = thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(threads);
+        for thread_index in 0..threads {
+            let prepared = &prepared;
+            let board_indices = &board_indices;
+            handles.push(scope.spawn(move || -> Result<f64, String> {
+                let mut checksum = 0.0f64;
+                let mut scratch = TerminalCfvScratch::new(&prepared[0].prepared);
+                let mut task_index = thread_index;
+                while task_index < board_indices.len() {
+                    let item = &prepared[board_indices[task_index]];
+                    terminal_cfv_prefix_blocker_into(
+                        &item.prepared,
+                        &item.oop_reach,
+                        &item.ip_reach,
+                        &mut scratch,
+                    )?;
+                    checksum += terminal_cfv_output_checksum(&scratch);
+                    task_index += threads;
+                }
+                Ok(checksum)
+            }));
+        }
+        handles
+            .into_iter()
+            .map(|handle| {
+                handle
+                    .join()
+                    .map_err(|_| "terminal CFV tree pass worker panicked".to_string())?
+            })
+            .try_fold(0.0f64, |total, checksum| {
+                checksum.map(|value| total + value)
+            })
+    })?;
+    let eval_elapsed_ms = started_eval.elapsed().as_secs_f64() * 1000.0;
+    let terminals = tree
+        .nodes
+        .iter()
+        .filter(|node| {
+            matches!(
+                node.kind,
+                PublicNodeKind::Terminal {
+                    reason: TerminalReason::Showdown | TerminalReason::AllIn
+                }
+            )
+        })
+        .count();
+
+    Ok(TerminalCfvTreePass {
+        terminals,
+        board_evals,
+        threads,
+        prepare_elapsed_ms,
+        eval_elapsed_ms,
+        checksum,
+    })
+}
+
+fn run_terminal_cfv_parallel_smoke_prepared(
+    prepared: &[PreparedTerminalBoard],
+    calls: usize,
+    requested_threads: usize,
+) -> Result<TerminalCfvParallelSmoke, String> {
     let available_threads = thread::available_parallelism().map_or(1, usize::from);
     let threads = if requested_threads == 0 {
         available_threads
@@ -169,7 +382,7 @@ pub fn terminal_cfv_parallel_smoke(
         board_count: prepared.len(),
         calls,
         threads,
-        prepare_elapsed_ms,
+        prepare_elapsed_ms: 0.0,
         eval_elapsed_ms,
         calls_per_second,
         checksum,
@@ -200,6 +413,14 @@ impl TerminalCfvScratch {
             hero_values: vec![0.0; combos],
             villain_values: vec![0.0; combos],
         }
+    }
+
+    pub fn hero_values(&self) -> &[f32] {
+        &self.hero_values
+    }
+
+    pub fn villain_values(&self) -> &[f32] {
+        &self.villain_values
     }
 }
 
@@ -311,6 +532,7 @@ fn side_values_prefix_blocker_into(
         prefix[sorted_index + 1] = prefix[sorted_index] + opponent_reach[*combo_index];
     }
     let total = prefix[combos.len()];
+
     for hero in 0..combos.len() {
         let (lower, upper) = prepared.group_bounds[hero];
         let weaker = prefix[lower];
@@ -401,6 +623,42 @@ fn river_boards_from_flop(flop: &Board) -> Result<Vec<Board>, String> {
         }
     }
     Ok(boards)
+}
+
+fn terminal_boards(board: &Board) -> Result<Vec<Board>, String> {
+    match board.cards().len() {
+        5 => Ok(vec![board.clone()]),
+        4 => {
+            let deck = board.remaining_deck();
+            let mut boards = Vec::with_capacity(deck.len());
+            for river in deck {
+                boards.push(board.push(river)?);
+            }
+            Ok(boards)
+        }
+        3 => river_boards_from_flop(board),
+        other => Err(format!(
+            "terminal CFV requires a flop, turn, or river board, got {other} cards"
+        )),
+    }
+}
+
+fn board_key(board: &Board) -> u64 {
+    let mut key = 0u64;
+    for card in board.cards() {
+        key |= 1u64 << card.index();
+    }
+    key
+}
+
+fn terminal_cfv_output_checksum(scratch: &TerminalCfvScratch) -> f64 {
+    scratch
+        .hero_values
+        .iter()
+        .chain(scratch.villain_values.iter())
+        .enumerate()
+        .map(|(index, value)| *value as f64 * (index as f64 + 1.0))
+        .sum()
 }
 
 fn deterministic_reach(
@@ -621,6 +879,14 @@ impl PrivateCombo {
             || self.second == other.first
             || self.second == other.second
     }
+
+    fn key(self) -> u64 {
+        private_combo_key(self.first, self.second)
+    }
+}
+
+fn private_combo_key(first: Card, second: Card) -> u64 {
+    (1u64 << first.index()) | (1u64 << second.index())
 }
 
 #[cfg(test)]

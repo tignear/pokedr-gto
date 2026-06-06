@@ -1,7 +1,7 @@
 use crate::cards::{Board, Card};
 use crate::range::RangeSpec;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Player {
     Oop,
     Ip,
@@ -14,7 +14,7 @@ pub enum Street {
     River,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ActionKind {
     Check,
     Bet { amount: u32 },
