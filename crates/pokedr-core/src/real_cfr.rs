@@ -131,6 +131,20 @@ struct TerminalBoardTask {
     cache_index: usize,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct TerminalPhaseTask {
+    state_index: usize,
+    cache_index: usize,
+    pot: u32,
+}
+
+#[derive(Debug, Clone)]
+struct TerminalAccumulator {
+    values: Values,
+    oop_counts: Vec<f32>,
+    ip_counts: Vec<f32>,
+}
+
 #[derive(Debug, Clone)]
 struct PhaseState {
     node_id: usize,
@@ -672,18 +686,41 @@ impl RealCfrSolver {
     ) -> Result<Vec<Values>, String> {
         let mut values =
             vec![Values::zero(self.oop_combos.len(), self.ip_combos.len()); states.len()];
-        let terminals = states
-            .iter()
-            .enumerate()
-            .filter_map(|(index, state)| {
-                matches!(
-                    self.tree.nodes[state.node_id].kind,
-                    PublicNodeKind::Terminal { .. }
-                )
-                .then_some(index)
-            })
-            .collect::<Vec<_>>();
-        if terminals.is_empty() {
+        let mut tasks = Vec::new();
+        for (state_index, state) in states.iter().enumerate() {
+            let node = &self.tree.nodes[state.node_id];
+            let PublicNodeKind::Terminal { reason } = node.kind else {
+                continue;
+            };
+            match reason {
+                TerminalReason::Fold => {
+                    values[state_index] = self.fold_values(
+                        &state.board,
+                        node.state.pot,
+                        node.state.player,
+                        &oop_reaches[state_index],
+                        &ip_reaches[state_index],
+                    );
+                }
+                TerminalReason::Showdown | TerminalReason::AllIn => {
+                    for terminal_board in terminal_boards(&state.board)? {
+                        let cache_index = self
+                            .terminal_cache_index_by_key
+                            .get(&unordered_board_key(&terminal_board))
+                            .copied()
+                            .ok_or_else(|| {
+                                "terminal board is outside the solver board cache".to_string()
+                            })?;
+                        tasks.push(TerminalPhaseTask {
+                            state_index,
+                            cache_index,
+                            pot: node.state.pot,
+                        });
+                    }
+                }
+            }
+        }
+        if tasks.is_empty() {
             return Ok(values);
         }
         let threads = if threads == 0 {
@@ -692,38 +729,61 @@ impl RealCfrSolver {
             threads
         }
         .max(1)
-        .min(terminals.len());
+        .min(tasks.len());
         let outputs = thread::scope(|scope| {
             let mut handles = Vec::with_capacity(threads);
             for thread_index in 0..threads {
-                let chunk = terminals.len().div_ceil(threads);
+                let chunk = tasks.len().div_ceil(threads);
                 let start = thread_index * chunk;
-                let end = (start + chunk).min(terminals.len());
-                let terminals = &terminals;
-                handles.push(
-                    scope.spawn(move || -> Result<Vec<(usize, Values)>, String> {
-                        let mut out = Vec::with_capacity(end.saturating_sub(start));
-                        for state_index in &terminals[start..end] {
-                            let state = &states[*state_index];
-                            let node = &self.tree.nodes[state.node_id];
-                            let PublicNodeKind::Terminal { reason } = node.kind else {
-                                continue;
-                            };
-                            out.push((
-                                *state_index,
-                                self.terminal_values(
-                                    &state.board,
-                                    node.state.pot,
-                                    node.state.player,
-                                    reason,
-                                    &oop_reaches[*state_index],
-                                    &ip_reaches[*state_index],
-                                )?,
-                            ));
+                let end = (start + chunk).min(tasks.len());
+                let tasks = &tasks;
+                handles.push(scope.spawn(
+                    move || -> Result<BTreeMap<usize, TerminalAccumulator>, String> {
+                        let scratch_source = self
+                            .terminal_cache
+                            .first()
+                            .ok_or_else(|| "terminal board cache is empty".to_string())?;
+                        let combos = scratch_source.prepared.combos().len();
+                        let mut scratch = TerminalCfvScratch::new(&scratch_source.prepared);
+                        let mut oop_live = vec![0.0f32; combos];
+                        let mut ip_live = vec![0.0f32; combos];
+                        let mut out = BTreeMap::new();
+                        for task in &tasks[start..end] {
+                            let cache = &self.terminal_cache[task.cache_index];
+                            reach_on_prepared_board_into(
+                                &cache.oop_combo_indices,
+                                &oop_reaches[task.state_index],
+                                &mut oop_live,
+                            );
+                            reach_on_prepared_board_into(
+                                &cache.ip_combo_indices,
+                                &ip_reaches[task.state_index],
+                                &mut ip_live,
+                            );
+                            terminal_cfv_prefix_blocker_into(
+                                &cache.prepared,
+                                &oop_live,
+                                &ip_live,
+                                &mut scratch,
+                            )?;
+                            out.entry(task.state_index)
+                                .or_insert_with(|| {
+                                    TerminalAccumulator::zero(
+                                        self.oop_combos.len(),
+                                        self.ip_combos.len(),
+                                    )
+                                })
+                                .add_board(
+                                    cache,
+                                    task.pot,
+                                    &scratch,
+                                    self.oop_combos.len(),
+                                    self.ip_combos.len(),
+                                );
                         }
                         Ok(out)
-                    }),
-                );
+                    },
+                ));
             }
             handles
                 .into_iter()
@@ -732,15 +792,25 @@ impl RealCfrSolver {
                         .join()
                         .map_err(|_| "terminal phase worker panicked".to_string())?
                 })
-                .try_fold(Vec::new(), |mut all, worker| {
-                    worker.map(|mut values| {
-                        all.append(&mut values);
+                .try_fold(BTreeMap::new(), |mut all, worker| {
+                    worker.map(|values| {
+                        for (state_index, accumulator) in values {
+                            all.entry(state_index)
+                                .or_insert_with(|| {
+                                    TerminalAccumulator::zero(
+                                        self.oop_combos.len(),
+                                        self.ip_combos.len(),
+                                    )
+                                })
+                                .merge(accumulator);
+                        }
                         all
                     })
                 })
         })?;
-        for (state_index, value) in outputs {
-            values[state_index] = value;
+        for (state_index, mut accumulator) in outputs {
+            accumulator.finish();
+            values[state_index] = accumulator.values;
         }
         Ok(values)
     }
@@ -1335,6 +1405,63 @@ impl Values {
             *left += *right * scale;
         }
         self.terminal_evals += other.terminal_evals;
+    }
+}
+
+impl TerminalAccumulator {
+    fn zero(oop: usize, ip: usize) -> Self {
+        Self {
+            values: Values::zero(oop, ip),
+            oop_counts: vec![0.0; oop],
+            ip_counts: vec![0.0; ip],
+        }
+    }
+
+    fn add_board(
+        &mut self,
+        cache: &TerminalEvalCache,
+        pot: u32,
+        scratch: &TerminalCfvScratch,
+        oop_combos: usize,
+        ip_combos: usize,
+    ) {
+        let pot = pot as f32;
+        for index in 0..oop_combos {
+            if let Some(board_index) = cache.oop_combo_indices[index] {
+                self.values.oop[index] += scratch.hero_values()[board_index] * pot;
+                self.oop_counts[index] += 1.0;
+            }
+        }
+        for index in 0..ip_combos {
+            if let Some(board_index) = cache.ip_combo_indices[index] {
+                self.values.ip[index] += scratch.villain_values()[board_index] * pot;
+                self.ip_counts[index] += 1.0;
+            }
+        }
+        self.values.terminal_evals += 1;
+    }
+
+    fn merge(&mut self, other: Self) {
+        self.values.add_scaled(&other.values, 1.0);
+        for (left, right) in self.oop_counts.iter_mut().zip(other.oop_counts) {
+            *left += right;
+        }
+        for (left, right) in self.ip_counts.iter_mut().zip(other.ip_counts) {
+            *left += right;
+        }
+    }
+
+    fn finish(&mut self) {
+        for (value, count) in self.values.oop.iter_mut().zip(&self.oop_counts) {
+            if *count > 0.0 {
+                *value /= *count;
+            }
+        }
+        for (value, count) in self.values.ip.iter_mut().zip(&self.ip_counts) {
+            if *count > 0.0 {
+                *value /= *count;
+            }
+        }
     }
 }
 
