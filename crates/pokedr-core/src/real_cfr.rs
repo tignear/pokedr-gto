@@ -94,6 +94,7 @@ pub struct RealCfrSolver {
     oop_combos: Vec<ComboWeight>,
     ip_combos: Vec<ComboWeight>,
     infosets: Vec<Option<RealInfoset>>,
+    completed_iterations: u32,
     flop_board: Board,
     turn_index_by_key: BTreeMap<u64, usize>,
     river_index_by_key: BTreeMap<u64, usize>,
@@ -221,6 +222,7 @@ impl RealCfrSolver {
             oop_combos,
             ip_combos,
             infosets,
+            completed_iterations: 0,
             flop_board,
             turn_index_by_key,
             river_index_by_key,
@@ -258,7 +260,9 @@ impl RealCfrSolver {
                 .map(|combo| combo.weight)
                 .collect::<Vec<_>>();
             let board = self.flop_board.clone();
-            root = self.traverse(0, &board, &oop_reach, &ip_reach)?;
+            self.completed_iterations += 1;
+            let average_weight = self.completed_iterations as f32;
+            root = self.traverse(0, &board, &oop_reach, &ip_reach, average_weight)?;
             progress(RealCfrIterationSummary {
                 iteration,
                 terminal_evals: root.terminal_evals,
@@ -324,8 +328,15 @@ impl RealCfrSolver {
             let terminal_ms = terminal_started.elapsed().as_secs_f64() * 1000.0;
 
             let backup_started = std::time::Instant::now();
-            last_terminal_evals =
-                self.backup_phase(&states, &oop_reaches, &ip_reaches, &mut values)?;
+            self.completed_iterations += 1;
+            let average_weight = self.completed_iterations as f32;
+            last_terminal_evals = self.backup_phase(
+                &states,
+                &oop_reaches,
+                &ip_reaches,
+                &mut values,
+                average_weight,
+            )?;
             let backup_ms = backup_started.elapsed().as_secs_f64() * 1000.0;
 
             root = values[0].clone();
@@ -821,6 +832,7 @@ impl RealCfrSolver {
         oop_reaches: &[Vec<f32>],
         ip_reaches: &[Vec<f32>],
         values: &mut [Values],
+        average_weight: f32,
     ) -> Result<usize, String> {
         for state_index in (0..states.len()).rev() {
             let state = &states[state_index];
@@ -916,7 +928,8 @@ impl RealCfrSolver {
                             let slot = row_start + local_slot;
                             infoset.regrets[slot] =
                                 (infoset.regrets[slot] + action_value - node_value).max(0.0);
-                            infoset.strategy_sum[slot] += own_reach[combo] * strategies[local_slot];
+                            infoset.strategy_sum[slot] +=
+                                average_weight * own_reach[combo] * strategies[local_slot];
                         }
                     }
                     values[state_index] = state_values;
@@ -1139,6 +1152,7 @@ impl RealCfrSolver {
         board: &Board,
         oop_reach: &[f32],
         ip_reach: &[f32],
+        average_weight: f32,
     ) -> Result<Values, String> {
         let node = self.tree.nodes[node_id].clone();
         match node.kind {
@@ -1160,7 +1174,8 @@ impl RealCfrSolver {
                 let chance_weight = 1.0f32 / next_cards.len() as f32;
                 for card in next_cards {
                     let next_board = board.push(card)?;
-                    let child_values = self.traverse(child, &next_board, oop_reach, ip_reach)?;
+                    let child_values =
+                        self.traverse(child, &next_board, oop_reach, ip_reach, average_weight)?;
                     values.add_scaled(&child_values, chance_weight);
                 }
                 Ok(values)
@@ -1212,6 +1227,7 @@ impl RealCfrSolver {
                         board,
                         &next_oop,
                         &next_ip,
+                        average_weight,
                     )?);
                 }
 
@@ -1262,7 +1278,8 @@ impl RealCfrSolver {
                         let slot = row_start + local_slot;
                         infoset.regrets[slot] =
                             (infoset.regrets[slot] + action_value - node_value).max(0.0);
-                        infoset.strategy_sum[slot] += own_reach[combo] * strategies[local_slot];
+                        infoset.strategy_sum[slot] +=
+                            average_weight * own_reach[combo] * strategies[local_slot];
                     }
                 }
                 Ok(values)
