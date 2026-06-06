@@ -9,9 +9,10 @@ use pokedr_core::{
 };
 
 use crate::{
-    PokedrAgentConfig, ShowdownMatrixCache, active_weighted_combos,
+    PokedrAgentConfig, ShowdownMatrixCache, active_weighted_combos, cfr_gpu_backend,
     cpu_infoset_profile_hero_payoff_matrix, fixed_flop_root_weights, format_pokedr_cards,
-    root_board, showdown_matrix_cache_capacity, solve_public_tree_cfr,
+    gpu_private_combos, linearize_gpu_public_tree, root_board, showdown_matrix_cache_capacity,
+    solve_public_tree_cfr,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -187,6 +188,9 @@ impl RiverBatchSolver {
     ) -> Vec<(usize, RiverSubgameResult)> {
         debug_assert!(!group.is_empty());
         group.sort_by_key(|(index, _)| *index);
+        if let Some(results) = self.try_solve_shape_group_batched_gpu(&group) {
+            return results;
+        }
         let template_state = group[0].1.public_state.clone();
         let template_tree = SubgameTree::build(
             template_state,
@@ -203,6 +207,135 @@ impl RiverBatchSolver {
                 (index, result)
             })
             .collect()
+    }
+
+    fn try_solve_shape_group_batched_gpu(
+        &self,
+        group: &[(usize, RiverSubgameInput)],
+    ) -> Option<Vec<(usize, RiverSubgameResult)>> {
+        let backend = cfr_gpu_backend()?;
+        let started = Instant::now();
+        let template_state = group[0].1.public_state.clone();
+        let template_tree = SubgameTree::build(
+            template_state,
+            SubgameTreeConfig {
+                action_set: self.config.action_set.clone(),
+                max_raises_per_street: self.config.max_raises_per_street,
+            },
+        );
+        let layout = PostflopDenseLayout::from_tree(&template_tree);
+        let batch_config = BatchedPrivateCfrConfig {
+            batches: group.len(),
+            public_infosets: layout.infoset_count(),
+            combos: COMBO_COUNT,
+            actions: layout.max_actions(),
+            variant: self.config.cfr_variant,
+        };
+        let mut gpu_state = backend.upload_batched_private_state(&BatchedPrivateCfrState::new(
+            batch_config.clone(),
+            layout.legal_actions(),
+        ));
+        let combos = gpu_private_combos();
+        let indexer = ComboIndexer::new();
+        let matrix_cache = RefCell::new(ShowdownMatrixCache::new(showdown_matrix_cache_capacity()));
+        let mut base_linearized: Option<crate::GpuLinearizedPublicTree> = None;
+        let mut showdown_boards_by_batch = Vec::with_capacity(group.len());
+        let mut combo_legals_by_batch = Vec::with_capacity(group.len());
+        let mut oop_weights_by_batch = Vec::with_capacity(group.len());
+        let mut ip_weights_by_batch = Vec::with_capacity(group.len());
+        let mut trees = Vec::with_capacity(group.len());
+
+        for (_, input) in group {
+            let tree = template_tree.with_replaced_board(input.public_state.board.clone());
+            let linearized =
+                linearize_gpu_public_tree(&tree, &layout, &backend, &self.config, &matrix_cache)?;
+            if let Some(base) = base_linearized.as_ref() {
+                if base.nodes.len() != linearized.nodes.len()
+                    || base.children.len() != linearized.children.len()
+                    || base.child_cards.len() != linearized.child_cards.len()
+                {
+                    return None;
+                }
+            } else {
+                base_linearized = Some(linearized);
+                trees.push(tree);
+                let root_dead = input.public_state.board.deck_mask();
+                combo_legals_by_batch.push(
+                    indexer
+                        .combos()
+                        .iter()
+                        .map(|combo| (!combo.collides_with(root_dead)) as u32)
+                        .collect(),
+                );
+                oop_weights_by_batch.push(input.oop_weights.clone());
+                ip_weights_by_batch.push(input.ip_weights.clone());
+                showdown_boards_by_batch
+                    .push(base_linearized.as_ref().unwrap().showdown_boards.clone());
+                continue;
+            }
+            showdown_boards_by_batch.push(linearized.showdown_boards);
+            trees.push(tree);
+            let root_dead = input.public_state.board.deck_mask();
+            combo_legals_by_batch.push(
+                indexer
+                    .combos()
+                    .iter()
+                    .map(|combo| (!combo.collides_with(root_dead)) as u32)
+                    .collect(),
+            );
+            oop_weights_by_batch.push(input.oop_weights.clone());
+            ip_weights_by_batch.push(input.ip_weights.clone());
+        }
+        let base = base_linearized?;
+        backend
+            .public_tree_run_batched_private_iterations_from(
+                &base.nodes,
+                &base.children,
+                &base.child_cards,
+                &combos,
+                &combo_legals_by_batch,
+                &oop_weights_by_batch,
+                &ip_weights_by_batch,
+                &showdown_boards_by_batch,
+                &mut gpu_state,
+                1,
+                self.config.cfr_iterations.max(1),
+            )
+            .ok()?;
+        let batched_state = gpu_state.download(&backend).ok()?;
+
+        let mut results = Vec::with_capacity(group.len());
+        for (batch, ((index, input), tree)) in group.iter().zip(trees.iter()).enumerate() {
+            let state = batched_state.dense_state_for_batch(batch);
+            let (oop_cfv, ip_cfv) = river_root_average_profile_cfvs(
+                tree,
+                &layout,
+                &state,
+                &input.oop_weights,
+                &input.ip_weights,
+                self.config.max_showdown_runouts,
+            );
+            results.push((
+                *index,
+                RiverSubgameResult {
+                    summary: FixedRiverSolveSummary {
+                        board: format_pokedr_cards(root_board(tree).cards()),
+                        iterations: self.config.cfr_iterations.max(1),
+                        decisions: tree.decision_count(),
+                        chance: tree.chance_count(),
+                        terminals: tree.terminal_count(),
+                        public_infosets: layout.infoset_count(),
+                        private_infosets: state.infosets(),
+                        max_actions: layout.max_actions(),
+                        elapsed_secs: started.elapsed().as_secs_f32(),
+                    },
+                    oop_cfv,
+                    ip_cfv,
+                    state,
+                },
+            ));
+        }
+        Some(results)
     }
 
     fn solve_subgame_with_layout(

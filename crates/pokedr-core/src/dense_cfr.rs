@@ -926,6 +926,43 @@ impl BatchedPrivateCfrState {
     pub fn strategy_sum(&self) -> &[f32] {
         &self.strategy_sum
     }
+
+    pub fn dense_state_for_batch(&self, batch: usize) -> DenseCfrState {
+        assert!(batch < self.config.batches, "batch index out of range");
+        let dense_config = DenseCfrConfig {
+            infosets: self.config.private_infosets_per_batch(),
+            actions: self.config.actions,
+            variant: self.config.variant,
+        };
+        let batch_start = batch * self.config.action_slots_per_batch();
+        let batch_end = batch_start + self.config.action_slots_per_batch();
+        let legal_actions = self.legal_actions[batch_start..batch_end].to_vec();
+        let legal_action_counts =
+            legal_action_counts(dense_config.infosets, dense_config.actions, &legal_actions);
+        DenseCfrState {
+            infosets: dense_config.infosets,
+            actions: dense_config.actions,
+            variant: dense_config.variant,
+            legal_actions,
+            legal_action_counts,
+            regrets: self.regrets[batch_start..batch_end].to_vec(),
+            prediction: self.prediction[batch_start..batch_end].to_vec(),
+            strategy_sum: self.strategy_sum[batch_start..batch_end].to_vec(),
+        }
+    }
+
+    pub fn overwrite_batch_from_dense(&mut self, batch: usize, state: &DenseCfrState) {
+        assert!(batch < self.config.batches, "batch index out of range");
+        assert_eq!(state.infosets, self.config.private_infosets_per_batch());
+        assert_eq!(state.actions, self.config.actions);
+        assert_eq!(state.variant, self.config.variant);
+        let batch_start = batch * self.config.action_slots_per_batch();
+        let batch_end = batch_start + self.config.action_slots_per_batch();
+        self.legal_actions[batch_start..batch_end].copy_from_slice(&state.legal_actions);
+        self.regrets[batch_start..batch_end].copy_from_slice(&state.regrets);
+        self.prediction[batch_start..batch_end].copy_from_slice(&state.prediction);
+        self.strategy_sum[batch_start..batch_end].copy_from_slice(&state.strategy_sum);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1674,6 +1711,46 @@ mod tests {
         assert!(!state.legal_actions()[config.offset(1, 0, 3, 2)]);
         assert!(state.legal_actions()[config.offset(2, 1, 4, 2)]);
         assert!(!state.legal_actions()[config.offset(2, 1, 4, 3)]);
+    }
+
+    #[test]
+    fn batched_private_state_extracts_and_overwrites_dense_batch() {
+        let config = BatchedPrivateCfrConfig {
+            batches: 2,
+            public_infosets: 3,
+            combos: 4,
+            actions: 3,
+            variant: CfrVariant::dcfr_plus_default(),
+        };
+        let legal = vec![true, false, true, true, true, false, false, true, true];
+        let mut state = BatchedPrivateCfrState::new(config.clone(), &legal);
+        let mut replacement = DenseCfrState::new_with_legal_actions(
+            DenseCfrConfig {
+                infosets: config.private_infosets_per_batch(),
+                actions: config.actions,
+                variant: config.variant,
+            },
+            state.dense_state_for_batch(1).legal_actions().to_vec(),
+        );
+        for (index, value) in replacement.regrets.iter_mut().enumerate() {
+            *value = index as f32 * 0.25;
+        }
+        for (index, value) in replacement.prediction.iter_mut().enumerate() {
+            *value = -(index as f32) * 0.125;
+        }
+        for (index, value) in replacement.strategy_sum.iter_mut().enumerate() {
+            *value = 1.0 + index as f32 * 0.5;
+        }
+
+        state.overwrite_batch_from_dense(1, &replacement);
+        let batch0 = state.dense_state_for_batch(0);
+        let batch1 = state.dense_state_for_batch(1);
+
+        assert!(batch0.regrets().iter().all(|value| *value == 0.0));
+        assert_eq!(batch1.regrets(), replacement.regrets());
+        assert_eq!(batch1.prediction(), replacement.prediction());
+        assert_eq!(batch1.strategy_sum(), replacement.strategy_sum());
+        assert_eq!(batch1.legal_actions(), replacement.legal_actions());
     }
 
     #[test]

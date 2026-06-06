@@ -34,6 +34,7 @@ fn main() {
     run_public_tree_multistreet_values_match_cpu_exact(&backend);
     run_public_tree_average_strategy_br_matches_cpu_exact(&backend);
     run_public_tree_iterations_match_cpu_exact(&backend);
+    run_public_tree_batched_iterations_match_individual_gpu(&backend);
     println!("GPU smoke passed");
 }
 
@@ -1103,6 +1104,115 @@ fn run_public_tree_iterations_match_cpu_exact(backend: &GpuDenseCfrBackend) {
         "public tree CFR prediction",
         cpu.prediction(),
         downloaded.prediction(),
+    );
+}
+
+fn run_public_tree_batched_iterations_match_individual_gpu(backend: &GpuDenseCfrBackend) {
+    let fixture = multistreet_public_tree_fixture();
+    let variant = CfrVariant::DcfrPlus {
+        alpha: 1.5,
+        gamma: 4.0,
+    };
+    let dense_config = DenseCfrConfig {
+        infosets: fixture.public_infosets * fixture.combos.len(),
+        actions: 2,
+        variant,
+    };
+    let legal_actions = vec![true; dense_config.infosets * dense_config.actions];
+    let mut individual_a =
+        backend.zeroed_state_with_legal_actions(dense_config.clone(), legal_actions.clone());
+    let mut individual_b =
+        backend.zeroed_state_with_legal_actions(dense_config.clone(), legal_actions);
+    let villain_b: Vec<_> = fixture.villain_weights.iter().copied().rev().collect();
+
+    backend
+        .public_tree_run_iterations(
+            &fixture.nodes,
+            &fixture.children,
+            &fixture.child_cards,
+            &fixture.combos,
+            &vec![1; fixture.combos.len()],
+            &vec![1.0; fixture.combos.len()],
+            &fixture.villain_weights,
+            &fixture.boards,
+            &mut individual_a,
+            4,
+        )
+        .unwrap_or_else(|error| fail(&format!("GPU public tree individual A failed: {error:?}")));
+    backend
+        .public_tree_run_iterations(
+            &fixture.nodes,
+            &fixture.children,
+            &fixture.child_cards,
+            &fixture.combos,
+            &vec![1; fixture.combos.len()],
+            &vec![1.0; fixture.combos.len()],
+            &villain_b,
+            &fixture.boards,
+            &mut individual_b,
+            4,
+        )
+        .unwrap_or_else(|error| fail(&format!("GPU public tree individual B failed: {error:?}")));
+
+    let batch_config = BatchedPrivateCfrConfig {
+        batches: 2,
+        public_infosets: fixture.public_infosets,
+        combos: fixture.combos.len(),
+        actions: 2,
+        variant,
+    };
+    let public_legal_actions = vec![true; fixture.public_infosets * 2];
+    let mut batched = backend.upload_batched_private_state(&BatchedPrivateCfrState::new(
+        batch_config,
+        &public_legal_actions,
+    ));
+    backend
+        .public_tree_run_batched_private_iterations_from(
+            &fixture.nodes,
+            &fixture.children,
+            &fixture.child_cards,
+            &fixture.combos,
+            &[vec![1; fixture.combos.len()], vec![1; fixture.combos.len()]],
+            &[
+                vec![1.0; fixture.combos.len()],
+                vec![1.0; fixture.combos.len()],
+            ],
+            &[fixture.villain_weights.clone(), villain_b],
+            &[fixture.boards.clone(), fixture.boards.clone()],
+            &mut batched,
+            1,
+            4,
+        )
+        .unwrap_or_else(|error| fail(&format!("GPU public tree batched failed: {error:?}")));
+    let batched = batched.download(backend).unwrap_or_else(|error| {
+        fail(&format!(
+            "GPU public tree batched download failed: {error:?}"
+        ))
+    });
+    let batch_a = batched.dense_state_for_batch(0);
+    let batch_b = batched.dense_state_for_batch(1);
+    let individual_a = individual_a.download(backend).unwrap();
+    let individual_b = individual_b.download(backend).unwrap();
+
+    assert_close(
+        "batched public tree A regret",
+        individual_a.regrets(),
+        batch_a.regrets(),
+    );
+    assert_close(
+        "batched public tree A strategy_sum",
+        individual_a.strategy_sum(),
+        batch_a.strategy_sum(),
+    );
+    assert_close(
+        "batched public tree B regret",
+        individual_b.regrets(),
+        batch_b.regrets(),
+    );
+    assert_close(
+        "batched public tree B strategy_sum",
+        individual_b.strategy_sum(),
+        batch_b.strategy_sum(),
     );
 }
 

@@ -4643,6 +4643,220 @@ impl GpuDenseCfrBackend {
     }
 
     #[allow(clippy::too_many_arguments)]
+    pub fn public_tree_run_batched_private_iterations_from(
+        &self,
+        nodes: &[GpuPublicTreeNode],
+        children: &[u32],
+        child_cards: &[u32],
+        combos: &[GpuPrivateCombo],
+        combo_legals_by_batch: &[Vec<u32>],
+        hero_weights_by_batch: &[Vec<f32>],
+        villain_weights_by_batch: &[Vec<f32>],
+        showdown_boards_by_batch: &[Vec<GpuFinalBoard>],
+        state: &mut GpuBatchedPrivateCfrState,
+        first_iteration: usize,
+        iterations: usize,
+    ) -> Result<(), GpuCfrError> {
+        if iterations == 0 {
+            return Ok(());
+        }
+        let batches = state.batches();
+        assert_eq!(combo_legals_by_batch.len(), batches);
+        assert_eq!(hero_weights_by_batch.len(), batches);
+        assert_eq!(villain_weights_by_batch.len(), batches);
+        assert_eq!(showdown_boards_by_batch.len(), batches);
+        for batch in 0..batches {
+            assert_eq!(combo_legals_by_batch[batch].len(), combos.len());
+            assert_eq!(hero_weights_by_batch[batch].len(), combos.len());
+            assert_eq!(villain_weights_by_batch[batch].len(), combos.len());
+        }
+        assert_eq!(
+            state.public_infosets(),
+            nodes_public_infoset_count(nodes),
+            "batched state public infosets must match the public tree"
+        );
+        assert_eq!(state.combos(), combos.len());
+        assert_eq!(state.private_infosets(), state.config.private_infosets());
+
+        let profile = Self::gpu_profile_enabled();
+        let setup_start = profile.then(Instant::now);
+        let contexts = (0..batches)
+            .map(|batch| {
+                self.public_tree_iteration_context(
+                    nodes,
+                    children,
+                    child_cards,
+                    combos,
+                    &combo_legals_by_batch[batch],
+                    &hero_weights_by_batch[batch],
+                    &villain_weights_by_batch[batch],
+                    &showdown_boards_by_batch[batch],
+                    state.config.private_infosets_per_batch(),
+                    state.actions(),
+                    true,
+                    true,
+                )
+            })
+            .collect::<Vec<_>>();
+        if let Some(start) = setup_start {
+            eprintln!(
+                "pokedr: gpu profile phase=batched_cfv_setup elapsed_ms={:.3} batches={}",
+                start.elapsed().as_secs_f64() * 1000.0,
+                batches
+            );
+        }
+
+        let legal_actions = state.legal_actions[0..state.config.action_slots_per_batch()].to_vec();
+        let scratch = GpuDenseCfrState {
+            infosets: state.config.private_infosets_per_batch(),
+            actions: state.actions(),
+            variant: state.config.variant,
+            legal_actions_buffer: readonly_buffer(
+                &self.device,
+                "batched private scratch legal actions",
+                &legal_actions,
+            ),
+            legal_actions,
+            regrets: uninit_storage_buffer_typed::<f32>(
+                &self.device,
+                "batched private scratch regrets",
+                state.config.action_slots_per_batch(),
+                true,
+                true,
+            ),
+            prediction: uninit_storage_buffer_typed::<f32>(
+                &self.device,
+                "batched private scratch prediction",
+                state.config.action_slots_per_batch(),
+                true,
+                true,
+            ),
+            strategy_sum: uninit_storage_buffer_typed::<f32>(
+                &self.device,
+                "batched private scratch strategy sum",
+                state.config.action_slots_per_batch(),
+                true,
+                true,
+            ),
+        };
+        let batched_action_values = uninit_storage_buffer_typed::<f32>(
+            &self.device,
+            "batched public tree action values",
+            state.action_slots(),
+            false,
+            true,
+        );
+        let batched_reach_weights = uninit_storage_buffer_typed::<f32>(
+            &self.device,
+            "batched public tree reach weights",
+            state.private_infosets(),
+            false,
+            true,
+        );
+        let batched_strategy_weights = uninit_storage_buffer_typed::<f32>(
+            &self.device,
+            "batched public tree strategy weights",
+            state.private_infosets(),
+            false,
+            true,
+        );
+        let flush_interval = std::env::var("POKEDR_GPU_ITERATION_FLUSH")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(64)
+            .max(1);
+        for iteration in first_iteration..first_iteration + iterations {
+            let iteration_start = profile.then(Instant::now);
+            for (batch, context) in contexts.iter().enumerate() {
+                let action_offset = batch * state.config.action_slots_per_batch();
+                let infoset_offset = batch * state.config.private_infosets_per_batch();
+                let mut encoder =
+                    self.device
+                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                            label: Some("batched public tree state slice copy encoder"),
+                        });
+                encoder.copy_buffer_to_buffer(
+                    state.regrets_buffer(),
+                    f32_range_byte_offset(action_offset),
+                    &scratch.regrets,
+                    0,
+                    f32_range_byte_size(state.config.action_slots_per_batch()),
+                );
+                encoder.copy_buffer_to_buffer(
+                    state.prediction_buffer(),
+                    f32_range_byte_offset(action_offset),
+                    &scratch.prediction,
+                    0,
+                    f32_range_byte_size(state.config.action_slots_per_batch()),
+                );
+                self.queue.submit(Some(encoder.finish()));
+
+                let (outputs, _output_len, action_len) = self
+                    .public_tree_iteration_output_with_context(
+                        context,
+                        &scratch.regrets,
+                        &scratch.prediction,
+                        state.config.variant,
+                        2,
+                        iteration,
+                        false,
+                    )?;
+                assert_eq!(action_len, state.config.action_slots_per_batch());
+                let mut encoder =
+                    self.device
+                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                            label: Some("batched public tree output gather encoder"),
+                        });
+                copy_buffer_range(
+                    &mut encoder,
+                    &outputs.action_values,
+                    0,
+                    &batched_action_values,
+                    action_offset,
+                    state.config.action_slots_per_batch(),
+                );
+                copy_buffer_range(
+                    &mut encoder,
+                    &outputs.reach_weights,
+                    0,
+                    &batched_reach_weights,
+                    infoset_offset,
+                    state.config.private_infosets_per_batch(),
+                );
+                copy_buffer_range(
+                    &mut encoder,
+                    &outputs.strategy_weights,
+                    0,
+                    &batched_strategy_weights,
+                    infoset_offset,
+                    state.config.private_infosets_per_batch(),
+                );
+                self.queue.submit(Some(encoder.finish()));
+            }
+            state.update_all_private_infosets_from_weighted_public_buffers(
+                self,
+                &batched_action_values,
+                &batched_reach_weights,
+                &batched_strategy_weights,
+                iteration,
+            )?;
+            if iteration % flush_interval == 0 {
+                self.wait_idle()?;
+            }
+            if let Some(start) = iteration_start {
+                eprintln!(
+                    "pokedr: gpu profile iteration={} phase=batched_public_tree_iteration elapsed_ms={:.3} batches={}",
+                    iteration,
+                    start.elapsed().as_secs_f64() * 1000.0,
+                    batches
+                );
+            }
+        }
+        self.wait_idle()?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub fn public_tree_run_iteration_checkpoints(
         &self,
         nodes: &[GpuPublicTreeNode],
@@ -5751,6 +5965,22 @@ impl GpuBatchedPrivateCfrState {
         self.config.action_slots()
     }
 
+    pub fn regrets_buffer(&self) -> &wgpu::Buffer {
+        &self.regrets
+    }
+
+    pub fn prediction_buffer(&self) -> &wgpu::Buffer {
+        &self.prediction
+    }
+
+    pub fn strategy_sum_buffer(&self) -> &wgpu::Buffer {
+        &self.strategy_sum
+    }
+
+    pub fn legal_actions_buffer(&self) -> &wgpu::Buffer {
+        &self.legal_actions_buffer
+    }
+
     pub fn update_all_private_infosets(
         &mut self,
         backend: &GpuDenseCfrBackend,
@@ -5764,18 +5994,6 @@ impl GpuBatchedPrivateCfrState {
         assert_eq!(reach_weights.len(), private_infosets);
         assert_eq!(strategy_weights.len(), private_infosets);
 
-        let params = [
-            private_infosets as u32,
-            self.config.actions as u32,
-            variant_code(self.config.variant),
-            iteration as u32,
-            variant_dcfr_alpha(self.config.variant, iteration).to_bits(),
-            variant_dcfr_gamma(self.config.variant, iteration).to_bits(),
-            variant_prediction_eta(self.config.variant, iteration).to_bits(),
-            super::average_strategy_delay() as u32,
-            super::average_strategy_power().to_bits(),
-            variant_dcfr_beta(self.config.variant, iteration).to_bits(),
-        ];
         let action_values = readonly_buffer(
             &backend.device,
             "batched private action values",
@@ -5791,6 +6009,36 @@ impl GpuBatchedPrivateCfrState {
             "batched private strategy weights",
             strategy_weights,
         );
+        self.update_all_private_infosets_from_buffers(
+            backend,
+            &action_values,
+            &reach_weights,
+            &strategy_weights,
+            iteration,
+        )
+    }
+
+    pub fn update_all_private_infosets_from_buffers(
+        &mut self,
+        backend: &GpuDenseCfrBackend,
+        action_values: &wgpu::Buffer,
+        reach_weights: &wgpu::Buffer,
+        strategy_weights: &wgpu::Buffer,
+        iteration: usize,
+    ) -> Result<(), GpuCfrError> {
+        let private_infosets = self.config.private_infosets();
+        let params = [
+            private_infosets as u32,
+            self.config.actions as u32,
+            variant_code(self.config.variant),
+            iteration as u32,
+            variant_dcfr_alpha(self.config.variant, iteration).to_bits(),
+            variant_dcfr_gamma(self.config.variant, iteration).to_bits(),
+            variant_prediction_eta(self.config.variant, iteration).to_bits(),
+            super::average_strategy_delay() as u32,
+            super::average_strategy_power().to_bits(),
+            variant_dcfr_beta(self.config.variant, iteration).to_bits(),
+        ];
         let params = readonly_buffer(&backend.device, "batched private params", &params);
         let bind_group = backend
             .device
@@ -5800,9 +6048,9 @@ impl GpuBatchedPrivateCfrState {
                 entries: &[
                     bind_entry(0, &self.regrets),
                     bind_entry(1, &self.strategy_sum),
-                    bind_entry(2, &action_values),
-                    bind_entry(3, &reach_weights),
-                    bind_entry(4, &strategy_weights),
+                    bind_entry(2, action_values),
+                    bind_entry(3, reach_weights),
+                    bind_entry(4, strategy_weights),
                     bind_entry(5, &params),
                     bind_entry(6, &self.legal_actions_buffer),
                     bind_entry(7, &self.prediction),
@@ -5820,6 +6068,90 @@ impl GpuBatchedPrivateCfrState {
                 timestamp_writes: None,
             });
             pass.set_pipeline(&backend.pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            let groups = (private_infosets as u32).div_ceil(WORKGROUP_SIZE);
+            pass.dispatch_workgroups(groups, 1, 1);
+        }
+        let submission = backend.queue.submit(Some(encoder.finish()));
+        backend
+            .device
+            .poll(wgpu::PollType::Wait {
+                submission_index: Some(submission),
+                timeout: None,
+            })
+            .map_err(|error| GpuCfrError::MapFailed(error.to_string()))?;
+        Ok(())
+    }
+
+    pub fn update_all_private_infosets_from_weighted_public_buffers(
+        &mut self,
+        backend: &GpuDenseCfrBackend,
+        action_values: &wgpu::Buffer,
+        reach_weights: &wgpu::Buffer,
+        strategy_weights: &wgpu::Buffer,
+        iteration: usize,
+    ) -> Result<(), GpuCfrError> {
+        let private_infosets = self.config.private_infosets();
+        let public_infosets = self.config.batches * self.config.public_infosets;
+        let zero_public_mask = vec![0u32; public_infosets.max(1)];
+        let zero_public_mask = readonly_buffer(
+            &backend.device,
+            "batched public tree zero fused mask",
+            &zero_public_mask,
+        );
+        let params = readonly_buffer(
+            &backend.device,
+            "batched public tree CFR update params",
+            &[
+                private_infosets as u32,
+                self.config.actions as u32,
+                variant_code(self.config.variant),
+                iteration as u32,
+                variant_dcfr_alpha(self.config.variant, iteration).to_bits(),
+                variant_dcfr_gamma(self.config.variant, iteration).to_bits(),
+                variant_prediction_eta(self.config.variant, iteration).to_bits(),
+                super::average_strategy_delay() as u32,
+                super::average_strategy_power().to_bits(),
+                0,
+                self.config.combos as u32,
+                variant_dcfr_beta(self.config.variant, iteration).to_bits(),
+            ],
+        );
+        let unused_action_weights = uninit_storage_buffer(
+            &backend.device,
+            "batched public tree unused action weights",
+            1,
+            false,
+        );
+        let bind_group = backend
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("batched public tree CFR update bind group"),
+                layout: &backend.public_tree_cfr_update_bind_group_layout,
+                entries: &[
+                    bind_entry(0, &self.regrets),
+                    bind_entry(1, &self.strategy_sum),
+                    bind_entry(2, action_values),
+                    bind_entry(3, &unused_action_weights),
+                    bind_entry(4, reach_weights),
+                    bind_entry(5, strategy_weights),
+                    bind_entry(6, &params),
+                    bind_entry(7, &self.legal_actions_buffer),
+                    bind_entry(8, &self.prediction),
+                    bind_entry(9, &zero_public_mask),
+                ],
+            });
+        let mut encoder = backend
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("batched public tree CFR update encoder"),
+            });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("batched public tree CFR update pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&backend.public_tree_cfr_update_pipeline);
             pass.set_bind_group(0, &bind_group, &[]);
             let groups = (private_infosets as u32).div_ceil(WORKGROUP_SIZE);
             pass.dispatch_workgroups(groups, 1, 1);
@@ -6038,6 +6370,23 @@ fn copy_buffer(
     len: usize,
 ) {
     encoder.copy_buffer_to_buffer(src, 0, dst, 0, byte_len::<f32>(len));
+}
+
+fn copy_buffer_range(
+    encoder: &mut wgpu::CommandEncoder,
+    src: &wgpu::Buffer,
+    src_start: usize,
+    dst: &wgpu::Buffer,
+    dst_start: usize,
+    len: usize,
+) {
+    encoder.copy_buffer_to_buffer(
+        src,
+        f32_range_byte_offset(src_start),
+        dst,
+        f32_range_byte_offset(dst_start),
+        f32_range_byte_size(len),
+    );
 }
 
 fn read_f32_buffer(
