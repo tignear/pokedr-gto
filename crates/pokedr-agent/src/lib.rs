@@ -1,5 +1,11 @@
 pub use pokedr_core::{dense_cfr, postflop, postflop_dense, range};
 
+mod river_batch;
+pub use river_batch::{
+    FixedRiverBatchSolveSummary, FixedRiverSolveSummary, RiverBatchSolver, RiverSubgameInput,
+    RiverSubgameResult,
+};
+
 use std::{
     cell::RefCell,
     collections::{BTreeMap, HashMap, VecDeque},
@@ -104,26 +110,6 @@ pub struct FixedFlopSolveSummary {
     pub private_infosets: usize,
     pub max_actions: usize,
     pub elapsed_secs: f32,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct FixedRiverSolveSummary {
-    pub board: String,
-    pub iterations: usize,
-    pub decisions: usize,
-    pub chance: usize,
-    pub terminals: usize,
-    pub public_infosets: usize,
-    pub private_infosets: usize,
-    pub max_actions: usize,
-    pub elapsed_secs: f32,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct FixedRiverBatchSolveSummary {
-    pub boards: Vec<FixedRiverSolveSummary>,
-    pub iterations: usize,
-    pub total_elapsed_secs: f32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -876,60 +862,16 @@ pub fn solve_fixed_river_once(
     board_cards: [PokedrCard; 5],
     config: PokedrAgentConfig,
 ) -> FixedRiverSolveSummary {
-    let started = Instant::now();
-    let public_state = PublicState {
-        street: Street::River,
-        board: Board::new(board_cards.to_vec()),
-        pot: 100,
-        hero_invested: 50,
-        villain_invested: 50,
-        effective_stack: 100,
-        to_call: 0,
-        min_aggressive_amount: 50,
-        acting_player: Player::Hero,
-        raises_this_street: 0,
-        checks_this_street: 0,
-    };
-    let tree = SubgameTree::build(
-        public_state,
-        SubgameTreeConfig {
-            action_set: config.action_set.clone(),
-            max_raises_per_street: config.max_raises_per_street,
-        },
-    );
-    let layout = PostflopDenseLayout::from_tree(&tree);
-    let indexer = ComboIndexer::new();
-    let root_dead = root_board(&tree).deck_mask();
-    let (hero_weights, villain_weights) = fixed_flop_root_weights(&indexer, root_dead);
-    let state = solve_public_tree_cfr(&tree, &layout, &config, &hero_weights, &villain_weights);
-    FixedRiverSolveSummary {
-        board: format_pokedr_cards(&board_cards),
-        iterations: config.cfr_iterations.max(1),
-        decisions: tree.decision_count(),
-        chance: tree.chance_count(),
-        terminals: tree.terminal_count(),
-        public_infosets: layout.infoset_count(),
-        private_infosets: state.infosets(),
-        max_actions: layout.max_actions(),
-        elapsed_secs: started.elapsed().as_secs_f32(),
-    }
+    RiverBatchSolver::new(config)
+        .solve_fixed_board(board_cards)
+        .summary
 }
 
 pub fn solve_fixed_river_batch(
     boards: &[[PokedrCard; 5]],
     config: PokedrAgentConfig,
 ) -> FixedRiverBatchSolveSummary {
-    let started = Instant::now();
-    let summaries = boards
-        .iter()
-        .copied()
-        .map(|board| solve_fixed_river_once(board, config.clone()))
-        .collect::<Vec<_>>();
-    FixedRiverBatchSolveSummary {
-        boards: summaries,
-        iterations: config.cfr_iterations.max(1),
-        total_elapsed_secs: started.elapsed().as_secs_f32(),
-    }
+    RiverBatchSolver::new(config).solve_fixed_boards(boards)
 }
 
 pub fn solve_fixed_flop_metrics(
