@@ -1236,6 +1236,7 @@ struct Params {
     edge_count: u32,
     aux0: u32,
     eta_bits: u32,
+    public_action_base: u32,
 };
 
 @group(0) @binding(0) var<storage, read> parent_nodes: array<TreeNode>;
@@ -1260,7 +1261,7 @@ fn combo_has_card(combo: Combo, card: u32) -> bool {
 
 fn compact_action_slot(node: TreeNode, private_combo: u32, action: u32) -> u32 {
     let public_action = public_action_offsets[node.public_infoset] + action;
-    return public_action * params.combo_count + private_combo;
+    return (public_action - params.public_action_base) * params.combo_count + private_combo;
 }
 
 fn effective_regret(index: u32) -> f32 {
