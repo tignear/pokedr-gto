@@ -18,11 +18,8 @@ GPU is working. Do not diagnose GPU breakage from a non-escalated GPU test.
 
 ## Optimization notes
 
-When an optimization attempt fails or is reverted, record it in the repo before
-moving on. Include the date, what was tried, why it was expected to help, the
-measurement or failure mode, and why it was not kept. This avoids retrying the
-same card-prefix, parallel-reduce, buffer-layout, or driver-workaround ideas
-without new evidence.
+Record optimization attempts in `docs/optimization-attempts.md`, not in this
+file.
 
 ## CFR references
 

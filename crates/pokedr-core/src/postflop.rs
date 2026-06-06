@@ -573,7 +573,10 @@ fn state_after_aggressive_action(state: &PublicState, amount: u32) -> PublicStat
     let mut next = state.clone();
     next.pot = next.pot.saturating_add(contribution);
     add_investment(&mut next, state.acting_player, contribution);
-    next.to_call = contribution;
+    next.to_call = match state.acting_player {
+        Player::Hero => next.hero_invested.saturating_sub(next.villain_invested),
+        Player::Villain => next.villain_invested.saturating_sub(next.hero_invested),
+    };
     next.min_aggressive_amount = contribution.saturating_mul(2).max(1);
     next.acting_player = state.acting_player.next();
     next.raises_this_street = next.raises_this_street.saturating_add(1);
@@ -946,6 +949,21 @@ mod tests {
 
         assert_eq!(next.to_call, 75);
         assert_eq!(next.effective_stack, 100);
+    }
+
+    #[test]
+    fn raise_to_call_is_investment_difference() {
+        let state = PublicState {
+            hero_invested: 125,
+            villain_invested: 50,
+            to_call: 75,
+            acting_player: Player::Villain,
+            ..root_state(Street::Flop)
+        };
+        let next = state_after_aggressive_action(&state, 175);
+
+        assert_eq!(next.villain_invested, 225);
+        assert_eq!(next.to_call, 100);
     }
 
     #[test]

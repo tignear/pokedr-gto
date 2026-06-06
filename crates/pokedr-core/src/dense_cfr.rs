@@ -117,6 +117,427 @@ pub struct DenseCfrState {
     strategy_sum: Vec<f32>,
 }
 
+#[derive(Debug, Clone)]
+pub struct CompactCfrConfig {
+    pub action_offsets: Vec<usize>,
+    pub variant: CfrVariant,
+}
+
+impl CompactCfrConfig {
+    pub fn infosets(&self) -> usize {
+        self.action_offsets.len().saturating_sub(1)
+    }
+
+    pub fn total_actions(&self) -> usize {
+        self.action_offsets.last().copied().unwrap_or(0)
+    }
+
+    pub fn validate(&self) {
+        assert!(
+            self.action_offsets.len() >= 2,
+            "action offsets must contain at least one infoset"
+        );
+        assert_eq!(self.action_offsets[0], 0);
+        for window in self.action_offsets.windows(2) {
+            assert!(
+                window[1] > window[0],
+                "each compact infoset must contain at least one action"
+            );
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CompactCfrState {
+    action_offsets: Vec<usize>,
+    variant: CfrVariant,
+    regrets: Vec<f32>,
+    prediction: Vec<f32>,
+    strategy_sum: Vec<f32>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CompactPrivateCfrConfig {
+    pub public_action_offsets: Vec<usize>,
+    pub combos: usize,
+    pub variant: CfrVariant,
+}
+
+impl CompactPrivateCfrConfig {
+    pub fn public_infosets(&self) -> usize {
+        self.public_action_offsets.len().saturating_sub(1)
+    }
+
+    pub fn public_actions(&self) -> usize {
+        self.public_action_offsets.last().copied().unwrap_or(0)
+    }
+
+    pub fn total_action_slots(&self) -> usize {
+        self.public_actions() * self.combos
+    }
+
+    pub fn validate(&self) {
+        assert!(self.combos > 0, "combo count must be non-empty");
+        assert!(
+            self.public_action_offsets.len() >= 2,
+            "action offsets must contain at least one public infoset"
+        );
+        assert_eq!(self.public_action_offsets[0], 0);
+        for window in self.public_action_offsets.windows(2) {
+            assert!(
+                window[1] > window[0],
+                "each public infoset must contain at least one action"
+            );
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CompactPrivateCfrState {
+    public_action_offsets: Vec<usize>,
+    combos: usize,
+    variant: CfrVariant,
+    regrets: Vec<f32>,
+    prediction: Vec<f32>,
+    strategy_sum: Vec<f32>,
+}
+
+impl CompactPrivateCfrState {
+    pub fn new(config: CompactPrivateCfrConfig) -> Self {
+        config.validate();
+        let len = config.total_action_slots();
+        Self {
+            public_action_offsets: config.public_action_offsets,
+            combos: config.combos,
+            variant: config.variant,
+            regrets: vec![0.0; len],
+            prediction: vec![0.0; len],
+            strategy_sum: vec![0.0; len],
+        }
+    }
+
+    pub fn from_dense_private_state(
+        dense: &DenseCfrState,
+        config: CompactPrivateCfrConfig,
+    ) -> Self {
+        config.validate();
+        assert_eq!(
+            dense.infosets(),
+            config.public_infosets() * config.combos,
+            "dense state must be indexed as public_infoset * combos + combo"
+        );
+        assert!(
+            dense.actions()
+                >= config
+                    .public_action_offsets
+                    .windows(2)
+                    .map(|window| window[1] - window[0])
+                    .max()
+                    .unwrap_or(0),
+            "dense max actions must cover compact public action counts"
+        );
+        let mut compact = Self::new(config);
+        for public_infoset in 0..compact.public_infosets() {
+            let action_count = compact.action_count(public_infoset);
+            for combo in 0..compact.combos {
+                let dense_infoset = public_infoset * compact.combos + combo;
+                for action in 0..action_count {
+                    let dense_slot = dense_infoset * dense.actions() + action;
+                    let compact_slot = compact.slot(public_infoset, combo, action);
+                    compact.regrets[compact_slot] = dense.regrets[dense_slot];
+                    compact.prediction[compact_slot] = dense.prediction[dense_slot];
+                    compact.strategy_sum[compact_slot] = dense.strategy_sum[dense_slot];
+                }
+            }
+        }
+        compact
+    }
+
+    pub fn public_infosets(&self) -> usize {
+        self.public_action_offsets.len() - 1
+    }
+
+    pub fn combos(&self) -> usize {
+        self.combos
+    }
+
+    pub fn public_actions(&self) -> usize {
+        self.public_action_offsets.last().copied().unwrap_or(0)
+    }
+
+    pub fn total_action_slots(&self) -> usize {
+        self.regrets.len()
+    }
+
+    pub fn action_count(&self, public_infoset: usize) -> usize {
+        self.public_action_offsets[public_infoset + 1] - self.public_action_offsets[public_infoset]
+    }
+
+    pub fn slot(&self, public_infoset: usize, combo: usize, action: usize) -> usize {
+        assert!(public_infoset < self.public_infosets());
+        assert!(combo < self.combos);
+        assert!(action < self.action_count(public_infoset));
+        (self.public_action_offsets[public_infoset] + action) * self.combos + combo
+    }
+
+    pub fn regrets(&self) -> &[f32] {
+        &self.regrets
+    }
+
+    pub fn prediction(&self) -> &[f32] {
+        &self.prediction
+    }
+
+    pub fn strategy_sum(&self) -> &[f32] {
+        &self.strategy_sum
+    }
+
+    pub fn strategy_for(&self, public_infoset: usize, combo: usize, out: &mut [f32]) {
+        self.strategy_for_at(public_infoset, combo, out, usize::MAX);
+    }
+
+    fn strategy_for_at(
+        &self,
+        public_infoset: usize,
+        combo: usize,
+        out: &mut [f32],
+        iteration: usize,
+    ) {
+        let action_count = self.action_count(public_infoset);
+        assert!(combo < self.combos);
+        assert!(out.len() >= action_count);
+        let normalizer: f32 = (0..action_count)
+            .map(|action| {
+                let slot = self.slot(public_infoset, combo, action);
+                effective_regret_at(
+                    self.variant,
+                    self.regrets[slot],
+                    self.prediction[slot],
+                    iteration,
+                )
+                .max(0.0)
+            })
+            .sum();
+        if normalizer > f32::EPSILON {
+            for (action, output) in out.iter_mut().take(action_count).enumerate() {
+                let slot = self.slot(public_infoset, combo, action);
+                *output = effective_regret_at(
+                    self.variant,
+                    self.regrets[slot],
+                    self.prediction[slot],
+                    iteration,
+                )
+                .max(0.0)
+                    / normalizer;
+            }
+        } else {
+            out[..action_count].fill(1.0 / action_count as f32);
+        }
+    }
+
+    pub fn average_strategy_for(&self, public_infoset: usize, combo: usize, out: &mut [f32]) {
+        let action_count = self.action_count(public_infoset);
+        assert!(combo < self.combos);
+        assert!(out.len() >= action_count);
+        let normalizer: f32 = (0..action_count)
+            .map(|action| self.strategy_sum[self.slot(public_infoset, combo, action)])
+            .sum();
+        if normalizer > f32::EPSILON {
+            for (action, output) in out.iter_mut().take(action_count).enumerate() {
+                *output = self.strategy_sum[self.slot(public_infoset, combo, action)] / normalizer;
+            }
+        } else {
+            self.strategy_for(public_infoset, combo, out);
+        }
+    }
+
+    pub fn update_infoset(
+        &mut self,
+        public_infoset: usize,
+        combo: usize,
+        action_values: &[f32],
+        reach_weight: f32,
+        strategy_weight: f32,
+        iteration: usize,
+    ) {
+        let action_count = self.action_count(public_infoset);
+        assert!(combo < self.combos);
+        assert!(action_values.len() >= action_count);
+        assert!(reach_weight.is_finite() && reach_weight >= 0.0);
+        assert!(strategy_weight.is_finite() && strategy_weight >= 0.0);
+
+        let mut strategy = vec![0.0; action_count];
+        self.strategy_for_at(public_infoset, combo, &mut strategy, iteration);
+        let node_value: f32 = strategy
+            .iter()
+            .zip(action_values.iter())
+            .map(|(probability, value)| probability * value)
+            .sum();
+
+        for action in 0..action_count {
+            let slot_index = self.slot(public_infoset, combo, action);
+            let regret = (action_values[action] - node_value) * reach_weight;
+            let slot = &mut self.regrets[slot_index];
+            *slot *= regret_discount(self.variant, iteration, *slot);
+            *slot += regret;
+            if matches!(
+                self.variant,
+                CfrVariant::CfrPlus
+                    | CfrVariant::DcfrPlus { .. }
+                    | CfrVariant::DcfrSchedule { .. }
+                    | CfrVariant::PdcfrPlus { .. }
+            ) {
+                *slot = slot.max(0.0);
+            }
+            if self.variant.uses_prediction() {
+                self.prediction[slot_index] = regret;
+            }
+            self.strategy_sum[slot_index] *= average_strategy_discount(self.variant, iteration);
+            self.strategy_sum[slot_index] +=
+                strategy_weight * average_strategy_weight_multiplier(iteration) * strategy[action];
+        }
+    }
+}
+
+impl CompactCfrState {
+    pub fn new(config: CompactCfrConfig) -> Self {
+        config.validate();
+        let len = config.total_actions();
+        Self {
+            action_offsets: config.action_offsets,
+            variant: config.variant,
+            regrets: vec![0.0; len],
+            prediction: vec![0.0; len],
+            strategy_sum: vec![0.0; len],
+        }
+    }
+
+    pub fn infosets(&self) -> usize {
+        self.action_offsets.len() - 1
+    }
+
+    pub fn total_actions(&self) -> usize {
+        self.regrets.len()
+    }
+
+    pub fn action_count(&self, infoset: usize) -> usize {
+        self.range(infoset).len()
+    }
+
+    pub fn action_offsets(&self) -> &[usize] {
+        &self.action_offsets
+    }
+
+    pub fn regrets(&self) -> &[f32] {
+        &self.regrets
+    }
+
+    pub fn prediction(&self) -> &[f32] {
+        &self.prediction
+    }
+
+    pub fn strategy_sum(&self) -> &[f32] {
+        &self.strategy_sum
+    }
+
+    pub fn strategy_for(&self, infoset: usize, out: &mut [f32]) {
+        self.strategy_for_at(infoset, out, usize::MAX);
+    }
+
+    fn strategy_for_at(&self, infoset: usize, out: &mut [f32], iteration: usize) {
+        let range = self.range(infoset);
+        assert!(out.len() >= range.len());
+        let regrets = &self.regrets[range.clone()];
+        let prediction = &self.prediction[range.clone()];
+        let normalizer: f32 = regrets
+            .iter()
+            .zip(prediction)
+            .map(|(value, predicted)| {
+                effective_regret_at(self.variant, *value, *predicted, iteration).max(0.0)
+            })
+            .sum();
+        if normalizer > f32::EPSILON {
+            for action in 0..range.len() {
+                out[action] = effective_regret_at(
+                    self.variant,
+                    regrets[action],
+                    prediction[action],
+                    iteration,
+                )
+                .max(0.0)
+                    / normalizer;
+            }
+        } else {
+            let uniform = 1.0 / range.len() as f32;
+            out[..range.len()].fill(uniform);
+        }
+    }
+
+    pub fn average_strategy_for(&self, infoset: usize, out: &mut [f32]) {
+        let range = self.range(infoset);
+        assert!(out.len() >= range.len());
+        let sum = &self.strategy_sum[range.clone()];
+        let normalizer: f32 = sum.iter().sum();
+        if normalizer > f32::EPSILON {
+            for action in 0..range.len() {
+                out[action] = sum[action] / normalizer;
+            }
+        } else {
+            self.strategy_for(infoset, out);
+        }
+    }
+
+    pub fn update_infoset(
+        &mut self,
+        infoset: usize,
+        action_values: &[f32],
+        reach_weight: f32,
+        strategy_weight: f32,
+        iteration: usize,
+    ) {
+        let range = self.range(infoset);
+        assert!(action_values.len() >= range.len());
+        assert!(reach_weight.is_finite() && reach_weight >= 0.0);
+        assert!(strategy_weight.is_finite() && strategy_weight >= 0.0);
+
+        let mut strategy = vec![0.0; range.len()];
+        self.strategy_for_at(infoset, &mut strategy, iteration);
+        let node_value: f32 = strategy
+            .iter()
+            .zip(action_values.iter())
+            .map(|(probability, value)| probability * value)
+            .sum();
+
+        for action in 0..range.len() {
+            let slot_index = range.start + action;
+            let regret = (action_values[action] - node_value) * reach_weight;
+            let slot = &mut self.regrets[slot_index];
+            *slot *= regret_discount(self.variant, iteration, *slot);
+            *slot += regret;
+            if matches!(
+                self.variant,
+                CfrVariant::CfrPlus
+                    | CfrVariant::DcfrPlus { .. }
+                    | CfrVariant::DcfrSchedule { .. }
+                    | CfrVariant::PdcfrPlus { .. }
+            ) {
+                *slot = slot.max(0.0);
+            }
+            if self.variant.uses_prediction() {
+                self.prediction[slot_index] = regret;
+            }
+            self.strategy_sum[slot_index] *= average_strategy_discount(self.variant, iteration);
+            self.strategy_sum[slot_index] +=
+                strategy_weight * average_strategy_weight_multiplier(iteration) * strategy[action];
+        }
+    }
+
+    fn range(&self, infoset: usize) -> std::ops::Range<usize> {
+        assert!(infoset < self.infosets());
+        self.action_offsets[infoset]..self.action_offsets[infoset + 1]
+    }
+}
+
 impl DenseCfrState {
     pub fn new(config: DenseCfrConfig) -> Self {
         assert!(config.infosets > 0, "infosets must be non-empty");
@@ -776,6 +1197,261 @@ mod tests {
         assert_eq!(strategy[3], 0.0);
         assert_eq!(state.regrets()[1], 0.0);
         assert_eq!(state.regrets()[3], 0.0);
+    }
+
+    #[test]
+    fn compact_state_matches_dense_state_without_padding_slots() {
+        let dense_config = DenseCfrConfig {
+            infosets: 3,
+            actions: 4,
+            variant: CfrVariant::PdcfrPlus {
+                alpha: 2.5,
+                gamma: 8.0,
+                eta_start: 1.0,
+                eta_end: 0.25,
+                eta_horizon: 8,
+            },
+        };
+        let legal = vec![
+            true, true, false, false, true, true, true, false, true, false, true, true,
+        ];
+        let mut dense = DenseCfrState::new_with_legal_actions(dense_config, legal);
+        let mut compact = CompactCfrState::new(CompactCfrConfig {
+            action_offsets: vec![0, 2, 5, 8],
+            variant: dense.variant,
+        });
+
+        let updates = [
+            (0, [3.0, -1.0, 0.0, 0.0], [3.0, -1.0, 0.0]),
+            (1, [0.25, 1.0, -2.0, 0.0], [0.25, 1.0, -2.0]),
+            (2, [-1.0, 0.0, 0.5, 2.0], [-1.0, 0.5, 2.0]),
+        ];
+
+        for iteration in 1..=4 {
+            for (infoset, dense_values, compact_values) in updates {
+                let reach_weight = 0.25 + infoset as f32 * 0.5;
+                let strategy_weight = 1.0 + iteration as f32 * 0.25;
+                dense.update_infoset(
+                    infoset,
+                    &dense_values,
+                    reach_weight,
+                    strategy_weight,
+                    iteration,
+                );
+                compact.update_infoset(
+                    infoset,
+                    &compact_values,
+                    reach_weight,
+                    strategy_weight,
+                    iteration,
+                );
+            }
+        }
+
+        for infoset in 0..3 {
+            let mut dense_strategy = [0.0; 4];
+            let mut compact_strategy = [0.0; 3];
+            dense.strategy_for(infoset, &mut dense_strategy);
+            compact.strategy_for(infoset, &mut compact_strategy);
+            let mut dense_average = [0.0; 4];
+            let mut compact_average = [0.0; 3];
+            dense.average_strategy_for(infoset, &mut dense_average);
+            compact.average_strategy_for(infoset, &mut compact_average);
+
+            let compact_range =
+                compact.action_offsets()[infoset]..compact.action_offsets()[infoset + 1];
+            let mut compact_action = 0;
+            for action in 0..4 {
+                if dense.legal_actions[dense.offset(infoset) + action] {
+                    assert!(
+                        (dense_strategy[action] - compact_strategy[compact_action]).abs() < 1e-6
+                    );
+                    assert!((dense_average[action] - compact_average[compact_action]).abs() < 1e-6);
+                    assert!(
+                        (dense.regrets()[dense.offset(infoset) + action]
+                            - compact.regrets()[compact_range.start + compact_action])
+                            .abs()
+                            < 1e-6
+                    );
+                    assert!(
+                        (dense.prediction()[dense.offset(infoset) + action]
+                            - compact.prediction()[compact_range.start + compact_action])
+                            .abs()
+                            < 1e-6
+                    );
+                    assert!(
+                        (dense.strategy_sum()[dense.offset(infoset) + action]
+                            - compact.strategy_sum()[compact_range.start + compact_action])
+                            .abs()
+                            < 1e-6
+                    );
+                    compact_action += 1;
+                }
+            }
+            assert_eq!(compact_action, compact.action_count(infoset));
+        }
+    }
+
+    #[test]
+    fn compact_private_state_matches_dense_private_infosets_without_padding_slots() {
+        let public_infosets = 2;
+        let combos = 3;
+        let max_actions = 3;
+        let variant = CfrVariant::dcfr_plus_default();
+        let public_action_counts = [2, 3];
+        let mut legal = vec![false; public_infosets * combos * max_actions];
+        for public_infoset in 0..public_infosets {
+            for combo in 0..combos {
+                let private_infoset = public_infoset * combos + combo;
+                for action in 0..public_action_counts[public_infoset] {
+                    legal[private_infoset * max_actions + action] = true;
+                }
+            }
+        }
+        let mut dense = DenseCfrState::new_with_legal_actions(
+            DenseCfrConfig {
+                infosets: public_infosets * combos,
+                actions: max_actions,
+                variant,
+            },
+            legal,
+        );
+        let mut compact = CompactPrivateCfrState::new(CompactPrivateCfrConfig {
+            public_action_offsets: vec![0, 2, 5],
+            combos,
+            variant,
+        });
+
+        for iteration in 1..=5 {
+            for public_infoset in 0..public_infosets {
+                for combo in 0..combos {
+                    let private_infoset = public_infoset * combos + combo;
+                    let dense_values = [
+                        1.0 + public_infoset as f32,
+                        -0.5 + combo as f32 * 0.25,
+                        0.75,
+                    ];
+                    let compact_values = &dense_values[..public_action_counts[public_infoset]];
+                    let reach_weight = 0.5 + combo as f32 * 0.25;
+                    let strategy_weight = 0.25 + iteration as f32 * 0.5;
+                    dense.update_infoset(
+                        private_infoset,
+                        &dense_values,
+                        reach_weight,
+                        strategy_weight,
+                        iteration,
+                    );
+                    compact.update_infoset(
+                        public_infoset,
+                        combo,
+                        compact_values,
+                        reach_weight,
+                        strategy_weight,
+                        iteration,
+                    );
+                }
+            }
+        }
+
+        for public_infoset in 0..public_infosets {
+            for combo in 0..combos {
+                let private_infoset = public_infoset * combos + combo;
+                let mut dense_strategy = [0.0; 3];
+                let mut compact_strategy = [0.0; 3];
+                dense.strategy_for(private_infoset, &mut dense_strategy);
+                compact.strategy_for(public_infoset, combo, &mut compact_strategy);
+                let mut dense_average = [0.0; 3];
+                let mut compact_average = [0.0; 3];
+                dense.average_strategy_for(private_infoset, &mut dense_average);
+                compact.average_strategy_for(public_infoset, combo, &mut compact_average);
+
+                for action in 0..public_action_counts[public_infoset] {
+                    let dense_slot = private_infoset * max_actions + action;
+                    let compact_slot = compact.slot(public_infoset, combo, action);
+                    assert!((dense_strategy[action] - compact_strategy[action]).abs() < 1e-6);
+                    assert!((dense_average[action] - compact_average[action]).abs() < 1e-6);
+                    assert!(
+                        (dense.regrets()[dense_slot] - compact.regrets()[compact_slot]).abs()
+                            < 1e-6
+                    );
+                    assert!(
+                        (dense.strategy_sum()[dense_slot] - compact.strategy_sum()[compact_slot])
+                            .abs()
+                            < 1e-6
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn compact_private_state_can_be_built_from_dense_private_state() {
+        let public_infosets = 2;
+        let combos = 3;
+        let max_actions = 3;
+        let variant = CfrVariant::CfrPlus;
+        let mut legal = vec![false; public_infosets * combos * max_actions];
+        for public_infoset in 0..public_infosets {
+            let action_count = if public_infoset == 0 { 2 } else { 3 };
+            for combo in 0..combos {
+                let private_infoset = public_infoset * combos + combo;
+                for action in 0..action_count {
+                    legal[private_infoset * max_actions + action] = true;
+                }
+            }
+        }
+        let mut dense = DenseCfrState::new_with_legal_actions(
+            DenseCfrConfig {
+                infosets: public_infosets * combos,
+                actions: max_actions,
+                variant,
+            },
+            legal,
+        );
+        for iteration in 1..=3 {
+            for public_infoset in 0..public_infosets {
+                for combo in 0..combos {
+                    let private_infoset = public_infoset * combos + combo;
+                    dense.update_infoset(
+                        private_infoset,
+                        &[combo as f32 + 1.0, public_infoset as f32 - 0.5, 0.25],
+                        1.0,
+                        1.0,
+                        iteration,
+                    );
+                }
+            }
+        }
+
+        let compact = CompactPrivateCfrState::from_dense_private_state(
+            &dense,
+            CompactPrivateCfrConfig {
+                public_action_offsets: vec![0, 2, 5],
+                combos,
+                variant,
+            },
+        );
+
+        for public_infoset in 0..public_infosets {
+            let action_count = compact.action_count(public_infoset);
+            for combo in 0..combos {
+                let private_infoset = public_infoset * combos + combo;
+                let mut dense_strategy = [0.0; 3];
+                let mut compact_strategy = [0.0; 3];
+                dense.average_strategy_for(private_infoset, &mut dense_strategy);
+                compact.average_strategy_for(public_infoset, combo, &mut compact_strategy);
+                for action in 0..action_count {
+                    let dense_slot = private_infoset * max_actions + action;
+                    let compact_slot = compact.slot(public_infoset, combo, action);
+                    assert_eq!(dense.regrets()[dense_slot], compact.regrets()[compact_slot]);
+                    assert_eq!(
+                        dense.strategy_sum()[dense_slot],
+                        compact.strategy_sum()[compact_slot]
+                    );
+                    assert!((dense_strategy[action] - compact_strategy[action]).abs() < 1e-6);
+                }
+            }
+        }
     }
 
     #[test]

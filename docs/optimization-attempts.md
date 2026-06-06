@@ -4,6 +4,26 @@ This file records optimization attempts that failed, were reverted, or were too
 small to count as a strategic direction. Add entries before retrying similar
 ideas.
 
+## 2026-06-06: Dense resident chunking after natural tree expansion
+
+- Tried: remove the postflop `max_depth` cutoff and keep using the resident
+  dense CFR state, with chunking by public-infoset range as a workaround for
+  wgpu's single-buffer limit.
+- Expected: preserve the existing resident GPU path while allowing the natural
+  full public tree to run.
+- Result: failed as a strategic direction. `As7h2c` with the default action set
+  expanded to about `477k` public infosets / `633M` private infosets. The old
+  state layout tried to allocate `private_infosets * max_actions` slots for
+  legal actions and then regrets/prediction/strategy; the first failure was a
+  `resident legal actions` buffer around `10.1GB`. Chunking avoids a single
+  oversized binding, and disabling prediction/strategy-sum reduces memory for a
+  no-download timing run, but default `max_aggressive_actions=4` still OOMs on
+  D3D12/DZN even with only regret chunks. `max_aggressive_actions=1` completes
+  but is not an acceptable abstraction.
+- Decision: do not retry plain dense resident chunking as the main fix. The real
+  representation needs compact/sparse action state by actual public action edge
+  count, not dense `max_actions` slots for every private infoset.
+
 ## 2026-06-06: Streamed strength-group card-prefix terminal CFV
 
 - Tried: add an optional `board_count == 1` river-terminal path that streams

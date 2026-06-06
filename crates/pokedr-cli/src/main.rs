@@ -5,7 +5,10 @@ use pokedr_core::{
         CfrVariant, DenseCfrConfig, DenseCfrIteration, DenseCfrSolver, DenseCfrState,
         gpu::{GpuCfrError, GpuDenseCfrBackend},
     },
-    postflop::{ActionSetConfig, Player, PublicState, Street, SubgameTree, SubgameTreeConfig},
+    postflop::{
+        ActionSetConfig, Player, PublicNodeKind, PublicState, Street, SubgameTree,
+        SubgameTreeConfig,
+    },
     postflop_dense::PostflopDenseLayout,
 };
 use rusqlite::{Connection, params};
@@ -21,6 +24,7 @@ fn main() {
         Command::SolveFlopReachSharing(args) => run_solve_flop_reach_sharing(args),
         Command::SolveFlopSweep(args) => run_solve_flop_sweep(args),
         Command::SolveFlopVariantBench(args) => run_solve_flop_variant_bench(args),
+        Command::TreeShape(args) => run_tree_shape(args),
         Command::TreeDb { command } => run_tree_db_command(command),
         Command::RsPokerSmoke => run_rs_poker_smoke(),
         Command::RsPokerTrace => run_rs_poker_trace(),
@@ -44,6 +48,7 @@ enum Command {
     SolveFlopReachSharing(FlopReachSharingArgs),
     SolveFlopSweep(FlopSweepArgs),
     SolveFlopVariantBench(FlopVariantBenchArgs),
+    TreeShape(FlopSolveArgs),
     TreeDb {
         #[command(subcommand)]
         command: TreeDbCommand,
@@ -799,6 +804,97 @@ fn run_solve_flop_variant_bench(args: FlopVariantBenchArgs) {
     );
     for result in &results {
         print_variant_bench_result(result, target_bb100);
+    }
+}
+
+fn run_tree_shape(args: FlopSolveArgs) {
+    let flop = parse_flop(&args.flop).unwrap_or_else(|error| {
+        eprintln!("{error}");
+        std::process::exit(2);
+    });
+    let config = fixed_flop_config(&args.solver);
+    let public_state = PublicState {
+        street: Street::Flop,
+        board: Board::new(flop.to_vec()),
+        pot: 4,
+        hero_invested: 2,
+        villain_invested: 2,
+        effective_stack: 100,
+        to_call: 0,
+        min_aggressive_amount: 2,
+        acting_player: Player::Hero,
+        raises_this_street: 0,
+        checks_this_street: 0,
+    };
+    let tree = SubgameTree::build(
+        public_state,
+        SubgameTreeConfig {
+            action_set: config.action_set,
+            max_raises_per_street: config.max_raises_per_street,
+        },
+    );
+    let layout = PostflopDenseLayout::from_tree(&tree);
+    let mut decision_by_street = [0usize; 3];
+    let mut chance_by_street = [0usize; 3];
+    let mut terminal_by_street = [0usize; 3];
+    let mut action_count_hist = std::collections::BTreeMap::<usize, usize>::new();
+    let mut public_actions = 0usize;
+    for node in tree.nodes() {
+        match &node.kind {
+            PublicNodeKind::Decision { state, actions } => {
+                decision_by_street[street_index(state.street)] += 1;
+                *action_count_hist.entry(actions.len()).or_default() += 1;
+                public_actions += actions.len();
+            }
+            PublicNodeKind::Chance { street, .. } => {
+                chance_by_street[street_index(*street)] += 1;
+            }
+            PublicNodeKind::Terminal { board, .. } => {
+                let street = match board.cards().len() {
+                    0..=3 => Street::Flop,
+                    4 => Street::Turn,
+                    _ => Street::River,
+                };
+                terminal_by_street[street_index(street)] += 1;
+            }
+        }
+    }
+    println!("board: {}", format_pokedr_cards_for_cli(&flop));
+    println!("nodes: {}", tree.nodes().len());
+    println!("decisions: {}", tree.decision_count());
+    println!("chance_nodes: {}", tree.chance_count());
+    println!("terminals: {}", tree.terminal_count());
+    println!("public_infosets: {}", layout.infoset_count());
+    println!("public_actions: {}", public_actions);
+    println!("private_infosets: {}", layout.infoset_count() * 1326usize);
+    println!(
+        "private_action_slots_dense: {}",
+        layout.infoset_count() * 1326usize * layout.max_actions()
+    );
+    println!(
+        "private_action_slots_compact: {}",
+        layout.total_actions() * 1326usize
+    );
+    println!(
+        "decisions_by_street: flop={} turn={} river={}",
+        decision_by_street[0], decision_by_street[1], decision_by_street[2]
+    );
+    println!(
+        "chance_by_street: flop={} turn={} river={}",
+        chance_by_street[0], chance_by_street[1], chance_by_street[2]
+    );
+    println!(
+        "terminals_by_street: flop={} turn={} river={}",
+        terminal_by_street[0], terminal_by_street[1], terminal_by_street[2]
+    );
+    println!("action_count_hist: {:?}", action_count_hist);
+}
+
+fn street_index(street: Street) -> usize {
+    match street {
+        Street::Flop => 0,
+        Street::Turn => 1,
+        Street::River => 2,
     }
 }
 

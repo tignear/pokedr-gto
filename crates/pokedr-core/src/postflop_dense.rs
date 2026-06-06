@@ -1,5 +1,5 @@
 use crate::{
-    dense_cfr::{CfrVariant, DenseCfrConfig},
+    dense_cfr::{CfrVariant, CompactCfrConfig, DenseCfrConfig},
     postflop::{ActionCandidate, PublicNodeKind, SubgameTree},
 };
 
@@ -8,6 +8,8 @@ pub struct PostflopDenseLayout {
     node_to_infoset: Vec<Option<usize>>,
     infoset_nodes: Vec<usize>,
     action_counts: Vec<usize>,
+    action_offsets: Vec<usize>,
+    total_actions: usize,
     max_actions: usize,
     legal_actions: Vec<bool>,
     child_by_action: Vec<Option<usize>>,
@@ -32,6 +34,13 @@ impl PostflopDenseLayout {
 
         assert!(!infoset_nodes.is_empty(), "tree must contain decisions");
         assert!(max_actions > 0, "decision nodes must contain actions");
+        let mut action_offsets = Vec::with_capacity(action_counts.len() + 1);
+        action_offsets.push(0);
+        for &action_count in &action_counts {
+            let next = action_offsets.last().copied().unwrap_or(0) + action_count;
+            action_offsets.push(next);
+        }
+        let total_actions = action_offsets.last().copied().unwrap_or(0);
 
         let mut legal_actions = vec![false; infoset_nodes.len() * max_actions];
         let mut child_by_action = vec![None; infoset_nodes.len() * max_actions];
@@ -54,6 +63,8 @@ impl PostflopDenseLayout {
             node_to_infoset,
             infoset_nodes,
             action_counts,
+            action_offsets,
+            total_actions,
             max_actions,
             legal_actions,
             child_by_action,
@@ -64,6 +75,25 @@ impl PostflopDenseLayout {
         DenseCfrConfig {
             infosets: self.infoset_count(),
             actions: self.max_actions,
+            variant,
+        }
+    }
+
+    pub fn compact_config(&self, variant: CfrVariant) -> CompactCfrConfig {
+        CompactCfrConfig {
+            action_offsets: self.action_offsets.clone(),
+            variant,
+        }
+    }
+
+    pub fn compact_private_config(
+        &self,
+        combos: usize,
+        variant: CfrVariant,
+    ) -> crate::dense_cfr::CompactPrivateCfrConfig {
+        crate::dense_cfr::CompactPrivateCfrConfig {
+            public_action_offsets: self.action_offsets.clone(),
+            combos,
             variant,
         }
     }
@@ -86,6 +116,18 @@ impl PostflopDenseLayout {
 
     pub fn action_count(&self, infoset: usize) -> usize {
         self.action_counts[infoset]
+    }
+
+    pub fn action_offset(&self, infoset: usize) -> usize {
+        self.action_offsets[infoset]
+    }
+
+    pub fn action_offsets(&self) -> &[usize] {
+        &self.action_offsets
+    }
+
+    pub fn total_actions(&self) -> usize {
+        self.total_actions
     }
 
     pub fn legal_actions(&self) -> &[bool] {
@@ -206,5 +248,30 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn compact_config_counts_actual_public_actions_only() {
+        let tree = tree();
+        let layout = PostflopDenseLayout::from_tree(&tree);
+        let config = layout.compact_config(CfrVariant::CfrPlus);
+        let expected_actions = (0..layout.infoset_count())
+            .map(|infoset| layout.action_count(infoset))
+            .sum::<usize>();
+
+        assert_eq!(config.infosets(), layout.infoset_count());
+        assert_eq!(config.total_actions(), expected_actions);
+        assert!(config.total_actions() <= layout.infoset_count() * layout.max_actions());
+    }
+
+    #[test]
+    fn compact_private_config_counts_actual_public_actions_times_combos() {
+        let tree = tree();
+        let layout = PostflopDenseLayout::from_tree(&tree);
+        let config = layout.compact_private_config(7, CfrVariant::CfrPlus);
+
+        assert_eq!(config.public_infosets(), layout.infoset_count());
+        assert_eq!(config.public_actions(), layout.total_actions());
+        assert_eq!(config.total_action_slots(), layout.total_actions() * 7);
     }
 }
