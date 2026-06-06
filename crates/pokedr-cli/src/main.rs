@@ -86,6 +86,8 @@ enum Command {
         run_real_cfr_three_phase: bool,
         #[arg(long, default_value_t = 1)]
         real_cfr_log_interval: u32,
+        #[arg(long, default_value_t = 0)]
+        real_cfr_exploitability_interval: u32,
         #[arg(long)]
         run_terminal_board_phase: bool,
         #[arg(long)]
@@ -289,6 +291,7 @@ fn main() -> Result<(), String> {
             run_real_cfr,
             run_real_cfr_three_phase,
             real_cfr_log_interval,
+            real_cfr_exploitability_interval,
             run_terminal_board_phase,
             terminal_eval_breakdown,
             terminal_cfv_calls,
@@ -430,40 +433,77 @@ fn main() -> Result<(), String> {
                     RangeSpec::from_str(&oop_range)?,
                     RangeSpec::from_str(&ip_range)?,
                 )?;
-                let summary = solver.run_three_phase(
-                    RealCfrConfig { iterations },
-                    state_threads,
-                    |progress| {
-                        if real_cfr_log_interval > 0
-                            && (progress.iteration == 1
-                                || progress.iteration == iterations
-                                || progress.iteration % real_cfr_log_interval == 0)
-                        {
-                            println!(
-                                "real_cfr_three_phase_progress iteration={} terminal_evals={} reach_ms={:.3} terminal_ms={:.3} backup_ms={:.3} root_oop_value={:.6} root_ip_value={:.6} zero_sum_delta={:.6}",
-                                progress.iteration,
-                                progress.terminal_evals,
-                                progress.reach_ms,
-                                progress.terminal_ms,
-                                progress.backup_ms,
-                                progress.root_oop_value,
-                                progress.root_ip_value,
-                                progress.root_oop_value + progress.root_ip_value,
-                            );
-                        }
-                    },
-                )?;
+                let mut completed = 0u32;
+                let mut summary = None;
+                let mut total_reach_ms = 0.0;
+                let mut total_terminal_ms = 0.0;
+                let mut total_backup_ms = 0.0;
+                while completed < iterations {
+                    let remaining = iterations - completed;
+                    let chunk = if real_cfr_exploitability_interval > 0 {
+                        remaining.min(real_cfr_exploitability_interval)
+                    } else {
+                        remaining
+                    };
+                    let chunk_start = completed;
+                    let chunk_summary = solver.run_three_phase(
+                        RealCfrConfig { iterations: chunk },
+                        state_threads,
+                        |progress| {
+                            let global_iteration = chunk_start + progress.iteration;
+                            if real_cfr_log_interval > 0
+                                && (global_iteration == 1
+                                    || global_iteration == iterations
+                                    || global_iteration % real_cfr_log_interval == 0)
+                            {
+                                println!(
+                                    "real_cfr_three_phase_progress iteration={} terminal_evals={} reach_ms={:.3} terminal_ms={:.3} backup_ms={:.3} root_oop_value={:.6} root_ip_value={:.6} zero_sum_delta={:.6}",
+                                    global_iteration,
+                                    progress.terminal_evals,
+                                    progress.reach_ms,
+                                    progress.terminal_ms,
+                                    progress.backup_ms,
+                                    progress.root_oop_value,
+                                    progress.root_ip_value,
+                                    progress.root_oop_value + progress.root_ip_value,
+                                );
+                            }
+                        },
+                    )?;
+                    total_reach_ms += chunk_summary.reach_ms;
+                    total_terminal_ms += chunk_summary.terminal_ms;
+                    total_backup_ms += chunk_summary.backup_ms;
+                    completed += chunk;
+                    if real_cfr_exploitability_interval > 0 {
+                        let exploitability = solver.exploitability(state_threads)?;
+                        println!(
+                            "real_cfr_exploitability iteration={} profile_oop={:.6} profile_ip={:.6} oop_br={:.6} ip_br={:.6} oop_gain={:.6} ip_gain={:.6} nash_conv_chips={:.6} exploitability_chips={:.6} exploitability_bb_per_100={:.6}",
+                            completed,
+                            exploitability.profile_oop_value,
+                            exploitability.profile_ip_value,
+                            exploitability.oop_best_response_value,
+                            exploitability.ip_best_response_value,
+                            exploitability.oop_gain,
+                            exploitability.ip_gain,
+                            exploitability.nash_conv_chips,
+                            exploitability.exploitability_chips,
+                            exploitability.exploitability_bb_per_100,
+                        );
+                    }
+                    summary = Some(chunk_summary);
+                }
+                let summary = summary.expect("at least one iteration must run");
                 println!(
                     "real_cfr_three_phase iterations={} states={} decision_nodes={} action_slots={} terminal_evals={} elapsed_ms={:.3} reach_ms={:.3} terminal_ms={:.3} backup_ms={:.3} root_oop_value={:.6} root_ip_value={:.6} zero_sum_delta={:.6}",
-                    summary.iterations,
+                    iterations,
                     summary.states,
                     summary.decision_nodes,
                     summary.action_slots,
                     summary.terminal_evals,
                     started.elapsed().as_secs_f64() * 1000.0,
-                    summary.reach_ms,
-                    summary.terminal_ms,
-                    summary.backup_ms,
+                    total_reach_ms,
+                    total_terminal_ms,
+                    total_backup_ms,
                     summary.root_oop_value,
                     summary.root_ip_value,
                     summary.root_oop_value + summary.root_ip_value,
