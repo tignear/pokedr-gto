@@ -102,6 +102,11 @@ struct RiverRunoutSolveArgs {
     board: String,
     #[arg(long, help = "Limit generated river boards for benchmarking")]
     limit: Option<usize>,
+    #[arg(
+        long,
+        help = "Compute root exploitability for the first N solved river boards"
+    )]
+    exploitability_limit: Option<usize>,
     #[command(flatten)]
     solver: SolverOptions,
 }
@@ -705,12 +710,25 @@ fn run_solve_river_runouts(args: RiverRunoutSolveArgs) {
     println!("largest_shape_batch: {}", plan.largest_group);
     println!("batched_action_slots: {}", plan.action_slots);
     let started = Instant::now();
-    let summary = pokedr_agent::solve_fixed_river_batch(&boards, config);
+    let iterations = config.cfr_iterations;
+    let inputs = boards
+        .iter()
+        .copied()
+        .map(pokedr_agent::RiverSubgameInput::with_default_ranges)
+        .collect::<Vec<_>>();
+    let solver = pokedr_agent::RiverBatchSolver::new(config);
+    let results = solver.solve_subgames(inputs.clone());
     let elapsed = started.elapsed().as_secs_f32();
-    let per_board = elapsed / summary.boards.len().max(1) as f32;
-    println!("boards: {}", summary.boards.len());
+    let per_board = elapsed / results.len().max(1) as f32;
+    println!("boards: {}", results.len());
     println!("generated_boards: {generated_boards}");
-    println!("iterations: {}", summary.iterations);
+    println!(
+        "iterations: {}",
+        results
+            .first()
+            .map(|result| result.summary.iterations)
+            .unwrap_or(iterations)
+    );
     println!("elapsed: {elapsed:.3}s");
     println!("elapsed_per_board: {per_board:.6}s");
     println!(
@@ -718,6 +736,49 @@ fn run_solve_river_runouts(args: RiverRunoutSolveArgs) {
         per_board * generated_boards as f32
     );
     println!("projected_49x48_ordered: {:.3}s", per_board * 49.0 * 48.0);
+    if let Some(limit) = args.exploitability_limit {
+        let metric_started = Instant::now();
+        let mut metrics = Vec::new();
+        for (input, result) in inputs.iter().zip(results.iter()).take(limit) {
+            match solver.root_exploitability(input, result) {
+                Some(metric) => {
+                    println!(
+                        "river_exploitability board={} root_exploitability={:.6} root_exploitability_bb100={:.3} hero_improve={:.6} villain_improve={:.6} profile_sum={:.6} elapsed={:.3}s",
+                        metric.board,
+                        metric.root_exploitability,
+                        metric.root_exploitability * 100.0,
+                        metric.hero_root_br_improvement,
+                        metric.villain_root_br_improvement,
+                        metric.hero_root_profile_value + metric.villain_root_profile_value,
+                        metric.elapsed_secs
+                    );
+                    metrics.push(metric);
+                }
+                None => {
+                    eprintln!(
+                        "river_exploitability failed for board={}",
+                        result.summary.board
+                    );
+                }
+            }
+        }
+        if !metrics.is_empty() {
+            let max_bb100 = metrics
+                .iter()
+                .map(|metric| metric.root_exploitability * 100.0)
+                .fold(f32::NEG_INFINITY, f32::max);
+            let avg_bb100 = metrics
+                .iter()
+                .map(|metric| metric.root_exploitability * 100.0)
+                .sum::<f32>()
+                / metrics.len() as f32;
+            println!(
+                "river_exploitability_summary boards={} avg_bb100={avg_bb100:.3} max_bb100={max_bb100:.3} elapsed={:.3}s",
+                metrics.len(),
+                metric_started.elapsed().as_secs_f32()
+            );
+        }
+    }
 }
 
 fn run_solve_flop_metrics(args: FlopMetricsArgs) {

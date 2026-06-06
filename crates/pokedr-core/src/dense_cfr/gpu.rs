@@ -3986,6 +3986,107 @@ impl GpuDenseCfrBackend {
         ))
     }
 
+    fn public_tree_root_values_with_context(
+        &self,
+        ctx: &GpuPublicTreeIterationContext,
+        regrets_buffer: &wgpu::Buffer,
+        prediction_buffer: &wgpu::Buffer,
+        variant: super::CfrVariant,
+        br_player: u32,
+        iteration: usize,
+    ) -> Result<(), GpuCfrError> {
+        if std::env::var_os("POKEDR_SOLVER_PROGRESS_OFF").is_none() {
+            eprintln!(
+                "pokedr: gpu public tree root cfv nodes={} combos={} node_combo_values={} folds={} showdowns={} terminal_chunk={}",
+                ctx.nodes_len,
+                ctx.combos_len,
+                ctx.node_combo_len,
+                ctx.fold_terminal_nodes.len(),
+                ctx.showdown_terminal_nodes.len(),
+                ctx.terminal_chunk_size
+            );
+        }
+
+        let profile = Self::gpu_profile_enabled();
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("public tree root CFV encoder"),
+            });
+        let mut phase_start = profile.then(Instant::now);
+        self.propagate_layer_reaches(
+            &mut encoder,
+            ctx,
+            regrets_buffer,
+            prediction_buffer,
+            variant,
+            br_player,
+            iteration,
+        );
+        encoder = self.finish_profile_phase(encoder, "root_cfv_reach", phase_start)?;
+        phase_start = profile.then(Instant::now);
+
+        for layer_tiles in &ctx.layer_tiles {
+            for tile in layer_tiles {
+                self.fill_fold_values(
+                    &mut encoder,
+                    &tile.node_buffer,
+                    &tile.fold_terminal_nodes,
+                    &ctx.combo_buffer,
+                    &tile.hero_reaches_buffer,
+                    &tile.villain_reaches_buffer,
+                    &tile.combo_live_buffer,
+                    &tile.hero_values_buffer,
+                    &tile.villain_values_buffer,
+                    ctx.combos_len,
+                )?;
+            }
+        }
+        self.queue.submit(Some(encoder.finish()));
+        self.profile_poll()?;
+        for layer_tiles in &ctx.layer_tiles {
+            for tile in layer_tiles {
+                self.fill_terminal_values_streaming(
+                    &tile.node_buffer,
+                    &tile.showdown_terminal_groups,
+                    &ctx.terminal_blocker_neighbors_buffer,
+                    &tile.hero_reaches_buffer,
+                    &tile.villain_reaches_buffer,
+                    &tile.hero_values_buffer,
+                    &tile.villain_values_buffer,
+                    &ctx.terminal_prefix_pairs_buffer,
+                    ctx.combos_len,
+                    ctx.terminal_blocker_neighbor_stride,
+                    ctx.terminal_prefix_pair_budget,
+                )?;
+            }
+        }
+        if let Some(start) = phase_start {
+            eprintln!(
+                "pokedr: gpu profile phase=root_cfv_terminal elapsed_ms={:.3}",
+                start.elapsed().as_secs_f64() * 1000.0
+            );
+        }
+
+        encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("public tree root CFV backup encoder"),
+            });
+        phase_start = profile.then(Instant::now);
+        self.backup_layer_values(
+            &mut encoder,
+            ctx,
+            regrets_buffer,
+            prediction_buffer,
+            variant,
+            br_player,
+            iteration,
+        );
+        self.submit_final_profile_phase(encoder, "root_cfv_backup", phase_start)?;
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn public_tree_iteration_values(
         &self,
@@ -5026,17 +5127,16 @@ impl GpuDenseCfrBackend {
             showdown_boards,
             state.private_infosets(),
             state.actions(),
-            true,
+            false,
             true,
         );
-        self.public_tree_iteration_output_with_context(
+        self.public_tree_root_values_with_context(
             &context,
             state.regrets_buffer(),
             state.prediction_buffer(),
             state.config.variant,
             2,
             usize::MAX,
-            false,
         )?;
 
         let root_node_count: usize = context

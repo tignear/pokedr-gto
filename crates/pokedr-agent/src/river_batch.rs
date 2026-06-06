@@ -62,6 +62,19 @@ pub struct RiverSubgameResult {
     pub state: DenseCfrState,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct RiverExploitabilitySummary {
+    pub board: String,
+    pub root_exploitability: f32,
+    pub hero_root_br_value: f32,
+    pub villain_root_br_value: f32,
+    pub hero_root_profile_value: f32,
+    pub villain_root_profile_value: f32,
+    pub hero_root_br_improvement: f32,
+    pub villain_root_br_improvement: f32,
+    pub elapsed_secs: f32,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RiverSubgameShapeKey {
     pot: u32,
@@ -183,6 +196,79 @@ impl RiverBatchSolver {
         self.solve_subgame_with_layout(input, &template_tree, &layout)
     }
 
+    pub fn root_exploitability(
+        &self,
+        input: &RiverSubgameInput,
+        result: &RiverSubgameResult,
+    ) -> Option<RiverExploitabilitySummary> {
+        input.validate();
+        let started = Instant::now();
+        let tree = SubgameTree::build(
+            input.public_state.clone(),
+            SubgameTreeConfig {
+                action_set: self.config.action_set.clone(),
+                max_raises_per_street: self.config.max_raises_per_street,
+            },
+        );
+        let layout = PostflopDenseLayout::from_tree(&tree);
+        let indexer = ComboIndexer::new();
+        let metrics = if let Some(backend) = cfr_gpu_backend() {
+            let root_dead = input.public_state.board.deck_mask();
+            let combo_legal = indexer
+                .combos()
+                .iter()
+                .map(|combo| (!combo.collides_with(root_dead)) as u32)
+                .collect::<Vec<_>>();
+            let combos = gpu_private_combos();
+            let matrix_cache =
+                RefCell::new(ShowdownMatrixCache::new(showdown_matrix_cache_capacity()));
+            let linearized =
+                linearize_gpu_public_tree(&tree, &layout, &backend, &self.config, &matrix_cache)?;
+            crate::recursive_br_gap_metrics_gpu(
+                &backend,
+                &tree,
+                &linearized,
+                &combos,
+                &combo_legal,
+                &input.oop_weights,
+                &input.ip_weights,
+                &layout,
+                &result.state,
+                false,
+            )
+            .map(|metrics| crate::RootExploitability {
+                exploitability: metrics.root_exploitability,
+                hero_br_value: metrics.hero_root_br_value,
+                villain_br_value: metrics.villain_root_br_value,
+                hero_profile_value: metrics.hero_root_profile_value,
+                villain_profile_value: metrics.villain_root_profile_value,
+                hero_improvement: metrics.hero_root_br_improvement,
+                villain_improvement: metrics.villain_root_br_improvement,
+            })?
+        } else {
+            crate::cpu_infoset_root_exploitability(
+                &tree,
+                &layout,
+                &result.state,
+                &indexer,
+                &input.oop_weights,
+                &input.ip_weights,
+                self.config.max_showdown_runouts,
+            )
+        };
+        Some(RiverExploitabilitySummary {
+            board: result.summary.board.clone(),
+            root_exploitability: metrics.exploitability,
+            hero_root_br_value: metrics.hero_br_value,
+            villain_root_br_value: metrics.villain_br_value,
+            hero_root_profile_value: metrics.hero_profile_value,
+            villain_root_profile_value: metrics.villain_profile_value,
+            hero_root_br_improvement: metrics.hero_improvement,
+            villain_root_br_improvement: metrics.villain_improvement,
+            elapsed_secs: started.elapsed().as_secs_f32(),
+        })
+    }
+
     fn solve_shape_group(
         &self,
         mut group: Vec<(usize, RiverSubgameInput)>,
@@ -214,6 +300,9 @@ impl RiverBatchSolver {
         &self,
         group: &[(usize, RiverSubgameInput)],
     ) -> Option<Vec<(usize, RiverSubgameResult)>> {
+        if std::env::var_os("POKEDR_DISABLE_RIVER_BATCH_GPU").is_some() {
+            return None;
+        }
         let backend = cfr_gpu_backend()?;
         let started = Instant::now();
         let template_state = group[0].1.public_state.clone();

@@ -3,7 +3,7 @@ pub use pokedr_core::{dense_cfr, postflop, postflop_dense, range};
 mod river_batch;
 pub use river_batch::{
     FixedRiverBatchSolveSummary, FixedRiverSolveSummary, RiverBatchSolver,
-    RiverShapeBatchPlanSummary, RiverSubgameInput, RiverSubgameResult,
+    RiverExploitabilitySummary, RiverShapeBatchPlanSummary, RiverSubgameInput, RiverSubgameResult,
 };
 
 use std::{
