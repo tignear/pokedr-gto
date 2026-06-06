@@ -951,6 +951,30 @@ impl BatchedPrivateCfrState {
         }
     }
 
+    pub fn average_strategy_profile_state(&self) -> Self {
+        let mut profile_config = self.config.clone();
+        profile_config.variant = CfrVariant::CfrPlus;
+        let mut profile = Self::new(profile_config, &self.legal_actions_per_public());
+        for batch in 0..self.config.batches {
+            let dense_profile = self
+                .dense_state_for_batch(batch)
+                .average_strategy_profile_state();
+            profile.overwrite_batch_from_dense(batch, &dense_profile);
+        }
+        profile
+    }
+
+    fn legal_actions_per_public(&self) -> Vec<bool> {
+        let mut legal = vec![false; self.config.public_infosets * self.config.actions];
+        for public_infoset in 0..self.config.public_infosets {
+            let source = self.config.offset(0, public_infoset, 0, 0);
+            let target = public_infoset * self.config.actions;
+            legal[target..target + self.config.actions]
+                .copy_from_slice(&self.legal_actions[source..source + self.config.actions]);
+        }
+        legal
+    }
+
     pub fn overwrite_batch_from_dense(&mut self, batch: usize, state: &DenseCfrState) {
         assert!(batch < self.config.batches, "batch index out of range");
         assert_eq!(state.infosets, self.config.private_infosets_per_batch());
@@ -1751,6 +1775,34 @@ mod tests {
         assert_eq!(batch1.prediction(), replacement.prediction());
         assert_eq!(batch1.strategy_sum(), replacement.strategy_sum());
         assert_eq!(batch1.legal_actions(), replacement.legal_actions());
+    }
+
+    #[test]
+    fn batched_private_average_profile_preserves_batches() {
+        let config = BatchedPrivateCfrConfig {
+            batches: 2,
+            public_infosets: 1,
+            combos: 2,
+            actions: 3,
+            variant: CfrVariant::CfrPlus,
+        };
+        let legal = vec![true, true, false];
+        let mut state = BatchedPrivateCfrState::new(config.clone(), &legal);
+        state.strategy_sum[config.offset(0, 0, 0, 0)] = 1.0;
+        state.strategy_sum[config.offset(0, 0, 0, 1)] = 3.0;
+        state.strategy_sum[config.offset(1, 0, 1, 0)] = 2.0;
+        state.strategy_sum[config.offset(1, 0, 1, 1)] = 2.0;
+
+        let profile = state.average_strategy_profile_state();
+        let batch0 = profile.dense_state_for_batch(0);
+        let batch1 = profile.dense_state_for_batch(1);
+
+        assert_eq!(batch0.regrets()[0], 0.25);
+        assert_eq!(batch0.regrets()[1], 0.75);
+        assert_eq!(batch0.regrets()[2], 0.0);
+        assert_eq!(batch1.regrets()[3], 0.5);
+        assert_eq!(batch1.regrets()[4], 0.5);
+        assert_eq!(batch1.regrets()[5], 0.0);
     }
 
     #[test]

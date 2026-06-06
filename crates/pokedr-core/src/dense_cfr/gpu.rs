@@ -754,6 +754,13 @@ pub struct GpuRootTerminalValues {
     pub root_villain_values: Vec<f32>,
 }
 
+pub struct GpuBatchedRootValues {
+    pub root_hero_values: Vec<f32>,
+    pub root_villain_values: Vec<f32>,
+    pub batches: usize,
+    pub combos: usize,
+}
+
 impl GpuDenseCfrBackend {
     pub fn new() -> Result<Self, GpuCfrError> {
         pollster::block_on(Self::new_async())
@@ -4988,6 +4995,113 @@ impl GpuDenseCfrBackend {
         }
         self.wait_idle()?;
         Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn public_tree_batched_root_values_from_state(
+        &self,
+        nodes: &[GpuPublicTreeNode],
+        children: &[u32],
+        child_cards: &[u32],
+        combos: &[GpuPrivateCombo],
+        combo_legals_by_root: &[Vec<u32>],
+        hero_weights_by_root: &[Vec<f32>],
+        villain_weights_by_root: &[Vec<f32>],
+        showdown_boards: &[GpuFinalBoard],
+        state: &GpuBatchedPrivateCfrState,
+    ) -> Result<GpuBatchedRootValues, GpuCfrError> {
+        let batches = state.batches();
+        assert_eq!(combo_legals_by_root.len(), batches);
+        assert_eq!(hero_weights_by_root.len(), batches);
+        assert_eq!(villain_weights_by_root.len(), batches);
+        assert_eq!(state.combos(), combos.len());
+        let context = self.public_tree_iteration_context_with_roots(
+            nodes,
+            children,
+            child_cards,
+            combos,
+            combo_legals_by_root,
+            hero_weights_by_root,
+            villain_weights_by_root,
+            showdown_boards,
+            state.private_infosets(),
+            state.actions(),
+            true,
+            true,
+        );
+        self.public_tree_iteration_output_with_context(
+            &context,
+            state.regrets_buffer(),
+            state.prediction_buffer(),
+            state.config.variant,
+            2,
+            usize::MAX,
+            false,
+        )?;
+
+        let root_node_count: usize = context
+            .layer_tiles
+            .first()
+            .map(|tiles| {
+                tiles
+                    .iter()
+                    .map(|tile| tile.node_end - tile.node_start)
+                    .sum()
+            })
+            .unwrap_or(0);
+        assert_eq!(
+            root_node_count, batches,
+            "batched root CFV materialization expects one layer-0 root per batch"
+        );
+        let root_values_len = batches * combos.len();
+        let root_hero_values_readback = readback_buffer(&self.device, root_values_len);
+        let root_villain_values_readback = readback_buffer(&self.device, root_values_len);
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("batched public tree root CFV readback encoder"),
+            });
+        for tile in &context.layer_tiles[0] {
+            let node_count = tile.node_end - tile.node_start;
+            let value_count = node_count * combos.len();
+            copy_buffer_range(
+                &mut encoder,
+                &tile.hero_values_buffer,
+                0,
+                &root_hero_values_readback,
+                tile.node_start * combos.len(),
+                value_count,
+            );
+            copy_buffer_range(
+                &mut encoder,
+                &tile.villain_values_buffer,
+                0,
+                &root_villain_values_readback,
+                tile.node_start * combos.len(),
+                value_count,
+            );
+        }
+        let submission = self.queue.submit(Some(encoder.finish()));
+        self.device
+            .poll(wgpu::PollType::Wait {
+                submission_index: Some(submission),
+                timeout: None,
+            })
+            .map_err(|error| GpuCfrError::MapFailed(error.to_string()))?;
+        Ok(GpuBatchedRootValues {
+            root_hero_values: read_f32_buffer(
+                &self.device,
+                &root_hero_values_readback,
+                root_values_len,
+            )?,
+            root_villain_values: read_f32_buffer(
+                &self.device,
+                &root_villain_values_readback,
+                root_values_len,
+            )?,
+            batches,
+            combos: combos.len(),
+        })
     }
 
     #[allow(clippy::too_many_arguments)]

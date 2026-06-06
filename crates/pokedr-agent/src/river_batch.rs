@@ -287,18 +287,29 @@ impl RiverBatchSolver {
             )
             .ok()?;
         let batched_state = gpu_state.download(&backend).ok()?;
+        let average_batched_state = batched_state.average_strategy_profile_state();
+        let average_gpu_state = backend.upload_batched_private_state(&average_batched_state);
+        let root_values = backend
+            .public_tree_batched_root_values_from_state(
+                &forest.nodes,
+                &forest.children,
+                &forest.child_cards,
+                &combos,
+                &combo_legals_by_batch,
+                &oop_weights_by_batch,
+                &ip_weights_by_batch,
+                &forest.showdown_boards,
+                &average_gpu_state,
+            )
+            .ok()?;
 
         let mut results = Vec::with_capacity(group.len());
-        for (batch, ((index, input), tree)) in group.iter().zip(trees.iter()).enumerate() {
+        for (batch, ((index, _input), tree)) in group.iter().zip(trees.iter()).enumerate() {
             let state = batched_state.dense_state_for_batch(batch);
-            let (oop_cfv, ip_cfv) = river_root_average_profile_cfvs(
-                tree,
-                &layout,
-                &state,
-                &input.oop_weights,
-                &input.ip_weights,
-                self.config.max_showdown_runouts,
-            );
+            let cfv_start = batch * root_values.combos;
+            let cfv_end = cfv_start + root_values.combos;
+            let oop_cfv = root_values.root_hero_values[cfv_start..cfv_end].to_vec();
+            let ip_cfv = root_values.root_villain_values[cfv_start..cfv_end].to_vec();
             results.push((
                 *index,
                 RiverSubgameResult {
