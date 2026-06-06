@@ -88,6 +88,8 @@ enum Command {
         real_cfr_log_interval: u32,
         #[arg(long, default_value_t = 0)]
         real_cfr_exploitability_interval: u32,
+        #[arg(long)]
+        real_cfr_target_exploitability_bb100: Option<f32>,
         #[arg(long, default_value = "cfr-plus")]
         real_cfr_variant: String,
         #[arg(long, default_value_t = 1.5)]
@@ -300,6 +302,7 @@ fn main() -> Result<(), String> {
             run_real_cfr_three_phase,
             real_cfr_log_interval,
             real_cfr_exploitability_interval,
+            real_cfr_target_exploitability_bb100,
             real_cfr_variant,
             dcfr_alpha,
             dcfr_beta,
@@ -498,6 +501,7 @@ fn main() -> Result<(), String> {
                     total_terminal_ms += chunk_summary.terminal_ms;
                     total_backup_ms += chunk_summary.backup_ms;
                     completed += chunk;
+                    summary = Some(chunk_summary);
                     if real_cfr_exploitability_interval > 0 {
                         let exploitability = solver.exploitability(state_threads)?;
                         println!(
@@ -513,13 +517,17 @@ fn main() -> Result<(), String> {
                             exploitability.exploitability_chips,
                             exploitability.exploitability_bb_per_100,
                         );
+                        if real_cfr_target_exploitability_bb100.is_some_and(|target| {
+                            exploitability.exploitability_bb_per_100 <= target
+                        }) {
+                            break;
+                        }
                     }
-                    summary = Some(chunk_summary);
                 }
                 let summary = summary.expect("at least one iteration must run");
                 println!(
                     "real_cfr_three_phase iterations={} states={} decision_nodes={} action_slots={} terminal_evals={} elapsed_ms={:.3} reach_ms={:.3} terminal_ms={:.3} backup_ms={:.3} root_oop_value={:.6} root_ip_value={:.6} zero_sum_delta={:.6}",
-                    iterations,
+                    completed,
                     summary.states,
                     summary.decision_nodes,
                     summary.action_slots,

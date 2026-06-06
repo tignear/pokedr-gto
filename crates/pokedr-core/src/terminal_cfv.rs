@@ -520,6 +520,66 @@ pub fn terminal_cfv_prefix_blocker_into(
     Ok(())
 }
 
+pub fn terminal_cfv_prefix_blocker_targets_into(
+    prepared: &PreparedTerminalBoard,
+    hero_reach: &[f32],
+    villain_reach: &[f32],
+    hero_targets: &[Option<usize>],
+    villain_targets: &[Option<usize>],
+    scratch: &mut TerminalCfvScratch,
+) -> Result<(), String> {
+    let combos = &prepared.combos;
+    if hero_reach.len() != combos.len() || villain_reach.len() != combos.len() {
+        return Err(format!("reach vectors must have {} entries", combos.len()));
+    }
+    side_values_prefix_blocker_targets_into(
+        prepared,
+        villain_reach,
+        hero_targets,
+        scratch.prefix.as_mut_slice(),
+        &mut scratch.hero_values,
+    );
+    side_values_prefix_blocker_targets_into(
+        prepared,
+        hero_reach,
+        villain_targets,
+        scratch.prefix.as_mut_slice(),
+        &mut scratch.villain_values,
+    );
+    Ok(())
+}
+
+pub fn terminal_cfv_sparse_targets_into(
+    prepared: &PreparedTerminalBoard,
+    hero_reach: &[f32],
+    villain_reach: &[f32],
+    hero_nonzero: &[u16],
+    villain_nonzero: &[u16],
+    hero_targets: &[Option<usize>],
+    villain_targets: &[Option<usize>],
+    scratch: &mut TerminalCfvScratch,
+) -> Result<(), String> {
+    let combos = &prepared.combos;
+    if hero_reach.len() != combos.len() || villain_reach.len() != combos.len() {
+        return Err(format!("reach vectors must have {} entries", combos.len()));
+    }
+    side_values_sparse_targets_into(
+        prepared,
+        villain_reach,
+        villain_nonzero,
+        hero_targets,
+        &mut scratch.hero_values,
+    );
+    side_values_sparse_targets_into(
+        prepared,
+        hero_reach,
+        hero_nonzero,
+        villain_targets,
+        &mut scratch.villain_values,
+    );
+    Ok(())
+}
+
 fn side_values_prefix_blocker_into(
     prepared: &PreparedTerminalBoard,
     opponent_reach: &[f32],
@@ -534,6 +594,63 @@ fn side_values_prefix_blocker_into(
     let total = prefix[combos.len()];
 
     for hero in 0..combos.len() {
+        let (lower, upper) = prepared.group_bounds[hero];
+        let weaker = prefix[lower];
+        let stronger = total - prefix[upper];
+        let mut value = weaker - stronger;
+
+        let (weak_start, weak_end) = prepared.weaker_blocker_ranges[hero];
+        for blocker in &prepared.weaker_blockers[weak_start..weak_end] {
+            value -= opponent_reach[*blocker as usize];
+        }
+        let (strong_start, strong_end) = prepared.stronger_blocker_ranges[hero];
+        for blocker in &prepared.stronger_blockers[strong_start..strong_end] {
+            value += opponent_reach[*blocker as usize];
+        }
+        values[hero] = value;
+    }
+}
+
+fn side_values_sparse_targets_into(
+    prepared: &PreparedTerminalBoard,
+    opponent_reach: &[f32],
+    opponent_nonzero: &[u16],
+    targets: &[Option<usize>],
+    values: &mut [f32],
+) {
+    for target in targets.iter().flatten() {
+        let hero = *target;
+        let hero_combo = prepared.combos[hero];
+        let hero_strength = prepared.strengths[hero];
+        let mut value = 0.0f32;
+        for opponent in opponent_nonzero {
+            let villain = *opponent as usize;
+            if hero_combo.collides(prepared.combos[villain]) {
+                continue;
+            }
+            value += opponent_reach[villain]
+                * compare_strength(hero_strength, prepared.strengths[villain]) as f32;
+        }
+        values[hero] = value;
+    }
+}
+
+fn side_values_prefix_blocker_targets_into(
+    prepared: &PreparedTerminalBoard,
+    opponent_reach: &[f32],
+    targets: &[Option<usize>],
+    prefix: &mut [f32],
+    values: &mut [f32],
+) {
+    let combos = &prepared.combos;
+    prefix[0] = 0.0f32;
+    for (sorted_index, combo_index) in prepared.order.iter().enumerate() {
+        prefix[sorted_index + 1] = prefix[sorted_index] + opponent_reach[*combo_index];
+    }
+    let total = prefix[combos.len()];
+
+    for target in targets.iter().flatten() {
+        let hero = *target;
         let (lower, upper) = prepared.group_bounds[hero];
         let weaker = prefix[lower];
         let stronger = total - prefix[upper];
@@ -973,6 +1090,102 @@ mod tests {
             assert_eq!(scratch.prefix.capacity(), prefix_capacity);
             assert_eq!(scratch.hero_values.capacity(), hero_capacity);
             assert_eq!(scratch.villain_values.capacity(), villain_capacity);
+        }
+    }
+
+    #[test]
+    fn prefix_blocker_targets_match_full_values_on_requested_combos() {
+        let board = Board::from_str("As7h2c2d2h").unwrap();
+        let prepared = PreparedTerminalBoard::new(&board).unwrap();
+        let combos = prepared.combos().len();
+        let hero_reach = (0..combos)
+            .map(|index| 0.25 + (index % 17) as f32 * 0.03125)
+            .collect::<Vec<_>>();
+        let villain_reach = (0..combos)
+            .map(|index| 0.5 + (index % 23) as f32 * 0.02125)
+            .collect::<Vec<_>>();
+        let hero_targets = (0..32)
+            .map(|index| Some((index * 19) % combos))
+            .collect::<Vec<_>>();
+        let villain_targets = (0..32)
+            .map(|index| Some((index * 31 + 7) % combos))
+            .collect::<Vec<_>>();
+
+        let mut full = TerminalCfvScratch::new(&prepared);
+        terminal_cfv_prefix_blocker_into(&prepared, &hero_reach, &villain_reach, &mut full)
+            .unwrap();
+        let mut subset = TerminalCfvScratch::new(&prepared);
+        terminal_cfv_prefix_blocker_targets_into(
+            &prepared,
+            &hero_reach,
+            &villain_reach,
+            &hero_targets,
+            &villain_targets,
+            &mut subset,
+        )
+        .unwrap();
+
+        for target in hero_targets.iter().flatten() {
+            assert_eq!(subset.hero_values[*target], full.hero_values[*target]);
+        }
+        for target in villain_targets.iter().flatten() {
+            assert_eq!(subset.villain_values[*target], full.villain_values[*target]);
+        }
+    }
+
+    #[test]
+    fn sparse_targets_match_full_values_on_requested_combos() {
+        let board = Board::from_str("As7h2c2d2h").unwrap();
+        let prepared = PreparedTerminalBoard::new(&board).unwrap();
+        let combos = prepared.combos().len();
+        let mut hero_reach = vec![0.0f32; combos];
+        let mut villain_reach = vec![0.0f32; combos];
+        let hero_nonzero = [3u16, 97, 251, 509];
+        let villain_nonzero = [11u16, 173, 431];
+        for index in hero_nonzero {
+            hero_reach[index as usize] = 0.25 + index as f32 * 0.001;
+        }
+        for index in villain_nonzero {
+            villain_reach[index as usize] = 0.5 + index as f32 * 0.001;
+        }
+        let hero_targets = (0..32)
+            .map(|index| Some((index * 19) % combos))
+            .collect::<Vec<_>>();
+        let villain_targets = (0..32)
+            .map(|index| Some((index * 31 + 7) % combos))
+            .collect::<Vec<_>>();
+
+        let mut full = TerminalCfvScratch::new(&prepared);
+        terminal_cfv_prefix_blocker_into(&prepared, &hero_reach, &villain_reach, &mut full)
+            .unwrap();
+        let mut sparse = TerminalCfvScratch::new(&prepared);
+        terminal_cfv_sparse_targets_into(
+            &prepared,
+            &hero_reach,
+            &villain_reach,
+            &hero_nonzero,
+            &villain_nonzero,
+            &hero_targets,
+            &villain_targets,
+            &mut sparse,
+        )
+        .unwrap();
+
+        for target in hero_targets.iter().flatten() {
+            assert!(
+                (sparse.hero_values[*target] - full.hero_values[*target]).abs() < 1e-5,
+                "hero target={target} sparse={} full={}",
+                sparse.hero_values[*target],
+                full.hero_values[*target],
+            );
+        }
+        for target in villain_targets.iter().flatten() {
+            assert!(
+                (sparse.villain_values[*target] - full.villain_values[*target]).abs() < 1e-5,
+                "villain target={target} sparse={} full={}",
+                sparse.villain_values[*target],
+                full.villain_values[*target],
+            );
         }
     }
 

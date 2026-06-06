@@ -1,7 +1,8 @@
 use crate::cards::Board;
 use crate::range::{ComboWeight, RangeSpec};
 use crate::terminal_cfv::{
-    PreparedTerminalBoard, TerminalCfvScratch, terminal_cfv_prefix_blocker_into,
+    PreparedTerminalBoard, TerminalCfvScratch, terminal_cfv_prefix_blocker_targets_into,
+    terminal_cfv_sparse_targets_into,
 };
 use crate::tree::{Player, PublicNodeKind, PublicTree, TerminalReason};
 use std::collections::BTreeMap;
@@ -152,6 +153,8 @@ struct TerminalPhaseTask {
     cache_index: usize,
     pot: u32,
 }
+
+const TERMINAL_SPARSE_NONZERO_LIMIT: usize = 64;
 
 #[derive(Debug, Clone)]
 struct TerminalAccumulator {
@@ -496,10 +499,12 @@ impl RealCfrSolver {
                             ip_reach,
                             &mut ip_live,
                         );
-                        terminal_cfv_prefix_blocker_into(
+                        terminal_cfv_prefix_blocker_targets_into(
                             &cache.prepared,
                             &oop_live,
                             &ip_live,
+                            &cache.oop_combo_indices,
+                            &cache.ip_combo_indices,
                             &mut scratch,
                         )?;
                         checksum += terminal_task_checksum(task, &cache.prepared, &scratch);
@@ -763,84 +768,124 @@ impl RealCfrSolver {
         }
         .max(1)
         .min(tasks.len());
-        let outputs = thread::scope(|scope| {
-            let mut handles = Vec::with_capacity(threads);
-            for thread_index in 0..threads {
-                let chunk = tasks.len().div_ceil(threads);
-                let start = thread_index * chunk;
-                let end = (start + chunk).min(tasks.len());
-                let tasks = &tasks;
-                handles.push(scope.spawn(
-                    move || -> Result<BTreeMap<usize, TerminalAccumulator>, String> {
-                        let scratch_source = self
-                            .terminal_cache
-                            .first()
-                            .ok_or_else(|| "terminal board cache is empty".to_string())?;
-                        let combos = scratch_source.prepared.combos().len();
-                        let mut scratch = TerminalCfvScratch::new(&scratch_source.prepared);
-                        let mut oop_live = vec![0.0f32; combos];
-                        let mut ip_live = vec![0.0f32; combos];
-                        let mut out = BTreeMap::new();
-                        for task in &tasks[start..end] {
-                            let cache = &self.terminal_cache[task.cache_index];
-                            reach_on_prepared_board_into(
-                                &cache.oop_combo_indices,
-                                &oop_reaches[task.state_index],
-                                &mut oop_live,
-                            );
-                            reach_on_prepared_board_into(
-                                &cache.ip_combo_indices,
-                                &ip_reaches[task.state_index],
-                                &mut ip_live,
-                            );
-                            terminal_cfv_prefix_blocker_into(
-                                &cache.prepared,
-                                &oop_live,
-                                &ip_live,
-                                &mut scratch,
-                            )?;
-                            out.entry(task.state_index)
-                                .or_insert_with(|| {
-                                    TerminalAccumulator::zero(
-                                        self.oop_combos.len(),
-                                        self.ip_combos.len(),
+        let outputs = thread::scope(
+            |scope| -> Result<Vec<(usize, TerminalAccumulator)>, String> {
+                let mut handles = Vec::with_capacity(threads);
+                for thread_index in 0..threads {
+                    let chunk = tasks.len().div_ceil(threads);
+                    let start = thread_index * chunk;
+                    let end = (start + chunk).min(tasks.len());
+                    let tasks = &tasks;
+                    handles.push(scope.spawn(
+                        move || -> Result<Vec<(usize, TerminalAccumulator)>, String> {
+                            let scratch_source = self
+                                .terminal_cache
+                                .first()
+                                .ok_or_else(|| "terminal board cache is empty".to_string())?;
+                            let combos = scratch_source.prepared.combos().len();
+                            let mut scratch = TerminalCfvScratch::new(&scratch_source.prepared);
+                            let mut oop_live = vec![0.0f32; combos];
+                            let mut ip_live = vec![0.0f32; combos];
+                            let mut oop_nonzero = Vec::new();
+                            let mut ip_nonzero = Vec::new();
+                            let mut out = Vec::new();
+                            let mut current: Option<(usize, TerminalAccumulator)> = None;
+                            for task in &tasks[start..end] {
+                                let cache = &self.terminal_cache[task.cache_index];
+                                reach_on_prepared_board_sparse_into(
+                                    &cache.oop_combo_indices,
+                                    &oop_reaches[task.state_index],
+                                    &mut oop_live,
+                                    &mut oop_nonzero,
+                                );
+                                reach_on_prepared_board_sparse_into(
+                                    &cache.ip_combo_indices,
+                                    &ip_reaches[task.state_index],
+                                    &mut ip_live,
+                                    &mut ip_nonzero,
+                                );
+                                if oop_nonzero.len() <= TERMINAL_SPARSE_NONZERO_LIMIT
+                                    && ip_nonzero.len() <= TERMINAL_SPARSE_NONZERO_LIMIT
+                                {
+                                    terminal_cfv_sparse_targets_into(
+                                        &cache.prepared,
+                                        &oop_live,
+                                        &ip_live,
+                                        &oop_nonzero,
+                                        &ip_nonzero,
+                                        &cache.oop_combo_indices,
+                                        &cache.ip_combo_indices,
+                                        &mut scratch,
+                                    )?;
+                                } else {
+                                    terminal_cfv_prefix_blocker_targets_into(
+                                        &cache.prepared,
+                                        &oop_live,
+                                        &ip_live,
+                                        &cache.oop_combo_indices,
+                                        &cache.ip_combo_indices,
+                                        &mut scratch,
+                                    )?;
+                                }
+                                if current.as_ref().is_some_and(|(state_index, _)| {
+                                    *state_index != task.state_index
+                                }) {
+                                    out.push(
+                                        current.take().expect("current accumulator is present"),
+                                    );
+                                }
+                                let (_, accumulator) = current.get_or_insert_with(|| {
+                                    (
+                                        task.state_index,
+                                        TerminalAccumulator::zero(
+                                            self.oop_combos.len(),
+                                            self.ip_combos.len(),
+                                        ),
                                     )
-                                })
-                                .add_board(
+                                });
+                                accumulator.add_board(
                                     cache,
                                     task.pot,
                                     &scratch,
                                     self.oop_combos.len(),
                                     self.ip_combos.len(),
                                 );
-                        }
-                        Ok(out)
-                    },
-                ));
-            }
-            handles
-                .into_iter()
-                .map(|handle| {
-                    handle
-                        .join()
-                        .map_err(|_| "terminal phase worker panicked".to_string())?
-                })
-                .try_fold(BTreeMap::new(), |mut all, worker| {
-                    worker.map(|values| {
-                        for (state_index, accumulator) in values {
-                            all.entry(state_index)
-                                .or_insert_with(|| {
-                                    TerminalAccumulator::zero(
-                                        self.oop_combos.len(),
-                                        self.ip_combos.len(),
-                                    )
-                                })
-                                .merge(accumulator);
-                        }
-                        all
+                            }
+                            if let Some(accumulator) = current {
+                                out.push(accumulator);
+                            }
+                            Ok(out)
+                        },
+                    ));
+                }
+                let mut outputs = handles
+                    .into_iter()
+                    .map(|handle| {
+                        handle
+                            .join()
+                            .map_err(|_| "terminal phase worker panicked".to_string())?
                     })
-                })
-        })?;
+                    .try_fold(Vec::new(), |mut all, worker| {
+                        worker.map(|mut values| {
+                            all.append(&mut values);
+                            all
+                        })
+                    })?;
+                outputs.sort_unstable_by_key(|(state_index, _)| *state_index);
+                let mut merged: Vec<(usize, TerminalAccumulator)> =
+                    Vec::with_capacity(outputs.len());
+                for (state_index, accumulator) in outputs {
+                    if let Some((last_state_index, last_accumulator)) = merged.last_mut() {
+                        if *last_state_index == state_index {
+                            last_accumulator.merge(accumulator);
+                            continue;
+                        }
+                    }
+                    merged.push((state_index, accumulator));
+                }
+                Ok(merged)
+            },
+        )?;
         for (state_index, mut accumulator) in outputs {
             accumulator.finish();
             values[state_index] = accumulator.values;
@@ -1411,11 +1456,45 @@ impl RealCfrSolver {
             let cache = &self.terminal_cache[cache_index];
             let mut scratch = TerminalCfvScratch::new(&cache.prepared);
             let prepared_combos = cache.prepared.combos().len();
-            let oop_live =
-                reach_on_prepared_board(&cache.oop_combo_indices, oop_reach, prepared_combos);
-            let ip_live =
-                reach_on_prepared_board(&cache.ip_combo_indices, ip_reach, prepared_combos);
-            terminal_cfv_prefix_blocker_into(&cache.prepared, &oop_live, &ip_live, &mut scratch)?;
+            let mut oop_live = vec![0.0f32; prepared_combos];
+            let mut ip_live = vec![0.0f32; prepared_combos];
+            let mut oop_nonzero = Vec::new();
+            let mut ip_nonzero = Vec::new();
+            reach_on_prepared_board_sparse_into(
+                &cache.oop_combo_indices,
+                oop_reach,
+                &mut oop_live,
+                &mut oop_nonzero,
+            );
+            reach_on_prepared_board_sparse_into(
+                &cache.ip_combo_indices,
+                ip_reach,
+                &mut ip_live,
+                &mut ip_nonzero,
+            );
+            if oop_nonzero.len() <= TERMINAL_SPARSE_NONZERO_LIMIT
+                && ip_nonzero.len() <= TERMINAL_SPARSE_NONZERO_LIMIT
+            {
+                terminal_cfv_sparse_targets_into(
+                    &cache.prepared,
+                    &oop_live,
+                    &ip_live,
+                    &oop_nonzero,
+                    &ip_nonzero,
+                    &cache.oop_combo_indices,
+                    &cache.ip_combo_indices,
+                    &mut scratch,
+                )?;
+            } else {
+                terminal_cfv_prefix_blocker_targets_into(
+                    &cache.prepared,
+                    &oop_live,
+                    &ip_live,
+                    &cache.oop_combo_indices,
+                    &cache.ip_combo_indices,
+                    &mut scratch,
+                )?;
+            }
             for index in 0..self.oop_combos.len() {
                 if let Some(board_index) = cache.oop_combo_indices[index] {
                     values.oop[index] += scratch.hero_values()[board_index] * pot as f32;
@@ -1719,16 +1798,6 @@ fn prepared_combo_indices(
         .collect()
 }
 
-fn reach_on_prepared_board(
-    combo_indices: &[Option<usize>],
-    reach: &[f32],
-    prepared_combos: usize,
-) -> Vec<f32> {
-    let mut out = vec![0.0f32; prepared_combos];
-    reach_on_prepared_board_into(combo_indices, reach, &mut out);
-    out
-}
-
 fn reach_on_prepared_board_into(combo_indices: &[Option<usize>], reach: &[f32], out: &mut [f32]) {
     out.fill(0.0);
     for (index, reach) in combo_indices.iter().zip(reach) {
@@ -1736,6 +1805,27 @@ fn reach_on_prepared_board_into(combo_indices: &[Option<usize>], reach: &[f32], 
             continue;
         }
         if let Some(index) = *index {
+            out[index] += *reach;
+        }
+    }
+}
+
+fn reach_on_prepared_board_sparse_into(
+    combo_indices: &[Option<usize>],
+    reach: &[f32],
+    out: &mut [f32],
+    nonzero: &mut Vec<u16>,
+) {
+    out.fill(0.0);
+    nonzero.clear();
+    for (index, reach) in combo_indices.iter().zip(reach) {
+        if *reach == 0.0 {
+            continue;
+        }
+        if let Some(index) = *index {
+            if out[index] == 0.0 {
+                nonzero.push(index as u16);
+            }
             out[index] += *reach;
         }
     }
