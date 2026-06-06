@@ -1,9 +1,12 @@
 use clap::{Parser, Subcommand};
 use pokedr_agent::{FlopTreeRequest, build_flop_tree};
 use pokedr_core::{
-    ActionKind, Board, ChanceExpansion, Player, PublicNodeKind, RangeSpec, Street, TreeTemplate,
+    ActionKind, Board, CfrPlusState, CfrStorageConfig, ChanceExpansion, Player, PublicNodeKind,
+    RangeSpec, Street, TreeTemplate, build_action_slot_layout, dry_run_cfr_plus_iteration,
+    plan_cfr_work, terminal_cfv_parallel_smoke,
 };
 use std::str::FromStr;
+use std::time::Instant;
 
 #[derive(Debug, Parser)]
 #[command(name = "pokedr-cli")]
@@ -32,6 +35,40 @@ enum Command {
         print_nodes: usize,
         #[arg(long)]
         enumerate_chance: bool,
+        #[arg(long, default_value_t = 256)]
+        chunk_mib: u32,
+    },
+    #[command(about = "Build the fixed flop CFR+ layout and optionally allocate solver state")]
+    SolveFlop {
+        flop: String,
+        #[arg(long, default_value_t = 650)]
+        pot: u32,
+        #[arg(long, default_value_t = 9700)]
+        effective_stack: u32,
+        #[arg(long, default_value = "full")]
+        oop_range: String,
+        #[arg(long, default_value = "full")]
+        ip_range: String,
+        #[arg(long, default_value = "oop")]
+        first_player: String,
+        #[arg(long, default_value_t = 1)]
+        iterations: u32,
+        #[arg(long, default_value_t = 256)]
+        chunk_mib: u32,
+        #[arg(long)]
+        allocate_state: bool,
+        #[arg(long)]
+        dry_run_iteration: bool,
+        #[arg(long, default_value_t = 0)]
+        update_slots: usize,
+        #[arg(long)]
+        update_chunk: Option<u128>,
+        #[arg(long)]
+        terminal_cfv_smoke: bool,
+        #[arg(long)]
+        terminal_cfv_calls: Option<usize>,
+        #[arg(long, default_value_t = 0)]
+        terminal_cfv_threads: usize,
     },
 }
 
@@ -47,6 +84,7 @@ fn main() -> Result<(), String> {
             first_player,
             print_nodes,
             enumerate_chance,
+            chunk_mib,
         } => {
             let first_player = parse_player(&first_player)?;
             let request = FlopTreeRequest {
@@ -106,20 +144,48 @@ fn main() -> Result<(), String> {
                 estimate.memory_regret_strategy_f32_mb
             );
             if !enumerate_chance {
-                let schematic = estimate_schematic_work(&tree);
+                let plan = plan_cfr_work(
+                    &tree,
+                    CfrStorageConfig {
+                        chunk_target_bytes: chunk_mib as u128 * 1024 * 1024,
+                        ..CfrStorageConfig::default()
+                    },
+                );
                 println!(
-                    "schematic_exact flop_decisions={} turn_decisions={} river_decisions={} flop_action_slots={} turn_action_slots={} river_action_slots={} total_action_slots={} terminal_pair_evals_per_iter={} memory_regret_strategy_f32_mb={:.1} memory_regret_f32_strategy_f16_mb={:.1} flop_turn_only_f32_mb={:.1}",
-                    schematic.flop_decisions,
-                    schematic.turn_decisions,
-                    schematic.river_decisions,
-                    schematic.flop_action_slots,
-                    schematic.turn_action_slots,
-                    schematic.river_action_slots,
-                    schematic.total_action_slots(),
-                    schematic.terminal_pair_evals_per_iter,
-                    schematic.memory_regret_strategy_f32_mb(),
-                    schematic.memory_regret_f32_strategy_f16_mb(),
-                    schematic.flop_turn_only_f32_mb(),
+                    "cfr_plan chunk_target_mib={} total_action_slots={} storage_gib={:.2} chunks={} max_chunk_mib={:.1}",
+                    chunk_mib,
+                    plan.total_action_slots,
+                    plan.storage_gib(),
+                    plan.total_chunks,
+                    plan.max_chunk_mib(),
+                );
+                println!(
+                    "cfr_plan_storage regret_f32_strategy_f32_gib={:.2} regret_f32_strategy_u16_gib={:.2} regret_f32_only_gib={:.2}",
+                    storage_gib(plan.total_action_slots, 4, 4),
+                    storage_gib(plan.total_action_slots, 4, 2),
+                    storage_gib(plan.total_action_slots, 4, 0),
+                );
+                for street in [Street::Flop, Street::Turn, Street::River] {
+                    let street_plan = plan.street[pokedr_core::plan::street_index(street)];
+                    println!(
+                        "cfr_plan_street street={street:?} decisions={} action_slots={} storage_gib={:.2} storage_f32_u16_gib={:.2} storage_regret_only_gib={:.2} chunks={}",
+                        street_plan.decisions,
+                        street_plan.action_slots,
+                        street_plan.storage_gib(),
+                        storage_gib(street_plan.action_slots, 4, 2),
+                        storage_gib(street_plan.action_slots, 4, 0),
+                        street_plan.chunks,
+                    );
+                }
+                println!(
+                    "cfr_plan_terminal folds={} showdowns={} allins={} terminal_cfv_calls={} showdown_board_evals={} allin_board_evals={} private_pair_upper_bound={}",
+                    plan.terminals.fold_terminals,
+                    plan.terminals.showdown_terminals,
+                    plan.terminals.all_in_terminals,
+                    plan.terminals.terminal_cfv_calls,
+                    plan.terminals.showdown_board_evals,
+                    plan.terminals.all_in_board_evals,
+                    plan.terminals.terminal_private_pair_upper_bound,
                 );
             }
             for node in tree.nodes.iter().take(print_nodes) {
@@ -153,8 +219,162 @@ fn main() -> Result<(), String> {
                 }
             }
         }
+        Command::SolveFlop {
+            flop,
+            pot,
+            effective_stack,
+            oop_range,
+            ip_range,
+            first_player,
+            iterations,
+            chunk_mib,
+            allocate_state,
+            dry_run_iteration,
+            update_slots,
+            update_chunk,
+            terminal_cfv_smoke,
+            terminal_cfv_calls,
+            terminal_cfv_threads,
+        } => {
+            let request = flop_tree_request(
+                &flop,
+                pot,
+                effective_stack,
+                &oop_range,
+                &ip_range,
+                &first_player,
+            )?;
+            let tree = build_flop_tree(request).map_err(|error| format!("{error:?}"))?;
+            let config = CfrStorageConfig {
+                chunk_target_bytes: chunk_mib as u128 * 1024 * 1024,
+                ..CfrStorageConfig::default()
+            };
+            let plan = plan_cfr_work(&tree, config);
+            let layout = build_action_slot_layout(&tree, config);
+            println!(
+                "solving flop={} variant=CfrPlus iterations={iterations}",
+                tree.spot.board
+            );
+            println!(
+                "layout records={} action_slots={} storage_gib={:.2} flop_slots={} turn_slots={} river_slots={}",
+                layout.records.len(),
+                layout.total_action_slots,
+                layout.storage_gib(),
+                layout.flop_slots(),
+                layout.turn_slots(),
+                layout.river_slots(),
+            );
+            println!(
+                "plan chunks={} max_chunk_mib={:.1} terminal_cfv_calls={} private_pair_upper_bound={}",
+                plan.total_chunks,
+                plan.max_chunk_mib(),
+                plan.terminals.terminal_cfv_calls,
+                plan.terminals.terminal_private_pair_upper_bound,
+            );
+            if terminal_cfv_smoke {
+                let calls = terminal_cfv_calls.unwrap_or_else(|| {
+                    usize::try_from(plan.terminals.terminal_cfv_calls).unwrap_or(usize::MAX)
+                });
+                let started = Instant::now();
+                let smoke =
+                    terminal_cfv_parallel_smoke(&tree.spot.board, calls, terminal_cfv_threads)?;
+                println!(
+                    "terminal_cfv_smoke boards={} calls={} threads={} prepare_ms={:.3} eval_ms={:.3} total_ms={:.3} calls_per_sec={:.1} checksum={:.6}",
+                    smoke.board_count,
+                    smoke.calls,
+                    smoke.threads,
+                    smoke.prepare_elapsed_ms,
+                    smoke.eval_elapsed_ms,
+                    started.elapsed().as_secs_f64() * 1000.0,
+                    smoke.calls_per_second,
+                    smoke.checksum,
+                );
+            }
+            if !allocate_state {
+                println!("dry_run=true state_allocated=false");
+                if dry_run_iteration {
+                    let dry_run = dry_run_cfr_plus_iteration(&layout, 1);
+                    println!(
+                        "iteration_dry_run iteration={} records={} infosets={} action_slots={} regret_reads={} regret_writes={} strategy_sum_writes={} strategy_sum_delta={:.3} checksum={:.6}",
+                        dry_run.iteration,
+                        dry_run.records_visited,
+                        dry_run.infosets_visited,
+                        dry_run.action_slots_visited,
+                        dry_run.regret_reads,
+                        dry_run.regret_writes,
+                        dry_run.strategy_sum_writes,
+                        dry_run.strategy_sum_delta,
+                        dry_run.checksum,
+                    );
+                }
+                println!("pass --allocate-state to allocate regret and strategy_sum vectors");
+                return Ok(());
+            }
+            let mut state = CfrPlusState::allocate(layout).map_err(|error| format!("{error:?}"))?;
+            println!(
+                "dry_run=false state_allocated=true regret_len={} strategy_sum_len={} storage_gib={:.2}",
+                state.regret.len(),
+                state.strategy_sum.len(),
+                state.storage_gib(),
+            );
+            if update_slots > 0 {
+                let started = Instant::now();
+                let summary = state.update_prefix_slots(update_slots);
+                println!(
+                    "prefix_update requested_slots={} updated_slots={} elapsed_ms={:.3} strategy_sum_delta={:.6} regret_checksum={:.6} strategy_sum_checksum={:.6}",
+                    summary.requested_slots,
+                    summary.updated_slots,
+                    started.elapsed().as_secs_f64() * 1000.0,
+                    summary.strategy_sum_delta,
+                    summary.regret_checksum,
+                    summary.strategy_sum_checksum,
+                );
+            }
+            if let Some(chunk_index) = update_chunk {
+                let chunk_bytes = chunk_mib as u128 * 1024 * 1024;
+                let Some(chunk) = state.layout.slot_chunk(chunk_index, chunk_bytes) else {
+                    return Err(format!(
+                        "chunk index {chunk_index} is outside the action slot layout"
+                    ));
+                };
+                let requested = chunk.end - chunk.start;
+                let started = Instant::now();
+                let summary = state.update_slot_chunk(chunk, requested);
+                println!(
+                    "chunk_update chunk={} start={} end={} requested_slots={} updated_slots={} elapsed_ms={:.3} strategy_sum_delta={:.6} regret_checksum={:.6} strategy_sum_checksum={:.6}",
+                    chunk.index,
+                    chunk.start,
+                    chunk.end,
+                    summary.requested_slots,
+                    summary.updated_slots,
+                    started.elapsed().as_secs_f64() * 1000.0,
+                    summary.strategy_sum_delta,
+                    summary.regret_checksum,
+                    summary.strategy_sum_checksum,
+                );
+            }
+        }
     }
     Ok(())
+}
+
+fn flop_tree_request(
+    flop: &str,
+    pot: u32,
+    effective_stack: u32,
+    oop_range: &str,
+    ip_range: &str,
+    first_player: &str,
+) -> Result<FlopTreeRequest, String> {
+    Ok(FlopTreeRequest {
+        board: Board::from_str(flop)?,
+        pot,
+        effective_stack,
+        oop_range: RangeSpec::from_str(oop_range)?,
+        ip_range: RangeSpec::from_str(ip_range)?,
+        first_player: parse_player(first_player)?,
+        action_abstraction: pokedr_core::ActionAbstraction::conservative_default(),
+    })
 }
 
 struct WorkEstimate {
@@ -163,35 +383,6 @@ struct WorkEstimate {
     private_pairs: u128,
     terminal_pair_visits: u128,
     memory_regret_strategy_f32_mb: f64,
-}
-
-#[derive(Default)]
-struct SchematicEstimate {
-    flop_decisions: u128,
-    turn_decisions: u128,
-    river_decisions: u128,
-    flop_action_slots: u128,
-    turn_action_slots: u128,
-    river_action_slots: u128,
-    terminal_pair_evals_per_iter: u128,
-}
-
-impl SchematicEstimate {
-    fn total_action_slots(&self) -> u128 {
-        self.flop_action_slots + self.turn_action_slots + self.river_action_slots
-    }
-
-    fn memory_regret_strategy_f32_mb(&self) -> f64 {
-        self.total_action_slots() as f64 * 2.0 * 4.0 / (1024.0 * 1024.0)
-    }
-
-    fn memory_regret_f32_strategy_f16_mb(&self) -> f64 {
-        self.total_action_slots() as f64 * (4.0 + 2.0) / (1024.0 * 1024.0)
-    }
-
-    fn flop_turn_only_f32_mb(&self) -> f64 {
-        (self.flop_action_slots + self.turn_action_slots) as f64 * 2.0 * 4.0 / (1024.0 * 1024.0)
-    }
 }
 
 fn estimate_tree_work(
@@ -228,56 +419,8 @@ fn estimate_tree_work(
     }
 }
 
-fn estimate_schematic_work(tree: &pokedr_core::PublicTree) -> SchematicEstimate {
-    let mut estimate = SchematicEstimate::default();
-    for node in &tree.nodes {
-        let PublicNodeKind::Decision { actions, .. } = &node.kind else {
-            if matches!(node.kind, PublicNodeKind::Terminal { .. }) {
-                let board_count = match node.state.street {
-                    Street::Flop => 1u128,
-                    Street::Turn => 49u128,
-                    Street::River => 49u128 * 48u128,
-                };
-                let live_combos = match node.state.street {
-                    Street::Flop => choose2(49),
-                    Street::Turn => choose2(48),
-                    Street::River => choose2(47),
-                };
-                estimate.terminal_pair_evals_per_iter += board_count * live_combos * live_combos;
-            }
-            continue;
-        };
-        let board_count = match node.state.street {
-            Street::Flop => 1u128,
-            Street::Turn => 49u128,
-            Street::River => 49u128 * 48u128,
-        };
-        let live_combos = match node.state.street {
-            Street::Flop => choose2(49),
-            Street::Turn => choose2(48),
-            Street::River => choose2(47),
-        };
-        let slots = board_count * live_combos * actions.len() as u128;
-        match node.state.street {
-            Street::Flop => {
-                estimate.flop_decisions += 1;
-                estimate.flop_action_slots += slots;
-            }
-            Street::Turn => {
-                estimate.turn_decisions += 1;
-                estimate.turn_action_slots += slots;
-            }
-            Street::River => {
-                estimate.river_decisions += 1;
-                estimate.river_action_slots += slots;
-            }
-        }
-    }
-    estimate
-}
-
-fn choose2(count: u128) -> u128 {
-    count * (count - 1) / 2
+fn storage_gib(action_slots: u128, regret_bytes: u128, strategy_sum_bytes: u128) -> f64 {
+    action_slots as f64 * (regret_bytes + strategy_sum_bytes) as f64 / (1024.0 * 1024.0 * 1024.0)
 }
 
 fn parse_player(value: &str) -> Result<Player, String> {

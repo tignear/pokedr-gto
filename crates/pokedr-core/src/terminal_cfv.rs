@@ -1,5 +1,7 @@
 use crate::cards::{Board, Card};
 use std::cmp::Ordering;
+use std::thread;
+use std::time::Instant;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PrivateCombo {
@@ -26,8 +28,10 @@ pub struct PreparedTerminalBoard {
     strengths: Vec<u64>,
     order: Vec<usize>,
     group_bounds: Vec<(usize, usize)>,
-    blocker_ranges: Vec<(usize, usize)>,
-    blockers: Vec<u16>,
+    weaker_blocker_ranges: Vec<(usize, usize)>,
+    weaker_blockers: Vec<u16>,
+    stronger_blocker_ranges: Vec<(usize, usize)>,
+    stronger_blockers: Vec<u16>,
 }
 
 #[derive(Debug, Clone)]
@@ -35,6 +39,17 @@ pub struct TerminalCfvScratch {
     prefix: Vec<f32>,
     hero_values: Vec<f32>,
     villain_values: Vec<f32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TerminalCfvParallelSmoke {
+    pub board_count: usize,
+    pub calls: usize,
+    pub threads: usize,
+    pub prepare_elapsed_ms: f64,
+    pub eval_elapsed_ms: f64,
+    pub calls_per_second: f64,
+    pub checksum: f64,
 }
 
 impl PreparedTerminalBoard {
@@ -60,20 +75,121 @@ impl PreparedTerminalBoard {
             }
             lower = upper;
         }
-        let (blocker_ranges, blockers) = blocker_table(&combos);
+        let split_blockers = split_blocker_tables(&combos, &strengths);
         Ok(Self {
             combos,
             strengths,
             order,
             group_bounds,
-            blocker_ranges,
-            blockers,
+            weaker_blocker_ranges: split_blockers.weaker_ranges,
+            weaker_blockers: split_blockers.weaker,
+            stronger_blocker_ranges: split_blockers.stronger_ranges,
+            stronger_blockers: split_blockers.stronger,
         })
     }
 
     pub fn combos(&self) -> &[PrivateCombo] {
         &self.combos
     }
+}
+
+pub fn terminal_cfv_parallel_smoke(
+    flop: &Board,
+    calls: usize,
+    requested_threads: usize,
+) -> Result<TerminalCfvParallelSmoke, String> {
+    if flop.cards().len() != 3 {
+        return Err("terminal CFV smoke requires a three-card flop".to_string());
+    }
+    let started_prepare = Instant::now();
+    let boards = river_boards_from_flop(flop)?;
+    let prepared = boards
+        .iter()
+        .map(PreparedTerminalBoard::new)
+        .collect::<Result<Vec<_>, _>>()?;
+    let prepare_elapsed_ms = started_prepare.elapsed().as_secs_f64() * 1000.0;
+    if prepared.is_empty() {
+        return Err("no terminal boards generated".to_string());
+    }
+    let available_threads = thread::available_parallelism().map_or(1, usize::from);
+    let threads = if requested_threads == 0 {
+        available_threads
+    } else {
+        requested_threads.min(available_threads)
+    }
+    .max(1)
+    .min(calls.max(1));
+
+    let started_eval = Instant::now();
+    let checksum = thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(threads);
+        for thread_index in 0..threads {
+            let prepared = &prepared;
+            handles.push(scope.spawn(move || -> Result<f64, String> {
+                let combos = prepared[0].combos().len();
+                let hero_reach = deterministic_reach(combos, 0, 17, 0.25, 0.03125);
+                let villain_reach = deterministic_reach(combos, 7, 23, 0.50, 0.02125);
+                let mut scratch = TerminalCfvScratch::new(&prepared[0]);
+                let mut checksum = 0.0f64;
+                let mut task = thread_index;
+                while task < calls {
+                    checksum += run_terminal_cfv_smoke_call(
+                        prepared,
+                        &hero_reach,
+                        &villain_reach,
+                        &mut scratch,
+                        task,
+                        combos,
+                        task % prepared.len(),
+                    )?;
+                    task += threads;
+                }
+                Ok(checksum)
+            }));
+        }
+        handles
+            .into_iter()
+            .map(|handle| {
+                handle
+                    .join()
+                    .map_err(|_| "terminal CFV worker panicked".to_string())?
+            })
+            .try_fold(0.0f64, |total, checksum| {
+                checksum.map(|value| total + value)
+            })
+    })?;
+    let eval_elapsed_ms = started_eval.elapsed().as_secs_f64() * 1000.0;
+    let calls_per_second = if eval_elapsed_ms > 0.0 {
+        calls as f64 / (eval_elapsed_ms / 1000.0)
+    } else {
+        0.0
+    };
+
+    Ok(TerminalCfvParallelSmoke {
+        board_count: prepared.len(),
+        calls,
+        threads,
+        prepare_elapsed_ms,
+        eval_elapsed_ms,
+        calls_per_second,
+        checksum,
+    })
+}
+
+fn run_terminal_cfv_smoke_call(
+    prepared: &[PreparedTerminalBoard],
+    hero_reach: &[f32],
+    villain_reach: &[f32],
+    scratch: &mut TerminalCfvScratch,
+    task: usize,
+    combos: usize,
+    board_index: usize,
+) -> Result<f64, String> {
+    let board = &prepared[board_index];
+    terminal_cfv_prefix_blocker_into(board, hero_reach, villain_reach, scratch)?;
+    let sample = task % combos;
+    Ok(scratch.hero_values[sample] as f64 * 0.5
+        + scratch.villain_values[(sample * 37) % combos] as f64 * 0.25)
 }
 
 impl TerminalCfvScratch {
@@ -190,56 +306,80 @@ fn side_values_prefix_blocker_into(
     values: &mut [f32],
 ) {
     let combos = &prepared.combos;
-    let strengths = &prepared.strengths;
     prefix[0] = 0.0f32;
     for (sorted_index, combo_index) in prepared.order.iter().enumerate() {
         prefix[sorted_index + 1] = prefix[sorted_index] + opponent_reach[*combo_index];
     }
     let total = prefix[combos.len()];
     for hero in 0..combos.len() {
-        let strength = strengths[hero];
         let (lower, upper) = prepared.group_bounds[hero];
         let weaker = prefix[lower];
         let stronger = total - prefix[upper];
         let mut value = weaker - stronger;
-        let (blocker_start, blocker_end) = prepared.blocker_ranges[hero];
-        for blocker_offset in blocker_start..blocker_end {
-            let villain = prepared.blockers[blocker_offset] as usize;
-            let blocked = opponent_reach[villain];
-            if strengths[villain] < strength {
-                value -= blocked;
-            } else if strengths[villain] > strength {
-                value += blocked;
-            }
+
+        let (weak_start, weak_end) = prepared.weaker_blocker_ranges[hero];
+        for blocker in &prepared.weaker_blockers[weak_start..weak_end] {
+            value -= opponent_reach[*blocker as usize];
+        }
+        let (strong_start, strong_end) = prepared.stronger_blocker_ranges[hero];
+        for blocker in &prepared.stronger_blockers[strong_start..strong_end] {
+            value += opponent_reach[*blocker as usize];
         }
         values[hero] = value;
     }
 }
 
-fn blocker_table(combos: &[PrivateCombo]) -> (Vec<(usize, usize)>, Vec<u16>) {
+fn card_combo_table(combos: &[PrivateCombo]) -> Vec<Vec<u16>> {
     let mut card_lists = vec![Vec::new(); 52];
     for (index, combo) in combos.iter().enumerate() {
         card_lists[combo.first.index()].push(index as u16);
         card_lists[combo.second.index()].push(index as u16);
     }
+    card_lists
+}
 
-    let mut ranges = Vec::with_capacity(combos.len());
-    let mut blockers = Vec::with_capacity(combos.len() * 92);
+struct SplitBlockerTables {
+    weaker_ranges: Vec<(usize, usize)>,
+    weaker: Vec<u16>,
+    stronger_ranges: Vec<(usize, usize)>,
+    stronger: Vec<u16>,
+}
+
+fn split_blocker_tables(combos: &[PrivateCombo], strengths: &[u64]) -> SplitBlockerTables {
+    let card_lists = card_combo_table(combos);
+    let mut weaker_ranges = Vec::with_capacity(combos.len());
+    let mut weaker = Vec::with_capacity(combos.len() * 46);
+    let mut stronger_ranges = Vec::with_capacity(combos.len());
+    let mut stronger = Vec::with_capacity(combos.len() * 46);
+
     for (hero, combo) in combos.iter().enumerate() {
-        let start = blockers.len();
-        for blocker in &card_lists[combo.first.index()] {
-            if *blocker != hero as u16 {
-                blockers.push(*blocker);
+        let hero_strength = strengths[hero];
+        let weaker_start = weaker.len();
+        let stronger_start = stronger.len();
+
+        for card in [combo.first, combo.second] {
+            for blocker in &card_lists[card.index()] {
+                if *blocker == hero as u16 {
+                    continue;
+                }
+                let villain = *blocker as usize;
+                match strengths[villain].cmp(&hero_strength) {
+                    Ordering::Less => weaker.push(*blocker),
+                    Ordering::Greater => stronger.push(*blocker),
+                    Ordering::Equal => {}
+                }
             }
         }
-        for blocker in &card_lists[combo.second.index()] {
-            if *blocker != hero as u16 {
-                blockers.push(*blocker);
-            }
-        }
-        ranges.push((start, blockers.len()));
+        weaker_ranges.push((weaker_start, weaker.len()));
+        stronger_ranges.push((stronger_start, stronger.len()));
     }
-    (ranges, blockers)
+
+    SplitBlockerTables {
+        weaker_ranges,
+        weaker,
+        stronger_ranges,
+        stronger,
+    }
 }
 
 fn validate_reach(input: &TerminalCfvInput, combos: usize) -> Result<(), String> {
@@ -249,6 +389,30 @@ fn validate_reach(input: &TerminalCfvInput, combos: usize) -> Result<(), String>
         ));
     }
     Ok(())
+}
+
+fn river_boards_from_flop(flop: &Board) -> Result<Vec<Board>, String> {
+    let deck = flop.remaining_deck();
+    let mut boards = Vec::with_capacity(deck.len() * (deck.len() - 1) / 2);
+    for turn_index in 0..deck.len() {
+        for river_index in turn_index + 1..deck.len() {
+            let board = flop.push(deck[turn_index])?.push(deck[river_index])?;
+            boards.push(board);
+        }
+    }
+    Ok(boards)
+}
+
+fn deterministic_reach(
+    combos: usize,
+    offset: usize,
+    period: usize,
+    base: f32,
+    step: f32,
+) -> Vec<f32> {
+    (0..combos)
+        .map(|index| base + ((index + offset) % period) as f32 * step)
+        .collect()
 }
 
 fn combo_strengths(board: &Board, combos: &[PrivateCombo]) -> Vec<u64> {
@@ -544,6 +708,17 @@ mod tests {
             assert_eq!(scratch.hero_values.capacity(), hero_capacity);
             assert_eq!(scratch.villain_values.capacity(), villain_capacity);
         }
+    }
+
+    #[test]
+    fn parallel_smoke_generates_river_boards_and_calls_cfv() {
+        let flop = Board::from_str("As7h2c").unwrap();
+        let smoke = terminal_cfv_parallel_smoke(&flop, 64, 2).unwrap();
+        assert_eq!(smoke.board_count, 1176);
+        assert_eq!(smoke.calls, 64);
+        assert!(smoke.threads >= 1);
+        assert!(smoke.calls_per_second > 0.0);
+        assert!(smoke.checksum.is_finite());
     }
 
     fn slow_best_7_card_strength(cards: [Card; 7]) -> u64 {
