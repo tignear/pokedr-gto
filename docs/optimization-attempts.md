@@ -4,6 +4,19 @@ This file records optimization attempts that failed, were reverted, or were too
 small to count as a strategic direction. Add entries before retrying similar
 ideas.
 
+## 2026-06-06: Resident compact regret plus resident reach context
+
+- Tried: allocate all compact regret chunks for the full `As7h2c` tree and run
+  compact reach propagation using the normal resident public-tree context.
+- Expected: `44` compact chunks should fit as roughly `5.44GiB` of f32 regrets,
+  leaving enough room for reach buffers.
+- Result: OOM on D3D12/DZN. Removing terminal/value buffers from the reach smoke
+  context was not enough; one-shot submission of all sliced reach buffers also
+  OOMed because temporary edge/group buffers stayed alive until submit.
+- Decision: do not require all compact regret chunks and all reach work buffers
+  to be resident together. Use chunk streaming and batched submits for compact
+  reach, then extend the same streaming design to the real solver path.
+
 ## 2026-06-06: Protect reach-tile public ranges in compact chunks
 
 - Tried: choose compact private CFR chunk boundaries so every reach-edge tile's

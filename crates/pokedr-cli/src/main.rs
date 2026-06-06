@@ -330,6 +330,10 @@ fn run_gpu_compact_state_smoke(args: FlopSolveArgs) {
         "reach_tiles_requiring_split: {}",
         summary.reach_tiles_requiring_split
     );
+    println!(
+        "compact_reach_dispatch_slices: {}",
+        summary.compact_reach_dispatch_slices
+    );
 }
 
 fn run_gpu_smoke() {

@@ -117,6 +117,7 @@ pub struct FixedFlopCompactSmokeSummary {
     pub compact_context_action_slots: usize,
     pub uncovered_reach_tiles: usize,
     pub reach_tiles_requiring_split: usize,
+    pub compact_reach_dispatch_slices: usize,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -644,7 +645,22 @@ pub fn fixed_flop_compact_smoke(
         .map(|chunk| chunk.action_slots)
         .max()
         .unwrap_or(0);
-    let (compact_context_action_slots, uncovered_reach_tiles) = backend
+    let (compact_context_action_slots, uncovered_reach_tiles, compact_reach_dispatch_slices) =
+        backend.compact_public_tree_reach_smoke_with_chunk_plan(
+            &linearized.nodes,
+            &linearized.children,
+            &linearized.child_cards,
+            &combos,
+            &combo_legal,
+            &hero_weights,
+            &villain_weights,
+            &linearized.showdown_boards,
+            compact_config.clone(),
+            max_chunk_bytes,
+            2,
+            1,
+        );
+    let (context_slots_check, uncovered_check) = backend
         .compact_public_tree_context_smoke_with_chunks(
             &linearized.nodes,
             &linearized.children,
@@ -656,6 +672,8 @@ pub fn fixed_flop_compact_smoke(
             &linearized.showdown_boards,
             Some(&chunks),
         );
+    debug_assert_eq!(compact_context_action_slots, context_slots_check);
+    debug_assert_eq!(uncovered_reach_tiles, uncovered_check);
     Some(FixedFlopCompactSmokeSummary {
         public_infosets: compact_config.public_infosets(),
         public_actions: compact_config.public_actions(),
@@ -666,6 +684,7 @@ pub fn fixed_flop_compact_smoke(
         compact_context_action_slots,
         uncovered_reach_tiles,
         reach_tiles_requiring_split: uncovered_reach_tiles,
+        compact_reach_dispatch_slices,
     })
 }
 

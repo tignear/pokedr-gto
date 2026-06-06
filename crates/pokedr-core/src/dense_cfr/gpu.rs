@@ -2072,6 +2072,7 @@ impl GpuDenseCfrBackend {
         combos: &[GpuPrivateCombo],
         showdown_boards: &[GpuFinalBoard],
         combo_live_masks: &[Vec<u32>],
+        include_terminal_work: bool,
     ) -> Vec<Vec<GpuPublicTreeLayerTileBuffers>> {
         layered
             .layers
@@ -2129,12 +2130,16 @@ impl GpuDenseCfrBackend {
                             node_end,
                             combos.len(),
                         );
-                        let showdown_terminal_group_data = terminal_group_data(
-                            &tile_nodes,
-                            &showdown_terminal_nodes,
-                            combos,
-                            showdown_boards,
-                        );
+                        let showdown_terminal_group_data = if include_terminal_work {
+                            terminal_group_data(
+                                &tile_nodes,
+                                &showdown_terminal_nodes,
+                                combos,
+                                showdown_boards,
+                            )
+                        } else {
+                            Vec::new()
+                        };
                         let node_buffer = readonly_buffer(
                             &self.device,
                             "public tree layer tile nodes",
@@ -2176,16 +2181,17 @@ impl GpuDenseCfrBackend {
                             "public tree layer tile combo live mask",
                             &tile_combo_live,
                         );
+                        let value_buffer_len = if include_terminal_work { value_len } else { 1 };
                         let hero_values_buffer = uninit_storage_buffer(
                             &self.device,
                             "public tree layer tile hero values",
-                            value_len,
+                            value_buffer_len,
                             true,
                         );
                         let villain_values_buffer = uninit_storage_buffer(
                             &self.device,
                             "public tree layer tile villain values",
-                            value_len,
+                            value_buffer_len,
                             true,
                         );
                         let showdown_terminal_groups = showdown_terminal_group_data
@@ -2415,6 +2421,124 @@ impl GpuDenseCfrBackend {
             pass.set_bind_group(0, &bind_group, &[]);
             pass.dispatch_workgroups(x_groups, y_groups, 1);
         }
+    }
+
+    fn submit_compact_layer_reach_edges_batched(
+        &self,
+        ctx: &GpuPublicTreeIterationContext,
+        state: &GpuCompactPrivateCfrState,
+        br_player: u32,
+        iteration: usize,
+    ) -> usize {
+        const SUBMIT_BATCH_SLICES: usize = 64;
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("compact public tree reach edge smoke encoder"),
+            });
+        let mut dispatch_slices = 0usize;
+        let mut pending_slices = 0usize;
+        for edge_tile in &ctx.layered.reach_edge_tiles {
+            let parent_tile_index = edge_tile.parent_tile.node_start / ctx.layered.node_tile_size;
+            let child_tile_index = edge_tile.child_tile.node_start / ctx.layered.node_tile_size;
+            let parent_tile = &ctx.layer_tiles[edge_tile.parent_layer][parent_tile_index];
+            let child_tile = &ctx.layer_tiles[edge_tile.child_layer][child_tile_index];
+            let parent_layer_nodes = &ctx.layered.layers[edge_tile.parent_layer].nodes
+                [parent_tile.node_start..parent_tile.node_end];
+            let slices = compact_reach_slices_for_tile(edge_tile, parent_layer_nodes, state);
+            for slice in slices {
+                if slice.groups.is_empty() {
+                    continue;
+                }
+                let (regrets_buffer, prediction_buffer, public_action_base) =
+                    if let Some(chunk_index) = slice.chunk_index {
+                        let chunk = &state.chunks[chunk_index];
+                        (
+                            &chunk.regrets,
+                            chunk
+                                .prediction
+                                .as_ref()
+                                .unwrap_or(&ctx.empty_storage_buffer),
+                            chunk.chunk.public_action_start as u32,
+                        )
+                    } else {
+                        (&ctx.empty_storage_buffer, &ctx.empty_storage_buffer, 0)
+                    };
+                let edge_buffer = readonly_buffer(
+                    &self.device,
+                    "public tree compact reach sliced edges",
+                    &slice.edges,
+                );
+                let group_buffer = readonly_buffer(
+                    &self.device,
+                    "public tree compact reach sliced groups",
+                    &slice.groups,
+                );
+                let invocation_count = slice.groups.len() * ctx.combos_len;
+                let (x_groups, y_groups, x_invocations) = dispatch_grid(invocation_count);
+                let params = uniform_buffer(
+                    &self.device,
+                    "public tree compact reach edge params",
+                    &[GpuPublicTreeParams {
+                        combo_count: ctx.combos_len as u32,
+                        node_count: 0,
+                        max_actions: ctx.actions as u32,
+                        output_len: x_invocations,
+                        pair_start: variant_code(state.variant),
+                        chunk_pairs: slice.groups.len() as u32,
+                        _pad0: br_player,
+                        _pad1: variant_prediction_eta(state.variant, iteration).to_bits(),
+                        _pad2: public_action_base,
+                        _pad3: 0,
+                    }],
+                );
+                let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("public tree compact reach edge bind group"),
+                    layout: &self.public_tree_compact_reach_edge_bind_group_layout,
+                    entries: &[
+                        bind_entry(0, &parent_tile.node_buffer),
+                        bind_entry(1, &edge_buffer),
+                        bind_entry(2, &group_buffer),
+                        bind_entry(3, &ctx.combo_buffer),
+                        bind_entry(4, &ctx.root_weights_buffer),
+                        bind_entry(5, regrets_buffer),
+                        bind_entry(6, &parent_tile.hero_reaches_buffer),
+                        bind_entry(7, &parent_tile.villain_reaches_buffer),
+                        bind_entry(8, &parent_tile.combo_live_buffer),
+                        bind_entry(9, &child_tile.hero_reaches_buffer),
+                        bind_entry(10, &child_tile.villain_reaches_buffer),
+                        bind_entry(11, &child_tile.combo_live_buffer),
+                        bind_entry(12, prediction_buffer),
+                        bind_entry(13, &params),
+                        bind_entry(14, ctx.public_action_offsets_buffer()),
+                    ],
+                });
+                {
+                    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("public tree compact reach edge pass"),
+                        timestamp_writes: None,
+                    });
+                    pass.set_pipeline(&self.public_tree_compact_reach_edge_pipeline);
+                    pass.set_bind_group(0, &bind_group, &[]);
+                    pass.dispatch_workgroups(x_groups, y_groups, 1);
+                }
+                dispatch_slices += 1;
+                pending_slices += 1;
+                if pending_slices >= SUBMIT_BATCH_SLICES {
+                    self.queue.submit(Some(encoder.finish()));
+                    encoder = self
+                        .device
+                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                            label: Some("compact public tree reach edge smoke encoder"),
+                        });
+                    pending_slices = 0;
+                }
+            }
+        }
+        if pending_slices > 0 {
+            self.queue.submit(Some(encoder.finish()));
+        }
+        dispatch_slices
     }
 
     fn backup_layer_values(
@@ -2948,6 +3072,7 @@ impl GpuDenseCfrBackend {
         infosets: usize,
         actions: usize,
         materialize_dense_outputs: bool,
+        include_terminal_work: bool,
     ) -> GpuPublicTreeIterationContext {
         assert!(!nodes.is_empty());
         assert_eq!(combo_legal.len(), combos.len());
@@ -3043,22 +3168,30 @@ impl GpuDenseCfrBackend {
             1,
             false,
         );
-        let fold_terminal_nodes: Vec<_> = nodes
-            .iter()
-            .enumerate()
-            .filter_map(|(index, node)| {
-                (node.kind != 0 && node.kind != 1 && node.terminal_kind != 2)
-                    .then_some(index as u32)
-            })
-            .collect();
-        let showdown_terminal_nodes: Vec<_> = nodes
-            .iter()
-            .enumerate()
-            .filter_map(|(index, node)| {
-                (node.kind != 0 && node.kind != 1 && node.terminal_kind == 2)
-                    .then_some(index as u32)
-            })
-            .collect();
+        let fold_terminal_nodes: Vec<_> = if include_terminal_work {
+            nodes
+                .iter()
+                .enumerate()
+                .filter_map(|(index, node)| {
+                    (node.kind != 0 && node.kind != 1 && node.terminal_kind != 2)
+                        .then_some(index as u32)
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let showdown_terminal_nodes: Vec<_> = if include_terminal_work {
+            nodes
+                .iter()
+                .enumerate()
+                .filter_map(|(index, node)| {
+                    (node.kind != 0 && node.kind != 1 && node.terminal_kind == 2)
+                        .then_some(index as u32)
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         let public_infoset_count = nodes_public_infoset_count(nodes);
         let max_showdown_boards = showdown_terminal_nodes
             .iter()
@@ -3066,18 +3199,26 @@ impl GpuDenseCfrBackend {
             .max()
             .unwrap_or(1)
             .max(1);
-        let (blocker_neighbors, blocker_neighbor_stride) = showdown_blocker_neighbors(combos);
+        let (blocker_neighbors, blocker_neighbor_stride) = if include_terminal_work {
+            showdown_blocker_neighbors(combos)
+        } else {
+            (vec![0u32], 1)
+        };
         let terminal_blocker_neighbors_buffer = readonly_buffer(
             &self.device,
             "public tree terminal blocker neighbors",
             &blocker_neighbors,
         );
         let default_max_terminal_prefix_pairs = 8_000_000usize;
-        let max_terminal_prefix_pairs = std::env::var("POKEDR_GPU_MAX_TERMINAL_PREFIX_PAIRS")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(default_max_terminal_prefix_pairs)
-            .max(max_showdown_boards * (combos.len() + 1));
+        let max_terminal_prefix_pairs = if include_terminal_work {
+            std::env::var("POKEDR_GPU_MAX_TERMINAL_PREFIX_PAIRS")
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(default_max_terminal_prefix_pairs)
+                .max(max_showdown_boards * (combos.len() + 1))
+        } else {
+            1
+        };
         let terminal_chunk_size =
             (max_terminal_prefix_pairs / (max_showdown_boards * (combos.len() + 1))).max(1);
         let terminal_prefix_pairs_buffer = uninit_storage_buffer(
@@ -3087,7 +3228,11 @@ impl GpuDenseCfrBackend {
             false,
         );
         const DECISION_AGGREGATE_SLOTS: usize = 53;
-        let decision_aggregate_len = public_infoset_count * DECISION_AGGREGATE_SLOTS;
+        let decision_aggregate_len = if include_terminal_work {
+            public_infoset_count * DECISION_AGGREGATE_SLOTS
+        } else {
+            1
+        };
         let hero_decision_aggregates_buffer = uninit_storage_buffer(
             &self.device,
             "public tree hero decision aggregates",
@@ -3150,6 +3295,7 @@ impl GpuDenseCfrBackend {
             combos,
             showdown_boards,
             &combo_live_masks,
+            include_terminal_work,
         );
         if std::env::var_os("POKEDR_GPU_TERMINAL_GROUP_TRACE").is_some() {
             let mut groups_by_board_count = BTreeMap::<usize, (usize, usize)>::new();
@@ -3554,6 +3700,7 @@ impl GpuDenseCfrBackend {
             state.infosets,
             state.actions,
             true,
+            true,
         );
         if let Some(start) = setup_start {
             eprintln!(
@@ -3678,6 +3825,7 @@ impl GpuDenseCfrBackend {
             showdown_boards,
             state.infosets,
             state.actions,
+            true,
             true,
         );
         if let Some(start) = setup_start {
@@ -4009,6 +4157,7 @@ impl GpuDenseCfrBackend {
             state.infosets,
             state.actions,
             true,
+            true,
         );
         if let Some(start) = setup_start {
             eprintln!(
@@ -4090,6 +4239,7 @@ impl GpuDenseCfrBackend {
             showdown_boards,
             state.infosets,
             state.actions,
+            true,
             true,
         );
         if let Some(start) = setup_start {
@@ -4262,6 +4412,7 @@ impl GpuDenseCfrBackend {
             nodes_public_infoset_count(nodes) * combos.len(),
             nodes_max_action_count(nodes),
             false,
+            false,
         );
         let uncovered_reach_tiles = chunks
             .map(|chunks| compact_uncovered_reach_tiles(&context, chunks))
@@ -4269,6 +4420,113 @@ impl GpuDenseCfrBackend {
         (
             context.compact_private_action_slots(),
             uncovered_reach_tiles,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn compact_public_tree_reach_smoke_with_state(
+        &self,
+        nodes: &[GpuPublicTreeNode],
+        children: &[u32],
+        child_cards: &[u32],
+        combos: &[GpuPrivateCombo],
+        combo_legal: &[u32],
+        hero_weights: &[f32],
+        villain_weights: &[f32],
+        showdown_boards: &[GpuFinalBoard],
+        state: &GpuCompactPrivateCfrState,
+        br_player: u32,
+        iteration: usize,
+    ) -> (usize, usize, usize) {
+        let context = self.public_tree_iteration_context(
+            nodes,
+            children,
+            child_cards,
+            combos,
+            combo_legal,
+            hero_weights,
+            villain_weights,
+            showdown_boards,
+            nodes_public_infoset_count(nodes) * combos.len(),
+            nodes_max_action_count(nodes),
+            false,
+            false,
+        );
+        let chunks: Vec<_> = state.chunks.iter().map(|chunk| chunk.chunk).collect();
+        let uncovered_reach_tiles = compact_uncovered_reach_tiles(&context, &chunks);
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("compact public tree reach init smoke encoder"),
+            });
+        self.propagate_layer_reach_inits(&mut encoder, &context, state.variant, iteration);
+        self.queue.submit(Some(encoder.finish()));
+        let dispatch_slices =
+            self.submit_compact_layer_reach_edges_batched(&context, state, br_player, iteration);
+        (
+            context.compact_private_action_slots(),
+            uncovered_reach_tiles,
+            dispatch_slices,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn compact_public_tree_reach_smoke_with_chunk_plan(
+        &self,
+        nodes: &[GpuPublicTreeNode],
+        children: &[u32],
+        child_cards: &[u32],
+        combos: &[GpuPrivateCombo],
+        combo_legal: &[u32],
+        hero_weights: &[f32],
+        villain_weights: &[f32],
+        showdown_boards: &[GpuFinalBoard],
+        config: CompactPrivateCfrConfig,
+        max_chunk_bytes: usize,
+        br_player: u32,
+        iteration: usize,
+    ) -> (usize, usize, usize) {
+        let chunks = config.chunk_by_action_bytes(max_chunk_bytes);
+        let largest_chunk_slots = chunks
+            .iter()
+            .map(|chunk| chunk.action_slots)
+            .max()
+            .unwrap_or(1)
+            .max(1);
+        let zeros = vec![0.0; largest_chunk_slots];
+        let scratch_regrets = storage_buffer(
+            &self.device,
+            "compact private streamed regret scratch",
+            &zeros,
+        );
+        let state = GpuCompactPrivateCfrState {
+            public_infosets: config.public_infosets(),
+            public_actions: config.public_actions(),
+            combos: config.combos,
+            variant: config.variant,
+            chunks: chunks
+                .into_iter()
+                .map(|chunk| GpuCompactPrivateCfrChunkState {
+                    chunk,
+                    regrets: scratch_regrets.clone(),
+                    prediction: None,
+                    strategy_sum: None,
+                })
+                .collect(),
+        };
+        self.compact_public_tree_reach_smoke_with_state(
+            nodes,
+            children,
+            child_cards,
+            combos,
+            combo_legal,
+            hero_weights,
+            villain_weights,
+            showdown_boards,
+            &state,
+            br_player,
+            iteration,
         )
     }
 
@@ -4833,6 +5091,61 @@ fn compact_uncovered_reach_tiles(
             compact_chunk_covering_public_range(chunks, public_start, public_end).is_none()
         })
         .count()
+}
+
+struct CompactReachSlice {
+    chunk_index: Option<usize>,
+    edges: Vec<GpuPublicTreeEdge>,
+    groups: Vec<GpuPublicTreeEdgeGroup>,
+}
+
+fn compact_reach_slices_for_tile(
+    edge_tile: &GpuPublicTreeLayerEdgeTile,
+    parent_layer_nodes: &[GpuPublicTreeNode],
+    state: &GpuCompactPrivateCfrState,
+) -> Vec<CompactReachSlice> {
+    let mut by_chunk: BTreeMap<Option<usize>, CompactReachSlice> = BTreeMap::new();
+    for group in &edge_tile.groups {
+        let node = parent_layer_nodes[group.parent as usize];
+        let chunk_index = if node.kind == 0 {
+            Some(compact_chunk_index_for_public_infoset(
+                &state.chunks,
+                node.public_infoset as usize,
+            ))
+        } else {
+            None
+        };
+        let slice = by_chunk
+            .entry(chunk_index)
+            .or_insert_with(|| CompactReachSlice {
+                chunk_index,
+                edges: Vec::new(),
+                groups: Vec::new(),
+            });
+        let first_edge = slice.edges.len() as u32;
+        let edge_start = group.first_edge as usize;
+        let edge_end = edge_start + group.edge_count as usize;
+        slice
+            .edges
+            .extend_from_slice(&edge_tile.edges[edge_start..edge_end]);
+        slice.groups.push(GpuPublicTreeEdgeGroup {
+            first_edge,
+            ..*group
+        });
+    }
+    by_chunk.into_values().collect()
+}
+
+fn compact_chunk_index_for_public_infoset(
+    chunks: &[GpuCompactPrivateCfrChunkState],
+    public_infoset: usize,
+) -> usize {
+    chunks
+        .iter()
+        .position(|chunk| {
+            chunk.chunk.public_start <= public_infoset && public_infoset < chunk.chunk.public_end
+        })
+        .expect("public infoset must be covered by compact chunk")
 }
 
 fn compact_chunk_covering_public_range(
