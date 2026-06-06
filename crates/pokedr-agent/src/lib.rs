@@ -586,6 +586,55 @@ pub fn gpu_backend_mode() -> BackendMode {
     }
 }
 
+pub fn fixed_flop_compact_context_smoke(
+    flop: [PokedrCard; 3],
+    config: PokedrAgentConfig,
+) -> Option<usize> {
+    let public_state = PublicState {
+        street: Street::Flop,
+        board: Board::new(flop.to_vec()),
+        pot: 4,
+        hero_invested: 2,
+        villain_invested: 2,
+        effective_stack: 100,
+        to_call: 0,
+        min_aggressive_amount: 2,
+        acting_player: Player::Hero,
+        raises_this_street: 0,
+        checks_this_street: 0,
+    };
+    let tree = SubgameTree::build(
+        public_state,
+        SubgameTreeConfig {
+            action_set: config.action_set.clone(),
+            max_raises_per_street: config.max_raises_per_street,
+        },
+    );
+    let layout = PostflopDenseLayout::from_tree(&tree);
+    let indexer = ComboIndexer::new();
+    let root_dead = root_board(&tree).deck_mask();
+    let (hero_weights, villain_weights) = fixed_flop_root_weights(&indexer, root_dead);
+    let backend = cfr_gpu_backend()?;
+    let matrix_cache = RefCell::new(ShowdownMatrixCache::new(showdown_matrix_cache_capacity()));
+    let linearized = linearize_gpu_public_tree(&tree, &layout, &backend, &config, &matrix_cache)?;
+    let combos = gpu_private_combos();
+    let combo_legal: Vec<u32> = indexer
+        .combos()
+        .iter()
+        .map(|combo| (!combo.collides_with(root_dead)) as u32)
+        .collect();
+    Some(backend.compact_public_tree_context_smoke(
+        &linearized.nodes,
+        &linearized.children,
+        &linearized.child_cards,
+        &combos,
+        &combo_legal,
+        &hero_weights,
+        &villain_weights,
+        &linearized.showdown_boards,
+    ))
+}
+
 pub fn solve_fixed_flop_once(
     flop: [PokedrCard; 3],
     config: PokedrAgentConfig,

@@ -229,6 +229,7 @@ struct GpuPublicTreeIterationContext {
     villain_decision_aggregates_buffer: wgpu::Buffer,
     fused_public_infoset_mask_buffer: wgpu::Buffer,
     split_public_infosets: Vec<u32>,
+    materializes_dense_outputs: bool,
 }
 
 struct GpuPublicTreeLayerTileBuffers {
@@ -2946,6 +2947,7 @@ impl GpuDenseCfrBackend {
         showdown_boards: &[GpuFinalBoard],
         infosets: usize,
         actions: usize,
+        materialize_dense_outputs: bool,
     ) -> GpuPublicTreeIterationContext {
         assert!(!nodes.is_empty());
         assert_eq!(combo_legal.len(), combos.len());
@@ -3007,22 +3009,32 @@ impl GpuDenseCfrBackend {
             "public tree public action offsets",
             &public_action_offsets,
         );
+        let dense_action_output_len = if materialize_dense_outputs {
+            action_len
+        } else {
+            1
+        };
+        let dense_infoset_output_len = if materialize_dense_outputs {
+            infosets
+        } else {
+            1
+        };
         let action_values_buffer = uninit_storage_buffer(
             &self.device,
             "public tree action values output",
-            action_len,
+            dense_action_output_len,
             true,
         );
         let reach_weights_buffer = uninit_storage_buffer(
             &self.device,
             "public tree reach weights output",
-            infosets,
+            dense_infoset_output_len,
             true,
         );
         let strategy_weights_buffer = uninit_storage_buffer(
             &self.device,
             "public tree strategy weights output",
-            infosets,
+            dense_infoset_output_len,
             true,
         );
         let empty_storage_buffer = uninit_storage_buffer(
@@ -3244,6 +3256,7 @@ impl GpuDenseCfrBackend {
             villain_decision_aggregates_buffer,
             fused_public_infoset_mask_buffer,
             split_public_infosets,
+            materializes_dense_outputs: materialize_dense_outputs,
         }
     }
 
@@ -3257,6 +3270,10 @@ impl GpuDenseCfrBackend {
         iteration: usize,
         split_only_action_edges: bool,
     ) -> Result<(GpuPublicTreeOutputBuffers, usize, usize), GpuCfrError> {
+        assert!(
+            ctx.materializes_dense_outputs,
+            "dense output materialization is disabled for compact public-tree context"
+        );
         if std::env::var_os("POKEDR_SOLVER_PROGRESS_OFF").is_none() {
             eprintln!(
                 "pokedr: gpu public tree cfv nodes={} combos={} node_combo_values={} folds={} showdowns={} terminal_chunk={}",
@@ -3536,6 +3553,7 @@ impl GpuDenseCfrBackend {
             showdown_boards,
             state.infosets,
             state.actions,
+            true,
         );
         if let Some(start) = setup_start {
             eprintln!(
@@ -3660,6 +3678,7 @@ impl GpuDenseCfrBackend {
             showdown_boards,
             state.infosets,
             state.actions,
+            true,
         );
         if let Some(start) = setup_start {
             eprintln!(
@@ -3989,6 +4008,7 @@ impl GpuDenseCfrBackend {
             showdown_boards,
             state.infosets,
             state.actions,
+            true,
         );
         if let Some(start) = setup_start {
             eprintln!(
@@ -4070,6 +4090,7 @@ impl GpuDenseCfrBackend {
             showdown_boards,
             state.infosets,
             state.actions,
+            true,
         );
         if let Some(start) = setup_start {
             eprintln!(
@@ -4155,6 +4176,34 @@ impl GpuDenseCfrBackend {
         max_chunk_bytes: usize,
     ) -> GpuCompactPrivateCfrState {
         self.zeroed_compact_private_state_with_buffers(config, max_chunk_bytes, false, false)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn compact_public_tree_context_smoke(
+        &self,
+        nodes: &[GpuPublicTreeNode],
+        children: &[u32],
+        child_cards: &[u32],
+        combos: &[GpuPrivateCombo],
+        combo_legal: &[u32],
+        hero_weights: &[f32],
+        villain_weights: &[f32],
+        showdown_boards: &[GpuFinalBoard],
+    ) -> usize {
+        let context = self.public_tree_iteration_context(
+            nodes,
+            children,
+            child_cards,
+            combos,
+            combo_legal,
+            hero_weights,
+            villain_weights,
+            showdown_boards,
+            nodes_public_infoset_count(nodes) * combos.len(),
+            nodes_max_action_count(nodes),
+            false,
+        );
+        context.compact_private_action_slots()
     }
 
     fn zeroed_compact_private_state_with_buffers(
@@ -4687,6 +4736,15 @@ fn nodes_public_infoset_count(nodes: &[GpuPublicTreeNode]) -> usize {
         .map(|node| node.public_infoset as usize + 1)
         .max()
         .unwrap_or(0)
+}
+
+fn nodes_max_action_count(nodes: &[GpuPublicTreeNode]) -> usize {
+    nodes
+        .iter()
+        .filter(|node| node.kind == 0)
+        .map(|node| node.child_count as usize)
+        .max()
+        .unwrap_or(1)
 }
 
 fn public_action_offsets_from_nodes(nodes: &[GpuPublicTreeNode]) -> Vec<u32> {

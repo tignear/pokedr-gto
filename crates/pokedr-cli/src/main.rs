@@ -326,7 +326,7 @@ fn run_gpu_compact_state_smoke(args: FlopSolveArgs) {
     let tree = SubgameTree::build(
         public_state,
         SubgameTreeConfig {
-            action_set: config.action_set,
+            action_set: config.action_set.clone(),
             max_raises_per_street: config.max_raises_per_street,
         },
     );
@@ -365,6 +365,9 @@ fn run_gpu_compact_state_smoke(args: FlopSolveArgs) {
             .max()
             .unwrap_or(0)
     );
+    if let Some(context_slots) = pokedr_agent::fixed_flop_compact_context_smoke(flop, config) {
+        println!("compact_context_action_slots: {context_slots}");
+    }
 }
 
 fn run_gpu_smoke() {
