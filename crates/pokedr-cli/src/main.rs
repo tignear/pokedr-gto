@@ -13,6 +13,7 @@ use pokedr_core::{
 };
 use rusqlite::{Connection, params};
 use serde_json::{Value, json};
+use std::time::Instant;
 
 fn main() {
     match Cli::parse().command {
@@ -24,6 +25,7 @@ fn main() {
         Command::SolveFlop(args) => run_solve_flop(args),
         Command::SolveRiver(args) => run_solve_river(args),
         Command::SolveRiverBatch(args) => run_solve_river_batch(args),
+        Command::SolveRiverRunouts(args) => run_solve_river_runouts(args),
         Command::SolveFlopMetrics(args) => run_solve_flop_metrics(args),
         Command::SolveFlopReachSharing(args) => run_solve_flop_reach_sharing(args),
         Command::SolveFlopSweep(args) => run_solve_flop_sweep(args),
@@ -52,6 +54,7 @@ enum Command {
     SolveFlop(FlopSolveArgs),
     SolveRiver(RiverSolveArgs),
     SolveRiverBatch(RiverBatchSolveArgs),
+    SolveRiverRunouts(RiverRunoutSolveArgs),
     SolveFlopMetrics(FlopMetricsArgs),
     SolveFlopReachSharing(FlopReachSharingArgs),
     SolveFlopSweep(FlopSweepArgs),
@@ -89,6 +92,16 @@ struct RiverBatchSolveArgs {
         help = "Comma-separated fixed river boards"
     )]
     boards: Vec<String>,
+    #[command(flatten)]
+    solver: SolverOptions,
+}
+
+#[derive(Debug, Args, Clone)]
+struct RiverRunoutSolveArgs {
+    #[arg(default_value = "As7h2c", help = "3-card flop or 4-card turn board")]
+    board: String,
+    #[arg(long, help = "Limit generated river boards for benchmarking")]
+    limit: Option<usize>,
     #[command(flatten)]
     solver: SolverOptions,
 }
@@ -662,6 +675,45 @@ fn run_solve_river_batch(args: RiverBatchSolveArgs) {
     println!("iterations: {}", summary.iterations);
     println!("elapsed: {:.2}s", summary.total_elapsed_secs);
     println!("elapsed_per_board: {:.3}s", per_board);
+}
+
+fn run_solve_river_runouts(args: RiverRunoutSolveArgs) {
+    let prefix = parse_runout_prefix(&args.board).unwrap_or_else(|error| {
+        eprintln!("{error}");
+        std::process::exit(2);
+    });
+    let mut boards = generate_river_runout_boards(&prefix);
+    let generated_boards = boards.len();
+    if let Some(limit) = args.limit {
+        boards.truncate(limit);
+    }
+    if boards.is_empty() {
+        eprintln!("no river boards generated");
+        std::process::exit(2);
+    }
+    let config = fixed_flop_config(&args.solver);
+    println!(
+        "solving river runouts prefix={} generated={} solving={} iterations={} variant={:?}",
+        format_pokedr_cards_for_cli(&prefix),
+        generated_boards,
+        boards.len(),
+        config.cfr_iterations,
+        config.cfr_variant
+    );
+    let started = Instant::now();
+    let summary = pokedr_agent::solve_fixed_river_batch(&boards, config);
+    let elapsed = started.elapsed().as_secs_f32();
+    let per_board = elapsed / summary.boards.len().max(1) as f32;
+    println!("boards: {}", summary.boards.len());
+    println!("generated_boards: {generated_boards}");
+    println!("iterations: {}", summary.iterations);
+    println!("elapsed: {elapsed:.3}s");
+    println!("elapsed_per_board: {per_board:.6}s");
+    println!(
+        "projected_all_generated: {:.3}s",
+        per_board * generated_boards as f32
+    );
+    println!("projected_49x48_ordered: {:.3}s", per_board * 49.0 * 48.0);
 }
 
 fn run_solve_flop_metrics(args: FlopMetricsArgs) {
@@ -3439,6 +3491,80 @@ fn parse_flop(input: &str) -> Result<[Card; 3], String> {
         return Err("flop contains duplicate cards".to_string());
     }
     Ok(cards)
+}
+
+fn parse_runout_prefix(input: &str) -> Result<Vec<Card>, String> {
+    let tokens = split_compact_cards(input)?;
+    if !(tokens.len() == 3 || tokens.len() == 4) {
+        return Err("runout prefix must contain exactly 3 or 4 cards".to_string());
+    }
+    let cards = tokens
+        .iter()
+        .map(|token| parse_card(token))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mask = cards
+        .iter()
+        .fold(0u64, |mask, card| mask | card.deck_mask());
+    if mask.count_ones() as usize != cards.len() {
+        return Err("runout prefix contains duplicate cards".to_string());
+    }
+    Ok(cards)
+}
+
+fn generate_river_runout_boards(prefix: &[Card]) -> Vec<[Card; 5]> {
+    let dead = prefix
+        .iter()
+        .fold(0u64, |mask, card| mask | card.deck_mask());
+    let remaining = full_deck()
+        .into_iter()
+        .filter(|card| card.deck_mask() & dead == 0)
+        .collect::<Vec<_>>();
+    let mut boards = Vec::new();
+    match prefix.len() {
+        3 => {
+            for first in 0..remaining.len() {
+                for second in first + 1..remaining.len() {
+                    boards.push([
+                        prefix[0],
+                        prefix[1],
+                        prefix[2],
+                        remaining[first],
+                        remaining[second],
+                    ]);
+                }
+            }
+        }
+        4 => {
+            for river in remaining {
+                boards.push([prefix[0], prefix[1], prefix[2], prefix[3], river]);
+            }
+        }
+        _ => {}
+    }
+    boards
+}
+
+fn full_deck() -> Vec<Card> {
+    const RANKS: [Rank; 13] = [
+        Rank::Two,
+        Rank::Three,
+        Rank::Four,
+        Rank::Five,
+        Rank::Six,
+        Rank::Seven,
+        Rank::Eight,
+        Rank::Nine,
+        Rank::Ten,
+        Rank::Jack,
+        Rank::Queen,
+        Rank::King,
+        Rank::Ace,
+    ];
+    const SUITS: [Suit; 4] = [Suit::Clubs, Suit::Diamonds, Suit::Hearts, Suit::Spades];
+    RANKS
+        .into_iter()
+        .flat_map(|rank| SUITS.into_iter().map(move |suit| Card::new(rank, suit)))
+        .collect()
 }
 
 fn parse_board_cards<const N: usize>(input: &str, expected: usize) -> Result<[Card; N], String> {

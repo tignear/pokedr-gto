@@ -38,5 +38,11 @@ It can solve many fixed river boards in one process and reuses the thread-local
 GPU backend. It now exposes the boundary CFVs needed by a trunk solver. It is
 still sequential per board; it is not yet a true batched GPU kernel.
 
+`solve-river-runouts` measures the current sequential baseline. On `As7h2c`
+with `64` generated river boards, `8` iterations took about `10.4s`
+(`0.162s/board`) and `1` iteration took about `7.4s` (`0.116s/board`). That
+projects to hundreds of seconds for `49*48` ordered runouts, so the current
+wrapper is not close to a sub-second batched river solver.
+
 The intended next step is grouping identical river tree shapes so one dispatch
 sequence processes multiple `(state, oop_weights, ip_weights)` inputs.
