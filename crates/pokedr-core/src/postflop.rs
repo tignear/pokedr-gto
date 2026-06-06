@@ -334,6 +334,28 @@ impl SubgameTree {
             .count()
     }
 
+    pub fn with_replaced_board(&self, board: Board) -> Self {
+        let mut tree = self.clone();
+        for node in &mut tree.nodes {
+            match &mut node.kind {
+                PublicNodeKind::Decision { state, .. } => {
+                    state.board = board.clone();
+                }
+                PublicNodeKind::Chance {
+                    board: node_board, ..
+                } => {
+                    *node_board = board.clone();
+                }
+                PublicNodeKind::Terminal {
+                    board: node_board, ..
+                } => {
+                    *node_board = board.clone();
+                }
+            }
+        }
+        tree
+    }
+
     fn push_node(&mut self, parent: Option<usize>, kind: PublicNodeKind) -> usize {
         let index = self.nodes.len();
         self.nodes.push(PublicNode {

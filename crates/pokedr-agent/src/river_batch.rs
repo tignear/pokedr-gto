@@ -1,4 +1,4 @@
-use std::{cell::RefCell, time::Instant};
+use std::{cell::RefCell, collections::HashMap, time::Instant};
 
 use pokedr_core::{
     cards::{Board, Card as PokedrCard},
@@ -49,6 +49,19 @@ pub struct RiverSubgameResult {
     pub state: DenseCfrState,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RiverSubgameShapeKey {
+    pot: u32,
+    hero_invested: u32,
+    villain_invested: u32,
+    effective_stack: u32,
+    to_call: u32,
+    min_aggressive_amount: u32,
+    acting_player: u8,
+    raises_this_street: u8,
+    checks_this_street: u8,
+}
+
 #[derive(Debug, Clone)]
 pub struct RiverBatchSolver {
     config: PokedrAgentConfig,
@@ -65,11 +78,16 @@ impl RiverBatchSolver {
 
     pub fn solve_fixed_boards(&self, boards: &[[PokedrCard; 5]]) -> FixedRiverBatchSolveSummary {
         let started = Instant::now();
-        let summaries = boards
+        let inputs = boards
             .iter()
             .copied()
-            .map(|board| self.solve_fixed_board(board).summary)
+            .map(RiverSubgameInput::with_default_ranges)
             .collect::<Vec<_>>();
+        let summaries = self
+            .solve_subgames(inputs)
+            .into_iter()
+            .map(|result| result.summary)
+            .collect();
         FixedRiverBatchSolveSummary {
             boards: summaries,
             iterations: self.config.cfr_iterations.max(1),
@@ -78,33 +96,82 @@ impl RiverBatchSolver {
     }
 
     pub fn solve_subgames(&self, inputs: Vec<RiverSubgameInput>) -> Vec<RiverSubgameResult> {
-        inputs
+        let mut groups: HashMap<RiverSubgameShapeKey, Vec<(usize, RiverSubgameInput)>> =
+            HashMap::new();
+        for (index, input) in inputs.into_iter().enumerate() {
+            input.validate();
+            groups
+                .entry(input.shape_key())
+                .or_default()
+                .push((index, input));
+        }
+
+        let mut indexed_results = Vec::new();
+        for group in groups.into_values() {
+            indexed_results.extend(self.solve_shape_group(group));
+        }
+        indexed_results.sort_by_key(|(index, _)| *index);
+        indexed_results
             .into_iter()
-            .map(|input| self.solve_subgame(input))
+            .map(|(_, result)| result)
             .collect()
     }
 
     pub fn solve_subgame(&self, input: RiverSubgameInput) -> RiverSubgameResult {
         input.validate();
-        let started = Instant::now();
-        let tree = SubgameTree::build(
-            input.public_state,
+        let template_tree = SubgameTree::build(
+            input.public_state.clone(),
             SubgameTreeConfig {
                 action_set: self.config.action_set.clone(),
                 max_raises_per_street: self.config.max_raises_per_street,
             },
         );
-        let layout = PostflopDenseLayout::from_tree(&tree);
+        let layout = PostflopDenseLayout::from_tree(&template_tree);
+        self.solve_subgame_with_layout(input, &template_tree, &layout)
+    }
+
+    fn solve_shape_group(
+        &self,
+        mut group: Vec<(usize, RiverSubgameInput)>,
+    ) -> Vec<(usize, RiverSubgameResult)> {
+        debug_assert!(!group.is_empty());
+        group.sort_by_key(|(index, _)| *index);
+        let template_state = group[0].1.public_state.clone();
+        let template_tree = SubgameTree::build(
+            template_state,
+            SubgameTreeConfig {
+                action_set: self.config.action_set.clone(),
+                max_raises_per_street: self.config.max_raises_per_street,
+            },
+        );
+        let layout = PostflopDenseLayout::from_tree(&template_tree);
+        group
+            .into_iter()
+            .map(|(index, input)| {
+                let result = self.solve_subgame_with_layout(input, &template_tree, &layout);
+                (index, result)
+            })
+            .collect()
+    }
+
+    fn solve_subgame_with_layout(
+        &self,
+        input: RiverSubgameInput,
+        template_tree: &SubgameTree,
+        layout: &PostflopDenseLayout,
+    ) -> RiverSubgameResult {
+        let started = Instant::now();
+        let tree = template_tree.with_replaced_board(input.public_state.board.clone());
         let state = solve_public_tree_cfr(
             &tree,
-            &layout,
+            layout,
             &self.config,
             &input.oop_weights,
             &input.ip_weights,
         );
         let (oop_cfv, ip_cfv) = river_root_average_profile_cfvs(
             &tree,
-            &layout,
+            layout,
             &state,
             &input.oop_weights,
             &input.ip_weights,
@@ -147,6 +214,23 @@ impl RiverSubgameInput {
         assert_eq!(self.public_state.board.cards().len(), 5);
         assert_eq!(self.oop_weights.len(), COMBO_COUNT);
         assert_eq!(self.ip_weights.len(), COMBO_COUNT);
+    }
+
+    pub fn shape_key(&self) -> RiverSubgameShapeKey {
+        RiverSubgameShapeKey {
+            pot: self.public_state.pot,
+            hero_invested: self.public_state.hero_invested,
+            villain_invested: self.public_state.villain_invested,
+            effective_stack: self.public_state.effective_stack,
+            to_call: self.public_state.to_call,
+            min_aggressive_amount: self.public_state.min_aggressive_amount,
+            acting_player: match self.public_state.acting_player {
+                Player::Hero => 0,
+                Player::Villain => 1,
+            },
+            raises_this_street: self.public_state.raises_this_street,
+            checks_this_street: self.public_state.checks_this_street,
+        }
     }
 }
 
