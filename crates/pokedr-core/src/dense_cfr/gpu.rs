@@ -202,12 +202,14 @@ struct GpuPublicTreeIterationContext {
     nodes_len: usize,
     combos_len: usize,
     actions: usize,
+    public_action_offsets: Vec<u32>,
     action_len: usize,
     output_len: usize,
     node_combo_len: usize,
     layered: GpuPublicTreeLayered,
     combo_buffer: wgpu::Buffer,
     root_weights_buffer: wgpu::Buffer,
+    public_action_offsets_buffer: wgpu::Buffer,
     action_values_buffer: wgpu::Buffer,
     reach_weights_buffer: wgpu::Buffer,
     strategy_weights_buffer: wgpu::Buffer,
@@ -340,6 +342,16 @@ struct GpuTerminalGroupData {
     terminal_refs: Vec<GpuTerminalRef>,
     combo_order: Vec<u32>,
     combo_bounds: Vec<u32>,
+}
+
+impl GpuPublicTreeIterationContext {
+    fn compact_private_action_slots(&self) -> usize {
+        self.public_action_offsets.last().copied().unwrap_or(0) as usize * self.combos_len
+    }
+
+    fn public_action_offsets_buffer(&self) -> &wgpu::Buffer {
+        &self.public_action_offsets_buffer
+    }
 }
 
 fn pack_showdown_bounds(bounds: GpuShowdownComboBounds) -> u32 {
@@ -2918,6 +2930,7 @@ impl GpuDenseCfrBackend {
                 &mut layered,
                 nodes_public_infoset_count(nodes),
             );
+        let public_action_offsets = public_action_offsets_from_nodes(nodes);
 
         let combo_buffer = readonly_buffer(&self.device, "public tree combos", combos);
         let mut root_weights = Vec::with_capacity(combos.len() * 2);
@@ -2937,6 +2950,11 @@ impl GpuDenseCfrBackend {
             &self.device,
             "public tree root reach weights",
             &root_weights,
+        );
+        let public_action_offsets_buffer = readonly_buffer(
+            &self.device,
+            "public tree public action offsets",
+            &public_action_offsets,
         );
         let action_values_buffer = uninit_storage_buffer(
             &self.device,
@@ -3150,12 +3168,14 @@ impl GpuDenseCfrBackend {
             nodes_len: nodes.len(),
             combos_len: combos.len(),
             actions,
+            public_action_offsets,
             action_len,
             output_len,
             node_combo_len,
             layered,
             combo_buffer,
             root_weights_buffer,
+            public_action_offsets_buffer,
             action_values_buffer,
             reach_weights_buffer,
             strategy_weights_buffer,
@@ -3925,6 +3945,14 @@ impl GpuDenseCfrBackend {
                 start.elapsed().as_secs_f64() * 1000.0
             );
         }
+        if std::env::var_os("POKEDR_GPU_COMPACT_TRACE").is_some() {
+            let _ = context.public_action_offsets_buffer();
+            eprintln!(
+                "pokedr: gpu compact context public_actions={} private_action_slots={}",
+                context.public_action_offsets.last().copied().unwrap_or(0),
+                context.compact_private_action_slots()
+            );
+        }
         let flush_interval = std::env::var("POKEDR_GPU_ITERATION_FLUSH")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
@@ -4610,6 +4638,27 @@ fn nodes_public_infoset_count(nodes: &[GpuPublicTreeNode]) -> usize {
         .unwrap_or(0)
 }
 
+fn public_action_offsets_from_nodes(nodes: &[GpuPublicTreeNode]) -> Vec<u32> {
+    let public_infoset_count = nodes_public_infoset_count(nodes);
+    let mut action_counts = vec![None; public_infoset_count];
+    for node in nodes.iter().filter(|node| node.kind == 0) {
+        let public_infoset = node.public_infoset as usize;
+        let previous = action_counts[public_infoset].replace(node.child_count);
+        assert!(
+            previous.is_none() || previous == Some(node.child_count),
+            "public infoset must have a stable action count"
+        );
+    }
+
+    let mut offsets = Vec::with_capacity(public_infoset_count + 1);
+    offsets.push(0);
+    for action_count in action_counts {
+        let action_count = action_count.expect("public infoset ids must be contiguous");
+        offsets.push(offsets.last().copied().unwrap_or(0) + action_count);
+    }
+    offsets
+}
+
 fn public_infoset_bind_base(public_infoset: usize) -> usize {
     public_infoset - public_infoset % 32
 }
@@ -5164,6 +5213,70 @@ mod tests {
                     )
             );
         }
+    }
+
+    #[test]
+    fn public_action_offsets_follow_decision_child_counts() {
+        let nodes = [
+            GpuPublicTreeNode {
+                kind: 0,
+                acting_player: 0,
+                public_infoset: 0,
+                first_child: 0,
+                child_count: 2,
+                terminal_kind: 0,
+                showdown_offset: 0,
+                _pad0: 0,
+                pot: 0.0,
+                hero_invested: 0.0,
+                _pad1: 0.0,
+                _pad2: 0.0,
+            },
+            GpuPublicTreeNode {
+                kind: 1,
+                acting_player: 0,
+                public_infoset: 0,
+                first_child: 0,
+                child_count: 0,
+                terminal_kind: 0,
+                showdown_offset: 0,
+                _pad0: 0,
+                pot: 0.0,
+                hero_invested: 0.0,
+                _pad1: 0.0,
+                _pad2: 0.0,
+            },
+            GpuPublicTreeNode {
+                kind: 0,
+                acting_player: 1,
+                public_infoset: 1,
+                first_child: 0,
+                child_count: 3,
+                terminal_kind: 0,
+                showdown_offset: 0,
+                _pad0: 0,
+                pot: 0.0,
+                hero_invested: 0.0,
+                _pad1: 0.0,
+                _pad2: 0.0,
+            },
+            GpuPublicTreeNode {
+                kind: 0,
+                acting_player: 0,
+                public_infoset: 2,
+                first_child: 0,
+                child_count: 1,
+                terminal_kind: 0,
+                showdown_offset: 0,
+                _pad0: 0,
+                pot: 0.0,
+                hero_invested: 0.0,
+                _pad1: 0.0,
+                _pad2: 0.0,
+            },
+        ];
+
+        assert_eq!(public_action_offsets_from_nodes(&nodes), vec![0, 2, 5, 6]);
     }
 
     #[test]
