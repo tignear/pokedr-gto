@@ -118,6 +118,8 @@ pub struct FixedFlopCompactSmokeSummary {
     pub uncovered_reach_tiles: usize,
     pub reach_tiles_requiring_split: usize,
     pub compact_reach_dispatch_slices: usize,
+    pub compact_update_dispatch_slices: usize,
+    pub split_public_infosets: usize,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -645,8 +647,13 @@ pub fn fixed_flop_compact_smoke(
         .map(|chunk| chunk.action_slots)
         .max()
         .unwrap_or(0);
-    let (compact_context_action_slots, uncovered_reach_tiles, compact_reach_dispatch_slices) =
-        backend.compact_public_tree_reach_smoke_with_chunk_plan(
+    let (
+        compact_context_action_slots,
+        uncovered_reach_tiles,
+        compact_reach_dispatch_slices,
+        compact_update_dispatch_slices,
+    ) = backend
+        .compact_public_tree_iteration_smoke_with_chunk_plan(
             &linearized.nodes,
             &linearized.children,
             &linearized.child_cards,
@@ -659,8 +666,9 @@ pub fn fixed_flop_compact_smoke(
             max_chunk_bytes,
             2,
             1,
-        );
-    let (context_slots_check, uncovered_check) = backend
+        )
+        .ok()?;
+    let (context_slots_check, uncovered_check, split_public_infosets) = backend
         .compact_public_tree_context_smoke_with_chunks(
             &linearized.nodes,
             &linearized.children,
@@ -685,6 +693,8 @@ pub fn fixed_flop_compact_smoke(
         uncovered_reach_tiles,
         reach_tiles_requiring_split: uncovered_reach_tiles,
         compact_reach_dispatch_slices,
+        compact_update_dispatch_slices,
+        split_public_infosets,
     })
 }
 

@@ -334,6 +334,11 @@ fn run_gpu_compact_state_smoke(args: FlopSolveArgs) {
         "compact_reach_dispatch_slices: {}",
         summary.compact_reach_dispatch_slices
     );
+    println!(
+        "compact_update_dispatch_slices: {}",
+        summary.compact_update_dispatch_slices
+    );
+    println!("split_public_infosets: {}", summary.split_public_infosets);
 }
 
 fn run_gpu_smoke() {

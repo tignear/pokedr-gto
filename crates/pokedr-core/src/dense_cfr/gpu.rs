@@ -57,12 +57,15 @@ pub struct GpuDenseCfrBackend {
     public_tree_fold_value_bind_group_layout: wgpu::BindGroupLayout,
     public_tree_layer_backup_init_pipeline: wgpu::ComputePipeline,
     public_tree_layer_backup_child_pipeline: wgpu::ComputePipeline,
+    public_tree_layer_compact_backup_child_pipeline: wgpu::ComputePipeline,
     public_tree_layer_backup_init_bind_group_layout: wgpu::BindGroupLayout,
     public_tree_layer_backup_child_bind_group_layout: wgpu::BindGroupLayout,
+    public_tree_layer_compact_backup_child_bind_group_layout: wgpu::BindGroupLayout,
     public_tree_layer_decision_aggregate_pipeline: wgpu::ComputePipeline,
     public_tree_layer_denominator_pipeline: wgpu::ComputePipeline,
     public_tree_layer_action_edge_pipeline: wgpu::ComputePipeline,
     public_tree_layer_fused_update_pipeline: wgpu::ComputePipeline,
+    public_tree_layer_compact_fused_update_pipeline: wgpu::ComputePipeline,
     public_tree_layer_output_bind_group_layout: wgpu::BindGroupLayout,
     public_tree_layer_fused_update_bind_group_layout: wgpu::BindGroupLayout,
 }
@@ -1193,6 +1196,11 @@ impl GpuDenseCfrBackend {
                 label: Some("public tree layer backup shader"),
                 source: wgpu::ShaderSource::Wgsl(PUBLIC_TREE_LAYER_BACKUP_SHADER.into()),
             });
+        let public_tree_layer_compact_backup_shader =
+            device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("public tree layer compact backup shader"),
+                source: wgpu::ShaderSource::Wgsl(PUBLIC_TREE_LAYER_COMPACT_BACKUP_SHADER.into()),
+            });
         let public_tree_layer_backup_init_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("public tree layer backup init bind group layout"),
@@ -1222,6 +1230,26 @@ impl GpuDenseCfrBackend {
                     uniform_entry(12),
                 ],
             });
+        let public_tree_layer_compact_backup_child_bind_group_layout = device
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("public tree layer compact backup child bind group layout"),
+                entries: &[
+                    storage_entry(0, true),
+                    storage_entry(1, true),
+                    storage_entry(2, true),
+                    storage_entry(3, true),
+                    storage_entry(4, true),
+                    storage_entry(5, true),
+                    storage_entry(6, true),
+                    storage_entry(7, true),
+                    storage_entry(8, false),
+                    storage_entry(9, false),
+                    storage_entry(10, true),
+                    storage_entry(11, true),
+                    uniform_entry(12),
+                    storage_entry(13, true),
+                ],
+            });
         let public_tree_layer_backup_init_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("public tree layer backup init pipeline layout"),
@@ -1232,6 +1260,14 @@ impl GpuDenseCfrBackend {
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("public tree layer backup child pipeline layout"),
                 bind_group_layouts: &[Some(&public_tree_layer_backup_child_bind_group_layout)],
+                immediate_size: 0,
+            });
+        let public_tree_layer_compact_backup_child_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("public tree layer compact backup child pipeline layout"),
+                bind_group_layouts: &[Some(
+                    &public_tree_layer_compact_backup_child_bind_group_layout,
+                )],
                 immediate_size: 0,
             });
         let public_tree_layer_backup_init_pipeline =
@@ -1252,6 +1288,15 @@ impl GpuDenseCfrBackend {
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
                 cache: None,
             });
+        let public_tree_layer_compact_backup_child_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("public tree layer compact backup child pipeline"),
+                layout: Some(&public_tree_layer_compact_backup_child_pipeline_layout),
+                module: &public_tree_layer_compact_backup_shader,
+                entry_point: Some("backup_child_tile"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                cache: None,
+            });
         let public_tree_layer_output_shader =
             device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("public tree layer output shader"),
@@ -1261,6 +1306,13 @@ impl GpuDenseCfrBackend {
             device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("public tree layer fused update shader"),
                 source: wgpu::ShaderSource::Wgsl(PUBLIC_TREE_LAYER_FUSED_UPDATE_SHADER.into()),
+            });
+        let public_tree_layer_compact_fused_update_shader =
+            device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("public tree layer compact fused update shader"),
+                source: wgpu::ShaderSource::Wgsl(
+                    PUBLIC_TREE_LAYER_COMPACT_FUSED_UPDATE_SHADER.into(),
+                ),
             });
         let public_tree_layer_output_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -1354,6 +1406,15 @@ impl GpuDenseCfrBackend {
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
                 cache: None,
             });
+        let public_tree_layer_compact_fused_update_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("public tree layer compact fused update pipeline"),
+                layout: Some(&public_tree_layer_fused_update_pipeline_layout),
+                module: &public_tree_layer_compact_fused_update_shader,
+                entry_point: Some("fused_update_tile"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                cache: None,
+            });
         Ok(Self {
             device,
             queue,
@@ -1383,12 +1444,15 @@ impl GpuDenseCfrBackend {
             public_tree_fold_value_bind_group_layout,
             public_tree_layer_backup_init_pipeline,
             public_tree_layer_backup_child_pipeline,
+            public_tree_layer_compact_backup_child_pipeline,
             public_tree_layer_backup_init_bind_group_layout,
             public_tree_layer_backup_child_bind_group_layout,
+            public_tree_layer_compact_backup_child_bind_group_layout,
             public_tree_layer_decision_aggregate_pipeline,
             public_tree_layer_denominator_pipeline,
             public_tree_layer_action_edge_pipeline,
             public_tree_layer_fused_update_pipeline,
+            public_tree_layer_compact_fused_update_pipeline,
             public_tree_layer_output_bind_group_layout,
             public_tree_layer_fused_update_bind_group_layout,
         })
@@ -2734,6 +2798,189 @@ impl GpuDenseCfrBackend {
         }
     }
 
+    fn backup_layer_values_compact(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        ctx: &GpuPublicTreeIterationContext,
+        state: &GpuCompactPrivateCfrState,
+        br_player: u32,
+        iteration: usize,
+    ) {
+        for parent_layer_index in (0..ctx.layer_tiles.len().saturating_sub(1)).rev() {
+            let child_layer_index = parent_layer_index + 1;
+            for parent_tile in &ctx.layer_tiles[parent_layer_index] {
+                let value_count = (parent_tile.node_end - parent_tile.node_start) * ctx.combos_len;
+                if value_count == 0 {
+                    continue;
+                }
+                let (x_groups, y_groups, x_invocations) = dispatch_grid(value_count);
+                let init_params = uniform_buffer(
+                    &self.device,
+                    "public tree compact backup init params",
+                    &[GpuPublicTreeParams {
+                        combo_count: ctx.combos_len as u32,
+                        node_count: (parent_tile.node_end - parent_tile.node_start) as u32,
+                        max_actions: ctx.actions as u32,
+                        output_len: x_invocations,
+                        pair_start: br_player,
+                        chunk_pairs: 0,
+                        _pad0: 0,
+                        _pad1: 0,
+                        _pad2: 0,
+                        _pad3: 0,
+                    }],
+                );
+                let init_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("public tree compact backup init bind group"),
+                    layout: &self.public_tree_layer_backup_init_bind_group_layout,
+                    entries: &[
+                        bind_entry(0, &parent_tile.node_buffer),
+                        bind_entry(1, &parent_tile.hero_values_buffer),
+                        bind_entry(2, &parent_tile.villain_values_buffer),
+                        bind_entry(3, &init_params),
+                    ],
+                });
+                {
+                    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("public tree compact backup init pass"),
+                        timestamp_writes: None,
+                    });
+                    pass.set_pipeline(&self.public_tree_layer_backup_init_pipeline);
+                    pass.set_bind_group(0, &init_bind_group, &[]);
+                    pass.dispatch_workgroups(x_groups, y_groups, 1);
+                }
+
+                for tile_pair in ctx.layered.backup_tile_pairs.iter().filter(|tile_pair| {
+                    tile_pair.parent_layer == parent_layer_index
+                        && tile_pair.parent_tile.node_start == parent_tile.node_start
+                }) {
+                    debug_assert_eq!(tile_pair.child_layer, child_layer_index);
+                    let child_tile_index =
+                        tile_pair.child_tile.node_start / ctx.layered.node_tile_size;
+                    let child_tile = &ctx.layer_tiles[child_layer_index][child_tile_index];
+                    let parent_layer_nodes = &ctx.layered.layers[parent_layer_index].nodes
+                        [parent_tile.node_start..parent_tile.node_end];
+                    let public_range = public_infoset_range_for_nodes(parent_layer_nodes);
+                    let mut include_chance = true;
+                    if let Some((public_base, public_end)) = public_range {
+                        for chunk in state.chunks.iter().filter(|chunk| {
+                            chunk.chunk.public_start < public_end
+                                && public_base < chunk.chunk.public_end
+                        }) {
+                            let chunk_public_base = public_base.max(chunk.chunk.public_start);
+                            let chunk_public_end = public_end.min(chunk.chunk.public_end);
+                            let flags = br_player
+                                | (variant_code(state.variant) << 8)
+                                | ((include_chance as u32) << 16);
+                            include_chance = false;
+                            let params = uniform_buffer(
+                                &self.device,
+                                "public tree compact backup child params",
+                                &[GpuPublicTreeParams {
+                                    combo_count: ctx.combos_len as u32,
+                                    node_count: (parent_tile.node_end - parent_tile.node_start)
+                                        as u32,
+                                    max_actions: chunk.chunk.public_action_start as u32,
+                                    output_len: x_invocations,
+                                    pair_start: flags,
+                                    chunk_pairs: child_tile.node_start as u32,
+                                    _pad0: child_tile.node_end as u32,
+                                    _pad1: chunk_public_end as u32,
+                                    _pad2: chunk_public_base as u32,
+                                    _pad3: variant_prediction_eta(state.variant, iteration)
+                                        .to_bits(),
+                                }],
+                            );
+                            let prediction = chunk
+                                .prediction
+                                .as_ref()
+                                .unwrap_or(&ctx.empty_storage_buffer);
+                            let bind_group =
+                                self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                                    label: Some("public tree compact backup child bind group"),
+                                    layout: &self
+                                        .public_tree_layer_compact_backup_child_bind_group_layout,
+                                    entries: &[
+                                        bind_entry(0, &parent_tile.node_buffer),
+                                        bind_entry(1, &parent_tile.child_buffer),
+                                        bind_entry(2, &child_tile.hero_values_buffer),
+                                        bind_entry(3, &child_tile.villain_values_buffer),
+                                        bind_entry(4, &parent_tile.hero_reaches_buffer),
+                                        bind_entry(5, &parent_tile.villain_reaches_buffer),
+                                        bind_entry(6, &child_tile.hero_reaches_buffer),
+                                        bind_entry(7, &child_tile.villain_reaches_buffer),
+                                        bind_entry(8, &parent_tile.hero_values_buffer),
+                                        bind_entry(9, &parent_tile.villain_values_buffer),
+                                        bind_entry(10, &chunk.regrets),
+                                        bind_entry(11, prediction),
+                                        bind_entry(12, &params),
+                                        bind_entry(13, &ctx.public_action_offsets_buffer),
+                                    ],
+                                });
+                            let mut pass =
+                                encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                                    label: Some("public tree compact backup child pass"),
+                                    timestamp_writes: None,
+                                });
+                            pass.set_pipeline(
+                                &self.public_tree_layer_compact_backup_child_pipeline,
+                            );
+                            pass.set_bind_group(0, &bind_group, &[]);
+                            pass.dispatch_workgroups(x_groups, y_groups, 1);
+                        }
+                    } else {
+                        let flags = br_player | (variant_code(state.variant) << 8) | (1u32 << 16);
+                        let params = uniform_buffer(
+                            &self.device,
+                            "public tree compact backup child params",
+                            &[GpuPublicTreeParams {
+                                combo_count: ctx.combos_len as u32,
+                                node_count: (parent_tile.node_end - parent_tile.node_start) as u32,
+                                max_actions: 0,
+                                output_len: x_invocations,
+                                pair_start: flags,
+                                chunk_pairs: child_tile.node_start as u32,
+                                _pad0: child_tile.node_end as u32,
+                                _pad1: 0,
+                                _pad2: 0,
+                                _pad3: variant_prediction_eta(state.variant, iteration).to_bits(),
+                            }],
+                        );
+                        let bind_group =
+                            self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                                label: Some("public tree compact backup child bind group"),
+                                layout: &self
+                                    .public_tree_layer_compact_backup_child_bind_group_layout,
+                                entries: &[
+                                    bind_entry(0, &parent_tile.node_buffer),
+                                    bind_entry(1, &parent_tile.child_buffer),
+                                    bind_entry(2, &child_tile.hero_values_buffer),
+                                    bind_entry(3, &child_tile.villain_values_buffer),
+                                    bind_entry(4, &parent_tile.hero_reaches_buffer),
+                                    bind_entry(5, &parent_tile.villain_reaches_buffer),
+                                    bind_entry(6, &child_tile.hero_reaches_buffer),
+                                    bind_entry(7, &child_tile.villain_reaches_buffer),
+                                    bind_entry(8, &parent_tile.hero_values_buffer),
+                                    bind_entry(9, &parent_tile.villain_values_buffer),
+                                    bind_entry(10, &ctx.empty_storage_buffer),
+                                    bind_entry(11, &ctx.empty_storage_buffer),
+                                    bind_entry(12, &params),
+                                    bind_entry(13, &ctx.public_action_offsets_buffer),
+                                ],
+                            });
+                        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                            label: Some("public tree compact backup child pass"),
+                            timestamp_writes: None,
+                        });
+                        pass.set_pipeline(&self.public_tree_layer_compact_backup_child_pipeline);
+                        pass.set_bind_group(0, &bind_group, &[]);
+                        pass.dispatch_workgroups(x_groups, y_groups, 1);
+                    }
+                }
+            }
+        }
+    }
+
     fn write_layer_outputs(
         &self,
         mut encoder: wgpu::CommandEncoder,
@@ -3056,6 +3303,73 @@ impl GpuDenseCfrBackend {
             encoder = self.finish_profile_phase(encoder, "cfv_output_action_edge", stage_start)?;
         }
         Ok(encoder)
+    }
+
+    fn write_compact_update_aggregates(
+        &self,
+        mut encoder: wgpu::CommandEncoder,
+        ctx: &GpuPublicTreeIterationContext,
+    ) -> wgpu::CommandEncoder {
+        for (layer_index, layer_tiles) in ctx.layer_tiles.iter().enumerate() {
+            for tile in layer_tiles {
+                let tile_nodes =
+                    &ctx.layered.layers[layer_index].nodes[tile.node_start..tile.node_end];
+                let Some((public_base, _public_end)) = public_infoset_range_for_nodes(tile_nodes)
+                else {
+                    continue;
+                };
+                let decision_invocations = tile.decision_node_count * 53usize;
+                if decision_invocations == 0 {
+                    continue;
+                }
+                let (x_groups, y_groups, x_invocations) = dispatch_grid(decision_invocations);
+                let params = uniform_buffer(
+                    &self.device,
+                    "public tree compact update aggregate params",
+                    &[GpuPublicTreeParams {
+                        combo_count: ctx.combos_len as u32,
+                        node_count: tile.decision_node_count as u32,
+                        max_actions: ctx.actions as u32,
+                        output_len: x_invocations,
+                        pair_start: 2,
+                        chunk_pairs: public_base as u32,
+                        _pad0: 0,
+                        _pad1: 0,
+                        _pad2: 0,
+                        _pad3: 0,
+                    }],
+                );
+                let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("public tree compact update aggregate bind group"),
+                    layout: &self.public_tree_layer_output_bind_group_layout,
+                    entries: &[
+                        bind_entry(0, &tile.node_buffer),
+                        bind_entry(1, &ctx.combo_buffer),
+                        bind_entry(2, &tile.hero_reaches_buffer),
+                        bind_entry(3, &tile.villain_reaches_buffer),
+                        bind_entry(4, &ctx.hero_decision_aggregates_buffer),
+                        bind_entry(5, &ctx.villain_decision_aggregates_buffer),
+                        bind_entry(6, &ctx.empty_storage_buffer),
+                        bind_entry(7, &tile.combo_live_buffer),
+                        bind_entry(8, &tile.decision_node_buffer),
+                        bind_entry(9, &tile.hero_values_buffer),
+                        bind_entry(10, &tile.villain_values_buffer),
+                        bind_entry(11, &ctx.root_weights_buffer),
+                        bind_entry(12, &ctx.empty_storage_buffer),
+                        bind_entry(13, &ctx.empty_storage_buffer),
+                        bind_entry(14, &params),
+                    ],
+                });
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("public tree compact update aggregate pass"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.public_tree_layer_decision_aggregate_pipeline);
+                pass.set_bind_group(0, &bind_group, &[]);
+                pass.dispatch_workgroups(x_groups, y_groups, 1);
+            }
+        }
+        encoder
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4096,6 +4410,124 @@ impl GpuDenseCfrBackend {
         }
     }
 
+    fn submit_compact_complete_group_updates_batched(
+        &self,
+        ctx: &GpuPublicTreeIterationContext,
+        state: &GpuCompactPrivateCfrState,
+        iteration: usize,
+    ) -> usize {
+        const SUBMIT_BATCH_SLICES: usize = 64;
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("compact public tree update encoder"),
+            });
+        let mut dispatch_slices = 0usize;
+        let mut pending_slices = 0usize;
+        for edge_tile in &ctx.layered.reach_edge_tiles {
+            let parent_tile_index = edge_tile.parent_tile.node_start / ctx.layered.node_tile_size;
+            let child_tile_index = edge_tile.child_tile.node_start / ctx.layered.node_tile_size;
+            let parent_tile = &ctx.layer_tiles[edge_tile.parent_layer][parent_tile_index];
+            let child_tile = &ctx.layer_tiles[edge_tile.child_layer][child_tile_index];
+            let parent_layer_nodes = &ctx.layered.layers[edge_tile.parent_layer].nodes
+                [parent_tile.node_start..parent_tile.node_end];
+            for slice in
+                compact_complete_group_slices_for_tile(edge_tile, parent_layer_nodes, state)
+            {
+                if slice.groups.is_empty() {
+                    continue;
+                }
+                let chunk = &state.chunks[slice.chunk_index.expect("decision group chunk")];
+                let strategy_sum = chunk
+                    .strategy_sum
+                    .as_ref()
+                    .unwrap_or(&ctx.empty_storage_buffer);
+                let prediction = chunk
+                    .prediction
+                    .as_ref()
+                    .unwrap_or(&ctx.empty_storage_buffer);
+                let edge_buffer = readonly_buffer(
+                    &self.device,
+                    "public tree compact update sliced edges",
+                    &slice.edges,
+                );
+                let group_buffer = readonly_buffer(
+                    &self.device,
+                    "public tree compact update sliced groups",
+                    &slice.groups,
+                );
+                let invocation_count = slice.groups.len() * ctx.combos_len;
+                let (x_groups, y_groups, x_invocations) = dispatch_grid(invocation_count);
+                let params = uniform_buffer(
+                    &self.device,
+                    "public tree compact fused update params",
+                    &[GpuPublicTreeFusedUpdateParams {
+                        combo_count: ctx.combos_len as u32,
+                        group_count: slice.groups.len() as u32,
+                        max_actions: ctx.actions as u32,
+                        output_len: x_invocations,
+                        variant: variant_code(state.variant),
+                        public_infoset_base: chunk.chunk.public_action_start as u32,
+                        iteration: iteration as u32,
+                        eta_bits: variant_prediction_eta(state.variant, iteration).to_bits(),
+                        alpha_bits: variant_dcfr_alpha(state.variant, iteration).to_bits(),
+                        gamma_bits: variant_dcfr_gamma(state.variant, iteration).to_bits(),
+                        beta_bits: variant_dcfr_beta(state.variant, iteration).to_bits(),
+                        avg_delay: super::average_strategy_delay() as u32,
+                        avg_power_bits: super::average_strategy_power().to_bits(),
+                    }],
+                );
+                let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("public tree compact fused update bind group"),
+                    layout: &self.public_tree_layer_fused_update_bind_group_layout,
+                    entries: &[
+                        bind_entry(0, &parent_tile.node_buffer),
+                        bind_entry(1, &ctx.combo_buffer),
+                        bind_entry(2, &parent_tile.hero_reaches_buffer),
+                        bind_entry(3, &parent_tile.villain_reaches_buffer),
+                        bind_entry(4, &ctx.hero_decision_aggregates_buffer),
+                        bind_entry(5, &ctx.villain_decision_aggregates_buffer),
+                        bind_entry(6, &parent_tile.combo_live_buffer),
+                        bind_entry(7, &edge_buffer),
+                        bind_entry(8, &group_buffer),
+                        bind_entry(9, &child_tile.hero_values_buffer),
+                        bind_entry(10, &child_tile.villain_values_buffer),
+                        bind_entry(11, &ctx.root_weights_buffer),
+                        bind_entry(12, &chunk.regrets),
+                        bind_entry(13, strategy_sum),
+                        bind_entry(14, &ctx.public_action_offsets_buffer),
+                        bind_entry(15, prediction),
+                        bind_entry(16, &params),
+                    ],
+                });
+                {
+                    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("public tree compact fused update pass"),
+                        timestamp_writes: None,
+                    });
+                    pass.set_pipeline(&self.public_tree_layer_compact_fused_update_pipeline);
+                    pass.set_bind_group(0, &bind_group, &[]);
+                    pass.dispatch_workgroups(x_groups, y_groups, 1);
+                }
+                dispatch_slices += 1;
+                pending_slices += 1;
+                if pending_slices >= SUBMIT_BATCH_SLICES {
+                    self.queue.submit(Some(encoder.finish()));
+                    encoder = self
+                        .device
+                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                            label: Some("compact public tree update encoder"),
+                        });
+                    pending_slices = 0;
+                }
+            }
+        }
+        if pending_slices > 0 {
+            self.queue.submit(Some(encoder.finish()));
+        }
+        dispatch_slices
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn public_tree_run_iterations(
         &self,
@@ -4366,7 +4798,7 @@ impl GpuDenseCfrBackend {
         villain_weights: &[f32],
         showdown_boards: &[GpuFinalBoard],
         state: Option<&GpuCompactPrivateCfrState>,
-    ) -> (usize, usize) {
+    ) -> (usize, usize, usize) {
         let chunks = state.map(|state| {
             state
                 .chunks
@@ -4399,7 +4831,7 @@ impl GpuDenseCfrBackend {
         villain_weights: &[f32],
         showdown_boards: &[GpuFinalBoard],
         chunks: Option<&[CompactPrivateCfrChunk]>,
-    ) -> (usize, usize) {
+    ) -> (usize, usize, usize) {
         let context = self.public_tree_iteration_context(
             nodes,
             children,
@@ -4420,6 +4852,7 @@ impl GpuDenseCfrBackend {
         (
             context.compact_private_action_slots(),
             uncovered_reach_tiles,
+            context.split_public_infosets.len(),
         )
     }
 
@@ -4528,6 +4961,162 @@ impl GpuDenseCfrBackend {
             br_player,
             iteration,
         )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn compact_public_tree_iteration_smoke_with_chunk_plan(
+        &self,
+        nodes: &[GpuPublicTreeNode],
+        children: &[u32],
+        child_cards: &[u32],
+        combos: &[GpuPrivateCombo],
+        combo_legal: &[u32],
+        hero_weights: &[f32],
+        villain_weights: &[f32],
+        showdown_boards: &[GpuFinalBoard],
+        config: CompactPrivateCfrConfig,
+        max_chunk_bytes: usize,
+        br_player: u32,
+        iteration: usize,
+    ) -> Result<(usize, usize, usize, usize), GpuCfrError> {
+        trace_pipeline_step("compact_iteration:chunk_plan:start");
+        let chunks = config.chunk_by_action_bytes(max_chunk_bytes);
+        let largest_chunk_slots = chunks
+            .iter()
+            .map(|chunk| chunk.action_slots)
+            .max()
+            .unwrap_or(1)
+            .max(1);
+        trace_pipeline_step("compact_iteration:scratch_buffers:start");
+        let zeros = vec![0.0; largest_chunk_slots];
+        let scratch_regrets = storage_buffer(
+            &self.device,
+            "compact private streamed iteration regret scratch",
+            &zeros,
+        );
+        let scratch_prediction = storage_buffer(
+            &self.device,
+            "compact private streamed iteration prediction scratch",
+            &zeros,
+        );
+        let scratch_strategy_sum = storage_buffer(
+            &self.device,
+            "compact private streamed iteration strategy scratch",
+            &zeros,
+        );
+        let state = GpuCompactPrivateCfrState {
+            public_infosets: config.public_infosets(),
+            public_actions: config.public_actions(),
+            combos: config.combos,
+            variant: config.variant,
+            chunks: chunks
+                .into_iter()
+                .map(|chunk| GpuCompactPrivateCfrChunkState {
+                    chunk,
+                    regrets: scratch_regrets.clone(),
+                    prediction: Some(scratch_prediction.clone()),
+                    strategy_sum: Some(scratch_strategy_sum.clone()),
+                })
+                .collect(),
+        };
+        trace_pipeline_step("compact_iteration:context:start");
+        let context = self.public_tree_iteration_context(
+            nodes,
+            children,
+            child_cards,
+            combos,
+            combo_legal,
+            hero_weights,
+            villain_weights,
+            showdown_boards,
+            nodes_public_infoset_count(nodes) * combos.len(),
+            nodes_max_action_count(nodes),
+            false,
+            true,
+        );
+        trace_pipeline_step("compact_iteration:context:done");
+        let chunk_plan: Vec<_> = state.chunks.iter().map(|chunk| chunk.chunk).collect();
+        let uncovered_reach_tiles = compact_uncovered_reach_tiles(&context, &chunk_plan);
+
+        trace_pipeline_step("compact_iteration:reach_init:start");
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("compact public tree iteration pre-terminal encoder"),
+            });
+        self.propagate_layer_reach_inits(&mut encoder, &context, state.variant, iteration);
+        self.queue.submit(Some(encoder.finish()));
+        trace_pipeline_step("compact_iteration:reach_edges:start");
+        let reach_slices =
+            self.submit_compact_layer_reach_edges_batched(&context, &state, br_player, iteration);
+
+        trace_pipeline_step("compact_iteration:fold:start");
+        for layer_tiles in &context.layer_tiles {
+            for tile in layer_tiles {
+                if tile.fold_terminal_nodes.is_empty() {
+                    continue;
+                }
+                let mut encoder =
+                    self.device
+                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                            label: Some("compact public tree iteration fold encoder"),
+                        });
+                self.fill_fold_values(
+                    &mut encoder,
+                    &tile.node_buffer,
+                    &tile.fold_terminal_nodes,
+                    &context.combo_buffer,
+                    &tile.hero_reaches_buffer,
+                    &tile.villain_reaches_buffer,
+                    &tile.combo_live_buffer,
+                    &tile.hero_values_buffer,
+                    &tile.villain_values_buffer,
+                    context.combos_len,
+                )?;
+                self.queue.submit(Some(encoder.finish()));
+            }
+        }
+        self.profile_poll()?;
+        trace_pipeline_step("compact_iteration:showdown:start");
+        for layer_tiles in &context.layer_tiles {
+            for tile in layer_tiles {
+                self.fill_terminal_values_streaming(
+                    &tile.node_buffer,
+                    &tile.showdown_terminal_groups,
+                    &context.terminal_blocker_neighbors_buffer,
+                    &tile.hero_reaches_buffer,
+                    &tile.villain_reaches_buffer,
+                    &tile.hero_values_buffer,
+                    &tile.villain_values_buffer,
+                    &context.terminal_prefix_pairs_buffer,
+                    context.combos_len,
+                    context.terminal_blocker_neighbor_stride,
+                    context.terminal_prefix_pair_budget,
+                )?;
+            }
+        }
+
+        trace_pipeline_step("compact_iteration:backup:start");
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("compact public tree iteration update prep encoder"),
+            });
+        self.backup_layer_values_compact(&mut encoder, &context, &state, br_player, iteration);
+        trace_pipeline_step("compact_iteration:aggregate:start");
+        let encoder = self.write_compact_update_aggregates(encoder, &context);
+        self.queue.submit(Some(encoder.finish()));
+        trace_pipeline_step("compact_iteration:update:start");
+        let update_slices =
+            self.submit_compact_complete_group_updates_batched(&context, &state, iteration);
+        trace_pipeline_step("compact_iteration:done");
+
+        Ok((
+            context.compact_private_action_slots(),
+            uncovered_reach_tiles,
+            reach_slices,
+            update_slices,
+        ))
     }
 
     fn zeroed_compact_private_state_with_buffers(
@@ -5115,6 +5704,42 @@ fn compact_reach_slices_for_tile(
         } else {
             None
         };
+        let slice = by_chunk
+            .entry(chunk_index)
+            .or_insert_with(|| CompactReachSlice {
+                chunk_index,
+                edges: Vec::new(),
+                groups: Vec::new(),
+            });
+        let first_edge = slice.edges.len() as u32;
+        let edge_start = group.first_edge as usize;
+        let edge_end = edge_start + group.edge_count as usize;
+        slice
+            .edges
+            .extend_from_slice(&edge_tile.edges[edge_start..edge_end]);
+        slice.groups.push(GpuPublicTreeEdgeGroup {
+            first_edge,
+            ..*group
+        });
+    }
+    by_chunk.into_values().collect()
+}
+
+fn compact_complete_group_slices_for_tile(
+    edge_tile: &GpuPublicTreeLayerEdgeTile,
+    parent_layer_nodes: &[GpuPublicTreeNode],
+    state: &GpuCompactPrivateCfrState,
+) -> Vec<CompactReachSlice> {
+    let mut by_chunk: BTreeMap<Option<usize>, CompactReachSlice> = BTreeMap::new();
+    for group in &edge_tile.complete_decision_groups {
+        let node = parent_layer_nodes[group.parent as usize];
+        if node.kind != 0 {
+            continue;
+        }
+        let chunk_index = Some(compact_chunk_index_for_public_infoset(
+            &state.chunks,
+            node.public_infoset as usize,
+        ));
         let slice = by_chunk
             .entry(chunk_index)
             .or_insert_with(|| CompactReachSlice {
