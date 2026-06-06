@@ -2,8 +2,9 @@ pub use pokedr_core::{dense_cfr, postflop, postflop_dense, range};
 
 mod river_batch;
 pub use river_batch::{
-    FixedRiverBatchSolveSummary, FixedRiverSolveSummary, RiverBatchSolver,
-    RiverExploitabilitySummary, RiverShapeBatchPlanSummary, RiverSubgameInput, RiverSubgameResult,
+    DEFAULT_RIVER_CHIPS_PER_BB, FixedRiverBatchSolveSummary, FixedRiverSolveSummary,
+    RiverBatchSolver, RiverExploitabilitySummary, RiverShapeBatchPlanSummary, RiverSubgameInput,
+    RiverSubgameResult,
 };
 
 use std::{
@@ -6487,6 +6488,15 @@ mod tests {
             7,
             PokedrAgentConfig {
                 cfr_iterations: 1,
+                action_set: ActionSetConfig {
+                    max_aggressive_actions: 1,
+                    flop_bet_fractions: vec![0.5],
+                    turn_bet_fractions: vec![0.5],
+                    river_bet_fractions: vec![0.5],
+                    raise_fractions: Vec::new(),
+                    ..ActionSetConfig::default()
+                },
+                max_raises_per_street: 0,
                 max_showdown_runouts: 1,
                 ..PokedrAgentConfig::default()
             },

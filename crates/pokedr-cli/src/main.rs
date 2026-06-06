@@ -696,7 +696,7 @@ fn run_solve_river_runouts(args: RiverRunoutSolveArgs) {
         eprintln!("no river boards generated");
         std::process::exit(2);
     }
-    let config = fixed_flop_config(&args.solver);
+    let config = river_runout_config(&args.solver);
     let plan = pokedr_agent::fixed_river_shape_batch_plan_summary(&boards, config.clone());
     println!(
         "solving river runouts prefix={} generated={} solving={} iterations={} variant={:?}",
@@ -716,6 +716,16 @@ fn run_solve_river_runouts(args: RiverRunoutSolveArgs) {
         .copied()
         .map(pokedr_agent::RiverSubgameInput::with_default_ranges)
         .collect::<Vec<_>>();
+    if let Some(input) = inputs.first() {
+        let scale = pokedr_agent::DEFAULT_RIVER_CHIPS_PER_BB as f32;
+        println!(
+            "river_spot pot_bb={:.2} effective_stack_bb={:.2} min_bet_bb={:.2} to_call_bb={:.2}",
+            input.public_state.pot as f32 / scale,
+            input.public_state.effective_stack as f32 / scale,
+            input.public_state.min_aggressive_amount as f32 / scale,
+            input.public_state.to_call as f32 / scale
+        );
+    }
     let solver = pokedr_agent::RiverBatchSolver::new(config);
     let results = solver.solve_subgames(inputs.clone());
     let elapsed = started.elapsed().as_secs_f32();
@@ -746,11 +756,27 @@ fn run_solve_river_runouts(args: RiverRunoutSolveArgs) {
                         "river_exploitability board={} root_exploitability={:.6} root_exploitability_bb100={:.3} hero_improve={:.6} villain_improve={:.6} profile_sum={:.6} elapsed={:.3}s",
                         metric.board,
                         metric.root_exploitability,
-                        metric.root_exploitability * 100.0,
+                        river_chips_to_bb100(metric.root_exploitability),
                         metric.hero_root_br_improvement,
                         metric.villain_root_br_improvement,
                         metric.hero_root_profile_value + metric.villain_root_profile_value,
                         metric.elapsed_secs
+                    );
+                    println!(
+                        "river_root_strategy board={} actions=[{}] probabilities=[{}]",
+                        metric.board,
+                        metric
+                            .root_actions
+                            .iter()
+                            .map(|action| river_action_label_to_bb(action))
+                            .collect::<Vec<_>>()
+                            .join(","),
+                        metric
+                            .root_action_probabilities
+                            .iter()
+                            .map(|probability| format!("{probability:.4}"))
+                            .collect::<Vec<_>>()
+                            .join(",")
                     );
                     metrics.push(metric);
                 }
@@ -765,11 +791,11 @@ fn run_solve_river_runouts(args: RiverRunoutSolveArgs) {
         if !metrics.is_empty() {
             let max_bb100 = metrics
                 .iter()
-                .map(|metric| metric.root_exploitability * 100.0)
+                .map(|metric| river_chips_to_bb100(metric.root_exploitability))
                 .fold(f32::NEG_INFINITY, f32::max);
             let avg_bb100 = metrics
                 .iter()
-                .map(|metric| metric.root_exploitability * 100.0)
+                .map(|metric| river_chips_to_bb100(metric.root_exploitability))
                 .sum::<f32>()
                 / metrics.len() as f32;
             println!(
@@ -1401,6 +1427,23 @@ fn format_optional(value: Option<f32>, decimals: usize) -> String {
 
 fn percentage(numerator: usize, denominator: usize) -> Option<f32> {
     (denominator > 0).then_some(numerator as f32 * 100.0 / denominator as f32)
+}
+
+fn river_chips_to_bb100(chips_per_hand: f32) -> f32 {
+    chips_per_hand / pokedr_agent::DEFAULT_RIVER_CHIPS_PER_BB as f32 * 100.0
+}
+
+fn river_action_label_to_bb(action: &str) -> String {
+    let Some((kind, amount)) = action.split_once(':') else {
+        return action.to_string();
+    };
+    let Ok(chips) = amount.parse::<f32>() else {
+        return action.to_string();
+    };
+    format!(
+        "{kind}:{:.2}bb",
+        chips / pokedr_agent::DEFAULT_RIVER_CHIPS_PER_BB as f32
+    )
 }
 
 fn print_metric_row(row: &pokedr_agent::FixedFlopMetricRow, target_bb100: f32) {
@@ -3254,6 +3297,14 @@ fn fixed_flop_config(options: &SolverOptions) -> pokedr_agent::PokedrAgentConfig
     let mut config = match_config(options);
     if options.iterations.is_none() && env_usize("POKEDR_CFR_ITERATIONS").is_none() {
         config.cfr_iterations = 1;
+    }
+    config
+}
+
+fn river_runout_config(options: &SolverOptions) -> pokedr_agent::PokedrAgentConfig {
+    let mut config = fixed_flop_config(options);
+    if options.variant.is_none() && std::env::var_os("POKEDR_CFR_VARIANT").is_none() {
+        config.cfr_variant = CfrVariant::CfrPlus;
     }
     config
 }

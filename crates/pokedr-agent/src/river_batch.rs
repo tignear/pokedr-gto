@@ -4,7 +4,7 @@ use pokedr_core::{
     cards::{Board, Card as PokedrCard},
     dense_cfr::gpu::{GpuFinalBoard, GpuPublicTreeNode},
     dense_cfr::{BatchedPrivateCfrConfig, BatchedPrivateCfrState, DenseCfrState},
-    postflop::{Player, PublicState, Street, SubgameTree, SubgameTreeConfig},
+    postflop::{Player, PlayerAction, PublicState, Street, SubgameTree, SubgameTreeConfig},
     postflop_dense::PostflopDenseLayout,
     range::{COMBO_COUNT, ComboIndexer},
 };
@@ -15,6 +15,8 @@ use crate::{
     gpu_private_combos, linearize_gpu_public_tree, root_board, showdown_matrix_cache_capacity,
     solve_public_tree_cfr,
 };
+
+pub const DEFAULT_RIVER_CHIPS_PER_BB: u32 = 100;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct FixedRiverSolveSummary {
@@ -66,6 +68,8 @@ pub struct RiverSubgameResult {
 pub struct RiverExploitabilitySummary {
     pub board: String,
     pub root_exploitability: f32,
+    pub root_actions: Vec<String>,
+    pub root_action_probabilities: Vec<f32>,
     pub hero_root_br_value: f32,
     pub villain_root_br_value: f32,
     pub hero_root_profile_value: f32,
@@ -256,9 +260,15 @@ impl RiverBatchSolver {
                 self.config.max_showdown_runouts,
             )
         };
+        let root_dead = input.public_state.board.deck_mask();
+        let root_actions = root_action_labels(&tree, &layout, 0);
+        let root_action_probabilities =
+            river_root_action_probabilities(&layout, &result.state, &indexer, root_dead, input);
         Some(RiverExploitabilitySummary {
             board: result.summary.board.clone(),
             root_exploitability: metrics.exploitability,
+            root_actions,
+            root_action_probabilities,
             hero_root_br_value: metrics.hero_br_value,
             villain_root_br_value: metrics.villain_br_value,
             hero_root_profile_value: metrics.hero_profile_value,
@@ -464,9 +474,67 @@ impl RiverBatchSolver {
     }
 }
 
+fn root_action_labels(
+    tree: &SubgameTree,
+    layout: &PostflopDenseLayout,
+    public_infoset: usize,
+) -> Vec<String> {
+    (0..layout.action_count(public_infoset))
+        .filter_map(|action| layout.action(tree, public_infoset, action))
+        .map(|candidate| format_river_action(candidate.action))
+        .collect()
+}
+
+fn format_river_action(action: PlayerAction) -> String {
+    match action {
+        PlayerAction::Fold => "fold".to_string(),
+        PlayerAction::Check => "check".to_string(),
+        PlayerAction::Call { amount } => format!("call:{amount}"),
+        PlayerAction::Bet { amount } => format!("bet:{amount}"),
+        PlayerAction::Raise { amount } => format!("raise:{amount}"),
+        PlayerAction::AllIn { amount } => format!("allin:{amount}"),
+    }
+}
+
+fn river_root_action_probabilities(
+    layout: &PostflopDenseLayout,
+    state: &DenseCfrState,
+    indexer: &ComboIndexer,
+    root_dead: u64,
+    input: &RiverSubgameInput,
+) -> Vec<f32> {
+    let action_count = layout.action_count(0);
+    let max_actions = layout.max_actions();
+    let mut probabilities = vec![0.0; action_count];
+    let mut strategy = vec![0.0; max_actions];
+    let mut weight_sum = 0.0f32;
+    for (combo_index, (combo, weight)) in
+        indexer.combos().iter().zip(&input.oop_weights).enumerate()
+    {
+        if *weight <= 0.0 || combo.collides_with(root_dead) {
+            continue;
+        }
+        state.average_strategy_for(combo_index, &mut strategy);
+        for action in 0..action_count {
+            probabilities[action] += strategy[action] * *weight;
+        }
+        weight_sum += *weight;
+    }
+    if weight_sum > 0.0 {
+        for probability in &mut probabilities {
+            *probability /= weight_sum;
+        }
+    }
+    probabilities
+}
+
 impl RiverSubgameInput {
     pub fn with_default_ranges(board_cards: [PokedrCard; 5]) -> Self {
         let public_state = default_river_public_state(board_cards);
+        Self::with_default_ranges_for_public_state(public_state)
+    }
+
+    pub fn with_default_ranges_for_public_state(public_state: PublicState) -> Self {
         let indexer = ComboIndexer::new();
         let root_dead = public_state.board.deck_mask();
         let (oop_weights, ip_weights) = fixed_flop_root_weights(&indexer, root_dead);
@@ -503,15 +571,18 @@ impl RiverSubgameInput {
 }
 
 fn default_river_public_state(board_cards: [PokedrCard; 5]) -> PublicState {
+    const POT_BB: u32 = 20;
+    const PLAYER_INVESTED_BB: u32 = POT_BB / 2;
+    const EFFECTIVE_STACK_BEHIND_BB: u32 = 90;
     PublicState {
         street: Street::River,
         board: Board::new(board_cards.to_vec()),
-        pot: 100,
-        hero_invested: 50,
-        villain_invested: 50,
-        effective_stack: 100,
+        pot: POT_BB * DEFAULT_RIVER_CHIPS_PER_BB,
+        hero_invested: PLAYER_INVESTED_BB * DEFAULT_RIVER_CHIPS_PER_BB,
+        villain_invested: PLAYER_INVESTED_BB * DEFAULT_RIVER_CHIPS_PER_BB,
+        effective_stack: EFFECTIVE_STACK_BEHIND_BB * DEFAULT_RIVER_CHIPS_PER_BB,
         to_call: 0,
-        min_aggressive_amount: 50,
+        min_aggressive_amount: DEFAULT_RIVER_CHIPS_PER_BB,
         acting_player: Player::Hero,
         raises_this_street: 0,
         checks_this_street: 0,

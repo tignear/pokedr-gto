@@ -3793,7 +3793,8 @@ impl GpuDenseCfrBackend {
             ctx.materializes_dense_outputs,
             "dense output materialization is disabled for compact public-tree context"
         );
-        if std::env::var_os("POKEDR_SOLVER_PROGRESS_OFF").is_none() {
+        let profile = Self::gpu_profile_enabled();
+        if profile || std::env::var_os("POKEDR_GPU_PIPELINE_TRACE").is_some() {
             eprintln!(
                 "pokedr: gpu public tree cfv nodes={} combos={} node_combo_values={} folds={} showdowns={} terminal_chunk={}",
                 ctx.nodes_len,
@@ -3805,7 +3806,6 @@ impl GpuDenseCfrBackend {
             );
         }
 
-        let profile = Self::gpu_profile_enabled();
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -3995,7 +3995,8 @@ impl GpuDenseCfrBackend {
         br_player: u32,
         iteration: usize,
     ) -> Result<(), GpuCfrError> {
-        if std::env::var_os("POKEDR_SOLVER_PROGRESS_OFF").is_none() {
+        let profile = Self::gpu_profile_enabled();
+        if profile || std::env::var_os("POKEDR_GPU_PIPELINE_TRACE").is_some() {
             eprintln!(
                 "pokedr: gpu public tree root cfv nodes={} combos={} node_combo_values={} folds={} showdowns={} terminal_chunk={}",
                 ctx.nodes_len,
@@ -4007,7 +4008,6 @@ impl GpuDenseCfrBackend {
             );
         }
 
-        let profile = Self::gpu_profile_enabled();
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
