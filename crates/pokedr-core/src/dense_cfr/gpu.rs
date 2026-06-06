@@ -305,6 +305,9 @@ struct GpuTerminalGroupCache {
     board_count: usize,
     terminal_count: usize,
     table_count: usize,
+    strength_group_count_sum: usize,
+    terminal_strength_group_count_sum: usize,
+    strength_group_count_max: usize,
     terminal_refs_buffer: wgpu::Buffer,
     combo_order_buffer: wgpu::Buffer,
     combo_bounds_buffer: wgpu::Buffer,
@@ -313,6 +316,9 @@ struct GpuTerminalGroupCache {
 struct GpuTerminalGroupData {
     board_count: usize,
     table_count: usize,
+    strength_group_count_sum: usize,
+    terminal_strength_group_count_sum: usize,
+    strength_group_count_max: usize,
     terminal_refs: Vec<GpuTerminalRef>,
     combo_order: Vec<u32>,
     combo_bounds: Vec<u32>,
@@ -453,6 +459,7 @@ fn terminal_group_data(
     showdown_boards: &[GpuFinalBoard],
 ) -> Vec<GpuTerminalGroupData> {
     const MAX_TERMINAL_GROUP_TABLE_BYTES: usize = 124 * 1024 * 1024;
+    let collect_group_stats = std::env::var_os("POKEDR_GPU_TERMINAL_GROUP_TRACE").is_some();
 
     let mut groups: BTreeMap<usize, Vec<u32>> = BTreeMap::new();
     for &node_index in terminal_nodes {
@@ -481,6 +488,10 @@ fn terminal_group_data(
             let mut terminal_refs = Vec::new();
             let mut combo_order = Vec::new();
             let mut combo_bounds = Vec::new();
+            let mut strength_group_count_sum = 0usize;
+            let mut terminal_strength_group_count_sum = 0usize;
+            let mut strength_group_count_max = 0usize;
+            let mut table_strength_group_counts = Vec::<usize>::new();
             while index < terminal_nodes.len() {
                 let node_index = terminal_nodes[index];
                 let node = nodes[node_index as usize];
@@ -499,6 +510,18 @@ fn terminal_group_data(
                         let boards = &showdown_boards[board_base..board_base + board_count];
                         let (node_combo_order, node_combo_bounds) =
                             showdown_strength_order_data(combos, boards);
+                        if collect_group_stats {
+                            let (sum, max) = showdown_strength_group_stats(
+                                &node_combo_bounds,
+                                board_count,
+                                combos.len(),
+                            );
+                            strength_group_count_sum += sum;
+                            strength_group_count_max = strength_group_count_max.max(max);
+                            table_strength_group_counts.push(sum);
+                        } else {
+                            table_strength_group_counts.push(0);
+                        }
                         combo_order.extend(node_combo_order);
                         combo_bounds
                             .extend(node_combo_bounds.into_iter().map(pack_showdown_bounds));
@@ -506,6 +529,10 @@ fn terminal_group_data(
                         table
                     }
                 };
+                if collect_group_stats {
+                    terminal_strength_group_count_sum +=
+                        table_strength_group_counts[table as usize];
+                }
                 terminal_refs.push(GpuTerminalRef {
                     node: node_index,
                     table,
@@ -515,6 +542,9 @@ fn terminal_group_data(
             caches.push(GpuTerminalGroupData {
                 board_count,
                 table_count: table_slots.len(),
+                strength_group_count_sum,
+                terminal_strength_group_count_sum,
+                strength_group_count_max,
                 terminal_refs,
                 combo_order,
                 combo_bounds,
@@ -522,6 +552,30 @@ fn terminal_group_data(
         }
     }
     caches
+}
+
+fn showdown_strength_group_stats(
+    bounds: &[GpuShowdownComboBounds],
+    board_count: usize,
+    combo_count: usize,
+) -> (usize, usize) {
+    let mut sum = 0usize;
+    let mut max = 0usize;
+    let mut seen = vec![false; combo_count];
+    for board in 0..board_count {
+        seen.fill(false);
+        let board_bounds = &bounds[board * combo_count..(board + 1) * combo_count];
+        for bound in board_bounds {
+            if bound.legal == 0 {
+                continue;
+            }
+            seen[bound.group_start as usize] = true;
+        }
+        let count = seen.iter().filter(|&&value| value).count();
+        sum += count;
+        max = max.max(count);
+    }
+    (sum, max)
 }
 
 fn requested_wgpu_backends() -> Option<wgpu::Backends> {
@@ -2056,6 +2110,10 @@ impl GpuDenseCfrBackend {
                                     board_count: group.board_count,
                                     terminal_count,
                                     table_count: group.table_count,
+                                    strength_group_count_sum: group.strength_group_count_sum,
+                                    terminal_strength_group_count_sum: group
+                                        .terminal_strength_group_count_sum,
+                                    strength_group_count_max: group.strength_group_count_max,
                                     terminal_refs_buffer: readonly_buffer(
                                         &self.device,
                                         "public tree resident terminal refs",
@@ -2993,6 +3051,15 @@ impl GpuDenseCfrBackend {
         if std::env::var_os("POKEDR_GPU_TERMINAL_GROUP_TRACE").is_some() {
             let mut groups_by_board_count = BTreeMap::<usize, (usize, usize)>::new();
             let mut tables_by_board_count = BTreeMap::<usize, usize>::new();
+            let mut total_groups = 0usize;
+            let mut total_terminals = 0usize;
+            let mut total_tables = 0usize;
+            let mut total_prefix_rows = 0usize;
+            let mut total_table_rows = 0usize;
+            let mut total_reduce_lanes = 0usize;
+            let mut total_strength_groups = 0usize;
+            let mut total_terminal_strength_groups = 0usize;
+            let mut max_strength_groups = 0usize;
             for layer in &layer_tiles {
                 for tile in layer {
                     for group in &tile.showdown_terminal_groups {
@@ -3003,9 +3070,38 @@ impl GpuDenseCfrBackend {
                         entry.1 += group.terminal_count;
                         *tables_by_board_count.entry(group.board_count).or_insert(0) +=
                             group.table_count;
+                        total_groups += 1;
+                        total_terminals += group.terminal_count;
+                        total_tables += group.table_count;
+                        total_prefix_rows += group.terminal_count * group.board_count;
+                        total_table_rows += group.table_count * group.board_count;
+                        total_reduce_lanes += group.terminal_count * combos.len();
+                        total_strength_groups += group.strength_group_count_sum;
+                        total_terminal_strength_groups += group.terminal_strength_group_count_sum;
+                        max_strength_groups =
+                            max_strength_groups.max(group.strength_group_count_max);
                     }
                 }
             }
+            let static_card_prefix_cells = total_strength_groups * (Card::COUNT + 1);
+            let terminal_card_prefix_cells = total_terminal_strength_groups * (Card::COUNT + 1);
+            eprintln!(
+                "pokedr: gpu terminal groups summary groups={} terminals={} unique_tables={} terminals_per_table={:.2} prefix_rows={} static_table_rows={} prefix_row_reuse={:.2} reduce_lanes={} strength_groups={} terminal_strength_groups={} max_strength_groups_per_board={} static_card_prefix_cells={} terminal_card_prefix_cells={} terminal_card_prefix_bytes_f32_pair={}",
+                total_groups,
+                total_terminals,
+                total_tables,
+                total_terminals as f64 / total_tables.max(1) as f64,
+                total_prefix_rows,
+                total_table_rows,
+                total_prefix_rows as f64 / total_table_rows.max(1) as f64,
+                total_reduce_lanes,
+                total_strength_groups,
+                total_terminal_strength_groups,
+                max_strength_groups,
+                static_card_prefix_cells,
+                terminal_card_prefix_cells,
+                terminal_card_prefix_cells * std::mem::size_of::<[f32; 2]>()
+            );
             eprintln!("pokedr: gpu terminal groups by board_count:");
             for (board_count, (group_count, terminal_count)) in groups_by_board_count {
                 let table_count = tables_by_board_count

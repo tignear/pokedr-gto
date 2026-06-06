@@ -44,6 +44,12 @@ Observed on `As7h2c`, `depth=5`:
 ```text
 board_count=1:  20 groups, 12808 tables, 122304 terminals, 9.55 terminals/table
 board_count=48:  1 group,    49 tables,    294 terminals, 6.00 terminals/table
+
+total showdown terminals:       122598
+unique final-board tables:       12857
+terminal reduce lanes:       162564948
+terminal-weighted strength groups: 14211160
+max strength groups per board:     185
 ```
 
 Implications:
@@ -55,5 +61,17 @@ Implications:
   coalescing reach reads, but it cannot rely on very wide GEMM columns.
 - Materializing dense `A_b` for every board table is too large. A practical GPU
   kernel should generate `A_b` tiles from combo/card/bounds data on the fly.
+- A fully materialized `(terminal, card, strength_group)` prefix also looks too
+  large: for the same trace it is about `6.0GB` of f32-pair cells. The useful
+  formula is still:
+
+```text
+block_total(h) = prefix_card[c1, G] + prefix_card[c2, G] - reach[h]
+block_win(h)   = prefix_card[c1, g(h)] + prefix_card[c2, g(h)]
+block_tie(h)   = equal_card[c1, g(h)] + equal_card[c2, g(h)] - reach[h]
+```
+
+  but those card/group aggregates need to be produced and consumed inside a
+  tile or small board-table batch rather than stored for every terminal.
 - Previous full 52-card prefix and per-combo workgroup blocker reductions were
   slower; do not retry those shapes unchanged.

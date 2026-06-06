@@ -4,6 +4,25 @@ This file records optimization attempts that failed, were reverted, or were too
 small to count as a strategic direction. Add entries before retrying similar
 ideas.
 
+## 2026-06-06: Strength-group card-prefix sizing
+
+- Tried: quantify a smaller version of terminal card-prefix blocker correction
+  that indexes by showdown strength group instead of by all `1326` combo
+  positions.
+- Expected: preserve the algebraic win of replacing the blocker-neighbor loop
+  with two-card prefix reads while reducing the memory footprint enough for GPU
+  streaming.
+- Result: the unique-board static table is small enough, but the reach-dependent
+  terminal-weighted table is still too large if fully materialized. On
+  `As7h2c`, `depth=5`, `iterations=1`, trace showed `122598` showdown
+  terminals, `12857` unique final-board tables, `162564948` reduce lanes,
+  `14211160` terminal-weighted strength groups, and about `6.0GB` of f32-pair
+  cells for a full terminal/card/group prefix.
+- Decision: do not implement a fully materialized 52-card strength-group prefix.
+  The blocker loop still needs an algebraic replacement, but it must be
+  streamed/tiled so card prefixes are produced and consumed locally, or it must
+  batch terminal columns by board table without storing every card prefix.
+
 ## 2026-06-05: Terminal card-prefix blocker correction
 
 - Tried: materialize per-terminal/per-board/per-card prefix sums so blocker
