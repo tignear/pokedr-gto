@@ -18,6 +18,7 @@ fn main() {
     match Cli::parse().command {
         Command::GpuInfo => print_gpu_info(),
         Command::GpuSmoke => run_gpu_smoke(),
+        Command::GpuCompactStateSmoke(args) => run_gpu_compact_state_smoke(args),
         Command::PostflopSmoke => run_postflop_smoke(),
         Command::SolveFlop(args) => run_solve_flop(args),
         Command::SolveFlopMetrics(args) => run_solve_flop_metrics(args),
@@ -42,6 +43,7 @@ struct Cli {
 enum Command {
     GpuInfo,
     GpuSmoke,
+    GpuCompactStateSmoke(FlopSolveArgs),
     PostflopSmoke,
     SolveFlop(FlopSolveArgs),
     SolveFlopMetrics(FlopMetricsArgs),
@@ -293,6 +295,69 @@ fn print_gpu_info() {
     println!("vendor: 0x{:x}", info.vendor);
     println!("device: 0x{:x}", info.device);
     println!("shader_float32_atomic: {}", supports_shader_float32_atomic);
+}
+
+fn run_gpu_compact_state_smoke(args: FlopSolveArgs) {
+    let flop = parse_flop(&args.flop).unwrap_or_else(|error| {
+        eprintln!("{error}");
+        std::process::exit(2);
+    });
+    let config = fixed_flop_config(&args.solver);
+    let public_state = PublicState {
+        street: Street::Flop,
+        board: Board::new(flop.to_vec()),
+        pot: 4,
+        hero_invested: 2,
+        villain_invested: 2,
+        effective_stack: 100,
+        to_call: 0,
+        min_aggressive_amount: 2,
+        acting_player: Player::Hero,
+        raises_this_street: 0,
+        checks_this_street: 0,
+    };
+    let tree = SubgameTree::build(
+        public_state,
+        SubgameTreeConfig {
+            action_set: config.action_set,
+            max_raises_per_street: config.max_raises_per_street,
+        },
+    );
+    let layout = PostflopDenseLayout::from_tree(&tree);
+    let backend = match GpuDenseCfrBackend::new() {
+        Ok(backend) => backend,
+        Err(GpuCfrError::NoAdapter) => {
+            eprintln!("no GPU adapter visible to wgpu");
+            std::process::exit(1);
+        }
+        Err(error) => {
+            eprintln!("failed to initialize GPU backend: {error:?}");
+            std::process::exit(1);
+        }
+    };
+    let max_chunk_bytes = (backend.max_storage_buffer_binding_size() as usize).min(128usize << 20);
+    let compact_config = layout.compact_private_config(1326usize, config.cfr_variant);
+    let state = backend.zeroed_compact_private_regret_state(compact_config, max_chunk_bytes);
+    println!("board: {}", format_pokedr_cards_for_cli(&flop));
+    println!(
+        "adapter: {} ({:?})",
+        backend.adapter_info().name,
+        backend.adapter_info().backend
+    );
+    println!("public_infosets: {}", state.public_infosets());
+    println!("public_actions: {}", state.public_actions());
+    println!("combos: {}", state.combos());
+    println!("compact_action_slots: {}", state.total_action_slots());
+    println!("chunks: {}", state.chunks().len());
+    println!(
+        "largest_chunk_slots: {}",
+        state
+            .chunks()
+            .iter()
+            .map(|chunk| chunk.chunk().action_slots)
+            .max()
+            .unwrap_or(0)
+    );
 }
 
 fn run_gpu_smoke() {
@@ -874,6 +939,17 @@ fn run_tree_shape(args: FlopSolveArgs) {
     println!(
         "private_action_slots_compact: {}",
         layout.total_actions() * 1326usize
+    );
+    let compact_config = layout.compact_private_config(1326usize, CfrVariant::CfrPlus);
+    let compact_chunks = compact_config.chunk_by_action_bytes(128usize << 20);
+    println!("compact_chunks_128mib: {}", compact_chunks.len());
+    println!(
+        "compact_largest_chunk_slots: {}",
+        compact_chunks
+            .iter()
+            .map(|chunk| chunk.action_slots)
+            .max()
+            .unwrap_or(0)
     );
     println!(
         "decisions_by_street: flop={} turn={} river={}",

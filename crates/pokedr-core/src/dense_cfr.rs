@@ -163,6 +163,15 @@ pub struct CompactPrivateCfrConfig {
     pub variant: CfrVariant,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompactPrivateCfrChunk {
+    pub public_start: usize,
+    pub public_end: usize,
+    pub public_action_start: usize,
+    pub public_action_end: usize,
+    pub action_slots: usize,
+}
+
 impl CompactPrivateCfrConfig {
     pub fn public_infosets(&self) -> usize {
         self.public_action_offsets.len().saturating_sub(1)
@@ -189,6 +198,39 @@ impl CompactPrivateCfrConfig {
                 "each public infoset must contain at least one action"
             );
         }
+    }
+
+    pub fn chunk_by_action_bytes(&self, max_bytes: usize) -> Vec<CompactPrivateCfrChunk> {
+        self.validate();
+        let bytes_per_public_action = self.combos * std::mem::size_of::<f32>();
+        assert!(
+            max_bytes >= bytes_per_public_action,
+            "max bytes must fit at least one public action"
+        );
+        let max_public_actions = (max_bytes / bytes_per_public_action).max(1);
+        let mut chunks = Vec::new();
+        let mut public_start = 0usize;
+        while public_start < self.public_infosets() {
+            let action_start = self.public_action_offsets[public_start];
+            let mut public_end = public_start + 1;
+            while public_end < self.public_infosets() {
+                let action_len = self.public_action_offsets[public_end + 1] - action_start;
+                if action_len > max_public_actions {
+                    break;
+                }
+                public_end += 1;
+            }
+            let action_end = self.public_action_offsets[public_end];
+            chunks.push(CompactPrivateCfrChunk {
+                public_start,
+                public_end,
+                public_action_start: action_start,
+                public_action_end: action_end,
+                action_slots: (action_end - action_start) * self.combos,
+            });
+            public_start = public_end;
+        }
+        chunks
     }
 }
 
@@ -1452,6 +1494,43 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn compact_private_config_chunks_by_public_action_bytes() {
+        let config = CompactPrivateCfrConfig {
+            public_action_offsets: vec![0, 2, 5, 7, 11],
+            combos: 10,
+            variant: CfrVariant::CfrPlus,
+        };
+        let chunks = config.chunk_by_action_bytes(5 * 10 * std::mem::size_of::<f32>());
+
+        assert_eq!(
+            chunks,
+            vec![
+                CompactPrivateCfrChunk {
+                    public_start: 0,
+                    public_end: 2,
+                    public_action_start: 0,
+                    public_action_end: 5,
+                    action_slots: 50,
+                },
+                CompactPrivateCfrChunk {
+                    public_start: 2,
+                    public_end: 3,
+                    public_action_start: 5,
+                    public_action_end: 7,
+                    action_slots: 20,
+                },
+                CompactPrivateCfrChunk {
+                    public_start: 3,
+                    public_end: 4,
+                    public_action_start: 7,
+                    public_action_end: 11,
+                    action_slots: 40,
+                },
+            ]
+        );
     }
 
     #[test]

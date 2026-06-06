@@ -9,7 +9,10 @@ use wgpu::util::DeviceExt;
 
 use crate::cards::{Card, evaluate};
 
-use super::{DenseCfrConfig, DenseCfrIteration, DenseCfrRunStats, DenseCfrState};
+use super::{
+    CompactPrivateCfrChunk, CompactPrivateCfrConfig, DenseCfrConfig, DenseCfrIteration,
+    DenseCfrRunStats, DenseCfrState,
+};
 
 const WORKGROUP_SIZE: u32 = 64;
 const SHOWDOWN_CARDS: usize = 9;
@@ -71,6 +74,21 @@ pub struct GpuDenseCfrState {
     regrets: wgpu::Buffer,
     prediction: wgpu::Buffer,
     strategy_sum: wgpu::Buffer,
+}
+
+pub struct GpuCompactPrivateCfrState {
+    public_infosets: usize,
+    public_actions: usize,
+    combos: usize,
+    variant: super::CfrVariant,
+    chunks: Vec<GpuCompactPrivateCfrChunkState>,
+}
+
+pub struct GpuCompactPrivateCfrChunkState {
+    chunk: CompactPrivateCfrChunk,
+    regrets: wgpu::Buffer,
+    prediction: Option<wgpu::Buffer>,
+    strategy_sum: Option<wgpu::Buffer>,
 }
 
 pub struct GpuResidentDenseCfrSolver {
@@ -1324,6 +1342,10 @@ impl GpuDenseCfrBackend {
 
     pub fn max_storage_buffer_binding_size(&self) -> u64 {
         self.device.limits().max_storage_buffer_binding_size
+    }
+
+    pub fn max_buffer_size(&self) -> u64 {
+        self.device.limits().max_buffer_size
     }
 
     pub fn adapter_features(&self) -> wgpu::Features {
@@ -4040,6 +4062,56 @@ impl GpuDenseCfrBackend {
         self.upload_state(&state)
     }
 
+    pub fn zeroed_compact_private_state(
+        &self,
+        config: CompactPrivateCfrConfig,
+        max_chunk_bytes: usize,
+    ) -> GpuCompactPrivateCfrState {
+        self.zeroed_compact_private_state_with_buffers(config, max_chunk_bytes, true, true)
+    }
+
+    pub fn zeroed_compact_private_regret_state(
+        &self,
+        config: CompactPrivateCfrConfig,
+        max_chunk_bytes: usize,
+    ) -> GpuCompactPrivateCfrState {
+        self.zeroed_compact_private_state_with_buffers(config, max_chunk_bytes, false, false)
+    }
+
+    fn zeroed_compact_private_state_with_buffers(
+        &self,
+        config: CompactPrivateCfrConfig,
+        max_chunk_bytes: usize,
+        include_prediction: bool,
+        include_strategy_sum: bool,
+    ) -> GpuCompactPrivateCfrState {
+        config.validate();
+        let chunks = config
+            .chunk_by_action_bytes(max_chunk_bytes)
+            .into_iter()
+            .map(|chunk| {
+                let zeros = vec![0.0; chunk.action_slots];
+                let prediction = include_prediction
+                    .then(|| storage_buffer(&self.device, "compact private prediction", &zeros));
+                let strategy_sum = include_strategy_sum
+                    .then(|| storage_buffer(&self.device, "compact private strategy sum", &zeros));
+                GpuCompactPrivateCfrChunkState {
+                    chunk,
+                    regrets: storage_buffer(&self.device, "compact private regrets", &zeros),
+                    prediction,
+                    strategy_sum,
+                }
+            })
+            .collect();
+        GpuCompactPrivateCfrState {
+            public_infosets: config.public_infosets(),
+            public_actions: config.public_actions(),
+            combos: config.combos,
+            variant: config.variant,
+            chunks,
+        }
+    }
+
     pub fn resident_solver(&self, config: DenseCfrConfig) -> GpuResidentDenseCfrSolver {
         GpuResidentDenseCfrSolver {
             state: self.zeroed_state(config.clone()),
@@ -4205,6 +4277,53 @@ impl GpuDenseCfrState {
             })
             .map_err(|error| GpuCfrError::MapFailed(error.to_string()))?;
         read_f32_buffer(&backend.device, &readback, len)
+    }
+}
+
+impl GpuCompactPrivateCfrState {
+    pub fn public_infosets(&self) -> usize {
+        self.public_infosets
+    }
+
+    pub fn public_actions(&self) -> usize {
+        self.public_actions
+    }
+
+    pub fn combos(&self) -> usize {
+        self.combos
+    }
+
+    pub fn variant(&self) -> super::CfrVariant {
+        self.variant
+    }
+
+    pub fn chunks(&self) -> &[GpuCompactPrivateCfrChunkState] {
+        &self.chunks
+    }
+
+    pub fn total_action_slots(&self) -> usize {
+        self.chunks
+            .iter()
+            .map(|chunk| chunk.chunk.action_slots)
+            .sum()
+    }
+}
+
+impl GpuCompactPrivateCfrChunkState {
+    pub fn chunk(&self) -> CompactPrivateCfrChunk {
+        self.chunk
+    }
+
+    pub fn regrets_buffer(&self) -> &wgpu::Buffer {
+        &self.regrets
+    }
+
+    pub fn prediction_buffer(&self) -> Option<&wgpu::Buffer> {
+        self.prediction.as_ref()
+    }
+
+    pub fn strategy_sum_buffer(&self) -> Option<&wgpu::Buffer> {
+        self.strategy_sum.as_ref()
     }
 }
 

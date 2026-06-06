@@ -1001,6 +1001,21 @@ fn try_solve_fixed_flop_metrics_gpu(
     let linearized = linearize_gpu_public_tree(tree, layout, &backend, base_config, &matrix_cache)?;
     let mut dense_config = layout.dense_config(base_config.cfr_variant);
     dense_config.infosets *= PRIVATE_INFOS_PER_PUBLIC;
+    if !gpu_dense_state_fits_single_buffers(&backend, &dense_config) {
+        if solver_progress_enabled() {
+            eprintln!(
+                "pokedr: skipping dense resident GPU metrics state; public_infosets={} private_infosets={} max_actions={} dense_action_slots={} compact_action_slots={}",
+                layout.infoset_count(),
+                dense_config.infosets,
+                dense_config.actions,
+                dense_config.infosets.saturating_mul(dense_config.actions),
+                layout
+                    .total_actions()
+                    .saturating_mul(PRIVATE_INFOS_PER_PUBLIC)
+            );
+        }
+        return None;
+    }
     assert_gpu_dense_binding_feasible(&backend, &dense_config);
     let combos = gpu_private_combos();
     let combo_legal: Vec<u32> = indexer
@@ -3387,6 +3402,7 @@ fn solve_public_tree_cfr(
         return gpu_state;
     }
 
+    assert_dense_private_state_feasible(layout);
     let mut state =
         DenseCfrState::new_with_legal_actions(dense_config.clone(), private_legal_actions(layout));
     let mut batch = DenseCfrIteration::new(&dense_config);
@@ -3452,6 +3468,26 @@ fn solve_public_tree_cfr(
     state
 }
 
+fn assert_dense_private_state_feasible(layout: &PostflopDenseLayout) {
+    let dense_action_slots = layout
+        .infoset_count()
+        .saturating_mul(PRIVATE_INFOS_PER_PUBLIC)
+        .saturating_mul(layout.max_actions());
+    let dense_action_bytes = dense_action_slots.saturating_mul(std::mem::size_of::<f32>());
+    const MAX_CPU_FALLBACK_ACTION_BYTES: usize = 1usize << 30;
+    assert!(
+        dense_action_bytes <= MAX_CPU_FALLBACK_ACTION_BYTES,
+        "postflop solver cannot use dense private fallback for this tree: public_infosets={} max_actions={} dense_action_slots={} dense_f32_bytes={} compact_action_slots={}. The solver needs chunked compact GPU state for this tree.",
+        layout.infoset_count(),
+        layout.max_actions(),
+        dense_action_slots,
+        dense_action_bytes,
+        layout
+            .total_actions()
+            .saturating_mul(PRIVATE_INFOS_PER_PUBLIC)
+    );
+}
+
 fn solver_progress_enabled() -> bool {
     !cfg!(test) && std::env::var_os("POKEDR_SOLVER_PROGRESS_OFF").is_none()
 }
@@ -3496,6 +3532,21 @@ fn try_solve_gpu_public_tree_resident(
     matrix_cache: &RefCell<ShowdownMatrixCache>,
 ) -> Option<DenseCfrState> {
     let linearized = linearize_gpu_public_tree(tree, layout, backend, config, matrix_cache)?;
+    if !gpu_dense_state_fits_single_buffers(backend, dense_config) {
+        if solver_progress_enabled() {
+            eprintln!(
+                "pokedr: skipping dense resident GPU state; public_infosets={} private_infosets={} max_actions={} dense_action_slots={} compact_action_slots={}",
+                layout.infoset_count(),
+                dense_config.infosets,
+                dense_config.actions,
+                dense_config.infosets.saturating_mul(dense_config.actions),
+                layout
+                    .total_actions()
+                    .saturating_mul(PRIVATE_INFOS_PER_PUBLIC)
+            );
+        }
+        return None;
+    }
     assert_gpu_dense_binding_feasible(backend, dense_config);
     if solver_progress_enabled() {
         eprintln!(
@@ -3537,6 +3588,24 @@ fn try_solve_gpu_public_tree_resident(
         );
     }
     gpu_state.download(backend).ok()
+}
+
+fn gpu_dense_state_fits_single_buffers(
+    backend: &GpuDenseCfrBackend,
+    config: &pokedr_core::dense_cfr::DenseCfrConfig,
+) -> bool {
+    let max_buffer_bytes = backend.max_buffer_size() as usize;
+    let max_binding_bytes = backend.max_storage_buffer_binding_size() as usize;
+    let action_slots = config.infosets.saturating_mul(config.actions);
+    let f32_action_bytes = action_slots.saturating_mul(std::mem::size_of::<f32>());
+    let u32_action_bytes = action_slots.saturating_mul(std::mem::size_of::<u32>());
+    let infoset_bytes = config.infosets.saturating_mul(std::mem::size_of::<f32>());
+    f32_action_bytes <= max_buffer_bytes
+        && f32_action_bytes <= max_binding_bytes
+        && u32_action_bytes <= max_buffer_bytes
+        && u32_action_bytes <= max_binding_bytes
+        && infoset_bytes <= max_buffer_bytes
+        && infoset_bytes <= max_binding_bytes
 }
 
 fn fill_public_tree_iteration(
