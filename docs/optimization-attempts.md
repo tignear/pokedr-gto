@@ -301,3 +301,40 @@ ideas.
 - Decision: reverted. Do not retry this exact shape; if reach propagation is
   optimized, change the dispatch/data layout rather than adding per-edge mask
   checks.
+
+## 2026-06-06: Full compact iteration streaming smoke
+
+- Tried: remove dense private action output materialization for the full default
+  flop tree by adding compact backup and compact fused update shaders. The
+  smoke path streams reach and complete-group updates over compact public-action
+  chunks instead of allocating the old dense action/reach/strategy output
+  tables.
+- Expected: prove the full tree can execute one CFR iteration core without the
+  previous dense-output OOM.
+- Result: kept as a smoke/diagnostic path. On `As7h2c`, full default tree:
+  `477170` public infosets, `1100854` public actions, `1326` combos,
+  `1459732404` compact action slots, `44` chunks, largest chunk `33554430`
+  slots, `1470` reach dispatch slices, and `1426` compact update dispatch
+  slices. One compact iteration smoke completed without OOM.
+- Decision: keep as validation scaffolding, not as the final solver. It proves
+  the dense table can be removed, but it still rebuilds/streams too much per
+  iteration.
+
+## 2026-06-06: Resident compact regrets on full flop
+
+- Tried: keep compact regrets resident on GPU and run multiple full-tree
+  compact iterations. A fully resident `regrets + strategy_sum` state OOM'd
+  immediately. A resident-regret plus streamed-strategy diagnostic path ran
+  `1` iteration in `34.94s`; after splitting backup and aggregate submissions,
+  `2` iterations completed in `41.17s`.
+- Expected: if VRAM could hold the compact state, reusing regrets would make
+  repeated iterations practical.
+- Result: not a viable final direction on the current WGPU/DZN setup. The
+  compact regret table alone is about `1,459,732,404 * 4 = 5.44GiB`; adding
+  average strategy doubles that before terminal/context/work buffers. In
+  practice this spills into shared GPU memory (DDR5), so resident state avoids
+  OOM only by becoming bandwidth-bound through shared memory.
+- Decision: do not pursue full resident fp32 compact state as the main solver
+  path. The next viable direction is either chunk-streamed persistent state
+  with explicit host backing and bounded VRAM working sets, or a compressed
+  state representation such as fp16/quantized regret and average strategy.

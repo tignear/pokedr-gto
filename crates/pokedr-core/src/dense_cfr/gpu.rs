@@ -4766,6 +4766,54 @@ impl GpuDenseCfrBackend {
         self.zeroed_compact_private_state_with_buffers(config, max_chunk_bytes, false, false)
     }
 
+    pub fn zeroed_compact_private_regret_state_with_streamed_strategy(
+        &self,
+        config: CompactPrivateCfrConfig,
+        max_chunk_bytes: usize,
+    ) -> GpuCompactPrivateCfrState {
+        config.validate();
+        let chunks = config.chunk_by_action_bytes(max_chunk_bytes);
+        let largest_chunk_slots = chunks
+            .iter()
+            .map(|chunk| chunk.action_slots)
+            .max()
+            .unwrap_or(1)
+            .max(1);
+        let scratch_zeros = vec![0.0; largest_chunk_slots];
+        let scratch_strategy_sum = storage_buffer(
+            &self.device,
+            "compact private streamed strategy sum scratch",
+            &scratch_zeros,
+        );
+        let include_prediction = matches!(config.variant, super::CfrVariant::PdcfrPlus { .. });
+        let scratch_prediction = include_prediction.then(|| {
+            storage_buffer(
+                &self.device,
+                "compact private streamed prediction scratch",
+                &scratch_zeros,
+            )
+        });
+        let chunks = chunks
+            .into_iter()
+            .map(|chunk| {
+                let zeros = vec![0.0; chunk.action_slots];
+                GpuCompactPrivateCfrChunkState {
+                    chunk,
+                    regrets: storage_buffer(&self.device, "compact private regrets", &zeros),
+                    prediction: scratch_prediction.clone(),
+                    strategy_sum: Some(scratch_strategy_sum.clone()),
+                }
+            })
+            .collect();
+        GpuCompactPrivateCfrState {
+            public_infosets: config.public_infosets(),
+            public_actions: config.public_actions(),
+            combos: config.combos,
+            variant: config.variant,
+            chunks,
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn compact_public_tree_context_smoke(
         &self,
@@ -5148,10 +5196,17 @@ impl GpuDenseCfrBackend {
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("compact public tree iteration update prep encoder"),
+                label: Some("compact public tree iteration backup encoder"),
             });
         self.backup_layer_values_compact(&mut encoder, &context, &state, br_player, iteration);
+        self.queue.submit(Some(encoder.finish()));
+        self.profile_poll()?;
         trace_pipeline_step("compact_iteration:aggregate:start");
+        let encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("compact public tree iteration aggregate encoder"),
+            });
         let encoder = self.write_compact_update_aggregates(encoder, &context);
         self.queue.submit(Some(encoder.finish()));
         trace_pipeline_step("compact_iteration:update:start");
@@ -5182,23 +5237,142 @@ impl GpuDenseCfrBackend {
         first_iteration: usize,
         iterations: usize,
     ) -> Result<(usize, usize, usize, usize), GpuCfrError> {
+        assert!(
+            state
+                .chunks
+                .iter()
+                .all(|chunk| chunk.strategy_sum.is_some()),
+            "compact public tree iteration requires strategy_sum buffers"
+        );
+        assert!(
+            !matches!(state.variant, super::CfrVariant::PdcfrPlus { .. })
+                || state.chunks.iter().all(|chunk| chunk.prediction.is_some()),
+            "PDCFR+ compact public tree iteration requires prediction buffers"
+        );
+        trace_pipeline_step("compact_iterations:context:start");
+        let context = self.public_tree_iteration_context(
+            nodes,
+            children,
+            child_cards,
+            combos,
+            combo_legal,
+            hero_weights,
+            villain_weights,
+            showdown_boards,
+            nodes_public_infoset_count(nodes) * combos.len(),
+            nodes_max_action_count(nodes),
+            false,
+            true,
+        );
+        trace_pipeline_step("compact_iterations:context:done");
         let mut last = (0, 0, 0, 0);
         for offset in 0..iterations {
-            last = self.compact_public_tree_run_iteration_with_state(
-                nodes,
-                children,
-                child_cards,
-                combos,
-                combo_legal,
-                hero_weights,
-                villain_weights,
-                showdown_boards,
+            last = self.compact_public_tree_run_iteration_on_context(
+                &context,
                 state,
                 2,
                 first_iteration + offset,
             )?;
         }
         Ok(last)
+    }
+
+    fn compact_public_tree_run_iteration_on_context(
+        &self,
+        context: &GpuPublicTreeIterationContext,
+        state: &GpuCompactPrivateCfrState,
+        br_player: u32,
+        iteration: usize,
+    ) -> Result<(usize, usize, usize, usize), GpuCfrError> {
+        let chunk_plan: Vec<_> = state.chunks.iter().map(|chunk| chunk.chunk).collect();
+        let uncovered_reach_tiles = compact_uncovered_reach_tiles(context, &chunk_plan);
+
+        trace_pipeline_step("compact_iteration:reach_init:start");
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("compact public tree iteration pre-terminal encoder"),
+            });
+        self.propagate_layer_reach_inits(&mut encoder, context, state.variant, iteration);
+        self.queue.submit(Some(encoder.finish()));
+        trace_pipeline_step("compact_iteration:reach_edges:start");
+        let reach_slices =
+            self.submit_compact_layer_reach_edges_batched(context, state, br_player, iteration);
+
+        trace_pipeline_step("compact_iteration:fold:start");
+        for layer_tiles in &context.layer_tiles {
+            for tile in layer_tiles {
+                if tile.fold_terminal_nodes.is_empty() {
+                    continue;
+                }
+                let mut encoder =
+                    self.device
+                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                            label: Some("compact public tree iteration fold encoder"),
+                        });
+                self.fill_fold_values(
+                    &mut encoder,
+                    &tile.node_buffer,
+                    &tile.fold_terminal_nodes,
+                    &context.combo_buffer,
+                    &tile.hero_reaches_buffer,
+                    &tile.villain_reaches_buffer,
+                    &tile.combo_live_buffer,
+                    &tile.hero_values_buffer,
+                    &tile.villain_values_buffer,
+                    context.combos_len,
+                )?;
+                self.queue.submit(Some(encoder.finish()));
+            }
+        }
+        self.profile_poll()?;
+        trace_pipeline_step("compact_iteration:showdown:start");
+        for layer_tiles in &context.layer_tiles {
+            for tile in layer_tiles {
+                self.fill_terminal_values_streaming(
+                    &tile.node_buffer,
+                    &tile.showdown_terminal_groups,
+                    &context.terminal_blocker_neighbors_buffer,
+                    &tile.hero_reaches_buffer,
+                    &tile.villain_reaches_buffer,
+                    &tile.hero_values_buffer,
+                    &tile.villain_values_buffer,
+                    &context.terminal_prefix_pairs_buffer,
+                    context.combos_len,
+                    context.terminal_blocker_neighbor_stride,
+                    context.terminal_prefix_pair_budget,
+                )?;
+            }
+        }
+
+        trace_pipeline_step("compact_iteration:backup:start");
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("compact public tree iteration backup encoder"),
+            });
+        self.backup_layer_values_compact(&mut encoder, context, state, br_player, iteration);
+        self.queue.submit(Some(encoder.finish()));
+        self.profile_poll()?;
+        trace_pipeline_step("compact_iteration:aggregate:start");
+        let encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("compact public tree iteration aggregate encoder"),
+            });
+        let encoder = self.write_compact_update_aggregates(encoder, context);
+        self.queue.submit(Some(encoder.finish()));
+        trace_pipeline_step("compact_iteration:update:start");
+        let update_slices =
+            self.submit_compact_complete_group_updates_batched(context, state, iteration);
+        trace_pipeline_step("compact_iteration:done");
+
+        Ok((
+            context.compact_private_action_slots(),
+            uncovered_reach_tiles,
+            reach_slices,
+            update_slices,
+        ))
     }
 
     fn zeroed_compact_private_state_with_buffers(

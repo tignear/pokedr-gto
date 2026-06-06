@@ -19,6 +19,7 @@ fn main() {
         Command::GpuInfo => print_gpu_info(),
         Command::GpuSmoke => run_gpu_smoke(),
         Command::GpuCompactStateSmoke(args) => run_gpu_compact_state_smoke(args),
+        Command::GpuCompactIterationBench(args) => run_gpu_compact_iteration_bench(args),
         Command::PostflopSmoke => run_postflop_smoke(),
         Command::SolveFlop(args) => run_solve_flop(args),
         Command::SolveFlopMetrics(args) => run_solve_flop_metrics(args),
@@ -44,6 +45,7 @@ enum Command {
     GpuInfo,
     GpuSmoke,
     GpuCompactStateSmoke(FlopSolveArgs),
+    GpuCompactIterationBench(FlopSolveArgs),
     PostflopSmoke,
     SolveFlop(FlopSolveArgs),
     SolveFlopMetrics(FlopMetricsArgs),
@@ -339,6 +341,41 @@ fn run_gpu_compact_state_smoke(args: FlopSolveArgs) {
         summary.compact_update_dispatch_slices
     );
     println!("split_public_infosets: {}", summary.split_public_infosets);
+}
+
+fn run_gpu_compact_iteration_bench(args: FlopSolveArgs) {
+    let flop = parse_flop(&args.flop).unwrap_or_else(|error| {
+        eprintln!("{error}");
+        std::process::exit(2);
+    });
+    let config = fixed_flop_config(&args.solver);
+    let summary =
+        pokedr_agent::fixed_flop_compact_iteration_bench(flop, config).unwrap_or_else(|| {
+            eprintln!("failed to run compact GPU iteration bench");
+            std::process::exit(1);
+        });
+    println!("board: {}", summary.board);
+    println!("iterations: {}", summary.iterations);
+    println!("public_infosets: {}", summary.public_infosets);
+    println!("public_actions: {}", summary.public_actions);
+    println!("combos: {}", summary.combos);
+    println!("compact_action_slots: {}", summary.compact_action_slots);
+    println!("chunks: {}", summary.chunks);
+    println!("largest_chunk_slots: {}", summary.largest_chunk_slots);
+    println!(
+        "compact_context_action_slots: {}",
+        summary.compact_context_action_slots
+    );
+    println!("uncovered_reach_tiles: {}", summary.uncovered_reach_tiles);
+    println!(
+        "compact_reach_dispatch_slices: {}",
+        summary.compact_reach_dispatch_slices
+    );
+    println!(
+        "compact_update_dispatch_slices: {}",
+        summary.compact_update_dispatch_slices
+    );
+    println!("elapsed: {:.2}s", summary.elapsed_secs);
 }
 
 fn run_gpu_smoke() {
