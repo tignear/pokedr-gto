@@ -106,6 +106,19 @@ pub struct FixedFlopSolveSummary {
     pub elapsed_secs: f32,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FixedFlopCompactSmokeSummary {
+    pub public_infosets: usize,
+    pub public_actions: usize,
+    pub combos: usize,
+    pub compact_action_slots: usize,
+    pub chunks: usize,
+    pub largest_chunk_slots: usize,
+    pub compact_context_action_slots: usize,
+    pub uncovered_reach_tiles: usize,
+    pub reach_tiles_requiring_split: usize,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct FixedFlopMetricRow {
     pub board: String,
@@ -586,10 +599,10 @@ pub fn gpu_backend_mode() -> BackendMode {
     }
 }
 
-pub fn fixed_flop_compact_context_smoke(
+pub fn fixed_flop_compact_smoke(
     flop: [PokedrCard; 3],
     config: PokedrAgentConfig,
-) -> Option<usize> {
+) -> Option<FixedFlopCompactSmokeSummary> {
     let public_state = PublicState {
         street: Street::Flop,
         board: Board::new(flop.to_vec()),
@@ -623,16 +636,44 @@ pub fn fixed_flop_compact_context_smoke(
         .iter()
         .map(|combo| (!combo.collides_with(root_dead)) as u32)
         .collect();
-    Some(backend.compact_public_tree_context_smoke(
-        &linearized.nodes,
-        &linearized.children,
-        &linearized.child_cards,
-        &combos,
-        &combo_legal,
-        &hero_weights,
-        &villain_weights,
-        &linearized.showdown_boards,
-    ))
+    let max_chunk_bytes = (backend.max_storage_buffer_binding_size() as usize).min(128usize << 20);
+    let compact_config = layout.compact_private_config(COMBO_COUNT, config.cfr_variant);
+    let chunks = compact_config.chunk_by_action_bytes(max_chunk_bytes);
+    let largest_chunk_slots = chunks
+        .iter()
+        .map(|chunk| chunk.action_slots)
+        .max()
+        .unwrap_or(0);
+    let (compact_context_action_slots, uncovered_reach_tiles) = backend
+        .compact_public_tree_context_smoke_with_chunks(
+            &linearized.nodes,
+            &linearized.children,
+            &linearized.child_cards,
+            &combos,
+            &combo_legal,
+            &hero_weights,
+            &villain_weights,
+            &linearized.showdown_boards,
+            Some(&chunks),
+        );
+    Some(FixedFlopCompactSmokeSummary {
+        public_infosets: compact_config.public_infosets(),
+        public_actions: compact_config.public_actions(),
+        combos: compact_config.combos,
+        compact_action_slots: compact_config.total_action_slots(),
+        chunks: chunks.len(),
+        largest_chunk_slots,
+        compact_context_action_slots,
+        uncovered_reach_tiles,
+        reach_tiles_requiring_split: uncovered_reach_tiles,
+    })
+}
+
+pub fn fixed_flop_compact_context_smoke(
+    flop: [PokedrCard; 3],
+    config: PokedrAgentConfig,
+) -> Option<usize> {
+    fixed_flop_compact_smoke(flop, config).map(|summary| summary.compact_context_action_slots)
 }
 
 pub fn solve_fixed_flop_once(

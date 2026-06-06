@@ -4,6 +4,20 @@ This file records optimization attempts that failed, were reverted, or were too
 small to count as a strategic direction. Add entries before retrying similar
 ideas.
 
+## 2026-06-06: Protect reach-tile public ranges in compact chunks
+
+- Tried: choose compact private CFR chunk boundaries so every reach-edge tile's
+  public-infoset range fits inside a single chunk.
+- Expected: allow compact reach propagation to bind one regret chunk per tile
+  without splitting reach tiles.
+- Result: failed as a layout direction. On the full `As7h2c` tree, the normal
+  compact regret-only plan is `44` chunks with about `1.46B` action slots. The
+  protected-boundary plan exploded to `465823` chunks because reach-tile ranges
+  overlap densely across adjacent public infosets. Total slot count did not
+  change, but the buffer/bind-group count would be unusable.
+- Decision: keep compact state chunks coarse and split reach-edge work at chunk
+  boundaries instead. Do not retry protected chunk boundaries.
+
 ## 2026-06-06: Dense resident chunking after natural tree expansion
 
 - Tried: remove the postflop `max_depth` cutoff and keep using the resident

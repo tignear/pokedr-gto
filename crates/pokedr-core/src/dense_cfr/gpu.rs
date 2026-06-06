@@ -4190,6 +4190,66 @@ impl GpuDenseCfrBackend {
         villain_weights: &[f32],
         showdown_boards: &[GpuFinalBoard],
     ) -> usize {
+        self.compact_public_tree_context_smoke_with_state(
+            nodes,
+            children,
+            child_cards,
+            combos,
+            combo_legal,
+            hero_weights,
+            villain_weights,
+            showdown_boards,
+            None,
+        )
+        .0
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn compact_public_tree_context_smoke_with_state(
+        &self,
+        nodes: &[GpuPublicTreeNode],
+        children: &[u32],
+        child_cards: &[u32],
+        combos: &[GpuPrivateCombo],
+        combo_legal: &[u32],
+        hero_weights: &[f32],
+        villain_weights: &[f32],
+        showdown_boards: &[GpuFinalBoard],
+        state: Option<&GpuCompactPrivateCfrState>,
+    ) -> (usize, usize) {
+        let chunks = state.map(|state| {
+            state
+                .chunks
+                .iter()
+                .map(|chunk| chunk.chunk)
+                .collect::<Vec<_>>()
+        });
+        self.compact_public_tree_context_smoke_with_chunks(
+            nodes,
+            children,
+            child_cards,
+            combos,
+            combo_legal,
+            hero_weights,
+            villain_weights,
+            showdown_boards,
+            chunks.as_deref(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn compact_public_tree_context_smoke_with_chunks(
+        &self,
+        nodes: &[GpuPublicTreeNode],
+        children: &[u32],
+        child_cards: &[u32],
+        combos: &[GpuPrivateCombo],
+        combo_legal: &[u32],
+        hero_weights: &[f32],
+        villain_weights: &[f32],
+        showdown_boards: &[GpuFinalBoard],
+        chunks: Option<&[CompactPrivateCfrChunk]>,
+    ) -> (usize, usize) {
         let context = self.public_tree_iteration_context(
             nodes,
             children,
@@ -4203,7 +4263,13 @@ impl GpuDenseCfrBackend {
             nodes_max_action_count(nodes),
             false,
         );
-        context.compact_private_action_slots()
+        let uncovered_reach_tiles = chunks
+            .map(|chunks| compact_uncovered_reach_tiles(&context, chunks))
+            .unwrap_or(0);
+        (
+            context.compact_private_action_slots(),
+            uncovered_reach_tiles,
+        )
     }
 
     fn zeroed_compact_private_state_with_buffers(
@@ -4747,6 +4813,38 @@ fn nodes_max_action_count(nodes: &[GpuPublicTreeNode]) -> usize {
         .unwrap_or(1)
 }
 
+fn compact_uncovered_reach_tiles(
+    ctx: &GpuPublicTreeIterationContext,
+    chunks: &[CompactPrivateCfrChunk],
+) -> usize {
+    ctx.layered
+        .reach_edge_tiles
+        .iter()
+        .filter(|edge_tile| {
+            let parent_tile_index = edge_tile.parent_tile.node_start / ctx.layered.node_tile_size;
+            let parent_tile = &ctx.layer_tiles[edge_tile.parent_layer][parent_tile_index];
+            let parent_layer_nodes = &ctx.layered.layers[edge_tile.parent_layer].nodes
+                [parent_tile.node_start..parent_tile.node_end];
+            let Some((public_start, public_end)) =
+                public_infoset_exact_range_for_edges(parent_layer_nodes, &edge_tile.edges)
+            else {
+                return false;
+            };
+            compact_chunk_covering_public_range(chunks, public_start, public_end).is_none()
+        })
+        .count()
+}
+
+fn compact_chunk_covering_public_range(
+    chunks: &[CompactPrivateCfrChunk],
+    public_start: usize,
+    public_end: usize,
+) -> Option<&CompactPrivateCfrChunk> {
+    chunks
+        .iter()
+        .find(|chunk| chunk.public_start <= public_start && public_end <= chunk.public_end)
+}
+
 fn public_action_offsets_from_nodes(nodes: &[GpuPublicTreeNode]) -> Vec<u32> {
     let public_infoset_count = nodes_public_infoset_count(nodes);
     let mut action_counts = vec![None; public_infoset_count];
@@ -4806,6 +4904,26 @@ fn public_infoset_range_for_edges(
         found = true;
     }
     found.then_some((public_infoset_bind_base(min_infoset), max_infoset + 1))
+}
+
+fn public_infoset_exact_range_for_edges(
+    nodes: &[GpuPublicTreeNode],
+    edges: &[GpuPublicTreeEdge],
+) -> Option<(usize, usize)> {
+    let mut min_infoset = usize::MAX;
+    let mut max_infoset = 0usize;
+    let mut found = false;
+    for edge in edges {
+        let node = nodes[edge.parent as usize];
+        if node.kind != 0 {
+            continue;
+        }
+        let infoset = node.public_infoset as usize;
+        min_infoset = min_infoset.min(infoset);
+        max_infoset = max_infoset.max(infoset);
+        found = true;
+    }
+    found.then_some((min_infoset, max_infoset + 1))
 }
 
 fn f32_range_byte_offset(elements: usize) -> u64 {

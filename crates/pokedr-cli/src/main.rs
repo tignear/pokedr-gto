@@ -310,64 +310,26 @@ fn run_gpu_compact_state_smoke(args: FlopSolveArgs) {
         std::process::exit(2);
     });
     let config = fixed_flop_config(&args.solver);
-    let public_state = PublicState {
-        street: Street::Flop,
-        board: Board::new(flop.to_vec()),
-        pot: 4,
-        hero_invested: 2,
-        villain_invested: 2,
-        effective_stack: 100,
-        to_call: 0,
-        min_aggressive_amount: 2,
-        acting_player: Player::Hero,
-        raises_this_street: 0,
-        checks_this_street: 0,
-    };
-    let tree = SubgameTree::build(
-        public_state,
-        SubgameTreeConfig {
-            action_set: config.action_set.clone(),
-            max_raises_per_street: config.max_raises_per_street,
-        },
-    );
-    let layout = PostflopDenseLayout::from_tree(&tree);
-    let backend = match GpuDenseCfrBackend::new() {
-        Ok(backend) => backend,
-        Err(GpuCfrError::NoAdapter) => {
-            eprintln!("no GPU adapter visible to wgpu");
-            std::process::exit(1);
-        }
-        Err(error) => {
-            eprintln!("failed to initialize GPU backend: {error:?}");
-            std::process::exit(1);
-        }
-    };
-    let max_chunk_bytes = (backend.max_storage_buffer_binding_size() as usize).min(128usize << 20);
-    let compact_config = layout.compact_private_config(1326usize, config.cfr_variant);
-    let state = backend.zeroed_compact_private_regret_state(compact_config, max_chunk_bytes);
+    let summary = pokedr_agent::fixed_flop_compact_smoke(flop, config).unwrap_or_else(|| {
+        eprintln!("failed to build compact GPU state/context");
+        std::process::exit(1);
+    });
     println!("board: {}", format_pokedr_cards_for_cli(&flop));
+    println!("public_infosets: {}", summary.public_infosets);
+    println!("public_actions: {}", summary.public_actions);
+    println!("combos: {}", summary.combos);
+    println!("compact_action_slots: {}", summary.compact_action_slots);
+    println!("chunks: {}", summary.chunks);
+    println!("largest_chunk_slots: {}", summary.largest_chunk_slots);
     println!(
-        "adapter: {} ({:?})",
-        backend.adapter_info().name,
-        backend.adapter_info().backend
+        "compact_context_action_slots: {}",
+        summary.compact_context_action_slots
     );
-    println!("public_infosets: {}", state.public_infosets());
-    println!("public_actions: {}", state.public_actions());
-    println!("combos: {}", state.combos());
-    println!("compact_action_slots: {}", state.total_action_slots());
-    println!("chunks: {}", state.chunks().len());
+    println!("uncovered_reach_tiles: {}", summary.uncovered_reach_tiles);
     println!(
-        "largest_chunk_slots: {}",
-        state
-            .chunks()
-            .iter()
-            .map(|chunk| chunk.chunk().action_slots)
-            .max()
-            .unwrap_or(0)
+        "reach_tiles_requiring_split: {}",
+        summary.reach_tiles_requiring_split
     );
-    if let Some(context_slots) = pokedr_agent::fixed_flop_compact_context_smoke(flop, config) {
-        println!("compact_context_action_slots: {context_slots}");
-    }
 }
 
 fn run_gpu_smoke() {
