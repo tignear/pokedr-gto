@@ -216,8 +216,6 @@ struct SolverOptions {
     iterations: Option<usize>,
     #[arg(long, value_enum, help = "CFR update rule")]
     variant: Option<CfrVariantOption>,
-    #[arg(long, help = "Maximum public tree decision depth")]
-    max_depth: Option<usize>,
     #[arg(long, help = "Maximum raises per street")]
     max_raises_per_street: Option<u8>,
     #[arg(long, help = "Maximum non-call/check/fold actions at one decision")]
@@ -476,10 +474,9 @@ fn run_solve_flop(args: FlopSolveArgs) {
     });
     let config = fixed_flop_config(&args.solver);
     println!(
-        "solving fixed flop iterations={} variant={:?} depth={} terminal_runouts={}",
+        "solving fixed flop iterations={} variant={:?} terminal_runouts={}",
         config.cfr_iterations,
         config.cfr_variant,
-        config.max_depth,
         format_terminal_runouts(config.max_showdown_runouts)
     );
     let summary = pokedr_agent::solve_fixed_flop_once(flop, config);
@@ -510,9 +507,8 @@ fn run_solve_flop_metrics(args: FlopMetricsArgs) {
         .map(|settings| settings.target_bb100)
         .unwrap_or_else(|| metric_target_bb100(&args));
     println!(
-        "solving fixed flop metrics variant={:?} depth={} terminal_runouts={} iterations={:?} target_bb100={:.2}",
+        "solving fixed flop metrics variant={:?} terminal_runouts={} iterations={:?} target_bb100={:.2}",
         config.cfr_variant,
-        config.max_depth,
         format_terminal_runouts(config.max_showdown_runouts),
         iterations,
         target_bb100
@@ -590,10 +586,9 @@ fn run_solve_flop_reach_sharing(args: FlopReachSharingArgs) {
     });
     let config = match_config(&args.solver);
     eprintln!(
-        "analyzing terminal reach sharing board={} variant={:?} depth={} terminal_runouts={} iterations={} strategy={}",
+        "analyzing terminal reach sharing board={} variant={:?} terminal_runouts={} iterations={} strategy={}",
         format_pokedr_cards_for_cli(&flop),
         config.cfr_variant,
-        config.max_depth,
         format_terminal_runouts(config.max_showdown_runouts),
         config.cfr_iterations.max(1),
         if args.current { "current" } else { "average" }
@@ -695,9 +690,8 @@ fn run_solve_flop_sweep(args: FlopSweepArgs) {
         .max(1);
     let candidates = pdcfr_sweep_candidates(&args);
     eprintln!(
-        "sweeping fixed flop pdcfr-plus board={} depth={} terminal_runouts={} iterations={} candidates={}",
+        "sweeping fixed flop pdcfr-plus board={} terminal_runouts={} iterations={} candidates={}",
         format_pokedr_cards_for_cli(&flop),
-        base_config.max_depth,
         format_terminal_runouts(base_config.max_showdown_runouts),
         iterations,
         candidates.len()
@@ -752,9 +746,8 @@ fn run_solve_flop_variant_bench(args: FlopVariantBenchArgs) {
     let iterations = variant_bench_iterations(&args);
     let target_bb100 = args.target_bb100.unwrap_or(1.0).max(0.0);
     eprintln!(
-        "benchmarking fixed flop variants board={} depth={} terminal_runouts={} iterations={:?} variants={} target_bb100={:.2}",
+        "benchmarking fixed flop variants board={} terminal_runouts={} iterations={:?} variants={} target_bb100={:.2}",
         format_pokedr_cards_for_cli(&flop),
-        base_config.max_depth,
         format_terminal_runouts(base_config.max_showdown_runouts),
         iterations,
         variants.len(),
@@ -2877,7 +2870,6 @@ fn match_config(options: &SolverOptions) -> pokedr_agent::PokedrAgentConfig {
     let mut config = pokedr_agent::PokedrAgentConfig::default();
     config.cfr_iterations = env_usize("POKEDR_CFR_ITERATIONS").unwrap_or(config.cfr_iterations);
     config.cfr_variant = env_cfr_variant("POKEDR_CFR_VARIANT").unwrap_or(config.cfr_variant);
-    config.max_depth = env_usize("POKEDR_MAX_DEPTH").unwrap_or(config.max_depth);
     if let Some(value) = env_usize("POKEDR_MAX_RAISES_PER_STREET") {
         config.max_raises_per_street = value.min(u8::MAX as usize) as u8;
     }
@@ -2893,9 +2885,6 @@ fn apply_solver_options(config: &mut pokedr_agent::PokedrAgentConfig, options: &
     }
     if let Some(value) = options.variant {
         config.cfr_variant = cfr_variant_from_options(value, options);
-    }
-    if let Some(value) = options.max_depth {
-        config.max_depth = value;
     }
     if let Some(value) = options.max_raises_per_street {
         config.max_raises_per_street = value;
@@ -3264,7 +3253,6 @@ fn smoke_postflop_tree() -> SubgameTree {
                 ..ActionSetConfig::default()
             },
             max_raises_per_street: 1,
-            max_depth: 5,
         },
     )
 }

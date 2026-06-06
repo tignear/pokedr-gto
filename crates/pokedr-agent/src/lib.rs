@@ -46,7 +46,6 @@ pub struct PokedrAgentConfig {
     pub cfr_variant: CfrVariant,
     pub action_set: ActionSetConfig,
     pub max_raises_per_street: u8,
-    pub max_depth: usize,
     pub max_showdown_runouts: usize,
 }
 
@@ -64,7 +63,6 @@ impl Default for PokedrAgentConfig {
                 ..ActionSetConfig::default()
             },
             max_raises_per_street: 1,
-            max_depth: 5,
             max_showdown_runouts: usize::MAX,
         }
     }
@@ -611,7 +609,6 @@ pub fn solve_fixed_flop_once(
         SubgameTreeConfig {
             action_set: config.action_set.clone(),
             max_raises_per_street: config.max_raises_per_street,
-            max_depth: config.max_depth,
         },
     );
     let layout = PostflopDenseLayout::from_tree(&tree);
@@ -686,7 +683,6 @@ where
         SubgameTreeConfig {
             action_set: base_config.action_set.clone(),
             max_raises_per_street: base_config.max_raises_per_street,
-            max_depth: base_config.max_depth,
         },
     );
     let layout = PostflopDenseLayout::from_tree(&tree);
@@ -980,7 +976,6 @@ fn fixed_flop_tree_and_layout(
         SubgameTreeConfig {
             action_set: config.action_set,
             max_raises_per_street: config.max_raises_per_street,
-            max_depth: config.max_depth,
         },
     );
     let layout = PostflopDenseLayout::from_tree(&tree);
@@ -3332,13 +3327,12 @@ fn build_postflop_plan(
     let started = Instant::now();
     if solver_progress_enabled() {
         eprintln!(
-            "pokedr: build postflop plan street={:?} board_cards={} pot={} to_call={} iterations={} depth={}",
+            "pokedr: build postflop plan street={:?} board_cards={} pot={} to_call={} iterations={}",
             public_state.street,
             public_state.board.cards().len(),
             public_state.pot,
             public_state.to_call,
-            config.cfr_iterations,
-            config.max_depth
+            config.cfr_iterations
         );
     }
     let tree = SubgameTree::build(
@@ -3346,7 +3340,6 @@ fn build_postflop_plan(
         SubgameTreeConfig {
             action_set: config.action_set.clone(),
             max_raises_per_street: config.max_raises_per_street,
-            max_depth: config.max_depth,
         },
     );
     let layout = PostflopDenseLayout::from_tree(&tree);
@@ -6168,7 +6161,6 @@ mod tests {
             7,
             PokedrAgentConfig {
                 cfr_iterations: 1,
-                max_depth: 1,
                 max_showdown_runouts: 1,
                 ..PokedrAgentConfig::default()
             },
@@ -6352,7 +6344,6 @@ mod tests {
                     ..ActionSetConfig::default()
                 },
                 max_raises_per_street: 0,
-                max_depth: 1,
             },
         );
         let layout = PostflopDenseLayout::from_tree(&tree);
@@ -6438,7 +6429,6 @@ mod tests {
                     ..ActionSetConfig::default()
                 },
                 max_raises_per_street: 1,
-                max_depth: 1,
             },
         );
         let layout = PostflopDenseLayout::from_tree(&tree);
@@ -6493,7 +6483,6 @@ mod tests {
                 ..ActionSetConfig::default()
             },
             max_raises_per_street: 1,
-            max_depth: 3,
             max_showdown_runouts: usize::MAX,
         };
         let (tree, layout) = fixed_flop_tree_and_layout(flop, config.clone());
@@ -6561,7 +6550,6 @@ mod tests {
                 ..ActionSetConfig::default()
             },
             max_raises_per_street: 1,
-            max_depth: 3,
             max_showdown_runouts: usize::MAX,
         };
         let (tree, layout) = fixed_flop_tree_and_layout(flop, config.clone());
@@ -6619,7 +6607,6 @@ mod tests {
                 ..ActionSetConfig::default()
             },
             max_raises_per_street: 1,
-            max_depth: 3,
             max_showdown_runouts: usize::MAX,
         };
         let (tree, layout) = fixed_flop_tree_and_layout(flop, config.clone());
@@ -6743,7 +6730,6 @@ mod tests {
                 ..ActionSetConfig::default()
             },
             max_raises_per_street: 1,
-            max_depth: 3,
             max_showdown_runouts: usize::MAX,
         };
         let (tree, layout) = fixed_flop_tree_and_layout(flop, config.clone());
@@ -6879,7 +6865,6 @@ mod tests {
                 ..ActionSetConfig::default()
             },
             max_raises_per_street: 1,
-            max_depth: 3,
             max_showdown_runouts: usize::MAX,
         };
         let (tree, layout) = fixed_flop_tree_and_layout(flop, config.clone());
@@ -7035,7 +7020,6 @@ mod tests {
                 ..ActionSetConfig::default()
             },
             max_raises_per_street: 1,
-            max_depth: 3,
             max_showdown_runouts: usize::MAX,
         };
         let (tree, layout) = fixed_flop_tree_and_layout(flop, config.clone());
@@ -7150,7 +7134,6 @@ mod tests {
                 ..ActionSetConfig::default()
             },
             max_raises_per_street: 1,
-            max_depth: 3,
             max_showdown_runouts: usize::MAX,
         };
         let (tree, layout) = fixed_flop_tree_and_layout(flop, config.clone());
@@ -7369,7 +7352,6 @@ mod tests {
                 ..ActionSetConfig::default()
             },
             max_raises_per_street: 0,
-            max_depth: 3,
             max_showdown_runouts: usize::MAX,
         };
         let (tree, layout) = fixed_flop_tree_and_layout(flop, config.clone());
@@ -7461,7 +7443,6 @@ mod tests {
                 ..ActionSetConfig::default()
             },
             max_raises_per_street: 1,
-            max_depth: 3,
             max_showdown_runouts: usize::MAX,
         };
         let (tree, layout) = fixed_flop_tree_and_layout(flop, config.clone());
@@ -7545,7 +7526,6 @@ mod tests {
                 ..ActionSetConfig::default()
             },
             max_raises_per_street: 1,
-            max_depth: 5,
             max_showdown_runouts: usize::MAX,
             ..PokedrAgentConfig::default()
         };
@@ -7588,7 +7568,6 @@ mod tests {
                 ..ActionSetConfig::default()
             },
             max_raises_per_street: 1,
-            max_depth: 5,
             max_showdown_runouts: usize::MAX,
         };
         let (tree, layout) = fixed_flop_tree_and_layout(flop, config.clone());
@@ -7677,7 +7656,6 @@ mod tests {
                 ..ActionSetConfig::default()
             },
             max_raises_per_street: 0,
-            max_depth: 3,
             max_showdown_runouts: usize::MAX,
         };
         let (tree, layout) = fixed_flop_tree_and_layout(flop, config.clone());
@@ -7769,7 +7747,6 @@ mod tests {
                 ..ActionSetConfig::default()
             },
             max_raises_per_street: 1,
-            max_depth: 3,
             max_showdown_runouts: usize::MAX,
         };
         let (tree, layout) = fixed_flop_tree_and_layout(flop, config.clone());
@@ -8238,7 +8215,6 @@ mod tests {
                     ..ActionSetConfig::default()
                 },
                 max_raises_per_street: 0,
-                max_depth: 1,
             },
         );
         let layout = PostflopDenseLayout::from_tree(&tree);

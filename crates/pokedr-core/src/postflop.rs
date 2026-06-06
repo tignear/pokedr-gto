@@ -106,7 +106,6 @@ pub struct PublicState {
 pub struct SubgameTreeConfig {
     pub action_set: ActionSetConfig,
     pub max_raises_per_street: u8,
-    pub max_depth: usize,
 }
 
 impl Default for SubgameTreeConfig {
@@ -114,7 +113,6 @@ impl Default for SubgameTreeConfig {
         Self {
             action_set: ActionSetConfig::default(),
             max_raises_per_street: 2,
-            max_depth: 16,
         }
     }
 }
@@ -307,7 +305,7 @@ impl SubgameTree {
     pub fn build(root: PublicState, config: SubgameTreeConfig) -> Self {
         let builder = ActionSetBuilder::new(config.action_set.clone());
         let mut tree = Self { nodes: Vec::new() };
-        tree.expand_state(None, root, 0, &config, &builder);
+        tree.expand_state(None, root, &config, &builder);
         tree
     }
 
@@ -353,11 +351,10 @@ impl SubgameTree {
         &mut self,
         parent: Option<usize>,
         state: PublicState,
-        depth: usize,
         config: &SubgameTreeConfig,
         builder: &ActionSetBuilder,
     ) -> usize {
-        if depth >= config.max_depth || state.effective_stack == 0 {
+        if state.effective_stack == 0 {
             return self.push_node(
                 parent,
                 PublicNodeKind::Terminal {
@@ -401,7 +398,7 @@ impl SubgameTree {
             },
         );
         for action in actions {
-            self.expand_action(node, &state, action.action, depth + 1, config, builder);
+            self.expand_action(node, &state, action.action, config, builder);
         }
         node
     }
@@ -411,7 +408,6 @@ impl SubgameTree {
         parent: usize,
         state: &PublicState,
         action: PlayerAction,
-        depth: usize,
         config: &SubgameTreeConfig,
         builder: &ActionSetBuilder,
     ) {
@@ -432,16 +428,16 @@ impl SubgameTree {
                 let advance = should_advance_street(state, action);
                 let next_state = state_after_passive_action(state, action);
                 if advance {
-                    self.expand_chance(Some(parent), next_state, depth, config, builder);
+                    self.expand_chance(Some(parent), next_state, config, builder);
                 } else {
-                    self.expand_state(Some(parent), next_state, depth, config, builder);
+                    self.expand_state(Some(parent), next_state, config, builder);
                 }
             }
             PlayerAction::Bet { amount }
             | PlayerAction::Raise { amount }
             | PlayerAction::AllIn { amount } => {
                 let next_state = state_after_aggressive_action(state, amount);
-                self.expand_state(Some(parent), next_state, depth, config, builder);
+                self.expand_state(Some(parent), next_state, config, builder);
             }
         }
     }
@@ -450,7 +446,6 @@ impl SubgameTree {
         &mut self,
         parent: Option<usize>,
         state: PublicState,
-        depth: usize,
         config: &SubgameTreeConfig,
         builder: &ActionSetBuilder,
     ) {
@@ -485,7 +480,7 @@ impl SubgameTree {
             child_state.min_aggressive_amount = child_state.pot.max(1);
             child_state.raises_this_street = 0;
             child_state.checks_this_street = 0;
-            self.expand_state(Some(chance), child_state, depth, config, builder);
+            self.expand_state(Some(chance), child_state, config, builder);
         }
     }
 }
@@ -842,7 +837,7 @@ mod tests {
         }
     }
 
-    fn compact_tree_config(max_depth: usize) -> SubgameTreeConfig {
+    fn compact_tree_config() -> SubgameTreeConfig {
         SubgameTreeConfig {
             action_set: ActionSetConfig {
                 max_aggressive_actions: 2,
@@ -853,7 +848,6 @@ mod tests {
                 ..ActionSetConfig::default()
             },
             max_raises_per_street: 1,
-            max_depth,
         }
     }
 
@@ -878,19 +872,19 @@ mod tests {
     }
 
     #[test]
-    fn subgame_tree_builds_bounded_public_nodes() {
-        let tree = SubgameTree::build(root_state(Street::Flop), compact_tree_config(4));
+    fn subgame_tree_builds_finite_public_nodes() {
+        let tree = SubgameTree::build(root_state(Street::Flop), compact_tree_config());
 
         assert!(!tree.nodes().is_empty());
         assert!(tree.decision_count() > 0);
         assert!(tree.chance_count() > 0);
         assert!(tree.terminal_count() > 0);
-        assert!(tree.nodes().len() < 20_000);
+        assert!(tree.nodes().len() < 500_000);
     }
 
     #[test]
     fn check_then_check_advances_to_turn_chance() {
-        let tree = SubgameTree::build(root_state(Street::Flop), compact_tree_config(3));
+        let tree = SubgameTree::build(root_state(Street::Flop), compact_tree_config());
 
         let root_check = tree.nodes()[0].children[0];
         let PublicNodeKind::Decision {
@@ -913,7 +907,7 @@ mod tests {
 
     #[test]
     fn bet_call_advances_to_turn_chance() {
-        let tree = SubgameTree::build(root_state(Street::Flop), compact_tree_config(3));
+        let tree = SubgameTree::build(root_state(Street::Flop), compact_tree_config());
         let root = &tree.nodes()[0];
 
         let facing_bet = root
@@ -956,7 +950,7 @@ mod tests {
 
     #[test]
     fn river_check_check_ends_at_showdown() {
-        let tree = SubgameTree::build(root_state(Street::River), compact_tree_config(3));
+        let tree = SubgameTree::build(root_state(Street::River), compact_tree_config());
 
         let root_check = tree.nodes()[0].children[0];
         let second_check = tree.nodes()[root_check].children[0];
@@ -967,8 +961,8 @@ mod tests {
     }
 
     #[test]
-    fn flop_tree_depth_budget_preserves_river_decisions() {
-        let tree = SubgameTree::build(root_state(Street::Flop), compact_tree_config(5));
+    fn flop_tree_reaches_river_decisions() {
+        let tree = SubgameTree::build(root_state(Street::Flop), compact_tree_config());
 
         let river_decisions = tree
             .nodes()

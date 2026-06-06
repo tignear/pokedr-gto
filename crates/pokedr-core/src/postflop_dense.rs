@@ -157,7 +157,6 @@ mod tests {
                     ..ActionSetConfig::default()
                 },
                 max_raises_per_street: 1,
-                max_depth: 4,
             },
         )
     }
