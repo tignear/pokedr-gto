@@ -22,6 +22,8 @@ fn main() {
         Command::GpuCompactIterationBench(args) => run_gpu_compact_iteration_bench(args),
         Command::PostflopSmoke => run_postflop_smoke(),
         Command::SolveFlop(args) => run_solve_flop(args),
+        Command::SolveRiver(args) => run_solve_river(args),
+        Command::SolveRiverBatch(args) => run_solve_river_batch(args),
         Command::SolveFlopMetrics(args) => run_solve_flop_metrics(args),
         Command::SolveFlopReachSharing(args) => run_solve_flop_reach_sharing(args),
         Command::SolveFlopSweep(args) => run_solve_flop_sweep(args),
@@ -48,6 +50,8 @@ enum Command {
     GpuCompactIterationBench(FlopSolveArgs),
     PostflopSmoke,
     SolveFlop(FlopSolveArgs),
+    SolveRiver(RiverSolveArgs),
+    SolveRiverBatch(RiverBatchSolveArgs),
     SolveFlopMetrics(FlopMetricsArgs),
     SolveFlopReachSharing(FlopReachSharingArgs),
     SolveFlopSweep(FlopSweepArgs),
@@ -65,6 +69,26 @@ enum Command {
 struct FlopSolveArgs {
     #[arg(default_value = "As7h2c")]
     flop: String,
+    #[command(flatten)]
+    solver: SolverOptions,
+}
+
+#[derive(Debug, Args, Clone)]
+struct RiverSolveArgs {
+    #[arg(default_value = "As7h2cKd3s")]
+    board: String,
+    #[command(flatten)]
+    solver: SolverOptions,
+}
+
+#[derive(Debug, Args, Clone)]
+struct RiverBatchSolveArgs {
+    #[arg(
+        default_value = "As7h2cKd3s,As7h2cKd4s,As7h2cQd3s,As7h2cQd4s",
+        value_delimiter = ',',
+        help = "Comma-separated fixed river boards"
+    )]
+    boards: Vec<String>,
     #[command(flatten)]
     solver: SolverOptions,
 }
@@ -577,6 +601,67 @@ fn run_solve_flop(args: FlopSolveArgs) {
     println!("private_infosets: {}", summary.private_infosets);
     println!("max_actions: {}", summary.max_actions);
     println!("elapsed: {:.2}s", summary.elapsed_secs);
+}
+
+fn run_solve_river(args: RiverSolveArgs) {
+    let board = parse_board_cards(&args.board, 5).unwrap_or_else(|error| {
+        eprintln!("{error}");
+        std::process::exit(2);
+    });
+    let config = fixed_flop_config(&args.solver);
+    println!(
+        "solving fixed river iterations={} variant={:?} terminal_runouts={}",
+        config.cfr_iterations,
+        config.cfr_variant,
+        format_terminal_runouts(config.max_showdown_runouts)
+    );
+    let summary = pokedr_agent::solve_fixed_river_once(board, config);
+    println!("board: {}", summary.board);
+    println!("iterations: {}", summary.iterations);
+    println!("public_decisions: {}", summary.decisions);
+    println!("chance_nodes: {}", summary.chance);
+    println!("terminals: {}", summary.terminals);
+    println!("public_infosets: {}", summary.public_infosets);
+    println!("private_infosets: {}", summary.private_infosets);
+    println!("max_actions: {}", summary.max_actions);
+    println!("elapsed: {:.2}s", summary.elapsed_secs);
+}
+
+fn run_solve_river_batch(args: RiverBatchSolveArgs) {
+    if args.boards.is_empty() {
+        eprintln!("at least one river board is required");
+        std::process::exit(2);
+    }
+    let boards = args
+        .boards
+        .iter()
+        .map(|board| {
+            parse_board_cards(board, 5).unwrap_or_else(|error| {
+                eprintln!("{error}");
+                std::process::exit(2);
+            })
+        })
+        .collect::<Vec<_>>();
+    let config = fixed_flop_config(&args.solver);
+    println!(
+        "solving fixed river batch boards={} iterations={} variant={:?} terminal_runouts={}",
+        boards.len(),
+        config.cfr_iterations,
+        config.cfr_variant,
+        format_terminal_runouts(config.max_showdown_runouts)
+    );
+    let summary = pokedr_agent::solve_fixed_river_batch(&boards, config);
+    for board in &summary.boards {
+        println!(
+            "board={} elapsed={:.3}s public_decisions={} private_infosets={}",
+            board.board, board.elapsed_secs, board.decisions, board.private_infosets
+        );
+    }
+    let per_board = summary.total_elapsed_secs / summary.boards.len().max(1) as f32;
+    println!("boards: {}", summary.boards.len());
+    println!("iterations: {}", summary.iterations);
+    println!("elapsed: {:.2}s", summary.total_elapsed_secs);
+    println!("elapsed_per_board: {:.3}s", per_board);
 }
 
 fn run_solve_flop_metrics(args: FlopMetricsArgs) {
@@ -3354,6 +3439,37 @@ fn parse_flop(input: &str) -> Result<[Card; 3], String> {
         return Err("flop contains duplicate cards".to_string());
     }
     Ok(cards)
+}
+
+fn parse_board_cards<const N: usize>(input: &str, expected: usize) -> Result<[Card; N], String> {
+    let normalized = input
+        .split(|character: char| character == ',' || character.is_whitespace())
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    let tokens = if normalized.len() == expected {
+        normalized
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    } else {
+        split_compact_cards(input)?
+    };
+    if tokens.len() != expected {
+        return Err(format!("board must contain exactly {expected} cards"));
+    }
+    let cards = tokens
+        .iter()
+        .map(|token| parse_card(token))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mask = cards
+        .iter()
+        .fold(0u64, |mask, card| mask | card.deck_mask());
+    if mask.count_ones() as usize != expected {
+        return Err("board contains duplicate cards".to_string());
+    }
+    cards
+        .try_into()
+        .map_err(|_| format!("board must contain exactly {expected} cards"))
 }
 
 fn split_compact_cards(input: &str) -> Result<Vec<String>, String> {

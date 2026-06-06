@@ -5284,10 +5284,13 @@ impl GpuDenseCfrBackend {
         br_player: u32,
         iteration: usize,
     ) -> Result<(usize, usize, usize, usize), GpuCfrError> {
+        let profile = Self::gpu_profile_enabled();
+        let iteration_start = profile.then(Instant::now);
         let chunk_plan: Vec<_> = state.chunks.iter().map(|chunk| chunk.chunk).collect();
         let uncovered_reach_tiles = compact_uncovered_reach_tiles(context, &chunk_plan);
 
         trace_pipeline_step("compact_iteration:reach_init:start");
+        let mut phase_start = profile.then(Instant::now);
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -5298,8 +5301,18 @@ impl GpuDenseCfrBackend {
         trace_pipeline_step("compact_iteration:reach_edges:start");
         let reach_slices =
             self.submit_compact_layer_reach_edges_batched(context, state, br_player, iteration);
+        if let Some(start) = phase_start {
+            self.profile_poll()?;
+            eprintln!(
+                "pokedr: gpu profile iteration={} phase=compact_reach elapsed_ms={:.3} slices={}",
+                iteration,
+                start.elapsed().as_secs_f64() * 1000.0,
+                reach_slices
+            );
+        }
 
         trace_pipeline_step("compact_iteration:fold:start");
+        phase_start = profile.then(Instant::now);
         for layer_tiles in &context.layer_tiles {
             for tile in layer_tiles {
                 if tile.fold_terminal_nodes.is_empty() {
@@ -5326,7 +5339,15 @@ impl GpuDenseCfrBackend {
             }
         }
         self.profile_poll()?;
+        if let Some(start) = phase_start {
+            eprintln!(
+                "pokedr: gpu profile iteration={} phase=compact_fold elapsed_ms={:.3}",
+                iteration,
+                start.elapsed().as_secs_f64() * 1000.0
+            );
+        }
         trace_pipeline_step("compact_iteration:showdown:start");
+        phase_start = profile.then(Instant::now);
         for layer_tiles in &context.layer_tiles {
             for tile in layer_tiles {
                 self.fill_terminal_values_streaming(
@@ -5344,8 +5365,16 @@ impl GpuDenseCfrBackend {
                 )?;
             }
         }
+        if let Some(start) = phase_start {
+            eprintln!(
+                "pokedr: gpu profile iteration={} phase=compact_showdown elapsed_ms={:.3}",
+                iteration,
+                start.elapsed().as_secs_f64() * 1000.0
+            );
+        }
 
         trace_pipeline_step("compact_iteration:backup:start");
+        phase_start = profile.then(Instant::now);
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -5354,7 +5383,15 @@ impl GpuDenseCfrBackend {
         self.backup_layer_values_compact(&mut encoder, context, state, br_player, iteration);
         self.queue.submit(Some(encoder.finish()));
         self.profile_poll()?;
+        if let Some(start) = phase_start {
+            eprintln!(
+                "pokedr: gpu profile iteration={} phase=compact_backup elapsed_ms={:.3}",
+                iteration,
+                start.elapsed().as_secs_f64() * 1000.0
+            );
+        }
         trace_pipeline_step("compact_iteration:aggregate:start");
+        phase_start = profile.then(Instant::now);
         let encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -5362,10 +5399,35 @@ impl GpuDenseCfrBackend {
             });
         let encoder = self.write_compact_update_aggregates(encoder, context);
         self.queue.submit(Some(encoder.finish()));
+        if let Some(start) = phase_start {
+            self.profile_poll()?;
+            eprintln!(
+                "pokedr: gpu profile iteration={} phase=compact_aggregate elapsed_ms={:.3}",
+                iteration,
+                start.elapsed().as_secs_f64() * 1000.0
+            );
+        }
         trace_pipeline_step("compact_iteration:update:start");
+        phase_start = profile.then(Instant::now);
         let update_slices =
             self.submit_compact_complete_group_updates_batched(context, state, iteration);
+        if let Some(start) = phase_start {
+            self.profile_poll()?;
+            eprintln!(
+                "pokedr: gpu profile iteration={} phase=compact_update elapsed_ms={:.3} slices={}",
+                iteration,
+                start.elapsed().as_secs_f64() * 1000.0,
+                update_slices
+            );
+        }
         trace_pipeline_step("compact_iteration:done");
+        if let Some(start) = iteration_start {
+            eprintln!(
+                "pokedr: gpu profile iteration={} phase=compact_iteration elapsed_ms={:.3}",
+                iteration,
+                start.elapsed().as_secs_f64() * 1000.0
+            );
+        }
 
         Ok((
             context.compact_private_action_slots(),

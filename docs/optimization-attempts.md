@@ -338,3 +338,23 @@ ideas.
   path. The next viable direction is either chunk-streamed persistent state
   with explicit host backing and bounded VRAM working sets, or a compressed
   state representation such as fp16/quantized regret and average strategy.
+
+## 2026-06-06: River subgame batch baseline
+
+- Tried: add `solve-river` and `solve-river-batch` CLI paths to measure river
+  subgames without flop/turn chance expansion. The batch path still solves
+  boards sequentially, but it runs in one process and reuses the thread-local
+  GPU backend.
+- Expected: river-only trees should be small enough that many subgames can be
+  solved quickly, and batching should expose how much time is real iteration
+  work versus GPU/driver setup.
+- Result: promising. On four fixed river boards from `As7h2c`, `64` iterations
+  took `4.13s` total, with the first board costing `2.76s` and later boards
+  `0.42-0.52s`. At `256` iterations the same four boards took `9.01s`; after
+  the first board, later boards were about `1.66-1.73s` each. Each river tree
+  had only `6` public decisions, `9` terminals, and `7956` private infosets.
+- Decision: keep. This suggests river re-solving/batch solving is a real path
+  for practical speed. It is not yet a true batched GPU formulation; the next
+  step would be grouping identical river tree shapes so one dispatch sequence
+  processes multiple boards/states instead of running each board as a separate
+  solve.
