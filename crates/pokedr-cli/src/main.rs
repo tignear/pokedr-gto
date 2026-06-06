@@ -2,10 +2,10 @@ use clap::{Parser, Subcommand};
 use pokedr_agent::{FlopTreeRequest, build_flop_tree};
 use pokedr_core::{
     ActionKind, Board, CfrPlusState, CfrStorageConfig, ChanceExpansion, Player,
-    PreparedTerminalCfvSmoke, PublicNodeKind, RangeSpec, RealCfrConfig, RealCfrSolver, Street,
-    TreeTemplate, analyze_cfr_storage_scenarios, analyze_public_state_duplicates,
-    build_action_slot_layout, dry_run_cfr_plus_iteration, plan_cfr_work,
-    terminal_cfv_parallel_smoke,
+    PreparedTerminalCfvSmoke, PublicNodeKind, RangeSpec, RealCfrConfig, RealCfrSolver,
+    RealCfrVariant, Street, TreeTemplate, analyze_cfr_storage_scenarios,
+    analyze_public_state_duplicates, build_action_slot_layout, dry_run_cfr_plus_iteration,
+    plan_cfr_work, terminal_cfv_parallel_smoke,
 };
 use std::str::FromStr;
 use std::time::Instant;
@@ -88,6 +88,14 @@ enum Command {
         real_cfr_log_interval: u32,
         #[arg(long, default_value_t = 0)]
         real_cfr_exploitability_interval: u32,
+        #[arg(long, default_value = "cfr-plus")]
+        real_cfr_variant: String,
+        #[arg(long, default_value_t = 1.5)]
+        dcfr_alpha: f32,
+        #[arg(long, default_value_t = 0.0)]
+        dcfr_beta: f32,
+        #[arg(long, default_value_t = 2.0)]
+        dcfr_gamma: f32,
         #[arg(long)]
         run_terminal_board_phase: bool,
         #[arg(long)]
@@ -292,6 +300,10 @@ fn main() -> Result<(), String> {
             run_real_cfr_three_phase,
             real_cfr_log_interval,
             real_cfr_exploitability_interval,
+            real_cfr_variant,
+            dcfr_alpha,
+            dcfr_beta,
+            dcfr_gamma,
             run_terminal_board_phase,
             terminal_eval_breakdown,
             terminal_cfv_calls,
@@ -329,11 +341,14 @@ fn main() -> Result<(), String> {
                 chunk_target_bytes: chunk_mib as u128 * 1024 * 1024,
                 ..CfrStorageConfig::default()
             };
+            let real_cfr_variant =
+                parse_real_cfr_variant(&real_cfr_variant, dcfr_alpha, dcfr_beta, dcfr_gamma)?;
             let plan = plan_cfr_work(&tree, config);
             let layout = build_action_slot_layout(&tree, config);
             println!(
-                "solving flop={} variant=CfrPlus iterations={iterations}",
-                tree.spot.board
+                "solving flop={} variant={} iterations={iterations}",
+                tree.spot.board,
+                format_real_cfr_variant(real_cfr_variant),
             );
             println!(
                 "layout records={} action_slots={} storage_gib={:.2} flop_slots={} turn_slots={} river_slots={}",
@@ -397,23 +412,29 @@ fn main() -> Result<(), String> {
                     RangeSpec::from_str(&oop_range)?,
                     RangeSpec::from_str(&ip_range)?,
                 )?;
-                let summary = solver.run_with_progress(RealCfrConfig { iterations }, |progress| {
-                    if real_cfr_log_interval > 0
-                        && (progress.iteration == 1
-                            || progress.iteration == iterations
-                            || progress.iteration % real_cfr_log_interval == 0)
-                    {
-                        println!(
-                            "real_cfr_progress iteration={} terminal_evals={} iteration_ms={:.3} root_oop_value={:.6} root_ip_value={:.6} zero_sum_delta={:.6}",
-                            progress.iteration,
-                            progress.terminal_evals,
-                            progress.elapsed_ms,
-                            progress.root_oop_value,
-                            progress.root_ip_value,
-                            progress.root_oop_value + progress.root_ip_value,
-                        );
-                    }
-                })?;
+                let summary = solver.run_with_progress(
+                    RealCfrConfig {
+                        iterations,
+                        variant: real_cfr_variant,
+                    },
+                    |progress| {
+                        if real_cfr_log_interval > 0
+                            && (progress.iteration == 1
+                                || progress.iteration == iterations
+                                || progress.iteration % real_cfr_log_interval == 0)
+                        {
+                            println!(
+                                "real_cfr_progress iteration={} terminal_evals={} iteration_ms={:.3} root_oop_value={:.6} root_ip_value={:.6} zero_sum_delta={:.6}",
+                                progress.iteration,
+                                progress.terminal_evals,
+                                progress.elapsed_ms,
+                                progress.root_oop_value,
+                                progress.root_ip_value,
+                                progress.root_oop_value + progress.root_ip_value,
+                            );
+                        }
+                    },
+                )?;
                 println!(
                     "real_cfr iterations={} decision_nodes={} action_slots={} terminal_evals={} elapsed_ms={:.3} root_oop_value={:.6} root_ip_value={:.6} zero_sum_delta={:.6}",
                     summary.iterations,
@@ -447,7 +468,10 @@ fn main() -> Result<(), String> {
                     };
                     let chunk_start = completed;
                     let chunk_summary = solver.run_three_phase(
-                        RealCfrConfig { iterations: chunk },
+                        RealCfrConfig {
+                            iterations: chunk,
+                            variant: real_cfr_variant,
+                        },
                         state_threads,
                         |progress| {
                             let global_iteration = chunk_start + progress.iteration;
@@ -762,6 +786,49 @@ fn parse_player(value: &str) -> Result<Player, String> {
         "oop" => Ok(Player::Oop),
         "ip" => Ok(Player::Ip),
         _ => Err(format!("invalid player {value:?}; expected oop or ip")),
+    }
+}
+
+fn parse_real_cfr_variant(
+    value: &str,
+    alpha: f32,
+    beta: f32,
+    gamma: f32,
+) -> Result<RealCfrVariant, String> {
+    if !alpha.is_finite() || alpha < 0.0 {
+        return Err(format!(
+            "invalid dcfr alpha {alpha}; expected finite value >= 0"
+        ));
+    }
+    if !beta.is_finite() || beta < 0.0 {
+        return Err(format!(
+            "invalid dcfr beta {beta}; expected finite value >= 0"
+        ));
+    }
+    if !gamma.is_finite() || gamma < 0.0 {
+        return Err(format!(
+            "invalid dcfr gamma {gamma}; expected finite value >= 0"
+        ));
+    }
+    match value.to_ascii_lowercase().as_str() {
+        "cfr-plus" | "cfr+" => Ok(RealCfrVariant::CfrPlus),
+        "dcfr" => Ok(RealCfrVariant::Dcfr { alpha, beta, gamma }),
+        "dcfr-plus" | "dcfr+" => Ok(RealCfrVariant::DcfrPlus { alpha, gamma }),
+        _ => Err(format!(
+            "invalid real CFR variant {value:?}; expected cfr-plus, dcfr, or dcfr-plus"
+        )),
+    }
+}
+
+fn format_real_cfr_variant(variant: RealCfrVariant) -> String {
+    match variant {
+        RealCfrVariant::CfrPlus => "cfr-plus".to_string(),
+        RealCfrVariant::Dcfr { alpha, beta, gamma } => {
+            format!("dcfr(alpha={alpha},beta={beta},gamma={gamma})")
+        }
+        RealCfrVariant::DcfrPlus { alpha, gamma } => {
+            format!("dcfr-plus(alpha={alpha},gamma={gamma})")
+        }
     }
 }
 

@@ -10,6 +10,20 @@ use std::thread;
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RealCfrConfig {
     pub iterations: u32,
+    pub variant: RealCfrVariant,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum RealCfrVariant {
+    CfrPlus,
+    Dcfr { alpha: f32, beta: f32, gamma: f32 },
+    DcfrPlus { alpha: f32, gamma: f32 },
+}
+
+impl Default for RealCfrVariant {
+    fn default() -> Self {
+        Self::CfrPlus
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -262,7 +276,14 @@ impl RealCfrSolver {
             let board = self.flop_board.clone();
             self.completed_iterations += 1;
             let average_weight = self.completed_iterations as f32;
-            root = self.traverse(0, &board, &oop_reach, &ip_reach, average_weight)?;
+            root = self.traverse(
+                0,
+                &board,
+                &oop_reach,
+                &ip_reach,
+                average_weight,
+                config.variant,
+            )?;
             progress(RealCfrIterationSummary {
                 iteration,
                 terminal_evals: root.terminal_evals,
@@ -336,6 +357,7 @@ impl RealCfrSolver {
                 &ip_reaches,
                 &mut values,
                 average_weight,
+                config.variant,
             )?;
             let backup_ms = backup_started.elapsed().as_secs_f64() * 1000.0;
 
@@ -833,6 +855,7 @@ impl RealCfrSolver {
         ip_reaches: &[Vec<f32>],
         values: &mut [Values],
         average_weight: f32,
+        variant: RealCfrVariant,
     ) -> Result<usize, String> {
         for state_index in (0..states.len()).rev() {
             let state = &states[state_index];
@@ -926,10 +949,14 @@ impl RealCfrSolver {
                             };
                             let local_slot = combo * actions_len + action_index;
                             let slot = row_start + local_slot;
-                            infoset.regrets[slot] =
-                                (infoset.regrets[slot] + action_value - node_value).max(0.0);
-                            infoset.strategy_sum[slot] +=
-                                average_weight * own_reach[combo] * strategies[local_slot];
+                            apply_real_cfr_update(
+                                &mut infoset.regrets[slot],
+                                &mut infoset.strategy_sum[slot],
+                                action_value - node_value,
+                                own_reach[combo] * strategies[local_slot],
+                                average_weight,
+                                variant,
+                            );
                         }
                     }
                     values[state_index] = state_values;
@@ -1153,6 +1180,7 @@ impl RealCfrSolver {
         oop_reach: &[f32],
         ip_reach: &[f32],
         average_weight: f32,
+        variant: RealCfrVariant,
     ) -> Result<Values, String> {
         let node = self.tree.nodes[node_id].clone();
         match node.kind {
@@ -1174,8 +1202,14 @@ impl RealCfrSolver {
                 let chance_weight = 1.0f32 / next_cards.len() as f32;
                 for card in next_cards {
                     let next_board = board.push(card)?;
-                    let child_values =
-                        self.traverse(child, &next_board, oop_reach, ip_reach, average_weight)?;
+                    let child_values = self.traverse(
+                        child,
+                        &next_board,
+                        oop_reach,
+                        ip_reach,
+                        average_weight,
+                        variant,
+                    )?;
                     values.add_scaled(&child_values, chance_weight);
                 }
                 Ok(values)
@@ -1228,6 +1262,7 @@ impl RealCfrSolver {
                         &next_oop,
                         &next_ip,
                         average_weight,
+                        variant,
                     )?);
                 }
 
@@ -1276,10 +1311,14 @@ impl RealCfrSolver {
                         };
                         let local_slot = combo * actions_len + action_index;
                         let slot = row_start + local_slot;
-                        infoset.regrets[slot] =
-                            (infoset.regrets[slot] + action_value - node_value).max(0.0);
-                        infoset.strategy_sum[slot] +=
-                            average_weight * own_reach[combo] * strategies[local_slot];
+                        apply_real_cfr_update(
+                            &mut infoset.regrets[slot],
+                            &mut infoset.strategy_sum[slot],
+                            action_value - node_value,
+                            own_reach[combo] * strategies[local_slot],
+                            average_weight,
+                            variant,
+                        );
                     }
                 }
                 Ok(values)
@@ -1503,6 +1542,44 @@ fn current_strategies(regrets: &[f32], combos: usize, actions: usize) -> Vec<f32
         }
     }
     strategies
+}
+
+fn apply_real_cfr_update(
+    regret: &mut f32,
+    strategy_sum: &mut f32,
+    regret_delta: f32,
+    average_delta: f32,
+    iteration_weight: f32,
+    variant: RealCfrVariant,
+) {
+    match variant {
+        RealCfrVariant::CfrPlus => {
+            *regret = (*regret + regret_delta).max(0.0);
+            *strategy_sum += iteration_weight * average_delta;
+        }
+        RealCfrVariant::Dcfr { alpha, beta, gamma } => {
+            let regret_discount = dcfr_regret_discount(*regret, iteration_weight, alpha, beta);
+            let strategy_discount = dcfr_strategy_discount(iteration_weight, gamma);
+            *regret = *regret * regret_discount + regret_delta;
+            *strategy_sum = *strategy_sum * strategy_discount + average_delta;
+        }
+        RealCfrVariant::DcfrPlus { alpha, gamma } => {
+            let regret_discount = dcfr_regret_discount(*regret, iteration_weight, alpha, 0.0);
+            let strategy_discount = dcfr_strategy_discount(iteration_weight, gamma);
+            *regret = (*regret * regret_discount + regret_delta).max(0.0);
+            *strategy_sum = *strategy_sum * strategy_discount + average_delta;
+        }
+    }
+}
+
+fn dcfr_regret_discount(regret: f32, iteration: f32, alpha: f32, beta: f32) -> f32 {
+    let exponent = if regret >= 0.0 { alpha } else { beta };
+    let powered = iteration.powf(exponent.max(0.0));
+    powered / (powered + 1.0)
+}
+
+fn dcfr_strategy_discount(iteration: f32, gamma: f32) -> f32 {
+    (iteration / (iteration + 1.0)).powf(gamma.max(0.0))
 }
 
 fn average_strategies(strategy_sum: &[f32], combos: usize, actions: usize) -> Vec<f32> {
@@ -1870,7 +1947,12 @@ mod tests {
             RangeSpec::from_str("QsQh,JsJh").unwrap(),
         )
         .unwrap();
-        let summary = solver.run(RealCfrConfig { iterations: 1 }).unwrap();
+        let summary = solver
+            .run(RealCfrConfig {
+                iterations: 1,
+                variant: RealCfrVariant::CfrPlus,
+            })
+            .unwrap();
         assert_eq!(summary.iterations, 1);
         assert!(summary.decision_nodes > 0);
         assert!(summary.action_slots > 0);
@@ -1911,9 +1993,21 @@ mod tests {
             RangeSpec::from_str("QsQh,JsJh").unwrap(),
         )
         .unwrap();
-        let recursive = recursive.run(RealCfrConfig { iterations: 1 }).unwrap();
+        let recursive = recursive
+            .run(RealCfrConfig {
+                iterations: 1,
+                variant: RealCfrVariant::CfrPlus,
+            })
+            .unwrap();
         let phased = phased
-            .run_three_phase(RealCfrConfig { iterations: 1 }, 4, |_| {})
+            .run_three_phase(
+                RealCfrConfig {
+                    iterations: 1,
+                    variant: RealCfrVariant::CfrPlus,
+                },
+                4,
+                |_| {},
+            )
             .unwrap();
         assert_eq!(recursive.terminal_evals, phased.terminal_evals);
         assert!((recursive.root_oop_value - phased.root_oop_value).abs() < 0.001);
