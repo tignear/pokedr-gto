@@ -71,6 +71,21 @@ ideas.
   pipeline is rebuilt around that layout. Prefer keeping DFS order and adding a
   logical level/range plan, or move directly to flat action-row storage.
 
+## 2026-06-07: Global flat real-CFR action storage
+
+- Tried: move each `RealInfoset`'s `regrets` and `strategy_sum` vectors into
+  solver-wide flat `Vec<f32>` arrays with per-infoset slot ranges. This was
+  intended as a first step toward splitting regret/strategy rows by owned
+  ranges for lock-free parallel backup.
+- Expected: preserve values and make future row ownership explicit.
+- Result: values matched, but the benchmark regressed before parallelism. On
+  UTG vs BU `As7h2c`, `iterations=4`, `16` threads, DCFR+, the previous path
+  was about `35.6s` elapsed with `13.6s` backup. Flat global action storage was
+  about `41.2s` elapsed with `15.0s` backup.
+- Decision: reverted. Do not retry global flat action storage as a standalone
+  refactor. If action rows are flattened, the same patch must also introduce a
+  parallel owner-computes update that pays for the locality loss.
+
 ## 2026-06-06: CPU terminal CFV card-prefix blocker correction
 
 - Tried: replace the per-combo blocker-neighbor loop in CPU terminal CFV with
