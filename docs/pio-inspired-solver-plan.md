@@ -154,3 +154,223 @@ flop+turn-only f32 state: 110.8MB
 ```
 
 This means memory alone is not enough. The terminal CFV algorithm is the first hard requirement.
+
+## Suspected Remaining Gaps Versus Production Solvers
+
+This section is a design memo, not a claim about PioSOLVER internals. It lists
+places where this implementation may still be structurally worse than a mature
+postflop solver. Each item should be treated as a hypothesis until measured or
+proved.
+
+### A. State Representation Density
+
+Current risk:
+
+- The real CFR path still stores and touches many public states and private
+  rows in a straightforward expanded representation.
+- River and late-street rows dominate storage and update bandwidth.
+
+Possible production-solver difference:
+
+- Store only actual action rows and live private rows.
+- Keep street-local state blocks that match cache and thread ownership.
+- Avoid carrying resident state for rows that can be deterministically rebuilt
+  from the betting skeleton and current boundary values.
+
+Validation requirement:
+
+- Report action slots, live private rows, and bytes touched per iteration by
+  street.
+- Show that any compressed representation produces the same root values on a
+  small exact tree.
+
+### B. Exact Board Isomorphism
+
+Current risk:
+
+- Concrete turn and river boards are handled separately even when suit
+  permutations make them equivalent under the root board and input ranges.
+
+Possible production-solver difference:
+
+- Canonicalize future boards under suit permutations that preserve all
+  suit-sensitive inputs.
+- Carry multiplicity weights for each canonical board.
+- Keep exact combo-level blockers inside the canonical class.
+
+Why this is not lossy:
+
+- Suit isomorphism is exact only when the suit permutation preserves the public
+  board, both ranges, and the action abstraction.
+- If ranges are suit-asymmetric, fewer boards are equivalent.
+
+Validation requirement:
+
+- For a tiny tree, solve all concrete boards and the canonical/multiplicity
+  version and compare profile values and exploitability.
+
+### C. Terminal CFV Batch Formulation
+
+Current risk:
+
+- Terminal CFV is faster than pair-quadratic, but the solver still calls it a
+  very large number of times per iteration.
+- Each call builds reach-dependent prefixes for one terminal state/board
+  column.
+
+Possible production-solver difference:
+
+- Batch many terminal states that share a final board, strength ordering, and
+  blocker tables.
+- Treat opponent reach columns as a dense/sparse matrix and compute multiple
+  CFV columns per pass.
+- Amortize prefix construction and blocker correction across many terminal
+  columns.
+
+Validation requirement:
+
+- Benchmark by fixed final board with many reach columns.
+- Compare against the current per-call prefix/blocker path with identical
+  output columns.
+
+Current measurement:
+
+- On `As7h2c` UTG vs BU, terminal board tasks are perfectly balanced by final
+  board: `1,608,768` tasks, `1,176` unique final boards, exactly `1,368`
+  tasks per final board.
+- In current traversal order, those tasks are not board-major:
+  `282,240` same-board runs, average run length `5.7`, max run length `13`.
+- A static board-major task list would be about `61 MiB` with the current
+  diagnostic `TerminalBoardTask` representation, so the schedule itself is not
+  the memory blocker.
+- A terminal-board smoke pass improved from about `2,084ms` to about `1,762ms`
+  on `16` threads when sorted by final board. This shows locality is real for
+  CFV-only work.
+
+Open blocker:
+
+- Real CFR terminal phase cannot simply sort tasks by final board because each
+  terminal state's final-board contributions must be accumulated back into one
+  `Values` row.
+- A naive board-major implementation would need locks, atomics, or a huge
+  `(terminal_state, final_board) -> Values` intermediate, all of which likely
+  lose.
+- A valid design needs owner-computes state accumulation, board-local CFV
+  reuse, or a two-level reduction with bounded scratch.
+
+### D. Street/Subgame Streaming
+
+Current risk:
+
+- Full flop-to-river state is too large, so later-street storage and value
+  scratch dominate memory pressure.
+
+Possible production-solver difference:
+
+- Keep flop/turn trunk state resident.
+- Stream or rebuild river chunks deterministically.
+- Pass exact counterfactual boundary values back to the trunk.
+
+Correctness caveat:
+
+- This is not the same as arbitrary one-sided resolving.
+- If a lower street is solved independently, the boundary condition must
+  preserve the counterfactual values expected by the upper game.
+
+Validation requirement:
+
+- Start with river chunks whose boundary ranges and pot/stack state are fixed.
+- Then test turn-to-river streaming against a full resident tiny tree.
+
+### E. Action Tree Canonicalization: Mostly Not Valid
+
+Earlier notes suggested that action lines with the same relative shape might be
+canonicalized. That is generally not a valid optimization.
+
+Why it is suspect:
+
+- Absolute pot size, remaining stack, minimum raise, all-in threshold, and SPR
+  affect legal actions and EV scale.
+- `bet 50%, call` after a different previous pot is not the same game state.
+- Raise sizing after a prior bet can change stack commitment and future legal
+  options even if the text shape looks similar.
+
+What is valid:
+
+- Use one schematic betting template to generate legal concrete actions for
+  each state.
+- Share static metadata for the template where it is truly independent of pot
+  and stack.
+- Canonicalize only after proving that pot, stack, street, player, legal action
+  set, and value scaling are equivalent or correctly transformed.
+
+Default decision:
+
+- Do not merge action states by "same looking line" as an optimization.
+- Keep this as a rejected or highly constrained direction until there is a
+  formal equivalence relation and a small-tree proof.
+
+### F. Lazy Or Reduced Average Strategy Writes
+
+Current risk:
+
+- Strategy sums and/or strategy rows may be written more often than needed for
+  convergence and output.
+
+Possible production-solver difference:
+
+- Use CFR+ or DCFR-style averaging schedules.
+- Update average strategy less frequently, or reconstruct output strategy from
+  checkpoints where valid.
+- Store average strategy in `f16` or fixed-point while keeping regret in `f32`.
+
+Correctness caveat:
+
+- The average strategy is the output policy. Skipping or changing writes must
+  preserve the intended weighting scheme.
+
+Validation requirement:
+
+- Compare exploitability and root strategy at fixed iteration counts against
+  the current exact averaging path.
+
+### G. Cache-Local Tree And Row Layout
+
+Current risk:
+
+- The tree is logically ordered, but not necessarily ordered for cache reuse.
+- Different phases may traverse values, reaches, regrets, and strategy sums in
+  incompatible orders.
+
+Possible production-solver difference:
+
+- Store states by street, dependency level, board class, and row ownership.
+- Make each worker own contiguous row ranges.
+- Keep hot loops branch-light and mostly sequential in memory.
+
+Validation requirement:
+
+- Measure bytes touched and worker imbalance per phase.
+- Compare physical layouts with repeated benchmarks, not one-off runs.
+
+### H. Exploitability Evaluation Cost
+
+Current risk:
+
+- Full best-response/exploitability evaluation is too expensive to run often.
+
+Possible production-solver difference:
+
+- Use exact exploitability at sparse intervals.
+- Use cheaper convergence proxies between exact checks.
+- Report practical accuracy in `BB/100` while avoiding exact BR every
+  iteration.
+
+Correctness caveat:
+
+- A proxy cannot replace exact exploitability as the final acceptance metric.
+
+Validation requirement:
+
+- Track which proxy correlates with exact exploitability on fixed benchmark
+  trees.

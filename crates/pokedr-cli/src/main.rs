@@ -101,6 +101,10 @@ enum Command {
         #[arg(long)]
         run_terminal_board_phase: bool,
         #[arg(long)]
+        run_terminal_board_phase_board_major: bool,
+        #[arg(long)]
+        terminal_board_locality: bool,
+        #[arg(long)]
         terminal_eval_breakdown: bool,
         #[arg(long)]
         terminal_cfv_calls: Option<usize>,
@@ -308,6 +312,8 @@ fn main() -> Result<(), String> {
             dcfr_beta,
             dcfr_gamma,
             run_terminal_board_phase,
+            run_terminal_board_phase_board_major,
+            terminal_board_locality,
             terminal_eval_breakdown,
             terminal_cfv_calls,
             terminal_cfv_threads,
@@ -556,6 +562,43 @@ fn main() -> Result<(), String> {
                     summary.elapsed_ms,
                     started.elapsed().as_secs_f64() * 1000.0,
                     summary.checksum,
+                );
+            }
+            if run_terminal_board_phase_board_major {
+                let started = Instant::now();
+                let solver = RealCfrSolver::new(
+                    tree.clone(),
+                    RangeSpec::from_str(&oop_range)?,
+                    RangeSpec::from_str(&ip_range)?,
+                )?;
+                let summary = solver.run_terminal_board_phase_board_major(state_threads)?;
+                println!(
+                    "terminal_board_phase_board_major threads={} terminal_evals={} elapsed_ms={:.3} total_ms={:.3} checksum={:.6}",
+                    state_threads,
+                    summary.terminal_evals,
+                    summary.elapsed_ms,
+                    started.elapsed().as_secs_f64() * 1000.0,
+                    summary.checksum,
+                );
+            }
+            if terminal_board_locality {
+                let solver = RealCfrSolver::new(
+                    tree.clone(),
+                    RangeSpec::from_str(&oop_range)?,
+                    RangeSpec::from_str(&ip_range)?,
+                )?;
+                let locality = solver.terminal_board_locality()?;
+                println!(
+                    "terminal_board_locality tasks={} unique_boards={} current_order_runs={} average_run_len={:.3} max_run_len={} min_tasks_per_board={} max_tasks_per_board={} average_tasks_per_board={:.3} board_major_task_mib={:.3}",
+                    locality.tasks,
+                    locality.unique_boards,
+                    locality.current_order_runs,
+                    locality.average_run_len,
+                    locality.max_run_len,
+                    locality.min_tasks_per_board,
+                    locality.max_tasks_per_board,
+                    locality.average_tasks_per_board,
+                    locality.board_major_task_bytes as f64 / (1024.0 * 1024.0),
                 );
             }
             if terminal_eval_breakdown {

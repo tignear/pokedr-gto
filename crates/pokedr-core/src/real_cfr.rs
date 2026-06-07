@@ -105,6 +105,19 @@ pub struct TerminalEvalBreakdown {
     pub river_all_in_evals: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TerminalBoardLocality {
+    pub tasks: usize,
+    pub unique_boards: usize,
+    pub current_order_runs: usize,
+    pub average_run_len: f64,
+    pub max_run_len: usize,
+    pub min_tasks_per_board: usize,
+    pub max_tasks_per_board: usize,
+    pub average_tasks_per_board: f64,
+    pub board_major_task_bytes: usize,
+}
+
 #[derive(Debug, Clone)]
 pub struct RealCfrSolver {
     tree: PublicTree,
@@ -548,8 +561,26 @@ impl RealCfrSolver {
         &self,
         threads: usize,
     ) -> Result<TerminalBoardPhaseSummary, String> {
+        self.run_terminal_board_phase_ordered(threads, false)
+    }
+
+    pub fn run_terminal_board_phase_board_major(
+        &self,
+        threads: usize,
+    ) -> Result<TerminalBoardPhaseSummary, String> {
+        self.run_terminal_board_phase_ordered(threads, true)
+    }
+
+    fn run_terminal_board_phase_ordered(
+        &self,
+        threads: usize,
+        board_major: bool,
+    ) -> Result<TerminalBoardPhaseSummary, String> {
         let started = std::time::Instant::now();
-        let tasks = self.collect_terminal_board_tasks()?;
+        let mut tasks = self.collect_terminal_board_tasks()?;
+        if board_major {
+            tasks.sort_by_key(|task| (task.cache_index, task.terminal_node));
+        }
         let threads = effective_worker_count(threads).min(tasks.len().max(1));
         let oop_reach = self
             .oop_combos
@@ -604,6 +635,57 @@ impl RealCfrSolver {
             threads,
             elapsed_ms: started.elapsed().as_secs_f64() * 1000.0,
             checksum,
+        })
+    }
+
+    pub fn terminal_board_locality(&self) -> Result<TerminalBoardLocality, String> {
+        let tasks = self.collect_terminal_board_tasks()?;
+        let mut counts = vec![0usize; self.terminal_cache.len()];
+        let mut current_order_runs = 0usize;
+        let mut max_run_len = 0usize;
+        let mut previous_cache_index = None;
+        let mut current_run_len = 0usize;
+        for task in &tasks {
+            counts[task.cache_index] += 1;
+            if previous_cache_index == Some(task.cache_index) {
+                current_run_len += 1;
+            } else {
+                if current_run_len > 0 {
+                    max_run_len = max_run_len.max(current_run_len);
+                }
+                current_order_runs += 1;
+                previous_cache_index = Some(task.cache_index);
+                current_run_len = 1;
+            }
+        }
+        max_run_len = max_run_len.max(current_run_len);
+        let used_counts = counts
+            .into_iter()
+            .filter(|count| *count > 0)
+            .collect::<Vec<_>>();
+        let unique_boards = used_counts.len();
+        let min_tasks_per_board = used_counts.iter().copied().min().unwrap_or(0);
+        let max_tasks_per_board = used_counts.iter().copied().max().unwrap_or(0);
+        let average_tasks_per_board = if unique_boards > 0 {
+            tasks.len() as f64 / unique_boards as f64
+        } else {
+            0.0
+        };
+        let average_run_len = if current_order_runs > 0 {
+            tasks.len() as f64 / current_order_runs as f64
+        } else {
+            0.0
+        };
+        Ok(TerminalBoardLocality {
+            tasks: tasks.len(),
+            unique_boards,
+            current_order_runs,
+            average_run_len,
+            max_run_len,
+            min_tasks_per_board,
+            max_tasks_per_board,
+            average_tasks_per_board,
+            board_major_task_bytes: tasks.len() * std::mem::size_of::<TerminalBoardTask>(),
         })
     }
 
