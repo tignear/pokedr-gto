@@ -539,3 +539,19 @@ ideas.
   `three_phase_real_cfr_matches_recursive_one_iteration_on_small_ranges` passed.
 - Decision: keep. This is not the main CFV breakthrough, but it is a clean
   exact optimization for turn/flop all-in and fold terminals.
+
+## 2026-06-07: Portable SIMD gather for terminal blocker correction
+
+- Tried: use nightly `std::simd` gather operations to sum
+  `weaker_blockers`/`stronger_blockers` for
+  `terminal_cfv_prefix_blocker_board_targets_into`.
+- Expected: blocker correction is a hot loop, so vectorizing several blocker
+  reach reads at once might reduce scalar loop overhead.
+- Result: failed. The SIMD path matched scalar values within normal f32
+  reduction noise, but on `As7h2c` UTG vs BU, `1` DCFR+ iteration with
+  `16` threads moved terminal time from about `2.67s` to about `4.54s`.
+- Decision: removed. SIMD gather is the wrong shape here: the indices are
+  random enough that gather latency and reduction overhead dominate. Do not
+  retry simple gather-SIMD for this loop. A viable SIMD approach would need a
+  different data layout with contiguous lanes, not gather over `u16` blocker
+  lists.
