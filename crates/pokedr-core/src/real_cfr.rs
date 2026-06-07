@@ -1142,35 +1142,8 @@ impl RealCfrSolver {
                     let board_slot = self.board_slot(&state.board)?;
                     let row_len = acting_combos * actions_len;
                     let row_start = board_slot * row_len;
-                    let row_end = row_start + row_len;
                     let (state_value, child_values) = split_state_and_children(values, state_index);
                     state_value.reset();
-                    {
-                        let infoset = self.infosets[state.node_id]
-                            .as_ref()
-                            .expect("decision node must have infoset");
-                        let regrets = &infoset.regrets[row_start..row_end];
-                        match player {
-                            Player::Oop => combine_acting_child_values_from_regrets(
-                                &mut state_value.oop,
-                                child_values,
-                                state_index,
-                                &state.children,
-                                regrets,
-                                actions_len,
-                                Player::Oop,
-                            )?,
-                            Player::Ip => combine_acting_child_values_from_regrets(
-                                &mut state_value.ip,
-                                child_values,
-                                state_index,
-                                &state.children,
-                                regrets,
-                                actions_len,
-                                Player::Ip,
-                            )?,
-                        }
-                    }
                     match player {
                         Player::Oop => combine_nonacting_child_values(
                             &mut state_value.ip,
@@ -1202,16 +1175,29 @@ impl RealCfrSolver {
                         .expect("decision node must have infoset");
                     let mut strategy_probs = [0.0f32; 8];
                     for combo in 0..acting_combos {
-                        let node_value = match player {
-                            Player::Oop => state_value.oop[combo],
-                            Player::Ip => state_value.ip[combo],
-                        };
                         let local_row_start = combo * actions_len;
                         fill_strategy_probs(
                             &infoset.regrets[row_start + local_row_start
                                 ..row_start + local_row_start + actions_len],
                             &mut strategy_probs,
                         )?;
+                        let mut node_value = 0.0f32;
+                        for action_index in 0..actions_len {
+                            let action_values = child_value(
+                                child_values,
+                                state_index,
+                                state.children[action_index],
+                            );
+                            let action_value = match player {
+                                Player::Oop => action_values.oop[combo],
+                                Player::Ip => action_values.ip[combo],
+                            };
+                            node_value += strategy_probs[action_index] * action_value;
+                        }
+                        match player {
+                            Player::Oop => state_value.oop[combo] = node_value,
+                            Player::Ip => state_value.ip[combo] = node_value,
+                        }
                         for action_index in 0..actions_len {
                             let action_values = child_value(
                                 child_values,
@@ -2084,35 +2070,6 @@ fn split_state_and_children(values: &mut [Values], state_index: usize) -> (&mut 
 fn child_value(children: &[Values], state_index: usize, child_index: usize) -> &Values {
     debug_assert!(child_index > state_index);
     &children[child_index - state_index - 1]
-}
-
-fn combine_acting_child_values_from_regrets(
-    out: &mut [f32],
-    child_values: &[Values],
-    state_index: usize,
-    children: &[usize],
-    regrets: &[f32],
-    actions: usize,
-    player: Player,
-) -> Result<(), String> {
-    let mut strategy_probs = [0.0f32; 8];
-    for combo in 0..out.len() {
-        let row_start = combo * actions;
-        fill_strategy_probs(
-            &regrets[row_start..row_start + actions],
-            &mut strategy_probs,
-        )?;
-        let mut value = 0.0f32;
-        for (action, child) in children.iter().copied().enumerate() {
-            value += strategy_probs[action]
-                * match player {
-                    Player::Oop => child_value(child_values, state_index, child).oop[combo],
-                    Player::Ip => child_value(child_values, state_index, child).ip[combo],
-                };
-        }
-        out[combo] = value;
-    }
-    Ok(())
 }
 
 fn fill_strategy_probs(row: &[f32], out: &mut [f32; 8]) -> Result<(), String> {
