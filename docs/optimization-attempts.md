@@ -54,6 +54,23 @@ ideas.
   backup hot loop. If impossible combos are skipped, use precomputed compact
   live combo ranges/lists so the loop shape is branch-free.
 
+## 2026-06-07: Physical topological phase-state reorder
+
+- Tried: reorder real-CFR `PhaseState`s so root-to-terminal topological order is
+  also backup-level contiguous, then route terminal evaluation over the terminal
+  suffix instead of all state chunks. This keeps `child_index > parent_index`
+  and is the standard setup for owner-computes level-parallel backup.
+- Expected: preserve values and provide contiguous backup level ranges without
+  the `Vec<Vec<Values>>` locality loss.
+- Result: values matched, but performance still regressed. On UTG vs BU
+  `As7h2c`, `iterations=4`, `16` threads, DCFR+, the previous path was about
+  `35.6s` elapsed with `13.6s` backup. Physical topological reorder was about
+  `41.5s` elapsed with `14.9s` backup and `11.6s` terminal.
+- Decision: reverted. The idea is still valid as metadata, but do not
+  physically reorder the state/value arrays unless the whole reach/terminal
+  pipeline is rebuilt around that layout. Prefer keeping DFS order and adding a
+  logical level/range plan, or move directly to flat action-row storage.
+
 ## 2026-06-06: CPU terminal CFV card-prefix blocker correction
 
 - Tried: replace the per-combo blocker-neighbor loop in CPU terminal CFV with
