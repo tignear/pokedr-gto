@@ -1752,7 +1752,9 @@ impl RealCfrSolver {
                                 TerminalSideValue::OopValue,
                                 &ip_live,
                                 &ip_nonzero,
+                                &cache.oop_targets,
                                 &cache.oop_board_targets,
+                                self.oop_combos.len(),
                                 use_sparse,
                                 &mut scratch,
                             )?;
@@ -1763,11 +1765,13 @@ impl RealCfrSolver {
                                 TerminalSideValue::IpValue,
                                 &oop_live,
                                 &oop_nonzero,
+                                &cache.ip_targets,
                                 &cache.ip_board_targets,
+                                self.ip_combos.len(),
                                 use_sparse,
                                 &mut scratch,
                             )?;
-                            self.add_terminal_ref_values(
+                            self.add_terminal_ref_compact_values(
                                 &mut accumulator,
                                 terminal_ref,
                                 cache,
@@ -1853,6 +1857,39 @@ impl RealCfrSolver {
                     "terminal isomorphism permutation is missing combo maps".to_string()
                 })?;
             accumulator.add_board_values_permuted(
+                cache,
+                pot,
+                hero_values,
+                villain_values,
+                &maps.oop_source_to_target,
+                &maps.ip_source_to_target,
+            );
+        }
+        Ok(())
+    }
+
+    fn add_terminal_ref_compact_values(
+        &self,
+        accumulator: &mut TerminalAccumulator,
+        terminal_ref: &TerminalCacheRef,
+        cache: &TerminalEvalCache,
+        pot: u32,
+        hero_values: &[f32],
+        villain_values: &[f32],
+    ) -> Result<(), String> {
+        let identity_code = crate::isomorphism::SuitPermutation::identity().code();
+        for permutation_code in &terminal_ref.member_permutation_codes {
+            if *permutation_code == identity_code {
+                accumulator.add_compact_board_values(cache, pot, hero_values, villain_values);
+                continue;
+            }
+            let maps = self
+                .combo_permutations
+                .get(permutation_code)
+                .ok_or_else(|| {
+                    "terminal isomorphism permutation is missing combo maps".to_string()
+                })?;
+            accumulator.add_compact_board_values_permuted(
                 cache,
                 pot,
                 hero_values,
@@ -2620,6 +2657,25 @@ impl TerminalAccumulator {
         self.values.terminal_evals += 1;
     }
 
+    fn add_compact_board_values(
+        &mut self,
+        cache: &TerminalEvalCache,
+        pot: u32,
+        hero_values: &[f32],
+        villain_values: &[f32],
+    ) {
+        let pot = pot as f32;
+        for target in &cache.oop_targets {
+            self.values.oop[target.range_index] += hero_values[target.range_index] * pot;
+            self.oop_counts[target.range_index] += 1.0;
+        }
+        for target in &cache.ip_targets {
+            self.values.ip[target.range_index] += villain_values[target.range_index] * pot;
+            self.ip_counts[target.range_index] += 1.0;
+        }
+        self.values.terminal_evals += 1;
+    }
+
     fn add_board_values_permuted(
         &mut self,
         cache: &TerminalEvalCache,
@@ -2639,6 +2695,31 @@ impl TerminalAccumulator {
         for (source_index, target_index) in ip_source_to_target.iter().enumerate() {
             if let Some(board_index) = cache.ip_combo_indices[*target_index] {
                 self.values.ip[source_index] += villain_values[board_index] * pot;
+                self.ip_counts[source_index] += 1.0;
+            }
+        }
+        self.values.terminal_evals += 1;
+    }
+
+    fn add_compact_board_values_permuted(
+        &mut self,
+        cache: &TerminalEvalCache,
+        pot: u32,
+        hero_values: &[f32],
+        villain_values: &[f32],
+        oop_source_to_target: &[usize],
+        ip_source_to_target: &[usize],
+    ) {
+        let pot = pot as f32;
+        for (source_index, target_index) in oop_source_to_target.iter().enumerate() {
+            if cache.oop_combo_indices[*target_index].is_some() {
+                self.values.oop[source_index] += hero_values[*target_index] * pot;
+                self.oop_counts[source_index] += 1.0;
+            }
+        }
+        for (source_index, target_index) in ip_source_to_target.iter().enumerate() {
+            if cache.ip_combo_indices[*target_index].is_some() {
+                self.values.ip[source_index] += villain_values[*target_index] * pot;
                 self.ip_counts[source_index] += 1.0;
             }
         }
@@ -3796,7 +3877,9 @@ fn terminal_side_cached_values(
     side: TerminalSideValue,
     opponent_reach: &[f32],
     opponent_nonzero: &[u16],
-    targets: &[u16],
+    targets: &[PreparedComboTarget],
+    board_targets: &[u16],
+    range_len: usize,
     use_sparse: bool,
     _scratch: &mut TerminalCfvScratch,
 ) -> Result<Arc<[f32]>, String> {
@@ -3817,22 +3900,26 @@ fn terminal_side_cached_values(
 
     cache.misses += 1;
     let combos = terminal.prepared.combos().len();
-    let mut values = vec![0.0f32; combos];
+    let mut board_values = vec![0.0f32; combos];
     if use_sparse {
         terminal_side_values_sparse_board_targets_into(
             &terminal.prepared,
             opponent_reach,
             opponent_nonzero,
-            targets,
-            &mut values,
+            board_targets,
+            &mut board_values,
         )?;
     } else {
         terminal_side_values_prefix_blocker_sorted_board_targets_into(
             &terminal.prepared,
             opponent_reach,
-            targets,
-            &mut values,
+            board_targets,
+            &mut board_values,
         )?;
+    }
+    let mut values = vec![0.0f32; range_len];
+    for target in targets {
+        values[target.range_index] = board_values[target.board_index as usize];
     }
     let values = Arc::<[f32]>::from(values);
     cache
