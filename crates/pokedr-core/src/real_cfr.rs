@@ -6,7 +6,6 @@ use crate::terminal_cfv::{
 };
 use crate::tree::{Player, PublicNodeKind, PublicTree, TerminalReason};
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::Instant;
 
@@ -171,14 +170,6 @@ struct TerminalWorkerProfile {
     output_states: usize,
     elapsed_ms: f64,
 }
-
-#[derive(Debug)]
-struct TerminalStateChunk {
-    start: usize,
-    values: Vec<Values>,
-}
-
-type TerminalWorkerResult = (TerminalWorkerProfile, Vec<TerminalStateChunk>);
 
 #[derive(Debug, Clone)]
 struct PhaseState {
@@ -747,23 +738,25 @@ impl RealCfrSolver {
         .max(1)
         .min(states.len().max(1));
         let profile_terminal = std::env::var_os("POKEDR_REAL_CFR_TERMINAL_PROFILE").is_some();
-        let state_chunk_len = terminal_state_chunk_len(states.len(), threads);
-        let state_chunks = states.len().div_ceil(state_chunk_len);
-        let next_chunk = AtomicUsize::new(0);
-        let worker_results = thread::scope(|scope| -> Result<Vec<TerminalWorkerResult>, String> {
-            let mut handles = Vec::with_capacity(threads);
-            for worker_index in 0..threads {
-                let next_chunk = &next_chunk;
+        let values_alloc_started = Instant::now();
+        let mut values =
+            vec![Values::zero(self.oop_combos.len(), self.ip_combos.len()); states.len()];
+        let values_alloc_ms = values_alloc_started.elapsed().as_secs_f64() * 1000.0;
+        let state_chunk_len = states.len().div_ceil(threads);
+        let worker_scope_started = Instant::now();
+        let profiles = thread::scope(|scope| -> Result<Vec<TerminalWorkerProfile>, String> {
+            let mut handles = Vec::new();
+            for (worker_index, values_chunk) in values.chunks_mut(state_chunk_len).enumerate() {
+                let start_index = worker_index * state_chunk_len;
                 handles.push(
-                    scope.spawn(move || -> Result<TerminalWorkerResult, String> {
+                    scope.spawn(move || -> Result<TerminalWorkerProfile, String> {
                         self.terminal_phase_worker(
                             states,
                             oop_reaches,
                             ip_reaches,
+                            start_index,
                             worker_index,
-                            state_chunk_len,
-                            state_chunks,
-                            next_chunk,
+                            values_chunk,
                         )
                     }),
                 );
@@ -777,18 +770,13 @@ impl RealCfrSolver {
                 })
                 .collect::<Result<Vec<_>, _>>()
         })?;
-        let mut values =
-            vec![Values::zero(self.oop_combos.len(), self.ip_combos.len()); states.len()];
-        let mut profiles = Vec::with_capacity(worker_results.len());
-        for (profile, output_chunks) in worker_results {
-            profiles.push(profile);
-            for chunk in output_chunks {
-                let end = chunk.start + chunk.values.len();
-                values[chunk.start..end].clone_from_slice(&chunk.values);
-            }
-        }
+        let worker_scope_ms = worker_scope_started.elapsed().as_secs_f64() * 1000.0;
         if profile_terminal {
             let total_tasks = profiles.iter().map(|profile| profile.tasks).sum();
+            eprintln!(
+                "real_cfr_terminal_stage_profile values_alloc_ms={:.3} worker_scope_ms={:.3}",
+                values_alloc_ms, worker_scope_ms,
+            );
             print_terminal_worker_profiles(total_tasks, profiles.len(), &profiles);
         }
         Ok(values)
@@ -799,11 +787,10 @@ impl RealCfrSolver {
         states: &[PhaseState],
         oop_reaches: &[Vec<f32>],
         ip_reaches: &[Vec<f32>],
+        start_index: usize,
         worker_index: usize,
-        state_chunk_len: usize,
-        state_chunks: usize,
-        next_chunk: &AtomicUsize,
-    ) -> Result<TerminalWorkerResult, String> {
+        values_chunk: &mut [Values],
+    ) -> Result<TerminalWorkerProfile, String> {
         let started = Instant::now();
         let scratch_source = self
             .terminal_cache
@@ -821,110 +808,92 @@ impl RealCfrSolver {
             worker_index,
             ..TerminalWorkerProfile::default()
         };
-        let mut output_chunks = Vec::new();
-        loop {
-            let chunk_index = next_chunk.fetch_add(1, Ordering::Relaxed);
-            if chunk_index >= state_chunks {
-                break;
-            }
-            let start_index = chunk_index * state_chunk_len;
-            let end_index = (start_index + state_chunk_len).min(states.len());
-            let mut chunk_values = vec![
-                Values::zero(self.oop_combos.len(), self.ip_combos.len());
-                end_index - start_index
-            ];
-            for (local_index, values_slot) in chunk_values.iter_mut().enumerate() {
-                let state_index = start_index + local_index;
-                let state = &states[state_index];
-                let node = &self.tree.nodes[state.node_id];
-                let PublicNodeKind::Terminal { reason } = node.kind else {
-                    continue;
-                };
-                match reason {
-                    TerminalReason::Fold => {
-                        *values_slot = self.fold_values(
-                            &state.board,
-                            node.state.pot,
-                            node.state.player,
+        for (local_index, values_slot) in values_chunk.iter_mut().enumerate() {
+            let state_index = start_index + local_index;
+            let state = &states[state_index];
+            let node = &self.tree.nodes[state.node_id];
+            let PublicNodeKind::Terminal { reason } = node.kind else {
+                continue;
+            };
+            match reason {
+                TerminalReason::Fold => {
+                    *values_slot = self.fold_values(
+                        &state.board,
+                        node.state.pot,
+                        node.state.player,
+                        &oop_reaches[state_index],
+                        &ip_reaches[state_index],
+                    );
+                }
+                TerminalReason::Showdown | TerminalReason::AllIn => {
+                    accumulator.reset();
+                    for terminal_board in terminal_boards(&state.board)? {
+                        let cache_index = self
+                            .terminal_cache_index_by_key
+                            .get(&unordered_board_key(&terminal_board))
+                            .copied()
+                            .ok_or_else(|| {
+                                "terminal board is outside the solver board cache".to_string()
+                            })?;
+                        let cache = &self.terminal_cache[cache_index];
+                        reach_on_prepared_board_sparse_into(
+                            &cache.oop_combo_indices,
                             &oop_reaches[state_index],
+                            &mut oop_live,
+                            &mut oop_nonzero,
+                        );
+                        reach_on_prepared_board_sparse_into(
+                            &cache.ip_combo_indices,
                             &ip_reaches[state_index],
+                            &mut ip_live,
+                            &mut ip_nonzero,
+                        );
+                        profile.tasks += 1;
+                        profile.oop_nonzero_sum += oop_nonzero.len();
+                        profile.ip_nonzero_sum += ip_nonzero.len();
+                        profile.oop_nonzero_max = profile.oop_nonzero_max.max(oop_nonzero.len());
+                        profile.ip_nonzero_max = profile.ip_nonzero_max.max(ip_nonzero.len());
+                        if oop_nonzero.len() <= TERMINAL_SPARSE_NONZERO_LIMIT
+                            && ip_nonzero.len() <= TERMINAL_SPARSE_NONZERO_LIMIT
+                        {
+                            profile.sparse_tasks += 1;
+                            terminal_cfv_sparse_targets_into(
+                                &cache.prepared,
+                                &oop_live,
+                                &ip_live,
+                                &oop_nonzero,
+                                &ip_nonzero,
+                                &cache.oop_combo_indices,
+                                &cache.ip_combo_indices,
+                                &mut scratch,
+                            )?;
+                        } else {
+                            profile.prefix_tasks += 1;
+                            terminal_cfv_prefix_blocker_targets_into(
+                                &cache.prepared,
+                                &oop_live,
+                                &ip_live,
+                                &cache.oop_combo_indices,
+                                &cache.ip_combo_indices,
+                                &mut scratch,
+                            )?;
+                        }
+                        accumulator.add_board(
+                            cache,
+                            node.state.pot,
+                            &scratch,
+                            self.oop_combos.len(),
+                            self.ip_combos.len(),
                         );
                     }
-                    TerminalReason::Showdown | TerminalReason::AllIn => {
-                        accumulator.reset();
-                        for terminal_board in terminal_boards(&state.board)? {
-                            let cache_index = self
-                                .terminal_cache_index_by_key
-                                .get(&unordered_board_key(&terminal_board))
-                                .copied()
-                                .ok_or_else(|| {
-                                    "terminal board is outside the solver board cache".to_string()
-                                })?;
-                            let cache = &self.terminal_cache[cache_index];
-                            reach_on_prepared_board_sparse_into(
-                                &cache.oop_combo_indices,
-                                &oop_reaches[state_index],
-                                &mut oop_live,
-                                &mut oop_nonzero,
-                            );
-                            reach_on_prepared_board_sparse_into(
-                                &cache.ip_combo_indices,
-                                &ip_reaches[state_index],
-                                &mut ip_live,
-                                &mut ip_nonzero,
-                            );
-                            profile.tasks += 1;
-                            profile.oop_nonzero_sum += oop_nonzero.len();
-                            profile.ip_nonzero_sum += ip_nonzero.len();
-                            profile.oop_nonzero_max =
-                                profile.oop_nonzero_max.max(oop_nonzero.len());
-                            profile.ip_nonzero_max = profile.ip_nonzero_max.max(ip_nonzero.len());
-                            if oop_nonzero.len() <= TERMINAL_SPARSE_NONZERO_LIMIT
-                                && ip_nonzero.len() <= TERMINAL_SPARSE_NONZERO_LIMIT
-                            {
-                                profile.sparse_tasks += 1;
-                                terminal_cfv_sparse_targets_into(
-                                    &cache.prepared,
-                                    &oop_live,
-                                    &ip_live,
-                                    &oop_nonzero,
-                                    &ip_nonzero,
-                                    &cache.oop_combo_indices,
-                                    &cache.ip_combo_indices,
-                                    &mut scratch,
-                                )?;
-                            } else {
-                                profile.prefix_tasks += 1;
-                                terminal_cfv_prefix_blocker_targets_into(
-                                    &cache.prepared,
-                                    &oop_live,
-                                    &ip_live,
-                                    &cache.oop_combo_indices,
-                                    &cache.ip_combo_indices,
-                                    &mut scratch,
-                                )?;
-                            }
-                            accumulator.add_board(
-                                cache,
-                                node.state.pot,
-                                &scratch,
-                                self.oop_combos.len(),
-                                self.ip_combos.len(),
-                            );
-                        }
-                        accumulator.finish();
-                        values_slot.copy_from(&accumulator.values);
-                    }
+                    accumulator.finish();
+                    values_slot.copy_from(&accumulator.values);
                 }
             }
-            profile.output_states += chunk_values.len();
-            output_chunks.push(TerminalStateChunk {
-                start: start_index,
-                values: chunk_values,
-            });
         }
+        profile.output_states = values_chunk.len();
         profile.elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
-        Ok((profile, output_chunks))
+        Ok(profile)
     }
 
     fn backup_phase(
@@ -1867,14 +1836,6 @@ fn reach_on_prepared_board_sparse_into(
             out[index] += *reach;
         }
     }
-}
-
-fn terminal_state_chunk_len(states: usize, threads: usize) -> usize {
-    if states == 0 {
-        return 1;
-    }
-    let target_chunks = threads.saturating_mul(16).max(1);
-    states.div_ceil(target_chunks).clamp(16, 256)
 }
 
 fn print_terminal_worker_profiles(
