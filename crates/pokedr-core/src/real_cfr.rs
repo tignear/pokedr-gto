@@ -5,9 +5,7 @@ use crate::isomorphism::{
 use crate::range::{ComboWeight, RangeSpec};
 use crate::terminal_cfv::{
     PreparedTerminalBoard, TerminalCfvScratch, terminal_cfv_prefix_blocker_board_targets_into,
-    terminal_cfv_prefix_blocker_sorted_board_targets_into,
-    terminal_cfv_prefix_blocker_targets_into, terminal_cfv_sparse_board_targets_into,
-    terminal_cfv_sparse_targets_into,
+    terminal_cfv_prefix_blocker_sorted_board_targets_into, terminal_cfv_sparse_board_targets_into,
     terminal_side_values_prefix_blocker_sorted_board_targets_into,
     terminal_side_values_sparse_board_targets_into,
 };
@@ -228,6 +226,15 @@ struct TerminalAccumulator {
     values: Values,
     oop_counts: Vec<f32>,
     ip_counts: Vec<f32>,
+}
+
+struct RecursiveTerminalScratch {
+    cfv: TerminalCfvScratch,
+    oop_live: Vec<f32>,
+    ip_live: Vec<f32>,
+    oop_nonzero: Vec<u16>,
+    ip_nonzero: Vec<u16>,
+    accumulator: TerminalAccumulator,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -514,6 +521,21 @@ impl RealCfrSolver {
         mut progress: impl FnMut(RealCfrIterationSummary),
     ) -> Result<RealCfrSummary, String> {
         let mut root = Values::zero(self.oop_combos.len(), self.ip_combos.len());
+        let scratch_source = self
+            .terminal_cache
+            .first()
+            .ok_or_else(|| "terminal board cache is empty".to_string())?;
+        let terminal_combos = scratch_source.prepared.combos().len();
+        let mut terminal_scratch = RecursiveTerminalScratch {
+            cfv: TerminalCfvScratch::new(&scratch_source.prepared),
+            oop_live: vec![0.0; terminal_combos],
+            ip_live: vec![0.0; terminal_combos],
+            oop_nonzero: Vec::new(),
+            ip_nonzero: Vec::new(),
+            accumulator: TerminalAccumulator::zero(self.oop_combos.len(), self.ip_combos.len()),
+        };
+        let mut terminal_ref_cache = BTreeMap::new();
+        let mut side_cache = TerminalSideValueCache::default();
         let oop_weight = self
             .oop_combos
             .iter()
@@ -542,6 +564,9 @@ impl RealCfrSolver {
                 &ip_reach,
                 average_weight,
                 config.variant,
+                &mut terminal_scratch,
+                &mut terminal_ref_cache,
+                &mut side_cache,
             )?;
             progress(RealCfrIterationSummary {
                 iteration,
@@ -2271,6 +2296,9 @@ impl RealCfrSolver {
         ip_reach: &[f32],
         average_weight: f32,
         variant: RealCfrVariant,
+        terminal_scratch: &mut RecursiveTerminalScratch,
+        terminal_ref_cache: &mut BTreeMap<u64, Vec<TerminalCacheRef>>,
+        side_cache: &mut TerminalSideValueCache,
     ) -> Result<Values, String> {
         let node = self.tree.nodes[node_id].clone();
         match node.kind {
@@ -2281,6 +2309,9 @@ impl RealCfrSolver {
                 reason,
                 oop_reach,
                 ip_reach,
+                terminal_scratch,
+                terminal_ref_cache,
+                side_cache,
             ),
             PublicNodeKind::Chance(_) => {
                 let Some(child) = node.children.first().copied() else {
@@ -2299,6 +2330,9 @@ impl RealCfrSolver {
                         ip_reach,
                         average_weight,
                         variant,
+                        terminal_scratch,
+                        terminal_ref_cache,
+                        side_cache,
                     )?;
                     values.add_scaled(&child_values, chance_weight);
                 }
@@ -2314,6 +2348,9 @@ impl RealCfrSolver {
                         ip_reach,
                         average_weight,
                         variant,
+                        terminal_scratch,
+                        terminal_ref_cache,
+                        side_cache,
                     );
                 }
                 let acting_combos = match player {
@@ -2365,6 +2402,9 @@ impl RealCfrSolver {
                         &next_ip,
                         average_weight,
                         variant,
+                        terminal_scratch,
+                        terminal_ref_cache,
+                        side_cache,
                     )?);
                 }
 
@@ -2454,14 +2494,23 @@ impl RealCfrSolver {
         reason: TerminalReason,
         oop_reach: &[f32],
         ip_reach: &[f32],
+        terminal_scratch: &mut RecursiveTerminalScratch,
+        terminal_ref_cache: &mut BTreeMap<u64, Vec<TerminalCacheRef>>,
+        side_cache: &mut TerminalSideValueCache,
     ) -> Result<Values, String> {
         match reason {
             TerminalReason::Fold => {
                 Ok(self.fold_values(board, pot, folding_player, oop_reach, ip_reach))
             }
-            TerminalReason::Showdown | TerminalReason::AllIn => {
-                self.showdown_values(board, pot, oop_reach, ip_reach)
-            }
+            TerminalReason::Showdown | TerminalReason::AllIn => self.showdown_values_cached(
+                board,
+                pot,
+                oop_reach,
+                ip_reach,
+                terminal_scratch,
+                terminal_ref_cache,
+                side_cache,
+            ),
         }
     }
 
@@ -2521,90 +2570,79 @@ impl RealCfrSolver {
         values.terminal_evals = 0;
     }
 
-    fn showdown_values(
+    fn showdown_values_cached(
         &self,
         board: &Board,
         pot: u32,
         oop_reach: &[f32],
         ip_reach: &[f32],
+        scratch: &mut RecursiveTerminalScratch,
+        terminal_ref_cache: &mut BTreeMap<u64, Vec<TerminalCacheRef>>,
+        side_cache: &mut TerminalSideValueCache,
     ) -> Result<Values, String> {
-        let terminal_boards = terminal_boards(board)?;
-        let mut values = Values::zero(self.oop_combos.len(), self.ip_combos.len());
-        let mut oop_counts = vec![0.0f32; self.oop_combos.len()];
-        let mut ip_counts = vec![0.0f32; self.ip_combos.len()];
+        let key = ordered_board_key(board);
+        let terminal_refs = if let Some(cached) = terminal_ref_cache.get(&key) {
+            cached.clone()
+        } else {
+            let refs = self.terminal_cache_refs_for_board(board)?;
+            terminal_ref_cache.insert(key, refs.clone());
+            refs
+        };
         let sparse_nonzero_limit = terminal_sparse_nonzero_limit();
-        for final_board in &terminal_boards {
-            let cache_index = self
-                .terminal_cache_index_by_key
-                .get(&unordered_board_key(final_board))
-                .copied()
-                .ok_or_else(|| "terminal board is outside the solver board cache".to_string())?;
-            let cache = &self.terminal_cache[cache_index];
-            let mut scratch = TerminalCfvScratch::new(&cache.prepared);
-            let prepared_combos = cache.prepared.combos().len();
-            let mut oop_live = vec![0.0f32; prepared_combos];
-            let mut ip_live = vec![0.0f32; prepared_combos];
-            let mut oop_nonzero = Vec::new();
-            let mut ip_nonzero = Vec::new();
-            reach_on_prepared_board_sparse_into(
-                &cache.oop_combo_indices,
+        scratch.accumulator.reset();
+        for terminal_ref in &terminal_refs {
+            let cache = &self.terminal_cache[terminal_ref.cache_index];
+            reach_on_prepared_board_targets_sparse_into(
+                &cache.oop_targets,
                 oop_reach,
-                &mut oop_live,
-                &mut oop_nonzero,
+                &mut scratch.oop_live,
+                &mut scratch.oop_nonzero,
             );
-            reach_on_prepared_board_sparse_into(
-                &cache.ip_combo_indices,
+            reach_on_prepared_board_targets_sparse_into(
+                &cache.ip_targets,
                 ip_reach,
-                &mut ip_live,
-                &mut ip_nonzero,
+                &mut scratch.ip_live,
+                &mut scratch.ip_nonzero,
             );
-            if oop_nonzero.len() <= sparse_nonzero_limit && ip_nonzero.len() <= sparse_nonzero_limit
-            {
-                terminal_cfv_sparse_targets_into(
-                    &cache.prepared,
-                    &oop_live,
-                    &ip_live,
-                    &oop_nonzero,
-                    &ip_nonzero,
-                    &cache.oop_combo_indices,
-                    &cache.ip_combo_indices,
-                    &mut scratch,
-                )?;
-            } else {
-                terminal_cfv_prefix_blocker_targets_into(
-                    &cache.prepared,
-                    &oop_live,
-                    &ip_live,
-                    &cache.oop_combo_indices,
-                    &cache.ip_combo_indices,
-                    &mut scratch,
-                )?;
-            }
-            for index in 0..self.oop_combos.len() {
-                if let Some(board_index) = cache.oop_combo_indices[index] {
-                    values.oop[index] += scratch.hero_values()[board_index] * pot as f32;
-                    oop_counts[index] += 1.0;
-                }
-            }
-            for index in 0..self.ip_combos.len() {
-                if let Some(board_index) = cache.ip_combo_indices[index] {
-                    values.ip[index] += scratch.villain_values()[board_index] * pot as f32;
-                    ip_counts[index] += 1.0;
-                }
-            }
+            let use_sparse = scratch.oop_nonzero.len() <= sparse_nonzero_limit
+                && scratch.ip_nonzero.len() <= sparse_nonzero_limit;
+            let hero_values = terminal_side_cached_values(
+                side_cache,
+                cache,
+                terminal_ref.cache_index,
+                TerminalSideValue::OopValue,
+                &scratch.ip_live,
+                &scratch.ip_nonzero,
+                &cache.oop_targets,
+                &cache.oop_board_targets,
+                self.oop_combos.len(),
+                use_sparse,
+                &mut scratch.cfv,
+            )?;
+            let villain_values = terminal_side_cached_values(
+                side_cache,
+                cache,
+                terminal_ref.cache_index,
+                TerminalSideValue::IpValue,
+                &scratch.oop_live,
+                &scratch.oop_nonzero,
+                &cache.ip_targets,
+                &cache.ip_board_targets,
+                self.ip_combos.len(),
+                use_sparse,
+                &mut scratch.cfv,
+            )?;
+            self.add_terminal_ref_compact_values(
+                &mut scratch.accumulator,
+                terminal_ref,
+                cache,
+                pot,
+                &hero_values,
+                &villain_values,
+            )?;
         }
-        for (value, count) in values.oop.iter_mut().zip(oop_counts) {
-            if count > 0.0 {
-                *value /= count;
-            }
-        }
-        for (value, count) in values.ip.iter_mut().zip(ip_counts) {
-            if count > 0.0 {
-                *value /= count;
-            }
-        }
-        values.terminal_evals = terminal_boards.len();
-        Ok(values)
+        scratch.accumulator.finish();
+        Ok(scratch.accumulator.values.clone())
     }
 }
 
@@ -3761,27 +3799,6 @@ fn reach_on_prepared_board_targets_into(
         let reach = reach[target.range_index];
         if reach != 0.0 {
             out[target.board_index as usize] += reach;
-        }
-    }
-}
-
-fn reach_on_prepared_board_sparse_into(
-    combo_indices: &[Option<usize>],
-    reach: &[f32],
-    out: &mut [f32],
-    nonzero: &mut Vec<u16>,
-) {
-    out.fill(0.0);
-    nonzero.clear();
-    for (index, reach) in combo_indices.iter().zip(reach) {
-        if *reach == 0.0 {
-            continue;
-        }
-        if let Some(index) = *index {
-            if out[index] == 0.0 {
-                nonzero.push(index as u16);
-            }
-            out[index] += *reach;
         }
     }
 }

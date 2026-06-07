@@ -518,6 +518,13 @@ fn main() -> Result<(), String> {
                     summary.root_ip_value,
                     summary.root_oop_value + summary.root_ip_value,
                 );
+                println!(
+                    "real_cfr_state_allocated=true regret_len={} strategy_sum_len={} storage_gib={:.2}",
+                    solver.regret_len(),
+                    solver.strategy_sum_len(),
+                    solver.storage_gib(),
+                );
+                return Ok(());
             }
             if run_real_cfr_three_phase {
                 let started = Instant::now();
