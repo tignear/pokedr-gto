@@ -111,6 +111,10 @@ enum Command {
         #[arg(long)]
         terminal_board_locality: bool,
         #[arg(long)]
+        terminal_board_reuse: bool,
+        #[arg(long, default_value_t = 12)]
+        terminal_board_reuse_top: usize,
+        #[arg(long)]
         terminal_eval_breakdown: bool,
         #[arg(long)]
         terminal_cfv_calls: Option<usize>,
@@ -323,6 +327,8 @@ fn main() -> Result<(), String> {
             run_terminal_board_phase,
             run_terminal_board_phase_board_major,
             terminal_board_locality,
+            terminal_board_reuse,
+            terminal_board_reuse_top,
             terminal_eval_breakdown,
             terminal_cfv_calls,
             terminal_cfv_threads,
@@ -631,6 +637,59 @@ fn main() -> Result<(), String> {
                     locality.average_tasks_per_board,
                     locality.board_major_task_bytes as f64 / (1024.0 * 1024.0),
                 );
+            }
+            if terminal_board_reuse {
+                let started = Instant::now();
+                let solver = RealCfrSolver::new(
+                    tree.clone(),
+                    RangeSpec::from_str(&oop_range)?,
+                    RangeSpec::from_str(&ip_range)?,
+                )?;
+                let report = solver.terminal_board_reuse_report()?;
+                let average_pair_reuse_factor =
+                    if report.average_pair_unique_reaches_per_board > 0.0 {
+                        report.average_state_board_pairs_per_board
+                            / report.average_pair_unique_reaches_per_board
+                    } else {
+                        0.0
+                    };
+                println!(
+                    "terminal_board_reuse state_board_pairs={} unique_boards={} avg_state_board_pairs_per_board={:.3} min_state_board_pairs_per_board={} max_state_board_pairs_per_board={} avg_unique_terminal_states_per_board={:.3} avg_oop_unique_reaches_per_board={:.3} avg_ip_unique_reaches_per_board={:.3} avg_pair_unique_reaches_per_board={:.3} avg_pair_reuse_factor={:.3} total_ms={:.3}",
+                    report.state_board_pairs,
+                    report.unique_boards,
+                    report.average_state_board_pairs_per_board,
+                    report.min_state_board_pairs_per_board,
+                    report.max_state_board_pairs_per_board,
+                    report.average_unique_terminal_states_per_board,
+                    report.average_oop_unique_reaches_per_board,
+                    report.average_ip_unique_reaches_per_board,
+                    report.average_pair_unique_reaches_per_board,
+                    average_pair_reuse_factor,
+                    started.elapsed().as_secs_f64() * 1000.0,
+                );
+                for row in report.rows.iter().take(terminal_board_reuse_top) {
+                    let pair_reuse_factor = if row.pair_unique_reaches > 0 {
+                        row.state_board_pairs as f64 / row.pair_unique_reaches as f64
+                    } else {
+                        0.0
+                    };
+                    println!(
+                        "terminal_board_reuse_row board_index={} board={} state_board_pairs={} unique_terminal_states={} pot_buckets={} oop_unique_reaches={} ip_unique_reaches={} pair_unique_reaches={} pair_reuse_factor={:.3} avg_oop_nonzero={:.3} avg_ip_nonzero={:.3} max_oop_nonzero={} max_ip_nonzero={}",
+                        row.board_index,
+                        row.board,
+                        row.state_board_pairs,
+                        row.unique_terminal_states,
+                        row.pot_buckets,
+                        row.oop_unique_reaches,
+                        row.ip_unique_reaches,
+                        row.pair_unique_reaches,
+                        pair_reuse_factor,
+                        row.average_oop_nonzero,
+                        row.average_ip_nonzero,
+                        row.max_oop_nonzero,
+                        row.max_ip_nonzero,
+                    );
+                }
             }
             if terminal_eval_breakdown {
                 let solver = RealCfrSolver::new(

@@ -7,7 +7,7 @@ use crate::terminal_cfv::{
 };
 use crate::tree::{Player, PublicNodeKind, PublicTree, TerminalReason};
 use rayon::prelude::*;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Instant;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -118,6 +118,36 @@ pub struct TerminalBoardLocality {
     pub board_major_task_bytes: usize,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct TerminalBoardReuseReport {
+    pub state_board_pairs: usize,
+    pub unique_boards: usize,
+    pub average_state_board_pairs_per_board: f64,
+    pub min_state_board_pairs_per_board: usize,
+    pub max_state_board_pairs_per_board: usize,
+    pub average_unique_terminal_states_per_board: f64,
+    pub average_oop_unique_reaches_per_board: f64,
+    pub average_ip_unique_reaches_per_board: f64,
+    pub average_pair_unique_reaches_per_board: f64,
+    pub rows: Vec<TerminalBoardReuseRow>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TerminalBoardReuseRow {
+    pub board_index: usize,
+    pub board: Board,
+    pub state_board_pairs: usize,
+    pub unique_terminal_states: usize,
+    pub pot_buckets: usize,
+    pub oop_unique_reaches: usize,
+    pub ip_unique_reaches: usize,
+    pub pair_unique_reaches: usize,
+    pub average_oop_nonzero: f64,
+    pub average_ip_nonzero: f64,
+    pub max_oop_nonzero: usize,
+    pub max_ip_nonzero: usize,
+}
+
 #[derive(Debug, Clone)]
 pub struct RealCfrSolver {
     tree: PublicTree,
@@ -154,6 +184,7 @@ struct Values {
 
 #[derive(Debug, Clone)]
 struct TerminalEvalCache {
+    board: Board,
     prepared: PreparedTerminalBoard,
     oop_combo_indices: Vec<Option<usize>>,
     ip_combo_indices: Vec<Option<usize>>,
@@ -204,6 +235,44 @@ struct TerminalWorkerProfile {
     cfv_ms: f64,
     accumulator_ms: f64,
     elapsed_ms: f64,
+}
+
+#[derive(Debug, Default)]
+struct TerminalBoardReuseStats {
+    tasks: usize,
+    terminal_states: BTreeSet<usize>,
+    pots: BTreeSet<u32>,
+    oop_reaches: BTreeSet<u64>,
+    ip_reaches: BTreeSet<u64>,
+    pair_reaches: BTreeSet<u64>,
+    oop_nonzero_sum: usize,
+    ip_nonzero_sum: usize,
+    oop_nonzero_max: usize,
+    ip_nonzero_max: usize,
+}
+
+impl TerminalBoardReuseStats {
+    fn add(
+        &mut self,
+        state_index: usize,
+        pot: u32,
+        oop_hash: u64,
+        ip_hash: u64,
+        oop_nonzero: usize,
+        ip_nonzero: usize,
+    ) {
+        self.tasks += 1;
+        self.terminal_states.insert(state_index);
+        self.pots.insert(pot);
+        self.oop_reaches.insert(oop_hash);
+        self.ip_reaches.insert(ip_hash);
+        self.pair_reaches
+            .insert(mix_hash(mix_hash(0xcbf29ce484222325, oop_hash), ip_hash));
+        self.oop_nonzero_sum += oop_nonzero;
+        self.ip_nonzero_sum += ip_nonzero;
+        self.oop_nonzero_max = self.oop_nonzero_max.max(oop_nonzero);
+        self.ip_nonzero_max = self.ip_nonzero_max.max(ip_nonzero);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -293,6 +362,7 @@ impl RealCfrSolver {
             let ip_board_targets = prepared_board_targets(&ip_targets);
             terminal_cache_index_by_key.insert(unordered_board_key(board), terminal_cache.len());
             terminal_cache.push(TerminalEvalCache {
+                board: board.clone(),
                 oop_combo_indices,
                 ip_combo_indices,
                 oop_targets,
@@ -687,6 +757,131 @@ impl RealCfrSolver {
             max_tasks_per_board,
             average_tasks_per_board,
             board_major_task_bytes: tasks.len() * std::mem::size_of::<TerminalBoardTask>(),
+        })
+    }
+
+    pub fn terminal_board_reuse_report(&self) -> Result<TerminalBoardReuseReport, String> {
+        let states = self.collect_phase_states()?;
+        let (oop_reaches, ip_reaches) = self.forward_reaches_for_mode(
+            &states,
+            EvaluationMode::Profile,
+            StrategySource::Current,
+        )?;
+        let first_cache = self
+            .terminal_cache
+            .first()
+            .ok_or_else(|| "terminal board cache is empty".to_string())?;
+        let combos = first_cache.prepared.combos().len();
+        let mut oop_live = vec![0.0f32; combos];
+        let mut ip_live = vec![0.0f32; combos];
+        let mut oop_nonzero = Vec::new();
+        let mut ip_nonzero = Vec::new();
+        let mut stats = (0..self.terminal_cache.len())
+            .map(|_| TerminalBoardReuseStats::default())
+            .collect::<Vec<_>>();
+
+        for (state_index, state) in states.iter().enumerate() {
+            if state.terminal_cache_indices.is_empty() {
+                continue;
+            }
+            let node = &self.tree.nodes[state.node_id];
+            let PublicNodeKind::Terminal {
+                reason: TerminalReason::Showdown | TerminalReason::AllIn,
+            } = node.kind
+            else {
+                continue;
+            };
+            for cache_index in &state.terminal_cache_indices {
+                let cache = &self.terminal_cache[*cache_index];
+                reach_on_prepared_board_targets_sparse_into(
+                    &cache.oop_targets,
+                    &oop_reaches[state_index],
+                    &mut oop_live,
+                    &mut oop_nonzero,
+                );
+                reach_on_prepared_board_targets_sparse_into(
+                    &cache.ip_targets,
+                    &ip_reaches[state_index],
+                    &mut ip_live,
+                    &mut ip_nonzero,
+                );
+                let oop_hash = hash_sparse_reach(&oop_live, &oop_nonzero);
+                let ip_hash = hash_sparse_reach(&ip_live, &ip_nonzero);
+                stats[*cache_index].add(
+                    state_index,
+                    node.state.pot,
+                    oop_hash,
+                    ip_hash,
+                    oop_nonzero.len(),
+                    ip_nonzero.len(),
+                );
+            }
+        }
+
+        let mut rows = stats
+            .iter()
+            .enumerate()
+            .filter(|(_, stats)| stats.tasks > 0)
+            .map(|(board_index, stats)| TerminalBoardReuseRow {
+                board_index,
+                board: self.terminal_cache[board_index].board.clone(),
+                state_board_pairs: stats.tasks,
+                unique_terminal_states: stats.terminal_states.len(),
+                pot_buckets: stats.pots.len(),
+                oop_unique_reaches: stats.oop_reaches.len(),
+                ip_unique_reaches: stats.ip_reaches.len(),
+                pair_unique_reaches: stats.pair_reaches.len(),
+                average_oop_nonzero: stats.oop_nonzero_sum as f64 / stats.tasks as f64,
+                average_ip_nonzero: stats.ip_nonzero_sum as f64 / stats.tasks as f64,
+                max_oop_nonzero: stats.oop_nonzero_max,
+                max_ip_nonzero: stats.ip_nonzero_max,
+            })
+            .collect::<Vec<_>>();
+        rows.sort_by(|left, right| {
+            right
+                .state_board_pairs
+                .cmp(&left.state_board_pairs)
+                .then_with(|| right.pair_unique_reaches.cmp(&left.pair_unique_reaches))
+                .then_with(|| left.board_index.cmp(&right.board_index))
+        });
+
+        let unique_boards = rows.len();
+        let state_board_pairs = rows.iter().map(|row| row.state_board_pairs).sum::<usize>();
+        let unique_terminal_states = rows
+            .iter()
+            .map(|row| row.unique_terminal_states)
+            .sum::<usize>();
+        Ok(TerminalBoardReuseReport {
+            state_board_pairs,
+            unique_boards,
+            average_state_board_pairs_per_board: average_usize(state_board_pairs, unique_boards),
+            min_state_board_pairs_per_board: rows
+                .iter()
+                .map(|row| row.state_board_pairs)
+                .min()
+                .unwrap_or(0),
+            max_state_board_pairs_per_board: rows
+                .iter()
+                .map(|row| row.state_board_pairs)
+                .max()
+                .unwrap_or(0),
+            average_unique_terminal_states_per_board: average_usize(
+                unique_terminal_states,
+                unique_boards,
+            ),
+            average_oop_unique_reaches_per_board: average_usize(
+                rows.iter().map(|row| row.oop_unique_reaches).sum(),
+                unique_boards,
+            ),
+            average_ip_unique_reaches_per_board: average_usize(
+                rows.iter().map(|row| row.ip_unique_reaches).sum(),
+                unique_boards,
+            ),
+            average_pair_unique_reaches_per_board: average_usize(
+                rows.iter().map(|row| row.pair_unique_reaches).sum(),
+                unique_boards,
+            ),
+            rows,
         })
     }
 
@@ -2994,6 +3189,28 @@ fn terminal_phase_partitions(
 
 fn terminal_phase_state_weight(state: &PhaseState) -> usize {
     state.terminal_cache_indices.len().max(1)
+}
+
+fn average_usize(sum: usize, count: usize) -> f64 {
+    if count > 0 {
+        sum as f64 / count as f64
+    } else {
+        0.0
+    }
+}
+
+fn hash_sparse_reach(reach: &[f32], nonzero: &[u16]) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    for board_index in nonzero {
+        let board_index = *board_index as usize;
+        hash = mix_hash(hash, board_index as u64);
+        hash = mix_hash(hash, reach[board_index].to_bits() as u64);
+    }
+    hash
+}
+
+fn mix_hash(hash: u64, value: u64) -> u64 {
+    (hash ^ value).wrapping_mul(0x100000001b3)
 }
 
 fn print_terminal_worker_profiles(

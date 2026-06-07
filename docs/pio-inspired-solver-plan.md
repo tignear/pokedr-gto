@@ -246,6 +246,12 @@ Current measurement:
 - A terminal-board smoke pass improved from about `2,084ms` to about `1,762ms`
   on `16` threads when sorted by final board. This shows locality is real for
   CFV-only work.
+- Added `solve-flop --terminal-board-reuse` to measure whether final-board
+  task batching has algebraic reuse, not just cache locality. On `As7h2c` UTG
+  vs BU at the initial strategy, every final board had exactly `1368` terminal
+  board tasks, but only `16` unique OOP reach vectors, `13` unique IP reach
+  vectors, and `46` unique `(OOP reach, IP reach)` pairs. That is about
+  `29.7x` task-to-reach-pair reuse per final board.
 
 Open blocker:
 
@@ -257,6 +263,10 @@ Open blocker:
   lose.
 - A valid design needs owner-computes state accumulation, board-local CFV
   reuse, or a two-level reduction with bounded scratch.
+- The reuse numbers above suggest the next viable design is not another local
+  sort. It should build per-final-board reach-pair groups, evaluate each unique
+  pair once, and scatter the reused board values back to all terminal states in
+  that group.
 
 Block-local experiment:
 
