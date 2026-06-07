@@ -604,6 +604,10 @@ impl TerminalCfvScratch {
     pub fn villain_values(&self) -> &[f32] {
         &self.villain_values
     }
+
+    pub fn prefix_mut(&mut self) -> &mut [f32] {
+        &mut self.prefix
+    }
 }
 
 pub fn live_combos(board: &Board) -> Result<Vec<PrivateCombo>, String> {

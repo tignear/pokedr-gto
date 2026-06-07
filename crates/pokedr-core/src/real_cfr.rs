@@ -3317,17 +3317,18 @@ fn terminal_side_cached_values(
     opponent_nonzero: &[u16],
     targets: &[u16],
     use_sparse: bool,
-    _scratch: &mut TerminalCfvScratch,
+    scratch: &mut TerminalCfvScratch,
 ) -> Result<Arc<[f32]>, String> {
     let reach_hash = hash_sparse_reach(opponent_reach, opponent_nonzero);
-    let signature = sparse_reach_signature(opponent_reach, opponent_nonzero);
     let key = TerminalSideCacheKey {
         cache_index,
         side,
         reach_hash,
     };
     if let Some(entries) = cache.entries.get(&key) {
-        if let Some(entry) = entries.iter().find(|entry| entry.signature == signature) {
+        if let Some(entry) = entries.iter().find(|entry| {
+            sparse_reach_signature_matches(&entry.signature, opponent_reach, opponent_nonzero)
+        }) {
             cache.hits += 1;
             return Ok(entry.values.clone());
         }
@@ -3345,12 +3346,11 @@ fn terminal_side_cached_values(
             &mut values,
         )?;
     } else {
-        let mut prefix = vec![0.0f32; combos + 1];
         terminal_side_values_prefix_blocker_board_targets_into(
             &terminal.prepared,
             opponent_reach,
             targets,
-            &mut prefix,
+            scratch.prefix_mut(),
             &mut values,
         )?;
     }
@@ -3360,10 +3360,24 @@ fn terminal_side_cached_values(
         .entry(key)
         .or_default()
         .push(TerminalSideCacheEntry {
-            signature,
+            signature: sparse_reach_signature(opponent_reach, opponent_nonzero),
             values: values.clone(),
         });
     Ok(values)
+}
+
+fn sparse_reach_signature_matches(
+    signature: &[(u16, u32)],
+    reach: &[f32],
+    nonzero: &[u16],
+) -> bool {
+    signature.len() == nonzero.len()
+        && signature
+            .iter()
+            .zip(nonzero)
+            .all(|((left_index, left_bits), right_index)| {
+                left_index == right_index && *left_bits == reach[*right_index as usize].to_bits()
+            })
 }
 
 fn sparse_reach_signature(reach: &[f32], nonzero: &[u16]) -> Vec<(u16, u32)> {

@@ -288,8 +288,9 @@ Open blocker:
   and exact opponent reach signature, then reuses only the side values that are
   mathematically independent of the acting side's own reach. On `As7h2c` UTG
   vs BU, `4` DCFR+ iterations improved from about `24.97s` total / `8.23s`
-  terminal to about `22.04s` total / `5.54s` terminal. This validates the
-  direction, but the total solver speedup is still modest because reach and
+  terminal to about `21.29s` total / `5.14s` terminal after removing per-hit
+  signature allocation and reusing the terminal prefix scratch. This validates
+  the direction, but the total solver speedup is still modest because reach and
   backup phases remain large.
 
 Block-local experiment:
