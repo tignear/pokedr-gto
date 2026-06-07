@@ -585,6 +585,21 @@ impl RealCfrSolver {
         threads: usize,
         mut progress: impl FnMut(RealCfrPhaseIterationSummary),
     ) -> Result<RealCfrPhaseSummary, String> {
+        self.run_three_phase_with_terminal_side_cache(
+            config,
+            threads,
+            terminal_side_cache_enabled(),
+            &mut progress,
+        )
+    }
+
+    fn run_three_phase_with_terminal_side_cache(
+        &mut self,
+        config: RealCfrConfig,
+        threads: usize,
+        use_side_cache: bool,
+        mut progress: impl FnMut(RealCfrPhaseIterationSummary),
+    ) -> Result<RealCfrPhaseSummary, String> {
         let states = self.collect_phase_states()?;
         let backup_plan = backup_level_plan(
             &self.tree,
@@ -641,6 +656,7 @@ impl RealCfrSolver {
                 0.0,
                 profile_terminal,
                 profile_side_cache_keys,
+                use_side_cache,
             )?;
             let terminal_ms = terminal_started.elapsed().as_secs_f64() * 1000.0;
 
@@ -1596,6 +1612,7 @@ impl RealCfrSolver {
             values_alloc_ms,
             std::env::var_os("POKEDR_REAL_CFR_TERMINAL_PROFILE").is_some(),
             std::env::var_os("POKEDR_REAL_CFR_SIDE_CACHE_KEY_PROFILE").is_some(),
+            terminal_side_cache_enabled(),
         )
     }
 
@@ -1609,6 +1626,7 @@ impl RealCfrSolver {
         values_alloc_ms: f64,
         profile_terminal: bool,
         profile_side_cache_keys: bool,
+        use_side_cache: bool,
     ) -> Result<(), String> {
         if values.len() != states.len() {
             return Err("terminal phase scratch length does not match state count".to_string());
@@ -1642,6 +1660,7 @@ impl RealCfrSolver {
                     values_chunk,
                     profile_terminal,
                     profile_side_cache_keys,
+                    use_side_cache,
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -1670,6 +1689,7 @@ impl RealCfrSolver {
         values_chunk: &mut [Values],
         profile_terminal: bool,
         profile_side_cache_keys: bool,
+        use_side_cache: bool,
     ) -> Result<TerminalWorkerProfile, String> {
         let started = Instant::now();
         let scratch_source = self
@@ -1683,7 +1703,6 @@ impl RealCfrSolver {
         let mut oop_nonzero = Vec::new();
         let mut ip_nonzero = Vec::new();
         let sparse_nonzero_limit = terminal_sparse_nonzero_limit();
-        let use_side_cache = terminal_side_cache_enabled();
         let mut side_cache = TerminalSideValueCache::default();
         let mut accumulator =
             TerminalAccumulator::zero(self.oop_combos.len(), self.ip_combos.len());
@@ -4419,6 +4438,51 @@ mod tests {
         assert_eq!(recursive.terminal_evals, phased.terminal_evals);
         assert!((recursive.root_oop_value - phased.root_oop_value).abs() < 0.001);
         assert!((recursive.root_ip_value - phased.root_ip_value).abs() < 0.001);
+    }
+
+    #[test]
+    #[ignore = "exact side-cache comparison traverses all turn/river runouts and is intentionally slow"]
+    fn three_phase_terminal_side_cache_matches_uncached_one_iteration_on_small_ranges() {
+        let board = Board::from_str("As7h2c").unwrap();
+        let tree = TreeBuilder::new(TreeTemplate {
+            action_abstraction: ActionAbstraction::conservative_default(),
+            chance_expansion: ChanceExpansion::TemplateOnly,
+        })
+        .unwrap()
+        .build(Spot {
+            board,
+            pot: 650,
+            effective_stack: 9700,
+            oop_range: RangeSpec::from_str("AsAh,KsKh").unwrap(),
+            ip_range: RangeSpec::from_str("QsQh,JsJh").unwrap(),
+            first_player: Player::Oop,
+        })
+        .unwrap();
+        let mut cached = RealCfrSolver::new(
+            tree.clone(),
+            RangeSpec::from_str("AsAh,KsKh").unwrap(),
+            RangeSpec::from_str("QsQh,JsJh").unwrap(),
+        )
+        .unwrap();
+        let mut uncached = RealCfrSolver::new(
+            tree,
+            RangeSpec::from_str("AsAh,KsKh").unwrap(),
+            RangeSpec::from_str("QsQh,JsJh").unwrap(),
+        )
+        .unwrap();
+        let config = RealCfrConfig {
+            iterations: 1,
+            variant: RealCfrVariant::CfrPlus,
+        };
+        let cached = cached
+            .run_three_phase_with_terminal_side_cache(config, 4, true, |_| {})
+            .unwrap();
+        let uncached = uncached
+            .run_three_phase_with_terminal_side_cache(config, 4, false, |_| {})
+            .unwrap();
+        assert_eq!(cached.terminal_evals, uncached.terminal_evals);
+        assert!((cached.root_oop_value - uncached.root_oop_value).abs() < 0.001);
+        assert!((cached.root_ip_value - uncached.root_ip_value).abs() < 0.001);
     }
 
     #[test]
