@@ -6,6 +6,7 @@ use crate::terminal_cfv::{
 };
 use crate::tree::{Player, PublicNodeKind, PublicTree, TerminalReason};
 use std::collections::BTreeMap;
+use std::sync::Mutex;
 use std::thread;
 use std::time::Instant;
 
@@ -194,6 +195,14 @@ struct PhaseState {
 struct BackupRun {
     start: usize,
     end: usize,
+    slot_start: usize,
+    slot_end: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BackupChunk {
+    state_start: usize,
+    state_end: usize,
     slot_start: usize,
     slot_end: usize,
 }
@@ -420,6 +429,7 @@ impl RealCfrSolver {
                 &oop_reaches,
                 &ip_reaches,
                 &mut values,
+                threads,
                 average_weight,
                 config.variant,
             )?;
@@ -1167,128 +1177,135 @@ impl RealCfrSolver {
         oop_reaches: &[Vec<f32>],
         ip_reaches: &[Vec<f32>],
         values: &mut [Values],
+        threads: usize,
         average_weight: f32,
         variant: RealCfrVariant,
     ) -> Result<usize, String> {
         let update_factors = RealCfrUpdateFactors::new(variant, average_weight);
+        let worker_count = if threads == 0 {
+            thread::available_parallelism().map_or(1, usize::from)
+        } else {
+            threads
+        }
+        .max(1);
         for level in backup_plan.levels.iter().skip(1) {
             for run in level {
-                for state_index in (run.start..run.end).rev() {
-                    self.backup_state(
+                let decision_end = backup_run_decision_prefix_end(&self.tree, states, run);
+                if decision_end > run.start {
+                    self.backup_decision_prefix(
                         states,
+                        run.start,
+                        decision_end,
                         oop_reaches,
                         ip_reaches,
                         values,
-                        state_index,
+                        worker_count,
                         &update_factors,
                     )?;
+                }
+                for state_index in decision_end..run.end {
+                    backup_chance_state(&self.tree, states, values, state_index)?;
                 }
             }
         }
         Ok(values[0].terminal_evals)
     }
 
-    fn backup_state(
+    fn backup_decision_prefix(
         &mut self,
         states: &[PhaseState],
+        state_start: usize,
+        state_end: usize,
         oop_reaches: &[Vec<f32>],
         ip_reaches: &[Vec<f32>],
         values: &mut [Values],
-        state_index: usize,
+        threads: usize,
         update_factors: &RealCfrUpdateFactors,
     ) -> Result<(), String> {
-        let state = &states[state_index];
-        let node = &self.tree.nodes[state.node_id];
-        match &node.kind {
-            PublicNodeKind::Terminal { .. } => {}
-            PublicNodeKind::Chance(_) => {
-                let (state_value, child_values) = split_state_and_children(values, state_index);
-                state_value.reset();
-                for child in &state.children {
-                    state_value.add_scaled(child_value(child_values, state_index, *child), 1.0);
-                }
-            }
-            PublicNodeKind::Decision { player, actions } => {
-                let actions_len = actions.len();
-                let acting_combos = match player {
-                    Player::Oop => self.oop_combos.len(),
-                    Player::Ip => self.ip_combos.len(),
-                };
-                let board_slot = state.board_slot;
-                let row_len = acting_combos * actions_len;
-                let row_start = board_slot * row_len;
-                let (state_value, child_values) = split_state_and_children(values, state_index);
-                match player {
-                    Player::Oop => combine_nonacting_child_values(
-                        &mut state_value.ip,
-                        child_values,
-                        state_index,
-                        &state.children,
-                        Player::Ip,
-                    ),
-                    Player::Ip => combine_nonacting_child_values(
-                        &mut state_value.oop,
-                        child_values,
-                        state_index,
-                        &state.children,
-                        Player::Oop,
-                    ),
-                }
-                state_value.terminal_evals = state
-                    .children
-                    .iter()
-                    .map(|child| child_value(child_values, state_index, *child).terminal_evals)
-                    .sum();
+        let chunks = backup_decision_chunks(
+            &self.tree,
+            &self.infosets,
+            self.oop_combos.len(),
+            self.ip_combos.len(),
+            states,
+            state_start,
+            state_end,
+            threads,
+        );
+        if chunks.is_empty() {
+            return Ok(());
+        }
+        let (value_prefix, child_values) = values.split_at_mut(state_end);
+        let child_values: &[Values] = child_values;
+        let current_values = &mut value_prefix[state_start..state_end];
+        let tree = &self.tree;
+        let infosets = &self.infosets;
+        let oop_combos = self.oop_combos.len();
+        let ip_combos = self.ip_combos.len();
+        let regrets = self.regrets.as_mut_slice();
+        let strategy_sum = self.strategy_sum.as_mut_slice();
+        let error = Mutex::new(None::<String>);
+        rayon::scope(|scope| {
+            let mut value_cursor = state_start;
+            let mut value_tail = current_values;
+            let mut slot_cursor = 0usize;
+            let mut regret_tail = regrets;
+            let mut strategy_tail = strategy_sum;
+            for chunk in chunks {
+                let value_skip = chunk.state_start - value_cursor;
+                let (_, rest) = value_tail.split_at_mut(value_skip);
+                value_tail = rest;
+                let value_len = chunk.state_end - chunk.state_start;
+                let (value_chunk, rest) = value_tail.split_at_mut(value_len);
+                value_tail = rest;
+                value_cursor = chunk.state_end;
 
-                let own_reach = match player {
-                    Player::Oop => &oop_reaches[state_index],
-                    Player::Ip => &ip_reaches[state_index],
-                };
-                let infoset = self.infosets[state.node_id]
-                    .as_ref()
-                    .expect("decision node must have infoset");
-                let slots_start = infoset.slots_start;
-                let mut strategy_probs = [0.0f32; 8];
-                for combo in 0..acting_combos {
-                    let local_row_start = combo * actions_len;
-                    fill_strategy_probs(
-                        &self.regrets[slots_start + row_start + local_row_start
-                            ..slots_start + row_start + local_row_start + actions_len],
-                        &mut strategy_probs,
-                    )?;
-                    let mut node_value = 0.0f32;
-                    for action_index in 0..actions_len {
-                        let action_values =
-                            child_value(child_values, state_index, state.children[action_index]);
-                        let action_value = match player {
-                            Player::Oop => action_values.oop[combo],
-                            Player::Ip => action_values.ip[combo],
-                        };
-                        node_value += strategy_probs[action_index] * action_value;
+                let slot_skip = chunk.slot_start - slot_cursor;
+                let (_, rest) = regret_tail.split_at_mut(slot_skip);
+                regret_tail = rest;
+                let (_, rest) = strategy_tail.split_at_mut(slot_skip);
+                strategy_tail = rest;
+                let slot_len = chunk.slot_end - chunk.slot_start;
+                let (regret_chunk, rest) = regret_tail.split_at_mut(slot_len);
+                regret_tail = rest;
+                let (strategy_chunk, rest) = strategy_tail.split_at_mut(slot_len);
+                strategy_tail = rest;
+                slot_cursor = chunk.slot_end;
+
+                let error = &error;
+                scope.spawn(move |_| {
+                    if let Err(message) = backup_decision_chunk(
+                        tree,
+                        infosets,
+                        oop_combos,
+                        ip_combos,
+                        states,
+                        oop_reaches,
+                        ip_reaches,
+                        child_values,
+                        state_end,
+                        value_chunk,
+                        chunk.state_start,
+                        regret_chunk,
+                        strategy_chunk,
+                        chunk.slot_start,
+                        update_factors,
+                    ) {
+                        let mut first_error = error
+                            .lock()
+                            .expect("backup error mutex should not be poisoned");
+                        if first_error.is_none() {
+                            *first_error = Some(message);
+                        }
                     }
-                    match player {
-                        Player::Oop => state_value.oop[combo] = node_value,
-                        Player::Ip => state_value.ip[combo] = node_value,
-                    }
-                    for action_index in 0..actions_len {
-                        let action_values =
-                            child_value(child_values, state_index, state.children[action_index]);
-                        let action_value = match player {
-                            Player::Oop => action_values.oop[combo],
-                            Player::Ip => action_values.ip[combo],
-                        };
-                        let local_slot = combo * actions_len + action_index;
-                        let slot = slots_start + row_start + local_slot;
-                        apply_real_cfr_update_with_factors(
-                            &mut self.regrets[slot],
-                            &mut self.strategy_sum[slot],
-                            action_value - node_value,
-                            own_reach[combo] * strategy_probs[action_index],
-                            update_factors,
-                        );
-                    }
-                }
+                });
             }
+        });
+        if let Some(message) = error
+            .into_inner()
+            .expect("backup error mutex should not be poisoned")
+        {
+            return Err(message);
         }
         Ok(())
     }
@@ -2188,6 +2205,223 @@ fn first_terminal_state_index(states: &[PhaseState]) -> usize {
         .unwrap_or(states.len())
 }
 
+fn backup_run_decision_prefix_end(
+    tree: &PublicTree,
+    states: &[PhaseState],
+    run: &BackupRun,
+) -> usize {
+    states[run.start..run.end]
+        .iter()
+        .position(|state| {
+            !matches!(
+                tree.nodes[state.node_id].kind,
+                PublicNodeKind::Decision { .. }
+            )
+        })
+        .map_or(run.end, |offset| run.start + offset)
+}
+
+fn backup_decision_chunks(
+    tree: &PublicTree,
+    infosets: &[Option<RealInfoset>],
+    oop_combos: usize,
+    ip_combos: usize,
+    states: &[PhaseState],
+    state_start: usize,
+    state_end: usize,
+    threads: usize,
+) -> Vec<BackupChunk> {
+    let state_count = state_end - state_start;
+    if state_count == 0 {
+        return Vec::new();
+    }
+    let chunk_count = threads.max(1).min(state_count);
+    let chunk_len = state_count.div_ceil(chunk_count);
+    let mut chunks = Vec::with_capacity(chunk_count);
+    let mut start = state_start;
+    while start < state_end {
+        let end = (start + chunk_len).min(state_end);
+        let run = backup_run_with_slots(tree, infosets, oop_combos, ip_combos, states, start, end);
+        debug_assert!(run.slot_start < run.slot_end);
+        chunks.push(BackupChunk {
+            state_start: start,
+            state_end: end,
+            slot_start: run.slot_start,
+            slot_end: run.slot_end,
+        });
+        start = end;
+    }
+    debug_assert!(backup_chunks_are_ordered(&chunks));
+    chunks
+}
+
+fn backup_chunks_are_ordered(chunks: &[BackupChunk]) -> bool {
+    let mut previous_slot_end = 0usize;
+    let mut previous_state_end = 0usize;
+    for (index, chunk) in chunks.iter().enumerate() {
+        if index > 0 {
+            if chunk.state_start != previous_state_end || chunk.slot_start < previous_slot_end {
+                return false;
+            }
+        }
+        previous_state_end = chunk.state_end;
+        previous_slot_end = chunk.slot_end;
+    }
+    true
+}
+
+fn backup_chance_state(
+    tree: &PublicTree,
+    states: &[PhaseState],
+    values: &mut [Values],
+    state_index: usize,
+) -> Result<(), String> {
+    let state = &states[state_index];
+    match &tree.nodes[state.node_id].kind {
+        PublicNodeKind::Chance(_) => {
+            let (state_value, child_values) = split_state_and_children(values, state_index);
+            state_value.reset();
+            for child in &state.children {
+                state_value.add_scaled(child_value(child_values, state_index, *child), 1.0);
+            }
+            Ok(())
+        }
+        PublicNodeKind::Terminal { .. } => Ok(()),
+        PublicNodeKind::Decision { .. } => {
+            Err("decision state reached chance backup path".to_string())
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn backup_decision_chunk(
+    tree: &PublicTree,
+    infosets: &[Option<RealInfoset>],
+    oop_combos: usize,
+    ip_combos: usize,
+    states: &[PhaseState],
+    oop_reaches: &[Vec<f32>],
+    ip_reaches: &[Vec<f32>],
+    child_values: &[Values],
+    child_base: usize,
+    current_values: &mut [Values],
+    current_base: usize,
+    regrets: &mut [f32],
+    strategy_sum: &mut [f32],
+    slot_base: usize,
+    update_factors: &RealCfrUpdateFactors,
+) -> Result<(), String> {
+    for (local_state_index, state_value) in current_values.iter_mut().enumerate() {
+        let state_index = current_base + local_state_index;
+        let state = &states[state_index];
+        let PublicNodeKind::Decision { player, actions } = &tree.nodes[state.node_id].kind else {
+            return Err("non-decision state reached decision backup path".to_string());
+        };
+        let actions_len = actions.len();
+        let acting_combos = match player {
+            Player::Oop => oop_combos,
+            Player::Ip => ip_combos,
+        };
+        let board_slot = state.board_slot;
+        let row_len = acting_combos * actions_len;
+        let row_start = board_slot * row_len;
+        match player {
+            Player::Oop => combine_nonacting_child_values_from_base(
+                &mut state_value.ip,
+                child_values,
+                child_base,
+                &state.children,
+                Player::Ip,
+            ),
+            Player::Ip => combine_nonacting_child_values_from_base(
+                &mut state_value.oop,
+                child_values,
+                child_base,
+                &state.children,
+                Player::Oop,
+            ),
+        }
+        state_value.terminal_evals = state
+            .children
+            .iter()
+            .map(|child| child_value_from_base(child_values, child_base, *child).terminal_evals)
+            .sum();
+
+        let own_reach = match player {
+            Player::Oop => &oop_reaches[state_index],
+            Player::Ip => &ip_reaches[state_index],
+        };
+        let infoset = infosets[state.node_id]
+            .as_ref()
+            .expect("decision node must have infoset");
+        let slots_start = infoset.slots_start;
+        let mut strategy_probs = [0.0f32; 8];
+        for combo in 0..acting_combos {
+            let local_row_start = combo * actions_len;
+            let row_slot = slots_start + row_start + local_row_start - slot_base;
+            fill_strategy_probs(
+                &regrets[row_slot..row_slot + actions_len],
+                &mut strategy_probs,
+            )?;
+            let mut node_value = 0.0f32;
+            for action_index in 0..actions_len {
+                let action_values =
+                    child_value_from_base(child_values, child_base, state.children[action_index]);
+                let action_value = match player {
+                    Player::Oop => action_values.oop[combo],
+                    Player::Ip => action_values.ip[combo],
+                };
+                node_value += strategy_probs[action_index] * action_value;
+            }
+            match player {
+                Player::Oop => state_value.oop[combo] = node_value,
+                Player::Ip => state_value.ip[combo] = node_value,
+            }
+            for action_index in 0..actions_len {
+                let action_values =
+                    child_value_from_base(child_values, child_base, state.children[action_index]);
+                let action_value = match player {
+                    Player::Oop => action_values.oop[combo],
+                    Player::Ip => action_values.ip[combo],
+                };
+                let local_slot = row_slot + action_index;
+                apply_real_cfr_update_with_factors(
+                    &mut regrets[local_slot],
+                    &mut strategy_sum[local_slot],
+                    action_value - node_value,
+                    own_reach[combo] * strategy_probs[action_index],
+                    update_factors,
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn child_value_from_base(children: &[Values], child_base: usize, child_index: usize) -> &Values {
+    debug_assert!(child_index >= child_base);
+    &children[child_index - child_base]
+}
+
+fn combine_nonacting_child_values_from_base(
+    out: &mut [f32],
+    child_values: &[Values],
+    child_base: usize,
+    children: &[usize],
+    player: Player,
+) {
+    for combo in 0..out.len() {
+        let mut value = 0.0f32;
+        for child in children {
+            value += match player {
+                Player::Oop => child_value_from_base(child_values, child_base, *child).oop[combo],
+                Player::Ip => child_value_from_base(child_values, child_base, *child).ip[combo],
+            };
+        }
+        out[combo] = value;
+    }
+}
+
 fn backup_level_plan(
     tree: &PublicTree,
     infosets: &[Option<RealInfoset>],
@@ -2409,25 +2643,6 @@ fn fill_strategy_probs(row: &[f32], out: &mut [f32; 8]) -> Result<(), String> {
         }
     }
     Ok(())
-}
-
-fn combine_nonacting_child_values(
-    out: &mut [f32],
-    child_values: &[Values],
-    state_index: usize,
-    children: &[usize],
-    player: Player,
-) {
-    for combo in 0..out.len() {
-        let mut value = 0.0f32;
-        for child in children {
-            value += match player {
-                Player::Oop => child_value(child_values, state_index, *child).oop[combo],
-                Player::Ip => child_value(child_values, state_index, *child).ip[combo],
-            };
-        }
-        out[combo] = value;
-    }
 }
 
 fn combine_best_response_values(
