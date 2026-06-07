@@ -585,3 +585,31 @@ retrying similar ideas, so attempts stay in chronological order.
 - Decision: reverted. Keep the all-or-nothing sparse gate for now; if revisited,
   tune with a side-specific benchmark first rather than changing the production
   terminal phase directly.
+
+## 2026-06-07: Fold/lightweight terminal partition weighting
+
+- Tried: change terminal worker partition weights from `max(board_evals, 1)` to
+  a rough cost model where fold terminals weigh `1` and showdown/all-in board
+  evals weigh `2`.
+- Expected: fold terminals are cheaper than terminal CFV board evals, so the
+  partitioner should balance wall time better than raw board-eval counts.
+- Result: slower. On `As7h2c` UTG vs BU with terminal profiling, one iteration
+  reported `terminal_ms=2591ms`, worse than the raw board-eval partition's
+  `~2307ms` profiled run.
+- Decision: reverted. The simple raw task-count weight is better for the current
+  traversal/cache behavior. Do not tune hand-written weights without a broader
+  repeated benchmark harness.
+
+## 2026-06-07: Block-local board-major terminal phase after repartitioning
+
+- Tried: remeasure the existing experimental
+  `POKEDR_REAL_CFR_TERMINAL_BLOCK_BOARD_MAJOR=1` path after adding weighted
+  terminal partitions. Tiles `64`, `256`, `512`, and `1024` were tested.
+- Expected: board-local sorting inside each worker chunk might recover the
+  locality win seen in pure terminal-board smoke without global locks.
+- Result: still worse. One-iteration `terminal_ms` values were about `2544ms`,
+  `2745ms`, `2767ms`, and `2668ms`, all worse than the simple owner-computes
+  state path.
+- Decision: removed the experimental env path and tile worker code. The local
+  sort/reduce shape does not pay for itself; a future board-major design needs a
+  different state reduction scheme, not another tile-size sweep.

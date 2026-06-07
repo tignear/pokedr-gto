@@ -277,6 +277,11 @@ Block-local experiment:
   noise-sized improvement at best. It does not yet capture the `~15%` win seen
   in pure terminal-board smoke, because per-state accumulation still dominates
   enough to offset much of the board locality gain.
+- Follow-up on 2026-06-07 after weighted terminal partitions also failed:
+  tiles `64`, `256`, `512`, and `1024` reported one-iteration terminal times
+  around `2544ms`, `2745ms`, `2767ms`, and `2668ms`, all worse than the simple
+  owner-computes path. The experimental env path was removed; resurrect it only
+  from history if a different reduction scheme is also introduced.
 
 ### D. Street/Subgame Streaming
 
