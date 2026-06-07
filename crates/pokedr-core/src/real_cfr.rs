@@ -2378,34 +2378,53 @@ impl RealCfrSolver {
                 };
 
                 let mut action_values = Vec::with_capacity(actions_len);
-                for action_index in 0..actions_len {
-                    let mut next_oop = oop_reach.to_vec();
-                    let mut next_ip = ip_reach.to_vec();
-                    match player {
-                        Player::Oop => apply_strategy_to_reach(
-                            &mut next_oop,
-                            &strategies,
-                            actions_len,
-                            action_index,
-                        ),
-                        Player::Ip => apply_strategy_to_reach(
-                            &mut next_ip,
-                            &strategies,
-                            actions_len,
-                            action_index,
-                        ),
+                match player {
+                    Player::Oop => {
+                        let mut next_oop = vec![0.0; oop_reach.len()];
+                        for action_index in 0..actions_len {
+                            strategy_reach_into(
+                                &mut next_oop,
+                                oop_reach,
+                                &strategies,
+                                actions_len,
+                                action_index,
+                            );
+                            action_values.push(self.traverse(
+                                node.children[action_index],
+                                board,
+                                &next_oop,
+                                ip_reach,
+                                average_weight,
+                                variant,
+                                terminal_scratch,
+                                terminal_ref_cache,
+                                side_cache,
+                            )?);
+                        }
                     }
-                    action_values.push(self.traverse(
-                        node.children[action_index],
-                        board,
-                        &next_oop,
-                        &next_ip,
-                        average_weight,
-                        variant,
-                        terminal_scratch,
-                        terminal_ref_cache,
-                        side_cache,
-                    )?);
+                    Player::Ip => {
+                        let mut next_ip = vec![0.0; ip_reach.len()];
+                        for action_index in 0..actions_len {
+                            strategy_reach_into(
+                                &mut next_ip,
+                                ip_reach,
+                                &strategies,
+                                actions_len,
+                                action_index,
+                            );
+                            action_values.push(self.traverse(
+                                node.children[action_index],
+                                board,
+                                oop_reach,
+                                &next_ip,
+                                average_weight,
+                                variant,
+                                terminal_scratch,
+                                terminal_ref_cache,
+                                side_cache,
+                            )?);
+                        }
+                    }
                 }
 
                 let mut values = Values::zero(self.oop_combos.len(), self.ip_combos.len());
@@ -2970,9 +2989,15 @@ fn average_strategies_into(
     }
 }
 
-fn apply_strategy_to_reach(reach: &mut [f32], strategies: &[f32], actions: usize, action: usize) {
-    for (combo, value) in reach.iter_mut().enumerate() {
-        *value *= strategies[combo * actions + action];
+fn strategy_reach_into(
+    out: &mut [f32],
+    input: &[f32],
+    strategies: &[f32],
+    actions: usize,
+    action: usize,
+) {
+    for (combo, (out, input)) in out.iter_mut().zip(input).enumerate() {
+        *out = *input * strategies[combo * actions + action];
     }
 }
 
