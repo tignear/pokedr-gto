@@ -555,3 +555,33 @@ retrying similar ideas, so attempts stay in chronological order.
   retry simple gather-SIMD for this loop. A viable SIMD approach would need a
   different data layout with contiguous lanes, not gather over `u16` blocker
   lists.
+
+## 2026-06-07: Terminal accumulator touched-index reset
+
+- Tried: make `TerminalAccumulator` remember touched range indices and reset /
+  normalize only those indices instead of clearing and scanning the full range
+  vectors for every terminal state.
+- Expected: reduce per-terminal memory bandwidth outside the CFV kernel.
+- Result: not useful on the fixed `As7h2c` UTG vs BU one-iteration benchmark.
+  The normal run reported `terminal_ms=2641ms`, worse than the previous
+  post-cache baseline around `2364ms`. The branch/push bookkeeping did not
+  beat dense clears for these range sizes.
+- Decision: reverted. Do not retry touched-index accumulator bookkeeping unless
+  terminal value vectors become much larger or the accumulator is redesigned to
+  avoid copying dense `Values` slots too.
+
+## 2026-06-07: Side-adaptive sparse terminal CFV
+
+- Tried: choose sparse or prefix independently for each CFV side. The existing
+  path only used sparse when both OOP and IP live reaches were below the
+  threshold, so one low-density side was forced through prefix if the other side
+  was wide.
+- Expected: exploit the common shape where one side has near-threshold nonzero
+  reach while the other side is wide.
+- Result: slower. On `As7h2c` UTG vs BU, one profiled iteration showed
+  `mixed_tasks=439128`, so the path did fire, but `terminal_ms` worsened from
+  about `2552ms` to about `3377ms`. The direct sparse loop's scattered reads and
+  extra branch shape outweighed the saved prefix construction.
+- Decision: reverted. Keep the all-or-nothing sparse gate for now; if revisited,
+  tune with a side-specific benchmark first rather than changing the production
+  terminal phase directly.

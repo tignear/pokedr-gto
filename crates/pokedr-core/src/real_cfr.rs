@@ -1099,13 +1099,20 @@ impl RealCfrSolver {
         let profile_terminal = std::env::var_os("POKEDR_REAL_CFR_TERMINAL_PROFILE").is_some();
         let block_board_major =
             std::env::var_os("POKEDR_REAL_CFR_TERMINAL_BLOCK_BOARD_MAJOR").is_some();
-        let state_chunk_len = terminal_len.div_ceil(threads);
+        let partitions = terminal_phase_partitions(states, terminal_start, threads);
         let worker_scope_started = Instant::now();
-        let profiles = values[terminal_start..]
-            .par_chunks_mut(state_chunk_len)
-            .enumerate()
-            .map(|(worker_index, values_chunk)| {
-                let start_index = terminal_start + worker_index * state_chunk_len;
+        let mut partition_chunks = Vec::with_capacity(partitions.len());
+        let mut remaining_values = &mut values[terminal_start..];
+        for (start_index, end_index) in partitions {
+            let chunk_len = end_index - start_index;
+            let (values_chunk, remaining) = remaining_values.split_at_mut(chunk_len);
+            let worker_index = partition_chunks.len();
+            partition_chunks.push((worker_index, start_index, values_chunk));
+            remaining_values = remaining;
+        }
+        let profiles = partition_chunks
+            .into_par_iter()
+            .map(|(worker_index, start_index, values_chunk)| {
                 if block_board_major {
                     self.terminal_phase_worker_block_board_major(
                         states,
@@ -3132,6 +3139,48 @@ fn terminal_board_major_tile() -> usize {
         .unwrap_or(TERMINAL_BOARD_MAJOR_TILE)
 }
 
+fn terminal_phase_partitions(
+    states: &[PhaseState],
+    terminal_start: usize,
+    threads: usize,
+) -> Vec<(usize, usize)> {
+    let terminal_len = states.len() - terminal_start;
+    let threads = threads.max(1).min(terminal_len.max(1));
+    if terminal_len == 0 {
+        return Vec::new();
+    }
+    let total_weight = states[terminal_start..]
+        .iter()
+        .map(terminal_phase_state_weight)
+        .sum::<usize>()
+        .max(1);
+    let target_weight = total_weight.div_ceil(threads);
+    let mut partitions = Vec::with_capacity(threads);
+    let mut start = terminal_start;
+    let mut weight = 0usize;
+    for index in terminal_start..states.len() {
+        weight += terminal_phase_state_weight(&states[index]);
+        let remaining_states = states.len() - index - 1;
+        let remaining_partitions = threads.saturating_sub(partitions.len() + 1);
+        if weight >= target_weight && remaining_states >= remaining_partitions {
+            partitions.push((start, index + 1));
+            start = index + 1;
+            weight = 0;
+            if partitions.len() + 1 == threads {
+                break;
+            }
+        }
+    }
+    if start < states.len() {
+        partitions.push((start, states.len()));
+    }
+    partitions
+}
+
+fn terminal_phase_state_weight(state: &PhaseState) -> usize {
+    state.terminal_cache_indices.len().max(1)
+}
+
 fn print_terminal_worker_profiles(
     total_tasks: usize,
     threads: usize,
@@ -3522,6 +3571,63 @@ mod tests {
         assert_eq!(recursive.terminal_evals, phased.terminal_evals);
         assert!((recursive.root_oop_value - phased.root_oop_value).abs() < 0.001);
         assert!((recursive.root_ip_value - phased.root_ip_value).abs() < 0.001);
+    }
+
+    #[test]
+    fn terminal_phase_partitions_cover_terminal_suffix_and_balance_weights() {
+        let board = Board::from_str("As7h2c").unwrap();
+        let states = vec![
+            PhaseState {
+                node_id: 0,
+                board: board.clone(),
+                board_slot: 0,
+                children: vec![1],
+                terminal_cache_indices: Vec::new(),
+            },
+            PhaseState {
+                node_id: 1,
+                board: board.clone(),
+                board_slot: 0,
+                children: Vec::new(),
+                terminal_cache_indices: vec![0],
+            },
+            PhaseState {
+                node_id: 2,
+                board: board.clone(),
+                board_slot: 0,
+                children: Vec::new(),
+                terminal_cache_indices: vec![0, 1, 2],
+            },
+            PhaseState {
+                node_id: 3,
+                board,
+                board_slot: 0,
+                children: Vec::new(),
+                terminal_cache_indices: vec![0, 1],
+            },
+        ];
+
+        let partitions = terminal_phase_partitions(&states, 1, 2);
+
+        assert_eq!(partitions.first().map(|partition| partition.0), Some(1));
+        assert_eq!(
+            partitions.last().map(|partition| partition.1),
+            Some(states.len())
+        );
+        for window in partitions.windows(2) {
+            assert_eq!(window[0].1, window[1].0);
+        }
+        let weights = partitions
+            .iter()
+            .map(|(start, end)| {
+                states[*start..*end]
+                    .iter()
+                    .map(terminal_phase_state_weight)
+                    .sum::<usize>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(weights.iter().sum::<usize>(), 6);
+        assert!(weights.iter().all(|weight| *weight <= 4), "{weights:?}");
     }
 
     #[test]
