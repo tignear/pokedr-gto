@@ -5,9 +5,8 @@ use crate::terminal_cfv::{
     terminal_cfv_sparse_targets_into,
 };
 use crate::tree::{Player, PublicNodeKind, PublicTree, TerminalReason};
+use rayon::prelude::*;
 use std::collections::BTreeMap;
-use std::sync::Mutex;
-use std::thread;
 use std::time::Instant;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -205,6 +204,14 @@ struct BackupChunk {
     state_end: usize,
     slot_start: usize,
     slot_end: usize,
+}
+
+struct BackupDecisionJob<'a> {
+    state_start: usize,
+    slot_start: usize,
+    values: &'a mut [Values],
+    regrets: &'a mut [f32],
+    strategy_sum: &'a mut [f32],
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -522,13 +529,7 @@ impl RealCfrSolver {
     ) -> Result<TerminalBoardPhaseSummary, String> {
         let started = std::time::Instant::now();
         let tasks = self.collect_terminal_board_tasks()?;
-        let threads = if threads == 0 {
-            thread::available_parallelism().map_or(1, usize::from)
-        } else {
-            threads
-        }
-        .max(1)
-        .min(tasks.len().max(1));
+        let threads = effective_worker_count(threads).min(tasks.len().max(1));
         let oop_reach = self
             .oop_combos
             .iter()
@@ -539,61 +540,40 @@ impl RealCfrSolver {
             .iter()
             .map(|combo| combo.weight)
             .collect::<Vec<_>>();
-        let checksum = thread::scope(|scope| {
-            let mut handles = Vec::with_capacity(threads);
-            for thread_index in 0..threads {
-                let tasks = &tasks;
-                let oop_reach = &oop_reach;
-                let ip_reach = &ip_reach;
-                handles.push(scope.spawn(move || -> Result<f64, String> {
-                    let chunk = tasks.len().div_ceil(threads);
-                    let start = thread_index * chunk;
-                    let end = (start + chunk).min(tasks.len());
-                    let mut checksum = 0.0f64;
-                    let scratch_source = self
-                        .terminal_cache
-                        .first()
-                        .ok_or_else(|| "terminal board cache is empty".to_string())?;
-                    let combos = scratch_source.prepared.combos().len();
-                    let mut scratch = TerminalCfvScratch::new(&scratch_source.prepared);
-                    let mut oop_live = vec![0.0f32; combos];
-                    let mut ip_live = vec![0.0f32; combos];
-                    for task in &tasks[start..end] {
-                        let cache = &self.terminal_cache[task.cache_index];
-                        reach_on_prepared_board_into(
-                            &cache.oop_combo_indices,
-                            oop_reach,
-                            &mut oop_live,
-                        );
-                        reach_on_prepared_board_into(
-                            &cache.ip_combo_indices,
-                            ip_reach,
-                            &mut ip_live,
-                        );
-                        terminal_cfv_prefix_blocker_targets_into(
-                            &cache.prepared,
-                            &oop_live,
-                            &ip_live,
-                            &cache.oop_combo_indices,
-                            &cache.ip_combo_indices,
-                            &mut scratch,
-                        )?;
-                        checksum += terminal_task_checksum(task, &cache.prepared, &scratch);
-                    }
-                    Ok(checksum)
-                }));
-            }
-            handles
-                .into_iter()
-                .map(|handle| {
-                    handle
-                        .join()
-                        .map_err(|_| "terminal board phase worker panicked".to_string())?
-                })
-                .try_fold(0.0f64, |total, checksum| {
-                    checksum.map(|value| total + value)
-                })
-        })?;
+        let chunk = tasks.len().div_ceil(threads);
+        let checksum = tasks
+            .par_chunks(chunk)
+            .map(|tasks| -> Result<f64, String> {
+                let mut checksum = 0.0f64;
+                let scratch_source = self
+                    .terminal_cache
+                    .first()
+                    .ok_or_else(|| "terminal board cache is empty".to_string())?;
+                let combos = scratch_source.prepared.combos().len();
+                let mut scratch = TerminalCfvScratch::new(&scratch_source.prepared);
+                let mut oop_live = vec![0.0f32; combos];
+                let mut ip_live = vec![0.0f32; combos];
+                for task in tasks {
+                    let cache = &self.terminal_cache[task.cache_index];
+                    reach_on_prepared_board_into(
+                        &cache.oop_combo_indices,
+                        &oop_reach,
+                        &mut oop_live,
+                    );
+                    reach_on_prepared_board_into(&cache.ip_combo_indices, &ip_reach, &mut ip_live);
+                    terminal_cfv_prefix_blocker_targets_into(
+                        &cache.prepared,
+                        &oop_live,
+                        &ip_live,
+                        &cache.oop_combo_indices,
+                        &cache.ip_combo_indices,
+                        &mut scratch,
+                    )?;
+                    checksum += terminal_task_checksum(task, &cache.prepared, &scratch);
+                }
+                Ok(checksum)
+            })
+            .try_reduce(|| 0.0f64, |left, right| Ok(left + right))?;
         Ok(TerminalBoardPhaseSummary {
             terminal_evals: tasks.len(),
             threads,
@@ -975,46 +955,26 @@ impl RealCfrSolver {
         if terminal_len == 0 {
             return Ok(());
         }
-        let threads = if threads == 0 {
-            thread::available_parallelism().map_or(1, usize::from)
-        } else {
-            threads
-        }
-        .max(1)
-        .min(terminal_len);
+        let threads = effective_worker_count(threads).min(terminal_len);
         let profile_terminal = std::env::var_os("POKEDR_REAL_CFR_TERMINAL_PROFILE").is_some();
         let state_chunk_len = terminal_len.div_ceil(threads);
         let worker_scope_started = Instant::now();
-        let profiles = thread::scope(|scope| -> Result<Vec<TerminalWorkerProfile>, String> {
-            let mut handles = Vec::new();
-            for (worker_index, values_chunk) in values[terminal_start..]
-                .chunks_mut(state_chunk_len)
-                .enumerate()
-            {
+        let profiles = values[terminal_start..]
+            .par_chunks_mut(state_chunk_len)
+            .enumerate()
+            .map(|(worker_index, values_chunk)| {
                 let start_index = terminal_start + worker_index * state_chunk_len;
-                handles.push(
-                    scope.spawn(move || -> Result<TerminalWorkerProfile, String> {
-                        self.terminal_phase_worker(
-                            states,
-                            oop_reaches,
-                            ip_reaches,
-                            start_index,
-                            worker_index,
-                            values_chunk,
-                            profile_terminal,
-                        )
-                    }),
-                );
-            }
-            handles
-                .into_iter()
-                .map(|handle| {
-                    handle
-                        .join()
-                        .map_err(|_| "terminal phase worker panicked".to_string())?
-                })
-                .collect::<Result<Vec<_>, _>>()
-        })?;
+                self.terminal_phase_worker(
+                    states,
+                    oop_reaches,
+                    ip_reaches,
+                    start_index,
+                    worker_index,
+                    values_chunk,
+                    profile_terminal,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let worker_scope_ms = worker_scope_started.elapsed().as_secs_f64() * 1000.0;
         if profile_terminal {
             let total_tasks = profiles.iter().map(|profile| profile.tasks).sum();
@@ -1182,12 +1142,7 @@ impl RealCfrSolver {
         variant: RealCfrVariant,
     ) -> Result<usize, String> {
         let update_factors = RealCfrUpdateFactors::new(variant, average_weight);
-        let worker_count = if threads == 0 {
-            thread::available_parallelism().map_or(1, usize::from)
-        } else {
-            threads
-        }
-        .max(1);
+        let worker_count = effective_worker_count(threads);
         for level in backup_plan.levels.iter().skip(1) {
             for run in level {
                 let decision_end = backup_run_decision_prefix_end(&self.tree, states, run);
@@ -1244,69 +1199,63 @@ impl RealCfrSolver {
         let ip_combos = self.ip_combos.len();
         let regrets = self.regrets.as_mut_slice();
         let strategy_sum = self.strategy_sum.as_mut_slice();
-        let error = Mutex::new(None::<String>);
-        rayon::scope(|scope| {
-            let mut value_cursor = state_start;
-            let mut value_tail = current_values;
-            let mut slot_cursor = 0usize;
-            let mut regret_tail = regrets;
-            let mut strategy_tail = strategy_sum;
-            for chunk in chunks {
-                let value_skip = chunk.state_start - value_cursor;
-                let (_, rest) = value_tail.split_at_mut(value_skip);
-                value_tail = rest;
-                let value_len = chunk.state_end - chunk.state_start;
-                let (value_chunk, rest) = value_tail.split_at_mut(value_len);
-                value_tail = rest;
-                value_cursor = chunk.state_end;
+        let mut jobs = Vec::with_capacity(chunks.len());
+        let mut value_cursor = state_start;
+        let mut value_tail = current_values;
+        let mut slot_cursor = 0usize;
+        let mut regret_tail = regrets;
+        let mut strategy_tail = strategy_sum;
+        for chunk in chunks {
+            let value_skip = chunk.state_start - value_cursor;
+            let (_, rest) = value_tail.split_at_mut(value_skip);
+            value_tail = rest;
+            let value_len = chunk.state_end - chunk.state_start;
+            let (value_chunk, rest) = value_tail.split_at_mut(value_len);
+            value_tail = rest;
+            value_cursor = chunk.state_end;
 
-                let slot_skip = chunk.slot_start - slot_cursor;
-                let (_, rest) = regret_tail.split_at_mut(slot_skip);
-                regret_tail = rest;
-                let (_, rest) = strategy_tail.split_at_mut(slot_skip);
-                strategy_tail = rest;
-                let slot_len = chunk.slot_end - chunk.slot_start;
-                let (regret_chunk, rest) = regret_tail.split_at_mut(slot_len);
-                regret_tail = rest;
-                let (strategy_chunk, rest) = strategy_tail.split_at_mut(slot_len);
-                strategy_tail = rest;
-                slot_cursor = chunk.slot_end;
+            let slot_skip = chunk.slot_start - slot_cursor;
+            let (_, rest) = regret_tail.split_at_mut(slot_skip);
+            regret_tail = rest;
+            let (_, rest) = strategy_tail.split_at_mut(slot_skip);
+            strategy_tail = rest;
+            let slot_len = chunk.slot_end - chunk.slot_start;
+            let (regret_chunk, rest) = regret_tail.split_at_mut(slot_len);
+            regret_tail = rest;
+            let (strategy_chunk, rest) = strategy_tail.split_at_mut(slot_len);
+            strategy_tail = rest;
+            slot_cursor = chunk.slot_end;
 
-                let error = &error;
-                scope.spawn(move |_| {
-                    if let Err(message) = backup_decision_chunk(
-                        tree,
-                        infosets,
-                        oop_combos,
-                        ip_combos,
-                        states,
-                        oop_reaches,
-                        ip_reaches,
-                        child_values,
-                        state_end,
-                        value_chunk,
-                        chunk.state_start,
-                        regret_chunk,
-                        strategy_chunk,
-                        chunk.slot_start,
-                        update_factors,
-                    ) {
-                        let mut first_error = error
-                            .lock()
-                            .expect("backup error mutex should not be poisoned");
-                        if first_error.is_none() {
-                            *first_error = Some(message);
-                        }
-                    }
-                });
-            }
-        });
-        if let Some(message) = error
-            .into_inner()
-            .expect("backup error mutex should not be poisoned")
-        {
-            return Err(message);
+            jobs.push(BackupDecisionJob {
+                state_start: chunk.state_start,
+                slot_start: chunk.slot_start,
+                values: value_chunk,
+                regrets: regret_chunk,
+                strategy_sum: strategy_chunk,
+            });
         }
+
+        jobs.into_par_iter()
+            .map(|job| {
+                backup_decision_chunk(
+                    tree,
+                    infosets,
+                    oop_combos,
+                    ip_combos,
+                    states,
+                    oop_reaches,
+                    ip_reaches,
+                    child_values,
+                    state_end,
+                    job.values,
+                    job.state_start,
+                    job.regrets,
+                    job.strategy_sum,
+                    job.slot_start,
+                    update_factors,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(())
     }
 
@@ -2203,6 +2152,15 @@ fn first_terminal_state_index(states: &[PhaseState]) -> usize {
         .iter()
         .position(|state| state.children.is_empty())
         .unwrap_or(states.len())
+}
+
+fn effective_worker_count(requested: usize) -> usize {
+    if requested == 0 {
+        rayon::current_num_threads()
+    } else {
+        requested
+    }
+    .max(1)
 }
 
 fn backup_run_decision_prefix_end(

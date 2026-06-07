@@ -1,7 +1,7 @@
 use crate::plan::{CfrStorageConfig, live_private_combos, public_board_multiplicity};
 use crate::tree::{ActionKind, Player, PublicNodeKind, PublicState, PublicTree, Street};
+use rayon::prelude::*;
 use std::collections::BTreeMap;
-use std::thread;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CfrVariant {
@@ -78,6 +78,13 @@ struct RecordChunk {
     record_end: usize,
     slot_start: usize,
     slot_end: usize,
+}
+
+struct CfrUpdateJob<'a> {
+    records: Vec<ActionSlotRecord>,
+    slot_start: usize,
+    regret: &'a mut [f32],
+    strategy_sum: &'a mut [f32],
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -204,7 +211,7 @@ impl CfrPlusState {
     ) -> CfrStateIterationSummary {
         let record_chunks = self.record_chunks(target_chunk_bytes);
         let threads = if requested_threads == 0 {
-            thread::available_parallelism().map_or(1, usize::from)
+            rayon::current_num_threads()
         } else {
             requested_threads
         }
@@ -231,36 +238,28 @@ impl CfrPlusState {
         let mut regret_tail = self.regret.as_mut_slice();
         let mut strategy_tail = self.strategy_sum.as_mut_slice();
         let mut previous_slot_end = 0usize;
-        let partials = thread::scope(|scope| {
-            let mut handles = Vec::with_capacity(work.len());
-            for (chunk, records) in work.iter().copied().zip(records) {
-                let gap = chunk.slot_start - previous_slot_end;
-                let (_, rest) = regret_tail.split_at_mut(gap);
-                regret_tail = rest;
-                let (_, rest) = strategy_tail.split_at_mut(gap);
-                strategy_tail = rest;
+        let mut jobs = Vec::with_capacity(work.len());
+        for (chunk, records) in work.iter().copied().zip(records) {
+            let gap = chunk.slot_start - previous_slot_end;
+            let (_, rest) = regret_tail.split_at_mut(gap);
+            regret_tail = rest;
+            let (_, rest) = strategy_tail.split_at_mut(gap);
+            strategy_tail = rest;
 
-                let len = chunk.slot_end - chunk.slot_start;
-                let (regret_chunk, rest) = regret_tail.split_at_mut(len);
-                regret_tail = rest;
-                let (strategy_chunk, rest) = strategy_tail.split_at_mut(len);
-                strategy_tail = rest;
-                previous_slot_end = chunk.slot_end;
-
-                handles.push(scope.spawn(move || {
-                    update_records_in_slices(
-                        &records,
-                        chunk.slot_start,
-                        regret_chunk,
-                        strategy_chunk,
-                    )
-                }));
-            }
-            handles
-                .into_iter()
-                .map(|handle| handle.join().expect("CFR state worker panicked"))
-                .collect::<Vec<_>>()
-        });
+            let len = chunk.slot_end - chunk.slot_start;
+            let (regret_chunk, rest) = regret_tail.split_at_mut(len);
+            regret_tail = rest;
+            let (strategy_chunk, rest) = strategy_tail.split_at_mut(len);
+            strategy_tail = rest;
+            previous_slot_end = chunk.slot_end;
+            jobs.push(CfrUpdateJob {
+                records,
+                slot_start: chunk.slot_start,
+                regret: regret_chunk,
+                strategy_sum: strategy_chunk,
+            });
+        }
+        let partials = update_cfr_jobs(jobs);
 
         let mut summary = CfrStateIterationSummary {
             chunks: record_chunks.len() as u128,
@@ -448,6 +447,14 @@ fn merge_record_chunks_for_threads(chunks: &[RecordChunk], threads: usize) -> Ve
         start = end;
     }
     merged
+}
+
+fn update_cfr_jobs(jobs: Vec<CfrUpdateJob<'_>>) -> Vec<CfrStateIterationSummary> {
+    jobs.into_par_iter()
+        .map(|job| {
+            update_records_in_slices(&job.records, job.slot_start, job.regret, job.strategy_sum)
+        })
+        .collect()
 }
 
 fn update_records_in_slices(

@@ -1,9 +1,9 @@
 use crate::cards::{Board, Card};
 use crate::range::RangeSpec;
 use crate::tree::{PublicNodeKind, PublicTree, TerminalReason};
+use rayon::prelude::*;
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
-use std::thread;
 use std::time::Instant;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -251,7 +251,7 @@ pub fn terminal_cfv_tree_pass(
         });
     }
 
-    let available_threads = thread::available_parallelism().map_or(1, usize::from);
+    let available_threads = rayon::current_num_threads();
     let threads = if requested_threads == 0 {
         available_threads
     } else {
@@ -261,40 +261,26 @@ pub fn terminal_cfv_tree_pass(
     .min(board_indices.len());
 
     let started_eval = Instant::now();
-    let checksum = thread::scope(|scope| {
-        let mut handles = Vec::with_capacity(threads);
-        for thread_index in 0..threads {
-            let prepared = &prepared;
-            let board_indices = &board_indices;
-            handles.push(scope.spawn(move || -> Result<f64, String> {
-                let mut checksum = 0.0f64;
-                let mut scratch = TerminalCfvScratch::new(&prepared[0].prepared);
-                let mut task_index = thread_index;
-                while task_index < board_indices.len() {
-                    let item = &prepared[board_indices[task_index]];
-                    terminal_cfv_prefix_blocker_into(
-                        &item.prepared,
-                        &item.oop_reach,
-                        &item.ip_reach,
-                        &mut scratch,
-                    )?;
-                    checksum += terminal_cfv_output_checksum(&scratch);
-                    task_index += threads;
-                }
-                Ok(checksum)
-            }));
-        }
-        handles
-            .into_iter()
-            .map(|handle| {
-                handle
-                    .join()
-                    .map_err(|_| "terminal CFV tree pass worker panicked".to_string())?
-            })
-            .try_fold(0.0f64, |total, checksum| {
-                checksum.map(|value| total + value)
-            })
-    })?;
+    let checksum = (0..threads)
+        .into_par_iter()
+        .map(|thread_index| -> Result<f64, String> {
+            let mut checksum = 0.0f64;
+            let mut scratch = TerminalCfvScratch::new(&prepared[0].prepared);
+            let mut task_index = thread_index;
+            while task_index < board_indices.len() {
+                let item = &prepared[board_indices[task_index]];
+                terminal_cfv_prefix_blocker_into(
+                    &item.prepared,
+                    &item.oop_reach,
+                    &item.ip_reach,
+                    &mut scratch,
+                )?;
+                checksum += terminal_cfv_output_checksum(&scratch);
+                task_index += threads;
+            }
+            Ok(checksum)
+        })
+        .try_reduce(|| 0.0f64, |left, right| Ok(left + right))?;
     let eval_elapsed_ms = started_eval.elapsed().as_secs_f64() * 1000.0;
     let terminals = tree
         .nodes
@@ -324,7 +310,7 @@ fn run_terminal_cfv_parallel_smoke_prepared(
     calls: usize,
     requested_threads: usize,
 ) -> Result<TerminalCfvParallelSmoke, String> {
-    let available_threads = thread::available_parallelism().map_or(1, usize::from);
+    let available_threads = rayon::current_num_threads();
     let threads = if requested_threads == 0 {
         available_threads
     } else {
@@ -334,43 +320,30 @@ fn run_terminal_cfv_parallel_smoke_prepared(
     .min(calls.max(1));
 
     let started_eval = Instant::now();
-    let checksum = thread::scope(|scope| {
-        let mut handles = Vec::with_capacity(threads);
-        for thread_index in 0..threads {
-            let prepared = &prepared;
-            handles.push(scope.spawn(move || -> Result<f64, String> {
-                let combos = prepared[0].combos().len();
-                let hero_reach = deterministic_reach(combos, 0, 17, 0.25, 0.03125);
-                let villain_reach = deterministic_reach(combos, 7, 23, 0.50, 0.02125);
-                let mut scratch = TerminalCfvScratch::new(&prepared[0]);
-                let mut checksum = 0.0f64;
-                let mut task = thread_index;
-                while task < calls {
-                    checksum += run_terminal_cfv_smoke_call(
-                        prepared,
-                        &hero_reach,
-                        &villain_reach,
-                        &mut scratch,
-                        task,
-                        combos,
-                        task % prepared.len(),
-                    )?;
-                    task += threads;
-                }
-                Ok(checksum)
-            }));
-        }
-        handles
-            .into_iter()
-            .map(|handle| {
-                handle
-                    .join()
-                    .map_err(|_| "terminal CFV worker panicked".to_string())?
-            })
-            .try_fold(0.0f64, |total, checksum| {
-                checksum.map(|value| total + value)
-            })
-    })?;
+    let checksum = (0..threads)
+        .into_par_iter()
+        .map(|thread_index| -> Result<f64, String> {
+            let combos = prepared[0].combos().len();
+            let hero_reach = deterministic_reach(combos, 0, 17, 0.25, 0.03125);
+            let villain_reach = deterministic_reach(combos, 7, 23, 0.50, 0.02125);
+            let mut scratch = TerminalCfvScratch::new(&prepared[0]);
+            let mut checksum = 0.0f64;
+            let mut task = thread_index;
+            while task < calls {
+                checksum += run_terminal_cfv_smoke_call(
+                    prepared,
+                    &hero_reach,
+                    &villain_reach,
+                    &mut scratch,
+                    task,
+                    combos,
+                    task % prepared.len(),
+                )?;
+                task += threads;
+            }
+            Ok(checksum)
+        })
+        .try_reduce(|| 0.0f64, |left, right| Ok(left + right))?;
     let eval_elapsed_ms = started_eval.elapsed().as_secs_f64() * 1000.0;
     let calls_per_second = if eval_elapsed_ms > 0.0 {
         calls as f64 / (eval_elapsed_ms / 1000.0)
