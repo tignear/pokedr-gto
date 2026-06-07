@@ -184,6 +184,7 @@ struct TerminalWorkerProfile {
 struct PhaseState {
     node_id: usize,
     board: Board,
+    board_slot: usize,
     children: Vec<usize>,
 }
 
@@ -589,9 +590,11 @@ impl RealCfrSolver {
         }
         let state_index = states.len();
         index_by_key.insert(key, state_index);
+        let board_slot = self.board_slot(board)?;
         states.push(PhaseState {
             node_id,
             board: board.clone(),
+            board_slot,
             children: Vec::new(),
         });
 
@@ -684,7 +687,7 @@ impl RealCfrSolver {
                         Player::Oop => self.oop_combos.len(),
                         Player::Ip => self.ip_combos.len(),
                     };
-                    let board_slot = self.board_slot(&state.board)?;
+                    let board_slot = state.board_slot;
                     let row_len = acting_combos * actions_len;
                     let row_start = board_slot * row_len;
                     let row_end = row_start + row_len;
@@ -798,7 +801,7 @@ impl RealCfrSolver {
                         Player::Oop => self.oop_combos.len(),
                         Player::Ip => self.ip_combos.len(),
                     };
-                    let board_slot = self.board_slot(&state.board)?;
+                    let board_slot = state.board_slot;
                     let row_len = acting_combos * actions_len;
                     let row_start = board_slot * row_len;
                     let row_end = row_start + row_len;
@@ -1139,11 +1142,10 @@ impl RealCfrSolver {
                         Player::Oop => self.oop_combos.len(),
                         Player::Ip => self.ip_combos.len(),
                     };
-                    let board_slot = self.board_slot(&state.board)?;
+                    let board_slot = state.board_slot;
                     let row_len = acting_combos * actions_len;
                     let row_start = board_slot * row_len;
                     let (state_value, child_values) = split_state_and_children(values, state_index);
-                    state_value.reset();
                     match player {
                         Player::Oop => combine_nonacting_child_values(
                             &mut state_value.ip,
@@ -1250,7 +1252,7 @@ impl RealCfrSolver {
                         Player::Oop => self.oop_combos.len(),
                         Player::Ip => self.ip_combos.len(),
                     };
-                    let board_slot = self.board_slot(&state.board)?;
+                    let board_slot = state.board_slot;
                     let row_len = acting_combos * actions_len;
                     let row_start = board_slot * row_len;
                     let row_end = row_start + row_len;
