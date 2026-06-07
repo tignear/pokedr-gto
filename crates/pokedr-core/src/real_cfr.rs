@@ -220,6 +220,7 @@ struct PhaseState {
     board: Board,
     board_slot: usize,
     children: Vec<usize>,
+    terminal_cache_indices: Vec<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -730,11 +731,13 @@ impl RealCfrSolver {
         let state_index = states.len();
         index_by_key.insert(key, state_index);
         let board_slot = self.board_slot(board)?;
+        let terminal_cache_indices = self.phase_state_terminal_cache_indices(node_id, board)?;
         states.push(PhaseState {
             node_id,
             board: board.clone(),
             board_slot,
             children: Vec::new(),
+            terminal_cache_indices,
         });
 
         let node = &self.tree.nodes[node_id];
@@ -768,6 +771,28 @@ impl RealCfrSolver {
         }
         states[state_index].children = children;
         Ok(state_index)
+    }
+
+    fn phase_state_terminal_cache_indices(
+        &self,
+        node_id: usize,
+        board: &Board,
+    ) -> Result<Vec<usize>, String> {
+        let PublicNodeKind::Terminal { reason } = self.tree.nodes[node_id].kind else {
+            return Ok(Vec::new());
+        };
+        if !matches!(reason, TerminalReason::Showdown | TerminalReason::AllIn) {
+            return Ok(Vec::new());
+        }
+        terminal_boards(board)?
+            .into_iter()
+            .map(|terminal_board| {
+                self.terminal_cache_index_by_key
+                    .get(&unordered_board_key(&terminal_board))
+                    .copied()
+                    .ok_or_else(|| "terminal board is outside the solver board cache".to_string())
+            })
+            .collect()
     }
 
     fn forward_reaches_into(
@@ -1156,7 +1181,8 @@ impl RealCfrSolver {
                     profile.terminal_states += 1;
                     profile.fold_states += 1;
                     let fold_started = profile_terminal.then(Instant::now);
-                    *values_slot = self.fold_values(
+                    self.fold_values_into(
+                        values_slot,
                         &state.board,
                         node.state.pot,
                         node.state.player,
@@ -1170,23 +1196,8 @@ impl RealCfrSolver {
                 TerminalReason::Showdown | TerminalReason::AllIn => {
                     profile.terminal_states += 1;
                     accumulator.reset();
-                    let terminal_boards = if profile_terminal {
-                        let started = Instant::now();
-                        let boards = terminal_boards(&state.board)?;
-                        profile.board_expand_ms += started.elapsed().as_secs_f64() * 1000.0;
-                        boards
-                    } else {
-                        terminal_boards(&state.board)?
-                    };
-                    for terminal_board in terminal_boards {
-                        let cache_index = self
-                            .terminal_cache_index_by_key
-                            .get(&unordered_board_key(&terminal_board))
-                            .copied()
-                            .ok_or_else(|| {
-                                "terminal board is outside the solver board cache".to_string()
-                            })?;
-                        let cache = &self.terminal_cache[cache_index];
+                    for cache_index in &state.terminal_cache_indices {
+                        let cache = &self.terminal_cache[*cache_index];
                         let reach_started = profile_terminal.then(Instant::now);
                         reach_on_prepared_board_targets_sparse_into(
                             &cache.oop_targets,
@@ -1303,7 +1314,8 @@ impl RealCfrSolver {
                         profile.terminal_states += 1;
                         profile.fold_states += 1;
                         let fold_started = profile_terminal.then(Instant::now);
-                        values_chunk[local_index] = self.fold_values(
+                        self.fold_values_into(
+                            &mut values_chunk[local_index],
                             &state.board,
                             node.state.pot,
                             node.state.player,
@@ -1319,25 +1331,10 @@ impl RealCfrSolver {
                         let local_slot = local_index - tile_start;
                         accumulators[local_slot].reset();
                         active_slots.push(local_slot);
-                        let terminal_boards = if profile_terminal {
-                            let started = Instant::now();
-                            let boards = terminal_boards(&state.board)?;
-                            profile.board_expand_ms += started.elapsed().as_secs_f64() * 1000.0;
-                            boards
-                        } else {
-                            terminal_boards(&state.board)?
-                        };
-                        for terminal_board in terminal_boards {
-                            let cache_index = self
-                                .terminal_cache_index_by_key
-                                .get(&unordered_board_key(&terminal_board))
-                                .copied()
-                                .ok_or_else(|| {
-                                    "terminal board is outside the solver board cache".to_string()
-                                })?;
+                        for cache_index in &state.terminal_cache_indices {
                             tasks.push(LocalTerminalBoardTask {
                                 local_slot,
-                                cache_index,
+                                cache_index: *cache_index,
                                 pot: node.state.pot,
                             });
                         }
@@ -1961,36 +1958,51 @@ impl RealCfrSolver {
         ip_reach: &[f32],
     ) -> Values {
         let mut values = Values::zero(self.oop_combos.len(), self.ip_combos.len());
+        self.fold_values_into(&mut values, board, pot, folding_player, oop_reach, ip_reach);
+        values
+    }
+
+    fn fold_values_into(
+        &self,
+        values: &mut Values,
+        board: &Board,
+        pot: u32,
+        folding_player: Player,
+        oop_reach: &[f32],
+        ip_reach: &[f32],
+    ) {
         let pot = pot as f32;
-        let oop_opp = opponent_weights_for_fast(
+        opponent_weights_for_fast_into(
             &self.oop_combos,
             &self.ip_combos,
             ip_reach,
             &self.oop_same_ip_combo_indices,
             board,
+            &mut values.oop,
         );
-        let ip_opp = opponent_weights_for_fast(
+        opponent_weights_for_fast_into(
             &self.ip_combos,
             &self.oop_combos,
             oop_reach,
             &self.ip_same_oop_combo_indices,
             board,
+            &mut values.ip,
         );
-        for (index, value) in values.oop.iter_mut().enumerate() {
+        for value in values.oop.iter_mut() {
             *value = if folding_player == Player::Oop {
                 -pot
             } else {
                 pot
-            } * oop_opp[index];
+            } * *value;
         }
-        for (index, value) in values.ip.iter_mut().enumerate() {
+        for value in values.ip.iter_mut() {
             *value = if folding_player == Player::Ip {
                 -pot
             } else {
                 pot
-            } * ip_opp[index];
+            } * *value;
         }
-        values
+        values.terminal_evals = 0;
     }
 
     fn showdown_values(
@@ -2933,6 +2945,7 @@ fn opponent_weights_for(
         .collect()
 }
 
+#[cfg(test)]
 fn opponent_weights_for_fast(
     own_combos: &[ComboWeight],
     opponent_combos: &[ComboWeight],
@@ -2940,8 +2953,29 @@ fn opponent_weights_for_fast(
     same_combo_indices: &[Option<usize>],
     board: &Board,
 ) -> Vec<f32> {
+    let mut out = vec![0.0f32; own_combos.len()];
+    opponent_weights_for_fast_into(
+        own_combos,
+        opponent_combos,
+        opponent_reach,
+        same_combo_indices,
+        board,
+        &mut out,
+    );
+    out
+}
+
+fn opponent_weights_for_fast_into(
+    own_combos: &[ComboWeight],
+    opponent_combos: &[ComboWeight],
+    opponent_reach: &[f32],
+    same_combo_indices: &[Option<usize>],
+    board: &Board,
+    out: &mut [f32],
+) {
     debug_assert_eq!(opponent_combos.len(), opponent_reach.len());
     debug_assert_eq!(own_combos.len(), same_combo_indices.len());
+    debug_assert_eq!(own_combos.len(), out.len());
 
     let mut total = 0.0f32;
     let mut card_totals = [0.0f32; 52];
@@ -2954,23 +2988,25 @@ fn opponent_weights_for_fast(
         card_totals[combo.second.index()] += *reach;
     }
 
-    own_combos
+    for ((own, same_index), out) in own_combos
         .iter()
         .zip(same_combo_indices)
-        .map(|(own, same_index)| {
-            if board.contains(own.first) || board.contains(own.second) {
-                return 0.0;
-            }
-            let same_reach = same_index
-                .and_then(|index| {
-                    let opponent = &opponent_combos[index];
-                    (!board.contains(opponent.first) && !board.contains(opponent.second))
-                        .then_some(opponent_reach[index])
-                })
-                .unwrap_or(0.0);
-            total - card_totals[own.first.index()] - card_totals[own.second.index()] + same_reach
-        })
-        .collect()
+        .zip(out.iter_mut())
+    {
+        if board.contains(own.first) || board.contains(own.second) {
+            *out = 0.0;
+            continue;
+        }
+        let same_reach = same_index
+            .and_then(|index| {
+                let opponent = &opponent_combos[index];
+                (!board.contains(opponent.first) && !board.contains(opponent.second))
+                    .then_some(opponent_reach[index])
+            })
+            .unwrap_or(0.0);
+        *out =
+            total - card_totals[own.first.index()] - card_totals[own.second.index()] + same_reach;
+    }
 }
 
 fn same_combo_indices(

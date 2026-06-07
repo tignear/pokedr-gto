@@ -516,3 +516,26 @@ ideas.
   strided memory traffic. A real batched terminal kernel needs a different
   memory layout or GPU-local tiling; do not promote this exact shape to the CFR
   hot path.
+
+## 2026-06-07: Terminal fold scratch and all-in runout cache
+
+- Tried: remove two per-fold temporary opponent-weight vectors by writing fold
+  opponent weights directly into the reusable terminal `Values` slot. Also
+  store terminal final-board cache indices in each `PhaseState`, so flop/turn
+  all-in states no longer rebuild `terminal_boards(board)` and do a BTree lookup
+  on every iteration.
+- Expected: river all-in cannot avoid the final-board CFV, but flop/turn all-in
+  can avoid repeated runout enumeration/cache lookup. Fold terminal values
+  should avoid hot allocation.
+- Result: kept. On `As7h2c` UTG vs BU, the terminal breakdown was:
+  `fold_terminals=647692`, `showdown_terminals=825552`,
+  `all_in_terminals=684140`, `flop_all_in_runout_evals=2352`,
+  `turn_all_in_runout_evals=98784`, `river_all_in_evals=682080`, and
+  `total_evals=1608768`. With terminal profiling enabled, cached runouts moved
+  `board_expand_ms` from about `132ms` to `0`, and terminal wall time in the
+  profiled run moved from about `2.62s` to about `2.33s`. A profile-free
+  one-iteration run reported `terminal_ms=2364ms`.
+- Validation: `cargo check --workspace` passed and
+  `three_phase_real_cfr_matches_recursive_one_iteration_on_small_ranges` passed.
+- Decision: keep. This is not the main CFV breakthrough, but it is a clean
+  exact optimization for turn/flop all-in and fold terminals.
