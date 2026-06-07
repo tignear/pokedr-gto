@@ -3,11 +3,13 @@ use crate::range::{ComboWeight, RangeSpec};
 use crate::terminal_cfv::{
     PreparedTerminalBoard, TerminalCfvScratch, terminal_cfv_prefix_blocker_board_targets_into,
     terminal_cfv_prefix_blocker_targets_into, terminal_cfv_sparse_board_targets_into,
-    terminal_cfv_sparse_targets_into,
+    terminal_cfv_sparse_targets_into, terminal_side_values_prefix_blocker_board_targets_into,
+    terminal_side_values_sparse_board_targets_into,
 };
 use crate::tree::{Player, PublicNodeKind, PublicTree, TerminalReason};
 use rayon::prelude::*;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::Arc;
 use std::time::Instant;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -228,6 +230,8 @@ struct TerminalWorkerProfile {
     fold_states: usize,
     sparse_tasks: usize,
     prefix_tasks: usize,
+    side_cache_hits: usize,
+    side_cache_misses: usize,
     oop_nonzero_sum: usize,
     ip_nonzero_sum: usize,
     oop_nonzero_max: usize,
@@ -239,6 +243,32 @@ struct TerminalWorkerProfile {
     cfv_ms: f64,
     accumulator_ms: f64,
     elapsed_ms: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum TerminalSideValue {
+    OopValue,
+    IpValue,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct TerminalSideCacheKey {
+    cache_index: usize,
+    side: TerminalSideValue,
+    reach_hash: u64,
+}
+
+#[derive(Debug, Clone)]
+struct TerminalSideCacheEntry {
+    signature: Vec<(u16, u32)>,
+    values: Arc<[f32]>,
+}
+
+#[derive(Debug, Default)]
+struct TerminalSideValueCache {
+    entries: HashMap<TerminalSideCacheKey, Vec<TerminalSideCacheEntry>>,
+    hits: usize,
+    misses: usize,
 }
 
 #[derive(Debug, Default)]
@@ -1369,6 +1399,8 @@ impl RealCfrSolver {
         let mut oop_nonzero = Vec::new();
         let mut ip_nonzero = Vec::new();
         let sparse_nonzero_limit = terminal_sparse_nonzero_limit();
+        let use_side_cache = terminal_side_cache_enabled();
+        let mut side_cache = TerminalSideValueCache::default();
         let mut accumulator =
             TerminalAccumulator::zero(self.oop_combos.len(), self.ip_combos.len());
         let mut profile = TerminalWorkerProfile {
@@ -1426,9 +1458,38 @@ impl RealCfrSolver {
                         profile.oop_nonzero_max = profile.oop_nonzero_max.max(oop_nonzero.len());
                         profile.ip_nonzero_max = profile.ip_nonzero_max.max(ip_nonzero.len());
                         let cfv_started = profile_terminal.then(Instant::now);
-                        if oop_nonzero.len() <= sparse_nonzero_limit
-                            && ip_nonzero.len() <= sparse_nonzero_limit
-                        {
+                        let use_sparse = oop_nonzero.len() <= sparse_nonzero_limit
+                            && ip_nonzero.len() <= sparse_nonzero_limit;
+                        if use_side_cache {
+                            let hero_values = terminal_side_cached_values(
+                                &mut side_cache,
+                                cache,
+                                *cache_index,
+                                TerminalSideValue::OopValue,
+                                &ip_live,
+                                &ip_nonzero,
+                                &cache.oop_board_targets,
+                                use_sparse,
+                                &mut scratch,
+                            )?;
+                            let villain_values = terminal_side_cached_values(
+                                &mut side_cache,
+                                cache,
+                                *cache_index,
+                                TerminalSideValue::IpValue,
+                                &oop_live,
+                                &oop_nonzero,
+                                &cache.ip_board_targets,
+                                use_sparse,
+                                &mut scratch,
+                            )?;
+                            accumulator.add_board_values(
+                                cache,
+                                node.state.pot,
+                                &hero_values,
+                                &villain_values,
+                            );
+                        } else if use_sparse {
                             profile.sparse_tasks += 1;
                             terminal_cfv_sparse_board_targets_into(
                                 &cache.prepared,
@@ -1454,10 +1515,12 @@ impl RealCfrSolver {
                         if let Some(started) = cfv_started {
                             profile.cfv_ms += started.elapsed().as_secs_f64() * 1000.0;
                         }
-                        let accumulator_started = profile_terminal.then(Instant::now);
-                        accumulator.add_board(cache, node.state.pot, &scratch);
-                        if let Some(started) = accumulator_started {
-                            profile.accumulator_ms += started.elapsed().as_secs_f64() * 1000.0;
+                        if !use_side_cache {
+                            let accumulator_started = profile_terminal.then(Instant::now);
+                            accumulator.add_board(cache, node.state.pot, &scratch);
+                            if let Some(started) = accumulator_started {
+                                profile.accumulator_ms += started.elapsed().as_secs_f64() * 1000.0;
+                            }
                         }
                     }
                     accumulator.finish();
@@ -1465,6 +1528,8 @@ impl RealCfrSolver {
                 }
             }
         }
+        profile.side_cache_hits = side_cache.hits;
+        profile.side_cache_misses = side_cache.misses;
         profile.output_states = values_chunk.len();
         profile.elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
         Ok(profile)
@@ -2193,15 +2258,25 @@ impl TerminalAccumulator {
     }
 
     fn add_board(&mut self, cache: &TerminalEvalCache, pot: u32, scratch: &TerminalCfvScratch) {
+        self.add_board_values(cache, pot, scratch.hero_values(), scratch.villain_values());
+    }
+
+    fn add_board_values(
+        &mut self,
+        cache: &TerminalEvalCache,
+        pot: u32,
+        hero_values: &[f32],
+        villain_values: &[f32],
+    ) {
         let pot = pot as f32;
         for target in &cache.oop_targets {
             let index = target.range_index;
-            self.values.oop[index] += scratch.hero_values()[target.board_index as usize] * pot;
+            self.values.oop[index] += hero_values[target.board_index as usize] * pot;
             self.oop_counts[index] += 1.0;
         }
         for target in &cache.ip_targets {
             let index = target.range_index;
-            self.values.ip[index] += scratch.villain_values()[target.board_index as usize] * pot;
+            self.values.ip[index] += villain_values[target.board_index as usize] * pot;
             self.ip_counts[index] += 1.0;
         }
         self.values.terminal_evals += 1;
@@ -3229,6 +3304,75 @@ fn average_f64(sum: f64, count: usize) -> f64 {
     if count > 0 { sum / count as f64 } else { 0.0 }
 }
 
+fn terminal_side_cache_enabled() -> bool {
+    std::env::var_os("POKEDR_REAL_CFR_TERMINAL_SIDE_CACHE").is_some()
+}
+
+fn terminal_side_cached_values(
+    cache: &mut TerminalSideValueCache,
+    terminal: &TerminalEvalCache,
+    cache_index: usize,
+    side: TerminalSideValue,
+    opponent_reach: &[f32],
+    opponent_nonzero: &[u16],
+    targets: &[u16],
+    use_sparse: bool,
+    _scratch: &mut TerminalCfvScratch,
+) -> Result<Arc<[f32]>, String> {
+    let reach_hash = hash_sparse_reach(opponent_reach, opponent_nonzero);
+    let signature = sparse_reach_signature(opponent_reach, opponent_nonzero);
+    let key = TerminalSideCacheKey {
+        cache_index,
+        side,
+        reach_hash,
+    };
+    if let Some(entries) = cache.entries.get(&key) {
+        if let Some(entry) = entries.iter().find(|entry| entry.signature == signature) {
+            cache.hits += 1;
+            return Ok(entry.values.clone());
+        }
+    }
+
+    cache.misses += 1;
+    let combos = terminal.prepared.combos().len();
+    let mut values = vec![0.0f32; combos];
+    if use_sparse {
+        terminal_side_values_sparse_board_targets_into(
+            &terminal.prepared,
+            opponent_reach,
+            opponent_nonzero,
+            targets,
+            &mut values,
+        )?;
+    } else {
+        let mut prefix = vec![0.0f32; combos + 1];
+        terminal_side_values_prefix_blocker_board_targets_into(
+            &terminal.prepared,
+            opponent_reach,
+            targets,
+            &mut prefix,
+            &mut values,
+        )?;
+    }
+    let values = Arc::<[f32]>::from(values);
+    cache
+        .entries
+        .entry(key)
+        .or_default()
+        .push(TerminalSideCacheEntry {
+            signature,
+            values: values.clone(),
+        });
+    Ok(values)
+}
+
+fn sparse_reach_signature(reach: &[f32], nonzero: &[u16]) -> Vec<(u16, u32)> {
+    nonzero
+        .iter()
+        .map(|index| (*index, reach[*index as usize].to_bits()))
+        .collect()
+}
+
 fn hash_sparse_reach(reach: &[f32], nonzero: &[u16]) -> u64 {
     let mut hash = 0xcbf29ce484222325u64;
     for board_index in nonzero {
@@ -3256,6 +3400,14 @@ fn print_terminal_worker_profiles(
     let prefix_tasks = profiles
         .iter()
         .map(|profile| profile.prefix_tasks)
+        .sum::<usize>();
+    let side_cache_hits = profiles
+        .iter()
+        .map(|profile| profile.side_cache_hits)
+        .sum::<usize>();
+    let side_cache_misses = profiles
+        .iter()
+        .map(|profile| profile.side_cache_misses)
         .sum::<usize>();
     let terminal_states = profiles
         .iter()
@@ -3306,12 +3458,14 @@ fn print_terminal_worker_profiles(
         0.0
     };
     eprintln!(
-        "real_cfr_terminal_profile tasks={} accounted_tasks={} threads={} sparse_tasks={} prefix_tasks={} avg_oop_nonzero={:.2} avg_ip_nonzero={:.2} min_worker_ms={:.3} max_worker_ms={:.3}",
+        "real_cfr_terminal_profile tasks={} accounted_tasks={} threads={} sparse_tasks={} prefix_tasks={} side_cache_hits={} side_cache_misses={} avg_oop_nonzero={:.2} avg_ip_nonzero={:.2} min_worker_ms={:.3} max_worker_ms={:.3}",
         total_tasks,
         tasks,
         threads,
         sparse_tasks,
         prefix_tasks,
+        side_cache_hits,
+        side_cache_misses,
         avg_oop_nonzero,
         avg_ip_nonzero,
         min_elapsed,
@@ -3339,13 +3493,15 @@ fn print_terminal_worker_profiles(
             0.0
         };
         eprintln!(
-            "real_cfr_terminal_worker worker={} terminal_states={} fold_states={} tasks={} sparse={} prefix={} avg_oop_nonzero={:.2} avg_ip_nonzero={:.2} max_oop_nonzero={} max_ip_nonzero={} output_states={} board_expand_ms={:.3} fold_ms={:.3} reach_map_ms={:.3} cfv_ms={:.3} accumulator_ms={:.3} elapsed_ms={:.3}",
+            "real_cfr_terminal_worker worker={} terminal_states={} fold_states={} tasks={} sparse={} prefix={} side_cache_hits={} side_cache_misses={} avg_oop_nonzero={:.2} avg_ip_nonzero={:.2} max_oop_nonzero={} max_ip_nonzero={} output_states={} board_expand_ms={:.3} fold_ms={:.3} reach_map_ms={:.3} cfv_ms={:.3} accumulator_ms={:.3} elapsed_ms={:.3}",
             profile.worker_index,
             profile.terminal_states,
             profile.fold_states,
             profile.tasks,
             profile.sparse_tasks,
             profile.prefix_tasks,
+            profile.side_cache_hits,
+            profile.side_cache_misses,
             avg_oop,
             avg_ip,
             profile.oop_nonzero_max,

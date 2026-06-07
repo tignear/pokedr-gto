@@ -283,6 +283,14 @@ Open blocker:
   improvement. Exact side-value grouping is more promising than pair grouping,
   but the measured `2.6x-2.9x` after four iterations says it should be treated
   as a bounded terminal-CFV optimization, not the whole solver breakthrough.
+- Implemented an experimental per-worker exact side-value cache behind
+  `POKEDR_REAL_CFR_TERMINAL_SIDE_CACHE=1`. It keys by final board, value side,
+  and exact opponent reach signature, then reuses only the side values that are
+  mathematically independent of the acting side's own reach. On `As7h2c` UTG
+  vs BU, `4` DCFR+ iterations improved from about `24.97s` total / `8.23s`
+  terminal to about `22.04s` total / `5.54s` terminal. This validates the
+  direction, but the total solver speedup is still modest because reach and
+  backup phases remain large.
 
 Block-local experiment:
 

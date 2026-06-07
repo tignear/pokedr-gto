@@ -743,20 +743,20 @@ pub fn terminal_cfv_prefix_blocker_board_targets_into(
     if hero_reach.len() != combos.len() || villain_reach.len() != combos.len() {
         return Err(format!("reach vectors must have {} entries", combos.len()));
     }
-    side_values_prefix_blocker_board_targets_into(
+    terminal_side_values_prefix_blocker_board_targets_into(
         prepared,
         villain_reach,
         hero_targets,
         scratch.prefix.as_mut_slice(),
         &mut scratch.hero_values,
-    );
-    side_values_prefix_blocker_board_targets_into(
+    )?;
+    terminal_side_values_prefix_blocker_board_targets_into(
         prepared,
         hero_reach,
         villain_targets,
         scratch.prefix.as_mut_slice(),
         &mut scratch.villain_values,
-    );
+    )?;
     Ok(())
 }
 
@@ -805,19 +805,73 @@ pub fn terminal_cfv_sparse_board_targets_into(
     if hero_reach.len() != combos.len() || villain_reach.len() != combos.len() {
         return Err(format!("reach vectors must have {} entries", combos.len()));
     }
-    side_values_sparse_board_targets_into(
+    terminal_side_values_sparse_board_targets_into(
         prepared,
         villain_reach,
         villain_nonzero,
         hero_targets,
         &mut scratch.hero_values,
-    );
-    side_values_sparse_board_targets_into(
+    )?;
+    terminal_side_values_sparse_board_targets_into(
         prepared,
         hero_reach,
         hero_nonzero,
         villain_targets,
         &mut scratch.villain_values,
+    )?;
+    Ok(())
+}
+
+pub fn terminal_side_values_sparse_board_targets_into(
+    prepared: &PreparedTerminalBoard,
+    opponent_reach: &[f32],
+    opponent_nonzero: &[u16],
+    targets: &[u16],
+    values: &mut [f32],
+) -> Result<(), String> {
+    let combos = &prepared.combos;
+    if opponent_reach.len() != combos.len() {
+        return Err(format!("reach vector must have {} entries", combos.len()));
+    }
+    if values.len() != combos.len() {
+        return Err(format!("values vector must have {} entries", combos.len()));
+    }
+    side_values_sparse_board_targets_into(
+        prepared,
+        opponent_reach,
+        opponent_nonzero,
+        targets,
+        values,
+    );
+    Ok(())
+}
+
+pub fn terminal_side_values_prefix_blocker_board_targets_into(
+    prepared: &PreparedTerminalBoard,
+    opponent_reach: &[f32],
+    targets: &[u16],
+    prefix: &mut [f32],
+    values: &mut [f32],
+) -> Result<(), String> {
+    let combos = &prepared.combos;
+    if opponent_reach.len() != combos.len() {
+        return Err(format!("reach vector must have {} entries", combos.len()));
+    }
+    if prefix.len() != combos.len() + 1 {
+        return Err(format!(
+            "prefix vector must have {} entries",
+            combos.len() + 1
+        ));
+    }
+    if values.len() != combos.len() {
+        return Err(format!("values vector must have {} entries", combos.len()));
+    }
+    side_values_prefix_blocker_board_targets_into(
+        prepared,
+        opponent_reach,
+        targets,
+        prefix,
+        values,
     );
     Ok(())
 }
