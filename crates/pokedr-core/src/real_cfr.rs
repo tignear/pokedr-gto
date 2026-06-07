@@ -1120,6 +1120,7 @@ impl RealCfrSolver {
         average_weight: f32,
         variant: RealCfrVariant,
     ) -> Result<usize, String> {
+        let update_factors = RealCfrUpdateFactors::new(variant, average_weight);
         for state_index in (0..states.len()).rev() {
             let state = &states[state_index];
             let node = &self.tree.nodes[state.node_id];
@@ -1223,13 +1224,12 @@ impl RealCfrSolver {
                             };
                             let local_slot = combo * actions_len + action_index;
                             let slot = row_start + local_slot;
-                            apply_real_cfr_update(
+                            apply_real_cfr_update_with_factors(
                                 &mut infoset.regrets[slot],
                                 &mut infoset.strategy_sum[slot],
                                 action_value - node_value,
                                 own_reach[combo] * strategy_probs[action_index],
-                                average_weight,
-                                variant,
+                                &update_factors,
                             );
                         }
                     }
@@ -1901,8 +1901,75 @@ fn apply_real_cfr_update(
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct RealCfrUpdateFactors {
+    variant: RealCfrVariant,
+    positive_regret_discount: f32,
+    negative_regret_discount: f32,
+    strategy_discount: f32,
+    iteration_weight: f32,
+}
+
+impl RealCfrUpdateFactors {
+    fn new(variant: RealCfrVariant, iteration_weight: f32) -> Self {
+        let (positive_regret_discount, negative_regret_discount, strategy_discount) = match variant
+        {
+            RealCfrVariant::CfrPlus => (1.0, 1.0, 1.0),
+            RealCfrVariant::Dcfr { alpha, beta, gamma } => (
+                dcfr_discount_for_exponent(iteration_weight, alpha),
+                dcfr_discount_for_exponent(iteration_weight, beta),
+                dcfr_strategy_discount(iteration_weight, gamma),
+            ),
+            RealCfrVariant::DcfrPlus { alpha, gamma } => (
+                dcfr_discount_for_exponent(iteration_weight, alpha),
+                dcfr_discount_for_exponent(iteration_weight, 0.0),
+                dcfr_strategy_discount(iteration_weight, gamma),
+            ),
+        };
+        Self {
+            variant,
+            positive_regret_discount,
+            negative_regret_discount,
+            strategy_discount,
+            iteration_weight,
+        }
+    }
+}
+
+fn apply_real_cfr_update_with_factors(
+    regret: &mut f32,
+    strategy_sum: &mut f32,
+    regret_delta: f32,
+    average_delta: f32,
+    factors: &RealCfrUpdateFactors,
+) {
+    match factors.variant {
+        RealCfrVariant::CfrPlus => {
+            *regret = (*regret + regret_delta).max(0.0);
+            *strategy_sum += factors.iteration_weight * average_delta;
+        }
+        RealCfrVariant::Dcfr { .. } => {
+            let regret_discount = if *regret >= 0.0 {
+                factors.positive_regret_discount
+            } else {
+                factors.negative_regret_discount
+            };
+            *regret = *regret * regret_discount + regret_delta;
+            *strategy_sum = *strategy_sum * factors.strategy_discount + average_delta;
+        }
+        RealCfrVariant::DcfrPlus { .. } => {
+            *regret = (*regret * factors.positive_regret_discount + regret_delta).max(0.0);
+            *strategy_sum = *strategy_sum * factors.strategy_discount + average_delta;
+        }
+    }
+}
+
 fn dcfr_regret_discount(regret: f32, iteration: f32, alpha: f32, beta: f32) -> f32 {
     let exponent = if regret >= 0.0 { alpha } else { beta };
+    dcfr_discount_for_exponent(iteration, exponent)
+}
+
+fn dcfr_discount_for_exponent(iteration: f32, exponent: f32) -> f32 {
     let powered = iteration.powf(exponent.max(0.0));
     powered / (powered + 1.0)
 }
