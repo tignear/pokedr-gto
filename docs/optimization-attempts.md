@@ -28,15 +28,17 @@ ideas.
   without locks or unsafe code.
 - Expected: preserve the same values while opening a path to parallel decision
   updates across each backup level.
-- Result: much slower before parallelism. On UTG vs BU `As7h2c`,
+- Result: slower in the single measurement used at the time. On UTG vs BU `As7h2c`,
   `iterations=4`, `16` threads, DCFR+, the previous path was about
   `35.6s` elapsed with `13.6s` backup. The level-major scratch path produced
   the same root values but regressed to about `56.5s` elapsed with `22.4s`
-  backup and `15.9s` terminal.
-- Decision: reverted. Do not retry `Vec<Vec<Values>>` level-major scratch.
-  If backup is parallelized, keep the flat contiguous value storage or use a
-  level plan that writes into contiguous ranges without fragmenting the value
-  arrays.
+  backup and `15.9s` terminal. Later repeated baseline runs on the same clean
+  HEAD were much slower (`~54s` to `~62s`), so the `35.6s` baseline was likely
+  an outlier.
+- Decision: reverted. Do not retry `Vec<Vec<Values>>` level-major scratch
+  without repeated baseline measurements. If backup is parallelized, keep the
+  flat contiguous value storage or use a level plan that writes into contiguous
+  ranges without fragmenting the value arrays.
 
 ## 2026-06-07: Real CFR acting-combo board-blocker skip
 
@@ -62,14 +64,17 @@ ideas.
   and is the standard setup for owner-computes level-parallel backup.
 - Expected: preserve values and provide contiguous backup level ranges without
   the `Vec<Vec<Values>>` locality loss.
-- Result: values matched, but performance still regressed. On UTG vs BU
+- Result: values matched, but performance looked worse against the single
+  baseline used at the time. On UTG vs BU
   `As7h2c`, `iterations=4`, `16` threads, DCFR+, the previous path was about
   `35.6s` elapsed with `13.6s` backup. Physical topological reorder was about
-  `41.5s` elapsed with `14.9s` backup and `11.6s` terminal.
-- Decision: reverted. The idea is still valid as metadata, but do not
-  physically reorder the state/value arrays unless the whole reach/terminal
-  pipeline is rebuilt around that layout. Prefer keeping DFS order and adding a
-  logical level/range plan, or move directly to flat action-row storage.
+  `41.5s` elapsed with `14.9s` backup and `11.6s` terminal. Later repeated
+  baseline runs were `~54s` to `~62s`, so this may have been an improvement
+  rather than a regression.
+- Decision: reverted, but classification is uncertain. Re-test with repeated
+  baseline and variant runs before rejecting physical topological order. The
+  idea is still valid as metadata; prefer keeping DFS order unless physical
+  reorder also improves repeated measurements.
 
 ## 2026-06-07: Global flat real-CFR action storage
 
@@ -78,13 +83,17 @@ ideas.
   intended as a first step toward splitting regret/strategy rows by owned
   ranges for lock-free parallel backup.
 - Expected: preserve values and make future row ownership explicit.
-- Result: values matched, but the benchmark regressed before parallelism. On
+- Result: values matched, but the benchmark looked worse against the single
+  baseline used at the time. On
   UTG vs BU `As7h2c`, `iterations=4`, `16` threads, DCFR+, the previous path
   was about `35.6s` elapsed with `13.6s` backup. Flat global action storage was
-  about `41.2s` elapsed with `15.0s` backup.
-- Decision: reverted. Do not retry global flat action storage as a standalone
-  refactor. If action rows are flattened, the same patch must also introduce a
-  parallel owner-computes update that pays for the locality loss.
+  about `41.2s` elapsed with `15.0s` backup. Later repeated baseline runs were
+  `~54s` to `~62s`, so this may have been an improvement rather than a
+  regression.
+- Decision: reverted, but classification is uncertain. Re-test with repeated
+  baseline and variant runs before rejecting global flat action storage. If
+  action rows are flattened, the same patch should still aim at parallel
+  owner-computes update to make the layout change pay off.
 
 ## 2026-06-06: CPU terminal CFV card-prefix blocker correction
 

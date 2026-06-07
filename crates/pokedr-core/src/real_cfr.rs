@@ -110,6 +110,8 @@ pub struct RealCfrSolver {
     oop_combos: Vec<ComboWeight>,
     ip_combos: Vec<ComboWeight>,
     infosets: Vec<Option<RealInfoset>>,
+    regrets: Vec<f32>,
+    strategy_sum: Vec<f32>,
     completed_iterations: u32,
     flop_board: Board,
     turn_index_by_key: BTreeMap<u64, usize>,
@@ -125,8 +127,8 @@ struct RealInfoset {
     player: Player,
     board_count: usize,
     actions: usize,
-    regrets: Vec<f32>,
-    strategy_sum: Vec<f32>,
+    slots_start: usize,
+    slots_len: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -237,6 +239,7 @@ impl RealCfrSolver {
             });
         }
         let mut infosets = vec![None; tree.nodes.len()];
+        let mut total_action_slots = 0usize;
         for node in &tree.nodes {
             let PublicNodeKind::Decision { player, actions } = &node.kind else {
                 continue;
@@ -246,19 +249,23 @@ impl RealCfrSolver {
                 Player::Ip => ip_combos.len(),
             };
             let board_count = board_count_for_len(node.state.board.cards().len())?;
+            let slots_len = board_count * combos * actions.len();
             infosets[node.id] = Some(RealInfoset {
                 player: *player,
                 board_count,
                 actions: actions.len(),
-                regrets: vec![0.0; board_count * combos * actions.len()],
-                strategy_sum: vec![0.0; board_count * combos * actions.len()],
+                slots_start: total_action_slots,
+                slots_len,
             });
+            total_action_slots += slots_len;
         }
         Ok(Self {
             tree,
             oop_combos,
             ip_combos,
             infosets,
+            regrets: vec![0.0; total_action_slots],
+            strategy_sum: vec![0.0; total_action_slots],
             completed_iterations: 0,
             flop_board,
             turn_index_by_key,
@@ -328,7 +335,7 @@ impl RealCfrSolver {
             .infosets
             .iter()
             .filter_map(Option::as_ref)
-            .map(|infoset| infoset.regrets.len())
+            .map(|infoset| infoset.slots_len)
             .sum();
         let decision_nodes = self
             .infosets
@@ -421,7 +428,7 @@ impl RealCfrSolver {
             .infosets
             .iter()
             .filter_map(Option::as_ref)
-            .map(|infoset| infoset.regrets.len())
+            .map(|infoset| infoset.slots_len)
             .sum();
         let decision_nodes = self
             .infosets
@@ -694,14 +701,16 @@ impl RealCfrSolver {
                     let infoset = self.infosets[state.node_id]
                         .as_ref()
                         .expect("decision node must have infoset");
+                    let slot_start = infoset.slots_start + row_start;
+                    let slot_end = infoset.slots_start + row_end;
                     let strategies = match strategy_source {
                         StrategySource::Current => current_strategies(
-                            &infoset.regrets[row_start..row_end],
+                            &self.regrets[slot_start..slot_end],
                             acting_combos,
                             actions_len,
                         ),
                         StrategySource::Average => average_strategies(
-                            &infoset.strategy_sum[row_start..row_end],
+                            &self.strategy_sum[slot_start..slot_end],
                             acting_combos,
                             actions_len,
                         ),
@@ -808,14 +817,16 @@ impl RealCfrSolver {
                     let infoset = self.infosets[state.node_id]
                         .as_ref()
                         .expect("decision node must have infoset");
+                    let slot_start = infoset.slots_start + row_start;
+                    let slot_end = infoset.slots_start + row_end;
                     let strategies = match strategy_source {
                         StrategySource::Current => current_strategies(
-                            &infoset.regrets[row_start..row_end],
+                            &self.regrets[slot_start..slot_end],
                             acting_combos,
                             actions_len,
                         ),
                         StrategySource::Average => average_strategies(
-                            &infoset.strategy_sum[row_start..row_end],
+                            &self.strategy_sum[slot_start..slot_end],
                             acting_combos,
                             actions_len,
                         ),
@@ -1173,14 +1184,15 @@ impl RealCfrSolver {
                         Player::Ip => &ip_reaches[state_index],
                     };
                     let infoset = self.infosets[state.node_id]
-                        .as_mut()
+                        .as_ref()
                         .expect("decision node must have infoset");
+                    let slots_start = infoset.slots_start;
                     let mut strategy_probs = [0.0f32; 8];
                     for combo in 0..acting_combos {
                         let local_row_start = combo * actions_len;
                         fill_strategy_probs(
-                            &infoset.regrets[row_start + local_row_start
-                                ..row_start + local_row_start + actions_len],
+                            &self.regrets[slots_start + row_start + local_row_start
+                                ..slots_start + row_start + local_row_start + actions_len],
                             &mut strategy_probs,
                         )?;
                         let mut node_value = 0.0f32;
@@ -1211,10 +1223,10 @@ impl RealCfrSolver {
                                 Player::Ip => action_values.ip[combo],
                             };
                             let local_slot = combo * actions_len + action_index;
-                            let slot = row_start + local_slot;
+                            let slot = slots_start + row_start + local_slot;
                             apply_real_cfr_update_with_factors(
-                                &mut infoset.regrets[slot],
-                                &mut infoset.strategy_sum[slot],
+                                &mut self.regrets[slot],
+                                &mut self.strategy_sum[slot],
                                 action_value - node_value,
                                 own_reach[combo] * strategy_probs[action_index],
                                 &update_factors,
@@ -1259,8 +1271,10 @@ impl RealCfrSolver {
                     let infoset = self.infosets[state.node_id]
                         .as_ref()
                         .expect("decision node must have infoset");
+                    let slot_start = infoset.slots_start + row_start;
+                    let slot_end = infoset.slots_start + row_end;
                     let strategies = average_strategies(
-                        &infoset.strategy_sum[row_start..row_end],
+                        &self.strategy_sum[slot_start..slot_end],
                         acting_combos,
                         actions_len,
                     );
@@ -1492,8 +1506,10 @@ impl RealCfrSolver {
                     debug_assert_eq!(infoset.player, player);
                     debug_assert_eq!(infoset.actions, actions_len);
                     debug_assert!(board_slot < infoset.board_count);
+                    let slot_start = infoset.slots_start + row_start;
+                    let slot_end = infoset.slots_start + row_end;
                     current_strategies(
-                        &infoset.regrets[row_start..row_end],
+                        &self.regrets[slot_start..slot_end],
                         acting_combos,
                         actions_len,
                     )
@@ -1558,8 +1574,9 @@ impl RealCfrSolver {
                     Player::Ip => ip_reach,
                 };
                 let infoset = self.infosets[node_id]
-                    .as_mut()
+                    .as_ref()
                     .expect("decision node must have infoset");
+                let slots_start = infoset.slots_start;
                 for combo in 0..acting_combos {
                     let node_value = match player {
                         Player::Oop => values.oop[combo],
@@ -1571,10 +1588,10 @@ impl RealCfrSolver {
                             Player::Ip => action_values[action_index].ip[combo],
                         };
                         let local_slot = combo * actions_len + action_index;
-                        let slot = row_start + local_slot;
+                        let slot = slots_start + row_start + local_slot;
                         apply_real_cfr_update(
-                            &mut infoset.regrets[slot],
-                            &mut infoset.strategy_sum[slot],
+                            &mut self.regrets[slot],
+                            &mut self.strategy_sum[slot],
                             action_value - node_value,
                             own_reach[combo] * strategies[local_slot],
                             average_weight,
@@ -2571,7 +2588,7 @@ mod tests {
             .infosets
             .iter()
             .filter_map(Option::as_ref)
-            .map(|infoset| infoset.regrets.len())
+            .map(|infoset| infoset.slots_len)
             .sum::<usize>();
         assert_eq!(action_slots, 5_981_008);
         assert_eq!(solver.turn_index_by_key.len(), 49);
