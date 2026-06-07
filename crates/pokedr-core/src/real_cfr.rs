@@ -8,7 +8,7 @@ use crate::terminal_cfv::{
 };
 use crate::tree::{Player, PublicNodeKind, PublicTree, TerminalReason};
 use rayon::prelude::*;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -222,7 +222,7 @@ struct TerminalAccumulator {
     ip_counts: Vec<f32>,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 struct TerminalWorkerProfile {
     worker_index: usize,
     tasks: usize,
@@ -243,6 +243,7 @@ struct TerminalWorkerProfile {
     cfv_ms: f64,
     accumulator_ms: f64,
     elapsed_ms: f64,
+    side_cache_keys: Vec<TerminalSideCacheKey>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1419,6 +1420,8 @@ impl RealCfrSolver {
         }
         let threads = effective_worker_count(threads).min(terminal_len);
         let profile_terminal = std::env::var_os("POKEDR_REAL_CFR_TERMINAL_PROFILE").is_some();
+        let profile_side_cache_keys =
+            std::env::var_os("POKEDR_REAL_CFR_SIDE_CACHE_KEY_PROFILE").is_some();
         let partitions = terminal_phase_partitions(states, terminal_start, threads);
         let worker_scope_started = Instant::now();
         let mut partition_chunks = Vec::with_capacity(partitions.len());
@@ -1441,6 +1444,7 @@ impl RealCfrSolver {
                     worker_index,
                     values_chunk,
                     profile_terminal,
+                    profile_side_cache_keys,
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -1452,6 +1456,9 @@ impl RealCfrSolver {
                 values_alloc_ms, worker_scope_ms,
             );
             print_terminal_worker_profiles(total_tasks, profiles.len(), &profiles);
+        }
+        if profile_side_cache_keys {
+            print_terminal_side_cache_key_profile(&profiles);
         }
         Ok(())
     }
@@ -1465,6 +1472,7 @@ impl RealCfrSolver {
         worker_index: usize,
         values_chunk: &mut [Values],
         profile_terminal: bool,
+        profile_side_cache_keys: bool,
     ) -> Result<TerminalWorkerProfile, String> {
         let started = Instant::now();
         let scratch_source = self
@@ -1609,6 +1617,9 @@ impl RealCfrSolver {
         }
         profile.side_cache_hits = side_cache.hits;
         profile.side_cache_misses = side_cache.misses;
+        if profile_side_cache_keys {
+            profile.side_cache_keys = side_cache.entries.keys().cloned().collect();
+        }
         profile.output_states = values_chunk.len();
         profile.elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
         Ok(profile)
@@ -3710,6 +3721,55 @@ fn print_terminal_worker_profiles(
             profile.elapsed_ms,
         );
     }
+}
+
+fn print_terminal_side_cache_key_profile(profiles: &[TerminalWorkerProfile]) {
+    let mut global_keys: HashMap<TerminalSideCacheKey, usize> = HashMap::new();
+    let mut board_keys: HashMap<usize, HashSet<TerminalSideCacheKey>> = HashMap::new();
+    let mut worker_local_keys = 0usize;
+    for profile in profiles {
+        let local_keys = profile
+            .side_cache_keys
+            .iter()
+            .cloned()
+            .collect::<HashSet<_>>();
+        worker_local_keys += local_keys.len();
+        for key in local_keys {
+            *global_keys.entry(key.clone()).or_insert(0) += 1;
+            board_keys.entry(key.cache_index).or_default().insert(key);
+        }
+    }
+    let unique_keys = global_keys.len();
+    let cross_worker_keys = global_keys
+        .values()
+        .filter(|worker_count| **worker_count > 1)
+        .count();
+    let cross_worker_extra_touches = global_keys
+        .values()
+        .map(|worker_count| worker_count.saturating_sub(1))
+        .sum::<usize>();
+    let max_workers_for_key = global_keys.values().copied().max().unwrap_or(0);
+    let mut board_unique_counts = board_keys
+        .iter()
+        .map(|(cache_index, keys)| (*cache_index, keys.len()))
+        .collect::<Vec<_>>();
+    board_unique_counts.sort_unstable_by(|left, right| right.1.cmp(&left.1));
+    let top_boards = board_unique_counts
+        .iter()
+        .take(8)
+        .map(|(cache_index, count)| format!("{cache_index}:{count}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    eprintln!(
+        "real_cfr_side_cache_key_profile workers={} worker_local_keys={} unique_keys={} cross_worker_keys={} cross_worker_extra_touches={} max_workers_for_key={} top_boards={}",
+        profiles.len(),
+        worker_local_keys,
+        unique_keys,
+        cross_worker_keys,
+        cross_worker_extra_touches,
+        max_workers_for_key,
+        top_boards,
+    );
 }
 
 fn terminal_task_checksum(
