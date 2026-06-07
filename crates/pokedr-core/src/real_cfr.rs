@@ -1008,7 +1008,14 @@ impl RealCfrSolver {
     fn collect_phase_states(&self) -> Result<Vec<PhaseState>, String> {
         let mut states = Vec::new();
         let mut index_by_key = BTreeMap::new();
-        self.collect_phase_state_from(0, &self.flop_board, &mut states, &mut index_by_key)?;
+        let mut terminal_ref_cache = BTreeMap::new();
+        self.collect_phase_state_from(
+            0,
+            &self.flop_board,
+            &mut states,
+            &mut index_by_key,
+            &mut terminal_ref_cache,
+        )?;
         reorder_phase_states_by_level_and_slot(
             &self.tree,
             &self.infosets,
@@ -1024,6 +1031,7 @@ impl RealCfrSolver {
         board: &Board,
         states: &mut Vec<PhaseState>,
         index_by_key: &mut BTreeMap<(usize, u64), usize>,
+        terminal_ref_cache: &mut BTreeMap<u64, Vec<TerminalCacheRef>>,
     ) -> Result<usize, String> {
         let key = (node_id, ordered_board_key(board));
         if let Some(index) = index_by_key.get(&key) {
@@ -1033,7 +1041,8 @@ impl RealCfrSolver {
         index_by_key.insert(key, state_index);
         let board_slot = self.board_slot(board)?;
         let terminal_cache_indices = self.phase_state_terminal_cache_indices(node_id, board)?;
-        let terminal_cache_refs = self.phase_state_terminal_cache_refs(node_id, board)?;
+        let terminal_cache_refs =
+            self.phase_state_terminal_cache_refs(node_id, board, terminal_ref_cache)?;
         states.push(PhaseState {
             node_id,
             board: board.clone(),
@@ -1058,6 +1067,7 @@ impl RealCfrSolver {
                         &board.push(card)?,
                         states,
                         index_by_key,
+                        terminal_ref_cache,
                     )?);
                 }
             }
@@ -1068,6 +1078,7 @@ impl RealCfrSolver {
                         board,
                         states,
                         index_by_key,
+                        terminal_ref_cache,
                     )?);
                 }
             }
@@ -1102,12 +1113,39 @@ impl RealCfrSolver {
         &self,
         node_id: usize,
         board: &Board,
+        terminal_ref_cache: &mut BTreeMap<u64, Vec<TerminalCacheRef>>,
     ) -> Result<Vec<TerminalCacheRef>, String> {
         let PublicNodeKind::Terminal { reason } = self.tree.nodes[node_id].kind else {
             return Ok(Vec::new());
         };
         if !matches!(reason, TerminalReason::Showdown | TerminalReason::AllIn) {
             return Ok(Vec::new());
+        }
+        let key = ordered_board_key(board);
+        if let Some(cached) = terminal_ref_cache.get(&key) {
+            return Ok(cached.clone());
+        }
+        let refs = self.terminal_cache_refs_for_board(board)?;
+        terminal_ref_cache.insert(key, refs.clone());
+        Ok(refs)
+    }
+
+    fn terminal_cache_refs_for_board(
+        &self,
+        board: &Board,
+    ) -> Result<Vec<TerminalCacheRef>, String> {
+        if board.cards().len() == 5 {
+            let cache_index = self
+                .terminal_cache_index_by_key
+                .get(&unordered_board_key(board))
+                .copied()
+                .ok_or_else(|| "terminal board is outside the solver board cache".to_string())?;
+            return Ok(vec![TerminalCacheRef {
+                cache_index,
+                member_permutation_codes: vec![
+                    crate::isomorphism::SuitPermutation::identity().code(),
+                ],
+            }]);
         }
         terminal_board_isomorphism(board, &self.oop_range, &self.ip_range)?
             .into_iter()
@@ -1757,7 +1795,12 @@ impl RealCfrSolver {
         hero_values: &[f32],
         villain_values: &[f32],
     ) -> Result<(), String> {
+        let identity_code = crate::isomorphism::SuitPermutation::identity().code();
         for permutation_code in &terminal_ref.member_permutation_codes {
+            if *permutation_code == identity_code {
+                accumulator.add_board_values(cache, pot, hero_values, villain_values);
+                continue;
+            }
             let maps = self
                 .combo_permutations
                 .get(permutation_code)
@@ -2496,6 +2539,25 @@ impl TerminalAccumulator {
         self.values.terminal_evals = 0;
         self.oop_counts.fill(0.0);
         self.ip_counts.fill(0.0);
+    }
+
+    fn add_board_values(
+        &mut self,
+        cache: &TerminalEvalCache,
+        pot: u32,
+        hero_values: &[f32],
+        villain_values: &[f32],
+    ) {
+        let pot = pot as f32;
+        for target in &cache.oop_targets {
+            self.values.oop[target.range_index] += hero_values[target.board_index as usize] * pot;
+            self.oop_counts[target.range_index] += 1.0;
+        }
+        for target in &cache.ip_targets {
+            self.values.ip[target.range_index] += villain_values[target.board_index as usize] * pot;
+            self.ip_counts[target.range_index] += 1.0;
+        }
+        self.values.terminal_evals += 1;
     }
 
     fn add_board_values_permuted(
