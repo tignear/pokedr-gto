@@ -491,6 +491,19 @@ impl RealCfrSolver {
         })
     }
 
+    pub fn regret_len(&self) -> usize {
+        self.regrets.len()
+    }
+
+    pub fn strategy_sum_len(&self) -> usize {
+        self.strategy_sum.len()
+    }
+
+    pub fn storage_gib(&self) -> f64 {
+        (self.regrets.len() + self.strategy_sum.len()) as f64 * std::mem::size_of::<f32>() as f64
+            / (1024.0 * 1024.0 * 1024.0)
+    }
+
     pub fn run(&mut self, config: RealCfrConfig) -> Result<RealCfrSummary, String> {
         self.run_with_progress(config, |_| {})
     }
