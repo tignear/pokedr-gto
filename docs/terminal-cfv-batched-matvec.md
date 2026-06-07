@@ -97,3 +97,34 @@ block_tie(h)   = equal_card[c1, g(h)] + equal_card[c2, g(h)] - reach[h]
   tile or small board-table batch rather than stored for every terminal.
 - Previous full 52-card prefix and per-combo workgroup blocker reductions were
   slower; do not retry those shapes unchanged.
+
+## Fixed-board multi-column prefix smoke
+
+A CPU smoke path now benchmarks the conservative version of this idea:
+
+```text
+terminal_cfv_batch_smoke columns=C batch_width=W
+```
+
+It uses one deterministic terminal board from the input flop/turn/river board,
+generates `C` independent reach columns, compares the current scalar
+prefix/blocker path against a multi-column prefix/blocker path, and reports
+`max_delta`.
+
+Measured on `As7h2c`, `128` reach columns, `16` threads:
+
+```text
+width=1   baseline_ms=1.514 batch_ms=2.218 speedup=0.683
+width=2   baseline_ms=1.643 batch_ms=1.917 speedup=0.857
+width=4   baseline_ms=1.689 batch_ms=1.665 speedup=1.014
+width=8   baseline_ms=1.518 batch_ms=1.714 speedup=0.885
+width=16  baseline_ms=1.317 batch_ms=1.638 speedup=0.804
+width=32  baseline_ms=1.290 batch_ms=1.903 speedup=0.678
+width=64  baseline_ms=1.441 batch_ms=2.959 speedup=0.487
+```
+
+All runs had `max_delta=0`. The formula is correct, but this layout is not a
+production win on CPU. It increases strided column access and prefix memory
+traffic enough to erase the amortization from shared rank/blocker tables. Do
+not make this the default terminal CFV path without a different layout or a GPU
+kernel that keeps the multi-column prefix/blocker tile in fast memory.

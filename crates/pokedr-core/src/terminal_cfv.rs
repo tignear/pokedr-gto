@@ -66,6 +66,19 @@ pub struct TerminalCfvTreePass {
     pub checksum: f64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TerminalCfvBatchSmoke {
+    pub columns: usize,
+    pub batch_width: usize,
+    pub threads: usize,
+    pub baseline_elapsed_ms: f64,
+    pub batch_elapsed_ms: f64,
+    pub speedup: f64,
+    pub max_delta: f32,
+    pub baseline_checksum: f64,
+    pub batch_checksum: f64,
+}
+
 #[derive(Debug, Clone)]
 pub struct PreparedTerminalCfvSmoke {
     prepared: Vec<PreparedTerminalBoard>,
@@ -305,6 +318,142 @@ pub fn terminal_cfv_tree_pass(
     })
 }
 
+pub fn terminal_cfv_batch_smoke(
+    board: &Board,
+    columns: usize,
+    batch_width: usize,
+    requested_threads: usize,
+) -> Result<TerminalCfvBatchSmoke, String> {
+    let terminal_board = first_terminal_board(board)?;
+    let prepared = PreparedTerminalBoard::new(&terminal_board)?;
+    let combos = prepared.combos().len();
+    let columns = columns.max(1);
+    let batch_width = batch_width.max(1).min(columns);
+    let available_threads = rayon::current_num_threads();
+    let threads = if requested_threads == 0 {
+        available_threads
+    } else {
+        requested_threads.min(available_threads)
+    }
+    .max(1)
+    .min(columns);
+
+    let mut hero_reaches = vec![0.0f32; columns * combos];
+    let mut villain_reaches = vec![0.0f32; columns * combos];
+    for column in 0..columns {
+        let hero = deterministic_reach(
+            combos,
+            column * 11,
+            17 + column % 7,
+            0.25,
+            0.0175 + (column % 5) as f32 * 0.001,
+        );
+        let villain = deterministic_reach(
+            combos,
+            7 + column * 13,
+            23 + column % 11,
+            0.50,
+            0.01125 + (column % 3) as f32 * 0.001,
+        );
+        hero_reaches[column * combos..(column + 1) * combos].copy_from_slice(&hero);
+        villain_reaches[column * combos..(column + 1) * combos].copy_from_slice(&villain);
+    }
+
+    let baseline_started = Instant::now();
+    let baseline_parts = (0..threads)
+        .into_par_iter()
+        .map(
+            |thread_index| -> Result<Vec<(usize, Vec<f32>, Vec<f32>)>, String> {
+                let mut scratch = TerminalCfvScratch::new(&prepared);
+                let mut outputs = Vec::new();
+                let mut column = thread_index;
+                while column < columns {
+                    terminal_cfv_prefix_blocker_into(
+                        &prepared,
+                        &hero_reaches[column * combos..(column + 1) * combos],
+                        &villain_reaches[column * combos..(column + 1) * combos],
+                        &mut scratch,
+                    )?;
+                    outputs.push((
+                        column,
+                        scratch.hero_values.clone(),
+                        scratch.villain_values.clone(),
+                    ));
+                    column += threads;
+                }
+                Ok(outputs)
+            },
+        )
+        .collect::<Result<Vec<_>, _>>()?;
+    let baseline_elapsed_ms = baseline_started.elapsed().as_secs_f64() * 1000.0;
+    let mut baseline_hero = vec![0.0f32; columns * combos];
+    let mut baseline_villain = vec![0.0f32; columns * combos];
+    for part in baseline_parts {
+        for (column, hero, villain) in part {
+            baseline_hero[column * combos..(column + 1) * combos].copy_from_slice(&hero);
+            baseline_villain[column * combos..(column + 1) * combos].copy_from_slice(&villain);
+        }
+    }
+
+    let batch_started = Instant::now();
+    let batch_ranges = (0..columns)
+        .step_by(batch_width)
+        .map(|start| (start, (start + batch_width).min(columns)))
+        .collect::<Vec<_>>();
+    let batch_parts = batch_ranges
+        .into_par_iter()
+        .map(|(start, end)| {
+            let width = end - start;
+            let mut hero_values = vec![0.0f32; width * combos];
+            let mut villain_values = vec![0.0f32; width * combos];
+            terminal_cfv_prefix_blocker_columns_into(
+                &prepared,
+                &hero_reaches[start * combos..end * combos],
+                &villain_reaches[start * combos..end * combos],
+                width,
+                &mut hero_values,
+                &mut villain_values,
+            );
+            (start, hero_values, villain_values)
+        })
+        .collect::<Vec<_>>();
+    let batch_elapsed_ms = batch_started.elapsed().as_secs_f64() * 1000.0;
+    let mut batch_hero = vec![0.0f32; columns * combos];
+    let mut batch_villain = vec![0.0f32; columns * combos];
+    for (start, hero, villain) in batch_parts {
+        let width = hero.len() / combos;
+        batch_hero[start * combos..(start + width) * combos].copy_from_slice(&hero);
+        batch_villain[start * combos..(start + width) * combos].copy_from_slice(&villain);
+    }
+
+    let max_delta = baseline_hero
+        .iter()
+        .chain(&baseline_villain)
+        .zip(batch_hero.iter().chain(&batch_villain))
+        .map(|(left, right)| (left - right).abs())
+        .fold(0.0f32, f32::max);
+    let baseline_checksum =
+        terminal_cfv_columns_checksum(&baseline_hero, &baseline_villain, combos);
+    let batch_checksum = terminal_cfv_columns_checksum(&batch_hero, &batch_villain, combos);
+    let speedup = if batch_elapsed_ms > 0.0 {
+        baseline_elapsed_ms / batch_elapsed_ms
+    } else {
+        0.0
+    };
+
+    Ok(TerminalCfvBatchSmoke {
+        columns,
+        batch_width,
+        threads,
+        baseline_elapsed_ms,
+        batch_elapsed_ms,
+        speedup,
+        max_delta,
+        baseline_checksum,
+        batch_checksum,
+    })
+}
+
 fn run_terminal_cfv_parallel_smoke_prepared(
     prepared: &[PreparedTerminalBoard],
     calls: usize,
@@ -362,6 +511,16 @@ fn run_terminal_cfv_parallel_smoke_prepared(
     })
 }
 
+fn first_terminal_board(board: &Board) -> Result<Board, String> {
+    if board.cards().len() == 5 {
+        return Ok(board.clone());
+    }
+    terminal_boards(board)?
+        .into_iter()
+        .next()
+        .ok_or_else(|| "no terminal boards generated".to_string())
+}
+
 fn run_terminal_cfv_smoke_call(
     prepared: &[PreparedTerminalBoard],
     hero_reach: &[f32],
@@ -376,6 +535,56 @@ fn run_terminal_cfv_smoke_call(
     let sample = task % combos;
     Ok(scratch.hero_values[sample] as f64 * 0.5
         + scratch.villain_values[(sample * 37) % combos] as f64 * 0.25)
+}
+
+fn terminal_cfv_prefix_blocker_columns_into(
+    prepared: &PreparedTerminalBoard,
+    hero_reaches: &[f32],
+    villain_reaches: &[f32],
+    columns: usize,
+    hero_values: &mut [f32],
+    villain_values: &mut [f32],
+) {
+    side_values_prefix_blocker_columns_into(prepared, villain_reaches, columns, hero_values);
+    side_values_prefix_blocker_columns_into(prepared, hero_reaches, columns, villain_values);
+}
+
+fn side_values_prefix_blocker_columns_into(
+    prepared: &PreparedTerminalBoard,
+    opponent_reaches: &[f32],
+    columns: usize,
+    values: &mut [f32],
+) {
+    let combos = prepared.combos.len();
+    let mut prefix = vec![0.0f32; (combos + 1) * columns];
+    for (sorted_index, combo_index) in prepared.order.iter().enumerate() {
+        let previous = sorted_index * columns;
+        let next = previous + columns;
+        for column in 0..columns {
+            prefix[next + column] =
+                prefix[previous + column] + opponent_reaches[column * combos + *combo_index];
+        }
+    }
+    let total_start = combos * columns;
+
+    for hero in 0..combos {
+        let (lower, upper) = prepared.group_bounds[hero];
+        let lower_start = lower * columns;
+        let upper_start = upper * columns;
+        let (weak_start, weak_end) = prepared.weaker_blocker_ranges[hero];
+        let (strong_start, strong_end) = prepared.stronger_blocker_ranges[hero];
+        for column in 0..columns {
+            let mut value = prefix[lower_start + column]
+                - (prefix[total_start + column] - prefix[upper_start + column]);
+            for blocker in &prepared.weaker_blockers[weak_start..weak_end] {
+                value -= opponent_reaches[column * combos + *blocker as usize];
+            }
+            for blocker in &prepared.stronger_blockers[strong_start..strong_end] {
+                value += opponent_reaches[column * combos + *blocker as usize];
+            }
+            values[column * combos + hero] = value;
+        }
+    }
 }
 
 impl TerminalCfvScratch {
@@ -868,6 +1077,25 @@ fn terminal_cfv_output_checksum(scratch: &TerminalCfvScratch) -> f64 {
         .sum()
 }
 
+fn terminal_cfv_columns_checksum(
+    hero_values: &[f32],
+    villain_values: &[f32],
+    combos: usize,
+) -> f64 {
+    hero_values
+        .chunks(combos)
+        .chain(villain_values.chunks(combos))
+        .enumerate()
+        .map(|(column, values)| {
+            values
+                .iter()
+                .enumerate()
+                .map(|(index, value)| *value as f64 * (column as f64 + 1.0) * (index as f64 + 1.0))
+                .sum::<f64>()
+        })
+        .sum()
+}
+
 fn deterministic_reach(
     combos: usize,
     offset: usize,
@@ -1327,6 +1555,19 @@ mod tests {
         assert!(smoke.threads >= 1);
         assert!(smoke.calls_per_second > 0.0);
         assert!(smoke.checksum.is_finite());
+    }
+
+    #[test]
+    fn batch_smoke_matches_scalar_prefix_for_flop_input() {
+        let flop = Board::from_str("As7h2c").unwrap();
+        let smoke = terminal_cfv_batch_smoke(&flop, 8, 4, 2).unwrap();
+        assert_eq!(smoke.columns, 8);
+        assert_eq!(smoke.batch_width, 4);
+        assert!(smoke.baseline_elapsed_ms >= 0.0);
+        assert!(smoke.batch_elapsed_ms >= 0.0);
+        assert!(smoke.max_delta < 1e-4, "max_delta={}", smoke.max_delta);
+        assert!(smoke.baseline_checksum.is_finite());
+        assert!(smoke.batch_checksum.is_finite());
     }
 
     fn flatten_targets(targets: &[Option<usize>]) -> Vec<u16> {

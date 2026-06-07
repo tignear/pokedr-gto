@@ -492,3 +492,27 @@ ideas.
   step would be grouping identical river tree shapes so one dispatch sequence
   processes multiple boards/states instead of running each board as a separate
   solve.
+
+## 2026-06-07: Fixed-board multi-column terminal CFV prefix
+
+- Tried: add a diagnostic `terminal_cfv_batch_smoke` path that evaluates
+  several independent reach columns for one fixed final board with one shared
+  multi-column prefix/blocker table.
+- Expected: if final-board rank/blocker reuse was the missing lever, batching
+  columns should beat the scalar prefix/blocker call loop while producing
+  identical values.
+- Result: correct but not useful on CPU. On `As7h2c`, `128` columns,
+  `16` threads, all runs had `max_delta=0`, but the best batch width only
+  reached parity:
+  - width `1`: `0.683x`
+  - width `2`: `0.857x`
+  - width `4`: `1.014x`
+  - width `8`: `0.885x`
+  - width `16`: `0.804x`
+  - width `32`: `0.678x`
+  - width `64`: `0.487x`
+- Decision: keep only as a diagnostic/smoke path. The scalar prefix/blocker
+  path is already compact enough that this CPU column-major layout mostly adds
+  strided memory traffic. A real batched terminal kernel needs a different
+  memory layout or GPU-local tiling; do not promote this exact shape to the CFR
+  hot path.

@@ -20,8 +20,8 @@ pub use real_cfr::{
     TerminalEvalBreakdown,
 };
 pub use terminal_cfv::{
-    PreparedTerminalCfvSmoke, TerminalCfvParallelSmoke, TerminalCfvTreePass,
-    terminal_cfv_parallel_smoke, terminal_cfv_tree_pass,
+    PreparedTerminalCfvSmoke, TerminalCfvBatchSmoke, TerminalCfvParallelSmoke, TerminalCfvTreePass,
+    terminal_cfv_batch_smoke, terminal_cfv_parallel_smoke, terminal_cfv_tree_pass,
 };
 pub use tree::{
     ActionAbstraction, ActionKind, ChanceExpansion, ChanceSpec, Player, PublicNode, PublicNodeKind,

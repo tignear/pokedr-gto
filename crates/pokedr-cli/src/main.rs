@@ -79,6 +79,12 @@ enum Command {
         #[arg(long)]
         terminal_cfv_smoke: bool,
         #[arg(long)]
+        terminal_cfv_batch_smoke: bool,
+        #[arg(long, default_value_t = 64)]
+        terminal_cfv_batch_columns: usize,
+        #[arg(long, default_value_t = 16)]
+        terminal_cfv_batch_width: usize,
+        #[arg(long)]
         terminal_cfv_tree_pass: bool,
         #[arg(long)]
         run_real_cfr: bool,
@@ -301,6 +307,9 @@ fn main() -> Result<(), String> {
             run_cost_benchmark,
             state_threads,
             terminal_cfv_smoke,
+            terminal_cfv_batch_smoke,
+            terminal_cfv_batch_columns,
+            terminal_cfv_batch_width,
             terminal_cfv_tree_pass,
             run_real_cfr,
             run_real_cfr_three_phase,
@@ -393,6 +402,28 @@ fn main() -> Result<(), String> {
                     started.elapsed().as_secs_f64() * 1000.0,
                     smoke.calls_per_second,
                     smoke.checksum,
+                );
+            }
+            if terminal_cfv_batch_smoke {
+                let started = Instant::now();
+                let smoke = pokedr_core::terminal_cfv_batch_smoke(
+                    &tree.spot.board,
+                    terminal_cfv_batch_columns,
+                    terminal_cfv_batch_width,
+                    terminal_cfv_threads,
+                )?;
+                println!(
+                    "terminal_cfv_batch_smoke columns={} batch_width={} threads={} baseline_ms={:.3} batch_ms={:.3} speedup={:.3} max_delta={:.6} total_ms={:.3} baseline_checksum={:.6} batch_checksum={:.6}",
+                    smoke.columns,
+                    smoke.batch_width,
+                    smoke.threads,
+                    smoke.baseline_elapsed_ms,
+                    smoke.batch_elapsed_ms,
+                    smoke.speedup,
+                    smoke.max_delta,
+                    started.elapsed().as_secs_f64() * 1000.0,
+                    smoke.baseline_checksum,
+                    smoke.batch_checksum,
                 );
             }
             if terminal_cfv_tree_pass {
