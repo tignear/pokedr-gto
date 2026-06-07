@@ -252,6 +252,13 @@ Current measurement:
   board tasks, but only `16` unique OOP reach vectors, `13` unique IP reach
   vectors, and `46` unique `(OOP reach, IP reach)` pairs. That is about
   `29.7x` task-to-reach-pair reuse per final board.
+- Added `--terminal-board-reuse-after-cfr` because the initial result was
+  mostly uniform-strategy reuse. On the same spot after `1` DCFR+ iteration,
+  the average unique reach-pair count increased to about `351`, leaving only
+  `3.9x` reuse. After `4` iterations it increased to about `710`, leaving only
+  `1.9x` reuse. This is still mathematically valid reuse, but it is too weak
+  to be the main terminal CFV optimization unless later converged strategies
+  collapse back to fewer distinct reach vectors.
 
 Open blocker:
 
@@ -267,6 +274,9 @@ Open blocker:
   sort. It should build per-final-board reach-pair groups, evaluate each unique
   pair once, and scatter the reused board values back to all terminal states in
   that group.
+- The after-CFR measurements weaken this plan: exact reach-pair grouping is a
+  diagnostic and maybe a small optimization, not the expected order-of-magnitude
+  improvement.
 
 Block-local experiment:
 

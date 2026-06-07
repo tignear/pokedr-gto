@@ -112,6 +112,8 @@ enum Command {
         terminal_board_locality: bool,
         #[arg(long)]
         terminal_board_reuse: bool,
+        #[arg(long)]
+        terminal_board_reuse_after_cfr: bool,
         #[arg(long, default_value_t = 12)]
         terminal_board_reuse_top: usize,
         #[arg(long)]
@@ -328,6 +330,7 @@ fn main() -> Result<(), String> {
             run_terminal_board_phase_board_major,
             terminal_board_locality,
             terminal_board_reuse,
+            terminal_board_reuse_after_cfr,
             terminal_board_reuse_top,
             terminal_eval_breakdown,
             terminal_cfv_calls,
@@ -640,11 +643,53 @@ fn main() -> Result<(), String> {
             }
             if terminal_board_reuse {
                 let started = Instant::now();
-                let solver = RealCfrSolver::new(
+                let mut solver = RealCfrSolver::new(
                     tree.clone(),
                     RangeSpec::from_str(&oop_range)?,
                     RangeSpec::from_str(&ip_range)?,
                 )?;
+                let mut completed_reuse_iterations = 0;
+                if terminal_board_reuse_after_cfr {
+                    let reuse_solve_started = Instant::now();
+                    let summary = solver.run_three_phase(
+                        RealCfrConfig {
+                            iterations,
+                            variant: real_cfr_variant,
+                        },
+                        state_threads,
+                        |progress| {
+                            if real_cfr_log_interval > 0
+                                && (progress.iteration == 1
+                                    || progress.iteration == iterations
+                                    || progress.iteration % real_cfr_log_interval == 0)
+                            {
+                                println!(
+                                    "terminal_board_reuse_cfr_progress iteration={} terminal_evals={} reach_ms={:.3} terminal_ms={:.3} backup_ms={:.3} root_oop_value={:.6} root_ip_value={:.6} zero_sum_delta={:.6}",
+                                    progress.iteration,
+                                    progress.terminal_evals,
+                                    progress.reach_ms,
+                                    progress.terminal_ms,
+                                    progress.backup_ms,
+                                    progress.root_oop_value,
+                                    progress.root_ip_value,
+                                    progress.root_oop_value + progress.root_ip_value,
+                                );
+                            }
+                        },
+                    )?;
+                    completed_reuse_iterations = summary.iterations;
+                    println!(
+                        "terminal_board_reuse_cfr iterations={} elapsed_ms={:.3} reach_ms={:.3} terminal_ms={:.3} backup_ms={:.3} root_oop_value={:.6} root_ip_value={:.6} zero_sum_delta={:.6}",
+                        summary.iterations,
+                        reuse_solve_started.elapsed().as_secs_f64() * 1000.0,
+                        summary.reach_ms,
+                        summary.terminal_ms,
+                        summary.backup_ms,
+                        summary.root_oop_value,
+                        summary.root_ip_value,
+                        summary.root_oop_value + summary.root_ip_value,
+                    );
+                }
                 let report = solver.terminal_board_reuse_report()?;
                 let average_pair_reuse_factor =
                     if report.average_pair_unique_reaches_per_board > 0.0 {
@@ -654,7 +699,8 @@ fn main() -> Result<(), String> {
                         0.0
                     };
                 println!(
-                    "terminal_board_reuse state_board_pairs={} unique_boards={} avg_state_board_pairs_per_board={:.3} min_state_board_pairs_per_board={} max_state_board_pairs_per_board={} avg_unique_terminal_states_per_board={:.3} avg_oop_unique_reaches_per_board={:.3} avg_ip_unique_reaches_per_board={:.3} avg_pair_unique_reaches_per_board={:.3} avg_pair_reuse_factor={:.3} total_ms={:.3}",
+                    "terminal_board_reuse cfr_iterations={} state_board_pairs={} unique_boards={} avg_state_board_pairs_per_board={:.3} min_state_board_pairs_per_board={} max_state_board_pairs_per_board={} avg_unique_terminal_states_per_board={:.3} avg_oop_unique_reaches_per_board={:.3} avg_ip_unique_reaches_per_board={:.3} avg_pair_unique_reaches_per_board={:.3} avg_pair_reuse_factor={:.3} total_ms={:.3}",
+                    completed_reuse_iterations,
                     report.state_board_pairs,
                     report.unique_boards,
                     report.average_state_board_pairs_per_board,
