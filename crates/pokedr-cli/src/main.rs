@@ -484,12 +484,11 @@ fn main() -> Result<(), String> {
                     RangeSpec::from_str(&oop_range)?,
                     RangeSpec::from_str(&ip_range)?,
                 )?;
-                let summary = solver.run_three_phase(
+                let summary = solver.run_with_progress(
                     RealCfrConfig {
                         iterations,
                         variant: real_cfr_variant,
                     },
-                    state_threads,
                     |progress| {
                         if real_cfr_log_interval > 0
                             && (progress.iteration == 1
@@ -497,12 +496,10 @@ fn main() -> Result<(), String> {
                                 || progress.iteration % real_cfr_log_interval == 0)
                         {
                             println!(
-                                "real_cfr_progress iteration={} terminal_evals={} reach_ms={:.3} terminal_ms={:.3} backup_ms={:.3} root_oop_value={:.6} root_ip_value={:.6} zero_sum_delta={:.6}",
+                                "real_cfr_progress iteration={} terminal_evals={} iteration_ms={:.3} root_oop_value={:.6} root_ip_value={:.6} zero_sum_delta={:.6}",
                                 progress.iteration,
                                 progress.terminal_evals,
-                                progress.reach_ms,
-                                progress.terminal_ms,
-                                progress.backup_ms,
+                                progress.elapsed_ms,
                                 progress.root_oop_value,
                                 progress.root_ip_value,
                                 progress.root_oop_value + progress.root_ip_value,
@@ -511,16 +508,12 @@ fn main() -> Result<(), String> {
                     },
                 )?;
                 println!(
-                    "real_cfr iterations={} states={} decision_nodes={} action_slots={} terminal_evals={} elapsed_ms={:.3} reach_ms={:.3} terminal_ms={:.3} backup_ms={:.3} root_oop_value={:.6} root_ip_value={:.6} zero_sum_delta={:.6}",
+                    "real_cfr iterations={} decision_nodes={} action_slots={} terminal_evals={} elapsed_ms={:.3} root_oop_value={:.6} root_ip_value={:.6} zero_sum_delta={:.6}",
                     summary.iterations,
-                    summary.states,
                     summary.decision_nodes,
                     summary.action_slots,
                     summary.terminal_evals,
                     started.elapsed().as_secs_f64() * 1000.0,
-                    summary.reach_ms,
-                    summary.terminal_ms,
-                    summary.backup_ms,
                     summary.root_oop_value,
                     summary.root_ip_value,
                     summary.root_oop_value + summary.root_ip_value,
