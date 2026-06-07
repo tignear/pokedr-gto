@@ -4,6 +4,21 @@ This file records optimization attempts that failed, were reverted, or were too
 small to count as a strategic direction. Add entries before retrying similar
 ideas.
 
+## 2026-06-07: Sparse clear for prepared-board live reach
+
+- Tried: replace `out.fill(0.0)` in `reach_on_prepared_board_sparse_into` with
+  clearing only the indices recorded in the previous `nonzero` list.
+- Expected: reduce per-terminal live-reach writes from two full prepared-board
+  combo arrays to only the actually live OOP/IP combos.
+- Result: slower on the practical UTG vs BU range. On `As7h2c`, `iterations=1`,
+  `16` threads, terminal time moved from about `19.0s` to about `21.7s`.
+  Small sparse-only ranges improved only marginally, about `37.9ms` to
+  `36.1ms`.
+- Decision: reverted. The prefix path is dominated elsewhere; scattered clears
+  and `Vec::drain` do not beat the sequential `fill`. Do not retry this shape
+  unless the live-reach representation changes enough to eliminate the dense
+  prefix input entirely.
+
 ## 2026-06-06: CPU terminal CFV card-prefix blocker correction
 
 - Tried: replace the per-combo blocker-neighbor loop in CPU terminal CFV with

@@ -1,4 +1,4 @@
-use crate::cards::Board;
+use crate::cards::{Board, Card};
 use crate::range::{ComboWeight, RangeSpec};
 use crate::terminal_cfv::{
     PreparedTerminalBoard, TerminalCfvScratch, terminal_cfv_prefix_blocker_targets_into,
@@ -116,6 +116,8 @@ pub struct RealCfrSolver {
     river_index_by_key: BTreeMap<u64, usize>,
     terminal_cache_index_by_key: BTreeMap<u64, usize>,
     terminal_cache: Vec<TerminalEvalCache>,
+    oop_same_ip_combo_indices: Vec<Option<usize>>,
+    ip_same_oop_combo_indices: Vec<Option<usize>>,
 }
 
 #[derive(Debug, Clone)]
@@ -161,6 +163,8 @@ struct TerminalAccumulator {
 struct TerminalWorkerProfile {
     worker_index: usize,
     tasks: usize,
+    terminal_states: usize,
+    fold_states: usize,
     sparse_tasks: usize,
     prefix_tasks: usize,
     oop_nonzero_sum: usize,
@@ -168,6 +172,11 @@ struct TerminalWorkerProfile {
     oop_nonzero_max: usize,
     ip_nonzero_max: usize,
     output_states: usize,
+    board_expand_ms: f64,
+    fold_ms: f64,
+    reach_map_ms: f64,
+    cfv_ms: f64,
+    accumulator_ms: f64,
     elapsed_ms: f64,
 }
 
@@ -199,6 +208,8 @@ impl RealCfrSolver {
     ) -> Result<Self, String> {
         let oop_combos = oop_range.combos().to_vec();
         let ip_combos = ip_range.combos().to_vec();
+        let oop_same_ip_combo_indices = same_combo_indices(&oop_combos, &ip_combos);
+        let ip_same_oop_combo_indices = same_combo_indices(&ip_combos, &oop_combos);
         let flop_board = tree.spot.board.clone();
         let turn_boards = turn_boards_from_flop(&flop_board)?;
         let river_boards = ordered_river_boards_from_flop(&flop_board)?;
@@ -253,6 +264,8 @@ impl RealCfrSolver {
             river_index_by_key,
             terminal_cache_index_by_key,
             terminal_cache,
+            oop_same_ip_combo_indices,
+            ip_same_oop_combo_indices,
         })
     }
 
@@ -929,6 +942,7 @@ impl RealCfrSolver {
                             start_index,
                             worker_index,
                             values_chunk,
+                            profile_terminal,
                         )
                     }),
                 );
@@ -962,6 +976,7 @@ impl RealCfrSolver {
         start_index: usize,
         worker_index: usize,
         values_chunk: &mut [Values],
+        profile_terminal: bool,
     ) -> Result<TerminalWorkerProfile, String> {
         let started = Instant::now();
         let scratch_source = self
@@ -990,6 +1005,9 @@ impl RealCfrSolver {
             };
             match reason {
                 TerminalReason::Fold => {
+                    profile.terminal_states += 1;
+                    profile.fold_states += 1;
+                    let fold_started = profile_terminal.then(Instant::now);
                     *values_slot = self.fold_values(
                         &state.board,
                         node.state.pot,
@@ -997,10 +1015,22 @@ impl RealCfrSolver {
                         &oop_reaches[state_index],
                         &ip_reaches[state_index],
                     );
+                    if let Some(started) = fold_started {
+                        profile.fold_ms += started.elapsed().as_secs_f64() * 1000.0;
+                    }
                 }
                 TerminalReason::Showdown | TerminalReason::AllIn => {
+                    profile.terminal_states += 1;
                     accumulator.reset();
-                    for terminal_board in terminal_boards(&state.board)? {
+                    let terminal_boards = if profile_terminal {
+                        let started = Instant::now();
+                        let boards = terminal_boards(&state.board)?;
+                        profile.board_expand_ms += started.elapsed().as_secs_f64() * 1000.0;
+                        boards
+                    } else {
+                        terminal_boards(&state.board)?
+                    };
+                    for terminal_board in terminal_boards {
                         let cache_index = self
                             .terminal_cache_index_by_key
                             .get(&unordered_board_key(&terminal_board))
@@ -1009,6 +1039,7 @@ impl RealCfrSolver {
                                 "terminal board is outside the solver board cache".to_string()
                             })?;
                         let cache = &self.terminal_cache[cache_index];
+                        let reach_started = profile_terminal.then(Instant::now);
                         reach_on_prepared_board_sparse_into(
                             &cache.oop_combo_indices,
                             &oop_reaches[state_index],
@@ -1021,11 +1052,15 @@ impl RealCfrSolver {
                             &mut ip_live,
                             &mut ip_nonzero,
                         );
+                        if let Some(started) = reach_started {
+                            profile.reach_map_ms += started.elapsed().as_secs_f64() * 1000.0;
+                        }
                         profile.tasks += 1;
                         profile.oop_nonzero_sum += oop_nonzero.len();
                         profile.ip_nonzero_sum += ip_nonzero.len();
                         profile.oop_nonzero_max = profile.oop_nonzero_max.max(oop_nonzero.len());
                         profile.ip_nonzero_max = profile.ip_nonzero_max.max(ip_nonzero.len());
+                        let cfv_started = profile_terminal.then(Instant::now);
                         if oop_nonzero.len() <= sparse_nonzero_limit
                             && ip_nonzero.len() <= sparse_nonzero_limit
                         {
@@ -1051,6 +1086,10 @@ impl RealCfrSolver {
                                 &mut scratch,
                             )?;
                         }
+                        if let Some(started) = cfv_started {
+                            profile.cfv_ms += started.elapsed().as_secs_f64() * 1000.0;
+                        }
+                        let accumulator_started = profile_terminal.then(Instant::now);
                         accumulator.add_board(
                             cache,
                             node.state.pot,
@@ -1058,6 +1097,9 @@ impl RealCfrSolver {
                             self.oop_combos.len(),
                             self.ip_combos.len(),
                         );
+                        if let Some(started) = accumulator_started {
+                            profile.accumulator_ms += started.elapsed().as_secs_f64() * 1000.0;
+                        }
                     }
                     accumulator.finish();
                     values_slot.copy_from(&accumulator.values);
@@ -1603,8 +1645,20 @@ impl RealCfrSolver {
     ) -> Values {
         let mut values = Values::zero(self.oop_combos.len(), self.ip_combos.len());
         let pot = pot as f32;
-        let oop_opp = opponent_weights_for(&self.oop_combos, &self.ip_combos, ip_reach, board);
-        let ip_opp = opponent_weights_for(&self.ip_combos, &self.oop_combos, oop_reach, board);
+        let oop_opp = opponent_weights_for_fast(
+            &self.oop_combos,
+            &self.ip_combos,
+            ip_reach,
+            &self.oop_same_ip_combo_indices,
+            board,
+        );
+        let ip_opp = opponent_weights_for_fast(
+            &self.ip_combos,
+            &self.oop_combos,
+            oop_reach,
+            &self.ip_same_oop_combo_indices,
+            board,
+        );
         for (index, value) in values.oop.iter_mut().enumerate() {
             *value = if folding_player == Player::Oop {
                 -pot
@@ -2058,6 +2112,7 @@ fn combine_best_response_values(
     }
 }
 
+#[cfg(test)]
 fn opponent_weights_for(
     own_combos: &[ComboWeight],
     opponent_combos: &[ComboWeight],
@@ -2083,6 +2138,69 @@ fn opponent_weights_for(
                 .sum()
         })
         .collect()
+}
+
+fn opponent_weights_for_fast(
+    own_combos: &[ComboWeight],
+    opponent_combos: &[ComboWeight],
+    opponent_reach: &[f32],
+    same_combo_indices: &[Option<usize>],
+    board: &Board,
+) -> Vec<f32> {
+    debug_assert_eq!(opponent_combos.len(), opponent_reach.len());
+    debug_assert_eq!(own_combos.len(), same_combo_indices.len());
+
+    let mut total = 0.0f32;
+    let mut card_totals = [0.0f32; 52];
+    for (combo, reach) in opponent_combos.iter().zip(opponent_reach) {
+        if *reach == 0.0 || board.contains(combo.first) || board.contains(combo.second) {
+            continue;
+        }
+        total += *reach;
+        card_totals[combo.first.index()] += *reach;
+        card_totals[combo.second.index()] += *reach;
+    }
+
+    own_combos
+        .iter()
+        .zip(same_combo_indices)
+        .map(|(own, same_index)| {
+            if board.contains(own.first) || board.contains(own.second) {
+                return 0.0;
+            }
+            let same_reach = same_index
+                .and_then(|index| {
+                    let opponent = &opponent_combos[index];
+                    (!board.contains(opponent.first) && !board.contains(opponent.second))
+                        .then_some(opponent_reach[index])
+                })
+                .unwrap_or(0.0);
+            total - card_totals[own.first.index()] - card_totals[own.second.index()] + same_reach
+        })
+        .collect()
+}
+
+fn same_combo_indices(
+    own_combos: &[ComboWeight],
+    opponent_combos: &[ComboWeight],
+) -> Vec<Option<usize>> {
+    let opponent_by_key = opponent_combos
+        .iter()
+        .enumerate()
+        .map(|(index, combo)| (combo_key(combo.first, combo.second), index))
+        .collect::<BTreeMap<_, _>>();
+    own_combos
+        .iter()
+        .map(|combo| {
+            opponent_by_key
+                .get(&combo_key(combo.first, combo.second))
+                .copied()
+        })
+        .collect()
+}
+
+fn combo_key(first: Card, second: Card) -> u64 {
+    (1u64 << first.index()) | (1u64 << second.index())
 }
 
 fn prepared_combo_indices(
@@ -2149,6 +2267,14 @@ fn print_terminal_worker_profiles(
         .iter()
         .map(|profile| profile.prefix_tasks)
         .sum::<usize>();
+    let terminal_states = profiles
+        .iter()
+        .map(|profile| profile.terminal_states)
+        .sum::<usize>();
+    let fold_states = profiles
+        .iter()
+        .map(|profile| profile.fold_states)
+        .sum::<usize>();
     let oop_nonzero_sum = profiles
         .iter()
         .map(|profile| profile.oop_nonzero_sum)
@@ -2165,6 +2291,20 @@ fn print_terminal_worker_profiles(
         .iter()
         .map(|profile| profile.elapsed_ms)
         .fold(f64::INFINITY, f64::min);
+    let board_expand_ms = profiles
+        .iter()
+        .map(|profile| profile.board_expand_ms)
+        .sum::<f64>();
+    let fold_ms = profiles.iter().map(|profile| profile.fold_ms).sum::<f64>();
+    let reach_map_ms = profiles
+        .iter()
+        .map(|profile| profile.reach_map_ms)
+        .sum::<f64>();
+    let cfv_ms = profiles.iter().map(|profile| profile.cfv_ms).sum::<f64>();
+    let accumulator_ms = profiles
+        .iter()
+        .map(|profile| profile.accumulator_ms)
+        .sum::<f64>();
     let avg_oop_nonzero = if tasks > 0 {
         oop_nonzero_sum as f64 / tasks as f64
     } else {
@@ -2187,6 +2327,16 @@ fn print_terminal_worker_profiles(
         min_elapsed,
         max_elapsed,
     );
+    eprintln!(
+        "real_cfr_terminal_phase_breakdown terminal_states={} fold_states={} board_expand_ms={:.3} fold_ms={:.3} reach_map_ms={:.3} cfv_ms={:.3} accumulator_ms={:.3}",
+        terminal_states,
+        fold_states,
+        board_expand_ms,
+        fold_ms,
+        reach_map_ms,
+        cfv_ms,
+        accumulator_ms,
+    );
     for profile in profiles {
         let avg_oop = if profile.tasks > 0 {
             profile.oop_nonzero_sum as f64 / profile.tasks as f64
@@ -2199,8 +2349,10 @@ fn print_terminal_worker_profiles(
             0.0
         };
         eprintln!(
-            "real_cfr_terminal_worker worker={} tasks={} sparse={} prefix={} avg_oop_nonzero={:.2} avg_ip_nonzero={:.2} max_oop_nonzero={} max_ip_nonzero={} output_states={} elapsed_ms={:.3}",
+            "real_cfr_terminal_worker worker={} terminal_states={} fold_states={} tasks={} sparse={} prefix={} avg_oop_nonzero={:.2} avg_ip_nonzero={:.2} max_oop_nonzero={} max_ip_nonzero={} output_states={} board_expand_ms={:.3} fold_ms={:.3} reach_map_ms={:.3} cfv_ms={:.3} accumulator_ms={:.3} elapsed_ms={:.3}",
             profile.worker_index,
+            profile.terminal_states,
+            profile.fold_states,
             profile.tasks,
             profile.sparse_tasks,
             profile.prefix_tasks,
@@ -2209,6 +2361,11 @@ fn print_terminal_worker_profiles(
             profile.oop_nonzero_max,
             profile.ip_nonzero_max,
             profile.output_states,
+            profile.board_expand_ms,
+            profile.fold_ms,
+            profile.reach_map_ms,
+            profile.cfv_ms,
+            profile.accumulator_ms,
             profile.elapsed_ms,
         );
     }
@@ -2254,6 +2411,7 @@ fn weighted_average(
         / (own_total_weight * opponent_total_weight)
 }
 
+#[cfg(test)]
 fn combos_collide(left: &ComboWeight, right: &ComboWeight) -> bool {
     left.first == right.first
         || left.first == right.second
@@ -2485,5 +2643,30 @@ mod tests {
         assert_eq!(recursive.terminal_evals, phased.terminal_evals);
         assert!((recursive.root_oop_value - phased.root_oop_value).abs() < 0.001);
         assert!((recursive.root_ip_value - phased.root_ip_value).abs() < 0.001);
+    }
+
+    #[test]
+    fn fast_opponent_weights_match_pairwise_fold_weights() {
+        let board = Board::from_str("As7h2c").unwrap();
+        let own = RangeSpec::from_str("AhAd,KsKh,QcQd,8s8h")
+            .unwrap()
+            .combos()
+            .to_vec();
+        let opponent = RangeSpec::from_str("AhAd,AcKd,KsKh,QhQs,8s8h,5c4c")
+            .unwrap()
+            .combos()
+            .to_vec();
+        let opponent_reach = vec![0.7, 0.0, 0.25, 1.0, 0.5, 0.125];
+        let same = same_combo_indices(&own, &opponent);
+        let slow = opponent_weights_for(&own, &opponent, &opponent_reach, &board);
+        let fast = opponent_weights_for_fast(&own, &opponent, &opponent_reach, &same, &board);
+
+        assert_eq!(slow.len(), fast.len());
+        for (index, (slow, fast)) in slow.iter().zip(&fast).enumerate() {
+            assert!(
+                (*slow - *fast).abs() < 1e-6,
+                "index={index} slow={slow} fast={fast}"
+            );
+        }
     }
 }
