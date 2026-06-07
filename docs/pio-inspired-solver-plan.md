@@ -292,6 +292,10 @@ Open blocker:
   signature allocation and reusing the terminal prefix scratch. This validates
   the direction, but the total solver speedup is still modest because reach and
   backup phases remain large.
+- A longer `16` iteration check still favored the side-value cache: baseline
+  was about `72.71s` total / `35.41s` terminal, while the side cache was about
+  `66.16s` total / `28.26s` terminal. The speedup persists, but it decays as
+  strategy-dependent reach vectors diversify.
 
 Block-local experiment:
 
