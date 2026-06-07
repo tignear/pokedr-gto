@@ -339,6 +339,8 @@ impl RealCfrSolver {
     ) -> Result<RealCfrPhaseSummary, String> {
         let states = self.collect_phase_states()?;
         let mut root = Values::zero(self.oop_combos.len(), self.ip_combos.len());
+        let mut values =
+            vec![Values::zero(self.oop_combos.len(), self.ip_combos.len()); states.len()];
         let mut last_terminal_evals = 0usize;
         let mut total_reach_ms = 0.0;
         let mut total_terminal_ms = 0.0;
@@ -356,7 +358,14 @@ impl RealCfrSolver {
             let reach_ms = reach_started.elapsed().as_secs_f64() * 1000.0;
 
             let terminal_started = std::time::Instant::now();
-            let mut values = self.terminal_phase(&states, &oop_reaches, &ip_reaches, threads)?;
+            self.terminal_phase_into(
+                &states,
+                &oop_reaches,
+                &ip_reaches,
+                threads,
+                &mut values,
+                0.0,
+            )?;
             let terminal_ms = terminal_started.elapsed().as_secs_f64() * 1000.0;
 
             let backup_started = std::time::Instant::now();
@@ -730,6 +739,33 @@ impl RealCfrSolver {
         ip_reaches: &[Vec<f32>],
         threads: usize,
     ) -> Result<Vec<Values>, String> {
+        let values_alloc_started = Instant::now();
+        let mut values =
+            vec![Values::zero(self.oop_combos.len(), self.ip_combos.len()); states.len()];
+        let values_alloc_ms = values_alloc_started.elapsed().as_secs_f64() * 1000.0;
+        self.terminal_phase_into(
+            states,
+            oop_reaches,
+            ip_reaches,
+            threads,
+            &mut values,
+            values_alloc_ms,
+        )?;
+        Ok(values)
+    }
+
+    fn terminal_phase_into(
+        &self,
+        states: &[PhaseState],
+        oop_reaches: &[Vec<f32>],
+        ip_reaches: &[Vec<f32>],
+        threads: usize,
+        values: &mut [Values],
+        values_alloc_ms: f64,
+    ) -> Result<(), String> {
+        if values.len() != states.len() {
+            return Err("terminal phase scratch length does not match state count".to_string());
+        }
         let threads = if threads == 0 {
             thread::available_parallelism().map_or(1, usize::from)
         } else {
@@ -738,10 +774,6 @@ impl RealCfrSolver {
         .max(1)
         .min(states.len().max(1));
         let profile_terminal = std::env::var_os("POKEDR_REAL_CFR_TERMINAL_PROFILE").is_some();
-        let values_alloc_started = Instant::now();
-        let mut values =
-            vec![Values::zero(self.oop_combos.len(), self.ip_combos.len()); states.len()];
-        let values_alloc_ms = values_alloc_started.elapsed().as_secs_f64() * 1000.0;
         let state_chunk_len = states.len().div_ceil(threads);
         let worker_scope_started = Instant::now();
         let profiles = thread::scope(|scope| -> Result<Vec<TerminalWorkerProfile>, String> {
@@ -779,7 +811,7 @@ impl RealCfrSolver {
             );
             print_terminal_worker_profiles(total_tasks, profiles.len(), &profiles);
         }
-        Ok(values)
+        Ok(())
     }
 
     fn terminal_phase_worker(
