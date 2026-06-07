@@ -237,6 +237,34 @@ struct RecursiveTerminalScratch {
     accumulator: TerminalAccumulator,
 }
 
+#[derive(Debug, Default)]
+struct RecursiveCfrProfile {
+    enabled: bool,
+    terminal_calls: u64,
+    fold_calls: u64,
+    showdown_calls: u64,
+    chance_calls: u64,
+    chance_cards: u64,
+    decision_calls: u64,
+    strategy_builds: u64,
+    reach_scratch_writes: u64,
+    values_zero: u64,
+}
+
+impl RecursiveCfrProfile {
+    fn reset_counts(&mut self) {
+        self.terminal_calls = 0;
+        self.fold_calls = 0;
+        self.showdown_calls = 0;
+        self.chance_calls = 0;
+        self.chance_cards = 0;
+        self.decision_calls = 0;
+        self.strategy_builds = 0;
+        self.reach_scratch_writes = 0;
+        self.values_zero = 0;
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 struct TerminalWorkerProfile {
     worker_index: usize,
@@ -536,6 +564,10 @@ impl RealCfrSolver {
         };
         let mut terminal_ref_cache = BTreeMap::new();
         let mut side_cache = TerminalSideValueCache::default();
+        let mut recursive_profile = RecursiveCfrProfile {
+            enabled: std::env::var_os("POKEDR_REAL_CFR_RECURSIVE_PROFILE").is_some(),
+            ..RecursiveCfrProfile::default()
+        };
         let oop_weight = self
             .oop_combos
             .iter()
@@ -567,7 +599,24 @@ impl RealCfrSolver {
                 &mut terminal_scratch,
                 &mut terminal_ref_cache,
                 &mut side_cache,
+                &mut recursive_profile,
             )?;
+            if recursive_profile.enabled {
+                eprintln!(
+                    "real_cfr_recursive_profile iteration={} terminal_calls={} fold_calls={} showdown_calls={} chance_calls={} chance_cards={} decision_calls={} strategy_builds={} reach_scratch_writes={} values_zero={}",
+                    iteration,
+                    recursive_profile.terminal_calls,
+                    recursive_profile.fold_calls,
+                    recursive_profile.showdown_calls,
+                    recursive_profile.chance_calls,
+                    recursive_profile.chance_cards,
+                    recursive_profile.decision_calls,
+                    recursive_profile.strategy_builds,
+                    recursive_profile.reach_scratch_writes,
+                    recursive_profile.values_zero,
+                );
+                recursive_profile.reset_counts();
+            }
             progress(RealCfrIterationSummary {
                 iteration,
                 terminal_evals: root.terminal_evals,
@@ -2299,6 +2348,7 @@ impl RealCfrSolver {
         terminal_scratch: &mut RecursiveTerminalScratch,
         terminal_ref_cache: &mut BTreeMap<u64, Vec<TerminalCacheRef>>,
         side_cache: &mut TerminalSideValueCache,
+        profile: &mut RecursiveCfrProfile,
     ) -> Result<Values, String> {
         let node = self.tree.nodes[node_id].clone();
         match node.kind {
@@ -2312,15 +2362,28 @@ impl RealCfrSolver {
                 terminal_scratch,
                 terminal_ref_cache,
                 side_cache,
+                profile,
             ),
             PublicNodeKind::Chance(_) => {
+                if profile.enabled {
+                    profile.chance_calls += 1;
+                }
                 let Some(child) = node.children.first().copied() else {
+                    if profile.enabled {
+                        profile.values_zero += 1;
+                    }
                     let values = Values::zero(self.oop_combos.len(), self.ip_combos.len());
                     return Ok(values);
                 };
+                if profile.enabled {
+                    profile.values_zero += 1;
+                }
                 let mut values = Values::zero(self.oop_combos.len(), self.ip_combos.len());
                 let next_cards = board.remaining_deck();
                 let chance_weight = 1.0f32 / next_cards.len() as f32;
+                if profile.enabled {
+                    profile.chance_cards += next_cards.len() as u64;
+                }
                 for card in next_cards {
                     let next_board = board.push(card)?;
                     let child_values = self.traverse(
@@ -2333,12 +2396,16 @@ impl RealCfrSolver {
                         terminal_scratch,
                         terminal_ref_cache,
                         side_cache,
+                        profile,
                     )?;
                     values.add_scaled(&child_values, chance_weight);
                 }
                 Ok(values)
             }
             PublicNodeKind::Decision { player, actions } => {
+                if profile.enabled {
+                    profile.decision_calls += 1;
+                }
                 let actions_len = actions.len();
                 if actions_len == 1 {
                     return self.traverse(
@@ -2351,6 +2418,7 @@ impl RealCfrSolver {
                         terminal_scratch,
                         terminal_ref_cache,
                         side_cache,
+                        profile,
                     );
                 }
                 let acting_combos = match player {
@@ -2361,21 +2429,22 @@ impl RealCfrSolver {
                 let row_len = acting_combos * actions_len;
                 let row_start = board_slot * row_len;
                 let row_end = row_start + row_len;
-                let strategies = {
-                    let infoset = self.infosets[node_id]
-                        .as_ref()
-                        .expect("decision node must have infoset");
-                    debug_assert_eq!(infoset.player, player);
-                    debug_assert_eq!(infoset.actions, actions_len);
-                    debug_assert!(board_slot < infoset.board_count);
-                    let slot_start = infoset.slots_start + row_start;
-                    let slot_end = infoset.slots_start + row_end;
-                    current_strategies(
-                        &self.regrets[slot_start..slot_end],
-                        acting_combos,
-                        actions_len,
-                    )
-                };
+                let infoset = self.infosets[node_id]
+                    .as_ref()
+                    .expect("decision node must have infoset");
+                debug_assert_eq!(infoset.player, player);
+                debug_assert_eq!(infoset.actions, actions_len);
+                debug_assert!(board_slot < infoset.board_count);
+                let slot_start = infoset.slots_start + row_start;
+                let slot_end = infoset.slots_start + row_end;
+                let strategies = current_strategies(
+                    &self.regrets[slot_start..slot_end],
+                    acting_combos,
+                    actions_len,
+                );
+                if profile.enabled {
+                    profile.strategy_builds += 1;
+                }
 
                 let mut action_values = Vec::with_capacity(actions_len);
                 match player {
@@ -2389,6 +2458,9 @@ impl RealCfrSolver {
                                 actions_len,
                                 action_index,
                             );
+                            if profile.enabled {
+                                profile.reach_scratch_writes += next_oop.len() as u64;
+                            }
                             action_values.push(self.traverse(
                                 node.children[action_index],
                                 board,
@@ -2399,6 +2471,7 @@ impl RealCfrSolver {
                                 terminal_scratch,
                                 terminal_ref_cache,
                                 side_cache,
+                                profile,
                             )?);
                         }
                     }
@@ -2412,6 +2485,9 @@ impl RealCfrSolver {
                                 actions_len,
                                 action_index,
                             );
+                            if profile.enabled {
+                                profile.reach_scratch_writes += next_ip.len() as u64;
+                            }
                             action_values.push(self.traverse(
                                 node.children[action_index],
                                 board,
@@ -2422,11 +2498,15 @@ impl RealCfrSolver {
                                 terminal_scratch,
                                 terminal_ref_cache,
                                 side_cache,
+                                profile,
                             )?);
                         }
                     }
                 }
 
+                if profile.enabled {
+                    profile.values_zero += 1;
+                }
                 let mut values = Values::zero(self.oop_combos.len(), self.ip_combos.len());
                 match player {
                     Player::Oop => {
@@ -2457,10 +2537,6 @@ impl RealCfrSolver {
                     Player::Oop => oop_reach,
                     Player::Ip => ip_reach,
                 };
-                let infoset = self.infosets[node_id]
-                    .as_ref()
-                    .expect("decision node must have infoset");
-                let slots_start = infoset.slots_start;
                 for combo in 0..acting_combos {
                     let node_value = match player {
                         Player::Oop => values.oop[combo],
@@ -2472,7 +2548,7 @@ impl RealCfrSolver {
                             Player::Ip => action_values[action_index].ip[combo],
                         };
                         let local_slot = combo * actions_len + action_index;
-                        let slot = slots_start + row_start + local_slot;
+                        let slot = slot_start + local_slot;
                         apply_real_cfr_update(
                             &mut self.regrets[slot],
                             &mut self.strategy_sum[slot],
@@ -2516,9 +2592,17 @@ impl RealCfrSolver {
         terminal_scratch: &mut RecursiveTerminalScratch,
         terminal_ref_cache: &mut BTreeMap<u64, Vec<TerminalCacheRef>>,
         side_cache: &mut TerminalSideValueCache,
+        profile: &mut RecursiveCfrProfile,
     ) -> Result<Values, String> {
+        if profile.enabled {
+            profile.terminal_calls += 1;
+        }
         match reason {
             TerminalReason::Fold => {
+                if profile.enabled {
+                    profile.fold_calls += 1;
+                    profile.values_zero += 1;
+                }
                 Ok(self.fold_values(board, pot, folding_player, oop_reach, ip_reach))
             }
             TerminalReason::Showdown | TerminalReason::AllIn => self.showdown_values_cached(
@@ -2529,6 +2613,7 @@ impl RealCfrSolver {
                 terminal_scratch,
                 terminal_ref_cache,
                 side_cache,
+                profile,
             ),
         }
     }
@@ -2598,7 +2683,11 @@ impl RealCfrSolver {
         scratch: &mut RecursiveTerminalScratch,
         terminal_ref_cache: &mut BTreeMap<u64, Vec<TerminalCacheRef>>,
         side_cache: &mut TerminalSideValueCache,
+        profile: &mut RecursiveCfrProfile,
     ) -> Result<Values, String> {
+        if profile.enabled {
+            profile.showdown_calls += 1;
+        }
         let key = ordered_board_key(board);
         let terminal_refs = if let Some(cached) = terminal_ref_cache.get(&key) {
             cached.clone()
