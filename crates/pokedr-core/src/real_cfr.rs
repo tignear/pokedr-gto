@@ -544,6 +544,12 @@ impl RealCfrSolver {
         let mut total_reach_ms = 0.0;
         let mut total_terminal_ms = 0.0;
         let mut total_backup_ms = 0.0;
+        let profile_start_iteration = real_cfr_profile_start_iteration();
+        let profile_reach_requested = std::env::var_os("POKEDR_REAL_CFR_REACH_PROFILE").is_some();
+        let profile_terminal_requested =
+            std::env::var_os("POKEDR_REAL_CFR_TERMINAL_PROFILE").is_some();
+        let profile_side_cache_keys_requested =
+            std::env::var_os("POKEDR_REAL_CFR_SIDE_CACHE_KEY_PROFILE").is_some();
         let oop_weight = self
             .oop_combos
             .iter()
@@ -552,18 +558,31 @@ impl RealCfrSolver {
         let ip_weight = self.ip_combos.iter().map(|combo| combo.weight).sum::<f32>();
 
         for iteration in 1..=config.iterations {
+            let global_iteration = self.completed_iterations + 1;
+            let profile_this_iteration = global_iteration >= profile_start_iteration;
+            let profile_reach = profile_reach_requested && profile_this_iteration;
+            let profile_terminal = profile_terminal_requested && profile_this_iteration;
+            let profile_side_cache_keys =
+                profile_side_cache_keys_requested && profile_this_iteration;
             let reach_started = std::time::Instant::now();
-            self.forward_reaches_into(&states, &mut oop_reaches, &mut ip_reaches)?;
+            self.forward_reaches_into_with_profile(
+                &states,
+                &mut oop_reaches,
+                &mut ip_reaches,
+                profile_reach,
+            )?;
             let reach_ms = reach_started.elapsed().as_secs_f64() * 1000.0;
 
             let terminal_started = std::time::Instant::now();
-            self.terminal_phase_into(
+            self.terminal_phase_into_with_profile_options(
                 &states,
                 &oop_reaches,
                 &ip_reaches,
                 threads,
                 &mut values,
                 0.0,
+                profile_terminal,
+                profile_side_cache_keys,
             )?;
             let terminal_ms = terminal_started.elapsed().as_secs_f64() * 1000.0;
 
@@ -1039,11 +1058,12 @@ impl RealCfrSolver {
             .collect()
     }
 
-    fn forward_reaches_into(
+    fn forward_reaches_into_with_profile(
         &self,
         states: &[PhaseState],
         oop_reaches: &mut [Vec<f32>],
         ip_reaches: &mut [Vec<f32>],
+        profile_reach: bool,
     ) -> Result<(), String> {
         self.forward_reaches_for_mode_into(
             states,
@@ -1051,6 +1071,7 @@ impl RealCfrSolver {
             StrategySource::Current,
             oop_reaches,
             ip_reaches,
+            profile_reach,
         )
     }
 
@@ -1162,11 +1183,11 @@ impl RealCfrSolver {
         strategy_source: StrategySource,
         oop_reaches: &mut [Vec<f32>],
         ip_reaches: &mut [Vec<f32>],
+        profile_reach: bool,
     ) -> Result<(), String> {
         if oop_reaches.len() != states.len() || ip_reaches.len() != states.len() {
             return Err("reach scratch length does not match state count".to_string());
         }
-        let profile_reach = std::env::var_os("POKEDR_REAL_CFR_REACH_PROFILE").is_some();
         let reach_started = if profile_reach {
             Some(Instant::now())
         } else {
@@ -1410,6 +1431,29 @@ impl RealCfrSolver {
         values: &mut [Values],
         values_alloc_ms: f64,
     ) -> Result<(), String> {
+        self.terminal_phase_into_with_profile_options(
+            states,
+            oop_reaches,
+            ip_reaches,
+            threads,
+            values,
+            values_alloc_ms,
+            std::env::var_os("POKEDR_REAL_CFR_TERMINAL_PROFILE").is_some(),
+            std::env::var_os("POKEDR_REAL_CFR_SIDE_CACHE_KEY_PROFILE").is_some(),
+        )
+    }
+
+    fn terminal_phase_into_with_profile_options(
+        &self,
+        states: &[PhaseState],
+        oop_reaches: &[Vec<f32>],
+        ip_reaches: &[Vec<f32>],
+        threads: usize,
+        values: &mut [Values],
+        values_alloc_ms: f64,
+        profile_terminal: bool,
+        profile_side_cache_keys: bool,
+    ) -> Result<(), String> {
         if values.len() != states.len() {
             return Err("terminal phase scratch length does not match state count".to_string());
         }
@@ -1419,9 +1463,6 @@ impl RealCfrSolver {
             return Ok(());
         }
         let threads = effective_worker_count(threads).min(terminal_len);
-        let profile_terminal = std::env::var_os("POKEDR_REAL_CFR_TERMINAL_PROFILE").is_some();
-        let profile_side_cache_keys =
-            std::env::var_os("POKEDR_REAL_CFR_SIDE_CACHE_KEY_PROFILE").is_some();
         let partitions = terminal_phase_partitions(states, terminal_start, threads);
         let worker_scope_started = Instant::now();
         let mut partition_chunks = Vec::with_capacity(partitions.len());
@@ -3433,6 +3474,14 @@ fn terminal_sparse_nonzero_limit() -> usize {
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(TERMINAL_SPARSE_NONZERO_LIMIT)
+}
+
+fn real_cfr_profile_start_iteration() -> u32 {
+    std::env::var("POKEDR_REAL_CFR_PROFILE_START_ITER")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|iteration| *iteration > 0)
+        .unwrap_or(1)
 }
 
 fn terminal_phase_partitions(
