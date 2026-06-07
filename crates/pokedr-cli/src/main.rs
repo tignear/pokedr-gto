@@ -699,7 +699,7 @@ fn main() -> Result<(), String> {
                         0.0
                     };
                 println!(
-                    "terminal_board_reuse cfr_iterations={} state_board_pairs={} unique_boards={} avg_state_board_pairs_per_board={:.3} min_state_board_pairs_per_board={} max_state_board_pairs_per_board={} avg_unique_terminal_states_per_board={:.3} avg_oop_unique_reaches_per_board={:.3} avg_ip_unique_reaches_per_board={:.3} avg_pair_unique_reaches_per_board={:.3} avg_pair_reuse_factor={:.3} total_ms={:.3}",
+                    "terminal_board_reuse cfr_iterations={} state_board_pairs={} unique_boards={} avg_state_board_pairs_per_board={:.3} min_state_board_pairs_per_board={} max_state_board_pairs_per_board={} avg_unique_terminal_states_per_board={:.3} avg_oop_unique_reaches_per_board={:.3} avg_ip_unique_reaches_per_board={:.3} avg_pair_unique_reaches_per_board={:.3} avg_pair_reuse_factor={:.3} avg_oop_value_side_reuse_factor={:.3} avg_ip_value_side_reuse_factor={:.3} total_ms={:.3}",
                     completed_reuse_iterations,
                     report.state_board_pairs,
                     report.unique_boards,
@@ -711,6 +711,8 @@ fn main() -> Result<(), String> {
                     report.average_ip_unique_reaches_per_board,
                     report.average_pair_unique_reaches_per_board,
                     average_pair_reuse_factor,
+                    report.average_oop_value_side_reuse_factor,
+                    report.average_ip_value_side_reuse_factor,
                     started.elapsed().as_secs_f64() * 1000.0,
                 );
                 for row in report.rows.iter().take(terminal_board_reuse_top) {
@@ -720,7 +722,7 @@ fn main() -> Result<(), String> {
                         0.0
                     };
                     println!(
-                        "terminal_board_reuse_row board_index={} board={} state_board_pairs={} unique_terminal_states={} pot_buckets={} oop_unique_reaches={} ip_unique_reaches={} pair_unique_reaches={} pair_reuse_factor={:.3} avg_oop_nonzero={:.3} avg_ip_nonzero={:.3} max_oop_nonzero={} max_ip_nonzero={}",
+                        "terminal_board_reuse_row board_index={} board={} state_board_pairs={} unique_terminal_states={} pot_buckets={} oop_unique_reaches={} ip_unique_reaches={} pair_unique_reaches={} pair_reuse_factor={:.3} oop_value_side_reuse_factor={:.3} ip_value_side_reuse_factor={:.3} avg_oop_nonzero={:.3} avg_ip_nonzero={:.3} max_oop_nonzero={} max_ip_nonzero={}",
                         row.board_index,
                         row.board,
                         row.state_board_pairs,
@@ -730,6 +732,8 @@ fn main() -> Result<(), String> {
                         row.ip_unique_reaches,
                         row.pair_unique_reaches,
                         pair_reuse_factor,
+                        row.oop_value_side_reuse_factor,
+                        row.ip_value_side_reuse_factor,
                         row.average_oop_nonzero,
                         row.average_ip_nonzero,
                         row.max_oop_nonzero,

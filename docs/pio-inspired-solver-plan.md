@@ -255,10 +255,14 @@ Current measurement:
 - Added `--terminal-board-reuse-after-cfr` because the initial result was
   mostly uniform-strategy reuse. On the same spot after `1` DCFR+ iteration,
   the average unique reach-pair count increased to about `351`, leaving only
-  `3.9x` reuse. After `4` iterations it increased to about `710`, leaving only
-  `1.9x` reuse. This is still mathematically valid reuse, but it is too weak
-  to be the main terminal CFV optimization unless later converged strategies
-  collapse back to fewer distinct reach vectors.
+  `3.9x` pair reuse. Side-value reuse is more meaningful because OOP values
+  only depend on IP reach and IP values only depend on OOP reach; after `1`
+  iteration the side reuse factors were about `4.1x` for OOP value and `23.6x`
+  for IP value. After `4` iterations, pair reuse dropped to `1.9x`, while
+  side reuse was still about `2.9x` for OOP value and `2.6x` for IP value.
+  This is mathematically valid reuse, but it is still too weak to be the main
+  terminal CFV optimization unless later converged strategies collapse back to
+  fewer distinct reach vectors.
 
 Open blocker:
 
@@ -276,7 +280,9 @@ Open blocker:
   that group.
 - The after-CFR measurements weaken this plan: exact reach-pair grouping is a
   diagnostic and maybe a small optimization, not the expected order-of-magnitude
-  improvement.
+  improvement. Exact side-value grouping is more promising than pair grouping,
+  but the measured `2.6x-2.9x` after four iterations says it should be treated
+  as a bounded terminal-CFV optimization, not the whole solver breakthrough.
 
 Block-local experiment:
 

@@ -129,6 +129,8 @@ pub struct TerminalBoardReuseReport {
     pub average_oop_unique_reaches_per_board: f64,
     pub average_ip_unique_reaches_per_board: f64,
     pub average_pair_unique_reaches_per_board: f64,
+    pub average_oop_value_side_reuse_factor: f64,
+    pub average_ip_value_side_reuse_factor: f64,
     pub rows: Vec<TerminalBoardReuseRow>,
 }
 
@@ -142,6 +144,8 @@ pub struct TerminalBoardReuseRow {
     pub oop_unique_reaches: usize,
     pub ip_unique_reaches: usize,
     pub pair_unique_reaches: usize,
+    pub oop_value_side_reuse_factor: f64,
+    pub ip_value_side_reuse_factor: f64,
     pub average_oop_nonzero: f64,
     pub average_ip_nonzero: f64,
     pub max_oop_nonzero: usize,
@@ -822,19 +826,33 @@ impl RealCfrSolver {
             .iter()
             .enumerate()
             .filter(|(_, stats)| stats.tasks > 0)
-            .map(|(board_index, stats)| TerminalBoardReuseRow {
-                board_index,
-                board: self.terminal_cache[board_index].board.clone(),
-                state_board_pairs: stats.tasks,
-                unique_terminal_states: stats.terminal_states.len(),
-                pot_buckets: stats.pots.len(),
-                oop_unique_reaches: stats.oop_reaches.len(),
-                ip_unique_reaches: stats.ip_reaches.len(),
-                pair_unique_reaches: stats.pair_reaches.len(),
-                average_oop_nonzero: stats.oop_nonzero_sum as f64 / stats.tasks as f64,
-                average_ip_nonzero: stats.ip_nonzero_sum as f64 / stats.tasks as f64,
-                max_oop_nonzero: stats.oop_nonzero_max,
-                max_ip_nonzero: stats.ip_nonzero_max,
+            .map(|(board_index, stats)| {
+                let oop_value_side_reuse_factor = if stats.ip_reaches.is_empty() {
+                    0.0
+                } else {
+                    stats.tasks as f64 / stats.ip_reaches.len() as f64
+                };
+                let ip_value_side_reuse_factor = if stats.oop_reaches.is_empty() {
+                    0.0
+                } else {
+                    stats.tasks as f64 / stats.oop_reaches.len() as f64
+                };
+                TerminalBoardReuseRow {
+                    board_index,
+                    board: self.terminal_cache[board_index].board.clone(),
+                    state_board_pairs: stats.tasks,
+                    unique_terminal_states: stats.terminal_states.len(),
+                    pot_buckets: stats.pots.len(),
+                    oop_unique_reaches: stats.oop_reaches.len(),
+                    ip_unique_reaches: stats.ip_reaches.len(),
+                    pair_unique_reaches: stats.pair_reaches.len(),
+                    oop_value_side_reuse_factor,
+                    ip_value_side_reuse_factor,
+                    average_oop_nonzero: stats.oop_nonzero_sum as f64 / stats.tasks as f64,
+                    average_ip_nonzero: stats.ip_nonzero_sum as f64 / stats.tasks as f64,
+                    max_oop_nonzero: stats.oop_nonzero_max,
+                    max_ip_nonzero: stats.ip_nonzero_max,
+                }
             })
             .collect::<Vec<_>>();
         rows.sort_by(|left, right| {
@@ -879,6 +897,14 @@ impl RealCfrSolver {
             ),
             average_pair_unique_reaches_per_board: average_usize(
                 rows.iter().map(|row| row.pair_unique_reaches).sum(),
+                unique_boards,
+            ),
+            average_oop_value_side_reuse_factor: average_f64(
+                rows.iter().map(|row| row.oop_value_side_reuse_factor).sum(),
+                unique_boards,
+            ),
+            average_ip_value_side_reuse_factor: average_f64(
+                rows.iter().map(|row| row.ip_value_side_reuse_factor).sum(),
                 unique_boards,
             ),
             rows,
@@ -3197,6 +3223,10 @@ fn average_usize(sum: usize, count: usize) -> f64 {
     } else {
         0.0
     }
+}
+
+fn average_f64(sum: f64, count: usize) -> f64 {
+    if count > 0 { sum / count as f64 } else { 0.0 }
 }
 
 fn hash_sparse_reach(reach: &[f32], nonzero: &[u16]) -> u64 {
