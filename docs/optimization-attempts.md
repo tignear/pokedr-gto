@@ -19,6 +19,41 @@ ideas.
   unless the live-reach representation changes enough to eliminate the dense
   prefix input entirely.
 
+## 2026-06-07: Real CFR level-major backup scratch
+
+- Tried: replace the flat state-indexed `Vec<Values>` backup scratch with
+  `Vec<Vec<Values>>` grouped by dependency level. Terminal phase wrote level
+  zero directly, and backup read lower levels immutably while writing the
+  current level. This was meant to make safe layer-parallel backup possible
+  without locks or unsafe code.
+- Expected: preserve the same values while opening a path to parallel decision
+  updates across each backup level.
+- Result: much slower before parallelism. On UTG vs BU `As7h2c`,
+  `iterations=4`, `16` threads, DCFR+, the previous path was about
+  `35.6s` elapsed with `13.6s` backup. The level-major scratch path produced
+  the same root values but regressed to about `56.5s` elapsed with `22.4s`
+  backup and `15.9s` terminal.
+- Decision: reverted. Do not retry `Vec<Vec<Values>>` level-major scratch.
+  If backup is parallelized, keep the flat contiguous value storage or use a
+  level plan that writes into contiguous ranges without fragmenting the value
+  arrays.
+
+## 2026-06-07: Real CFR acting-combo board-blocker skip
+
+- Tried: in real CFR decision backup, skip regret and strategy-sum updates for
+  acting combos whose private cards collide with the current public board,
+  setting that combo's acting value to zero.
+- Expected: remove work for impossible combo rows without changing the game
+  values.
+- Result: slower on the practical benchmark. On UTG vs BU `As7h2c`,
+  `iterations=4`, `16` threads, DCFR+, the previous path was about `35.6s`
+  elapsed with `13.6s` backup. The blocker-skip path produced the same root
+  values but regressed to about `55.9s` elapsed with `20.6s` backup. The extra
+  branch in the hot combo loop costs more than the skipped blocked rows.
+- Decision: reverted. Do not retry per-combo board-blocker branches in the
+  backup hot loop. If impossible combos are skipped, use precomputed compact
+  live combo ranges/lists so the loop shape is branch-free.
+
 ## 2026-06-06: CPU terminal CFV card-prefix blocker correction
 
 - Tried: replace the per-combo blocker-neighbor loop in CPU terminal CFV with
