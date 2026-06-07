@@ -296,6 +296,11 @@ Open blocker:
   was about `72.71s` total / `35.41s` terminal, while the side cache was about
   `66.16s` total / `28.26s` terminal. The speedup persists, but it decays as
   strategy-dependent reach vectors diversify.
+- A `64` iteration side-cache run completed in about `223.01s` total with
+  `102.58s` in terminal CFV. Per-iteration terminal time stayed around
+  `1.4s-1.6s` near the end (`1.39s` on iteration `64`), so the cache path did
+  not obviously degrade over a longer run. The container does not currently
+  have `/usr/bin/time`, so max-RSS was not captured for this run.
 
 Block-local experiment:
 
