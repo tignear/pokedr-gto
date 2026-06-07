@@ -194,6 +194,8 @@ struct PhaseState {
 struct BackupRun {
     start: usize,
     end: usize,
+    slot_start: usize,
+    slot_end: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -370,7 +372,13 @@ impl RealCfrSolver {
         mut progress: impl FnMut(RealCfrPhaseIterationSummary),
     ) -> Result<RealCfrPhaseSummary, String> {
         let states = self.collect_phase_states()?;
-        let backup_plan = backup_level_plan(&states);
+        let backup_plan = backup_level_plan(
+            &self.tree,
+            &self.infosets,
+            self.oop_combos.len(),
+            self.ip_combos.len(),
+            &states,
+        );
         let mut root = Values::zero(self.oop_combos.len(), self.ip_combos.len());
         let mut values =
             vec![Values::zero(self.oop_combos.len(), self.ip_combos.len()); states.len()];
@@ -594,7 +602,13 @@ impl RealCfrSolver {
         let mut states = Vec::new();
         let mut index_by_key = BTreeMap::new();
         self.collect_phase_state_from(0, &self.flop_board, &mut states, &mut index_by_key)?;
-        Ok(states)
+        reorder_phase_states_by_level_and_slot(
+            &self.tree,
+            &self.infosets,
+            self.oop_combos.len(),
+            self.ip_combos.len(),
+            states,
+        )
     }
 
     fn collect_phase_state_from(
@@ -946,20 +960,28 @@ impl RealCfrSolver {
         if values.len() != states.len() {
             return Err("terminal phase scratch length does not match state count".to_string());
         }
+        let terminal_start = first_terminal_state_index(states);
+        let terminal_len = states.len() - terminal_start;
+        if terminal_len == 0 {
+            return Ok(());
+        }
         let threads = if threads == 0 {
             thread::available_parallelism().map_or(1, usize::from)
         } else {
             threads
         }
         .max(1)
-        .min(states.len().max(1));
+        .min(terminal_len);
         let profile_terminal = std::env::var_os("POKEDR_REAL_CFR_TERMINAL_PROFILE").is_some();
-        let state_chunk_len = states.len().div_ceil(threads);
+        let state_chunk_len = terminal_len.div_ceil(threads);
         let worker_scope_started = Instant::now();
         let profiles = thread::scope(|scope| -> Result<Vec<TerminalWorkerProfile>, String> {
             let mut handles = Vec::new();
-            for (worker_index, values_chunk) in values.chunks_mut(state_chunk_len).enumerate() {
-                let start_index = worker_index * state_chunk_len;
+            for (worker_index, values_chunk) in values[terminal_start..]
+                .chunks_mut(state_chunk_len)
+                .enumerate()
+            {
+                let start_index = terminal_start + worker_index * state_chunk_len;
                 handles.push(
                     scope.spawn(move || -> Result<TerminalWorkerProfile, String> {
                         self.terminal_phase_worker(
@@ -2081,7 +2103,98 @@ fn child_reach_mut(
     &mut child_reaches[child_index - state_index - 1]
 }
 
-fn backup_level_plan(states: &[PhaseState]) -> BackupLevelPlan {
+fn reorder_phase_states_by_level_and_slot(
+    tree: &PublicTree,
+    infosets: &[Option<RealInfoset>],
+    oop_combos: usize,
+    ip_combos: usize,
+    states: Vec<PhaseState>,
+) -> Result<Vec<PhaseState>, String> {
+    if states.is_empty() {
+        return Ok(states);
+    }
+    let state_level = phase_state_levels(&states);
+    let mut order = (0..states.len()).collect::<Vec<_>>();
+    order.sort_by(|left, right| {
+        state_level[*right]
+            .cmp(&state_level[*left])
+            .then_with(|| {
+                phase_state_slot_sort_key(tree, infosets, oop_combos, ip_combos, &states[*left])
+                    .cmp(&phase_state_slot_sort_key(
+                        tree,
+                        infosets,
+                        oop_combos,
+                        ip_combos,
+                        &states[*right],
+                    ))
+            })
+            .then_with(|| left.cmp(right))
+    });
+    if order.first().copied() != Some(0) {
+        return Err("phase-state reorder did not keep the root first".to_string());
+    }
+
+    let mut old_to_new = vec![0usize; states.len()];
+    for (new_index, old_index) in order.iter().copied().enumerate() {
+        old_to_new[old_index] = new_index;
+    }
+
+    let mut reordered = Vec::with_capacity(states.len());
+    for old_index in order {
+        let mut state = states[old_index].clone();
+        state.children = state
+            .children
+            .iter()
+            .map(|child| old_to_new[*child])
+            .collect();
+        debug_assert!(state.children.iter().all(|child| *child > reordered.len()));
+        reordered.push(state);
+    }
+    Ok(reordered)
+}
+
+fn phase_state_levels(states: &[PhaseState]) -> Vec<usize> {
+    let mut state_level = vec![0usize; states.len()];
+    for state_index in (0..states.len()).rev() {
+        state_level[state_index] = states[state_index]
+            .children
+            .iter()
+            .map(|child| state_level[*child] + 1)
+            .max()
+            .unwrap_or(0);
+    }
+    state_level
+}
+
+fn phase_state_slot_sort_key(
+    tree: &PublicTree,
+    infosets: &[Option<RealInfoset>],
+    oop_combos: usize,
+    ip_combos: usize,
+    state: &PhaseState,
+) -> (bool, usize, usize) {
+    let Some((slot_start, slot_end)) =
+        backup_state_slot_range(tree, infosets, oop_combos, ip_combos, state)
+    else {
+        return (true, usize::MAX, usize::MAX);
+    };
+    (false, slot_start, slot_end)
+}
+
+fn first_terminal_state_index(states: &[PhaseState]) -> usize {
+    states
+        .iter()
+        .position(|state| state.children.is_empty())
+        .unwrap_or(states.len())
+}
+
+fn backup_level_plan(
+    tree: &PublicTree,
+    infosets: &[Option<RealInfoset>],
+    oop_combos: usize,
+    ip_combos: usize,
+    states: &[PhaseState],
+) -> BackupLevelPlan {
     let mut state_level = vec![0usize; states.len()];
     let mut max_level = 0usize;
     for state_index in (0..states.len()).rev() {
@@ -2100,21 +2213,134 @@ fn backup_level_plan(states: &[PhaseState]) -> BackupLevelPlan {
     let mut run_level = state_level.first().copied().unwrap_or(0);
     for (state_index, level) in state_level.iter().copied().enumerate().skip(1) {
         if level != run_level {
-            levels[run_level].push(BackupRun {
-                start: run_start,
-                end: state_index,
-            });
+            levels[run_level].push(backup_run_with_slots(
+                tree,
+                infosets,
+                oop_combos,
+                ip_combos,
+                states,
+                run_start,
+                state_index,
+            ));
             run_start = state_index;
             run_level = level;
         }
     }
     if !states.is_empty() {
-        levels[run_level].push(BackupRun {
-            start: run_start,
-            end: states.len(),
-        });
+        levels[run_level].push(backup_run_with_slots(
+            tree,
+            infosets,
+            oop_combos,
+            ip_combos,
+            states,
+            run_start,
+            states.len(),
+        ));
+    }
+    for level in &mut levels {
+        sort_backup_level_runs(level);
+        if !backup_level_slots_are_ordered(level) {
+            let mut refined = Vec::new();
+            for run in level.iter() {
+                for state_index in run.start..run.end {
+                    refined.push(backup_run_with_slots(
+                        tree,
+                        infosets,
+                        oop_combos,
+                        ip_combos,
+                        states,
+                        state_index,
+                        state_index + 1,
+                    ));
+                }
+            }
+            sort_backup_level_runs(&mut refined);
+            debug_assert!(backup_level_slots_are_ordered(&refined));
+            *level = refined;
+        }
     }
     BackupLevelPlan { levels }
+}
+
+fn sort_backup_level_runs(level: &mut [BackupRun]) {
+    level.sort_by_key(|run| {
+        (
+            run.slot_start == run.slot_end,
+            run.slot_start,
+            run.slot_end,
+            run.start,
+        )
+    });
+}
+
+fn backup_level_slots_are_ordered(level: &[BackupRun]) -> bool {
+    let mut previous_end = 0usize;
+    let mut have_previous = false;
+    for run in level {
+        if run.slot_start == run.slot_end {
+            continue;
+        }
+        if have_previous && run.slot_start < previous_end {
+            return false;
+        }
+        previous_end = run.slot_end;
+        have_previous = true;
+    }
+    true
+}
+
+fn backup_run_with_slots(
+    tree: &PublicTree,
+    infosets: &[Option<RealInfoset>],
+    oop_combos: usize,
+    ip_combos: usize,
+    states: &[PhaseState],
+    start: usize,
+    end: usize,
+) -> BackupRun {
+    let mut slot_start = usize::MAX;
+    let mut slot_end = 0usize;
+    for state in &states[start..end] {
+        let Some((start, end)) =
+            backup_state_slot_range(tree, infosets, oop_combos, ip_combos, state)
+        else {
+            continue;
+        };
+        slot_start = slot_start.min(start);
+        slot_end = slot_end.max(end);
+    }
+    if slot_start == usize::MAX {
+        slot_start = 0;
+        slot_end = 0;
+    }
+    BackupRun {
+        start,
+        end,
+        slot_start,
+        slot_end,
+    }
+}
+
+fn backup_state_slot_range(
+    tree: &PublicTree,
+    infosets: &[Option<RealInfoset>],
+    oop_combos: usize,
+    ip_combos: usize,
+    state: &PhaseState,
+) -> Option<(usize, usize)> {
+    let PublicNodeKind::Decision { .. } = &tree.nodes[state.node_id].kind else {
+        return None;
+    };
+    let infoset = infosets[state.node_id]
+        .as_ref()
+        .expect("decision node must have infoset");
+    let combos = match infoset.player {
+        Player::Oop => oop_combos,
+        Player::Ip => ip_combos,
+    };
+    let row_len = combos * infoset.actions;
+    let slot_start = infoset.slots_start + state.board_slot * row_len;
+    Some((slot_start, slot_start + row_len))
 }
 
 fn combine_acting_values(
