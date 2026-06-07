@@ -33,6 +33,8 @@ enum Command {
         ip_range: String,
         #[arg(long, default_value = "oop")]
         first_player: String,
+        #[arg(long, default_value = "conservative")]
+        tree_preset: String,
         #[arg(long, default_value_t = 20)]
         print_nodes: usize,
         #[arg(long)]
@@ -53,6 +55,8 @@ enum Command {
         ip_range: String,
         #[arg(long, default_value = "oop")]
         first_player: String,
+        #[arg(long, default_value = "conservative")]
+        tree_preset: String,
         #[arg(long)]
         enumerate_chance: bool,
         #[arg(long, default_value_t = 1)]
@@ -150,11 +154,13 @@ fn main() -> Result<(), String> {
             oop_range,
             ip_range,
             first_player,
+            tree_preset,
             print_nodes,
             enumerate_chance,
             chunk_mib,
         } => {
             let first_player = parse_player(&first_player)?;
+            let action_abstraction = parse_tree_preset(&tree_preset)?;
             let request = FlopTreeRequest {
                 board: Board::from_str(&flop)?,
                 pot,
@@ -162,7 +168,7 @@ fn main() -> Result<(), String> {
                 oop_range: RangeSpec::from_str(&oop_range)?,
                 ip_range: RangeSpec::from_str(&ip_range)?,
                 first_player,
-                action_abstraction: pokedr_core::ActionAbstraction::conservative_default(),
+                action_abstraction,
             };
             let tree = if enumerate_chance {
                 let template = TreeTemplate {
@@ -317,6 +323,7 @@ fn main() -> Result<(), String> {
             oop_range,
             ip_range,
             first_player,
+            tree_preset,
             enumerate_chance,
             iterations,
             chunk_mib,
@@ -358,10 +365,11 @@ fn main() -> Result<(), String> {
                 &oop_range,
                 &ip_range,
                 &first_player,
+                &tree_preset,
             )?;
             let tree = if enumerate_chance {
                 let template = TreeTemplate {
-                    action_abstraction: pokedr_core::ActionAbstraction::conservative_default(),
+                    action_abstraction: request.action_abstraction.clone(),
                     chance_expansion: ChanceExpansion::Enumerate,
                 };
                 let spot = pokedr_core::Spot {
@@ -982,6 +990,7 @@ fn flop_tree_request(
     oop_range: &str,
     ip_range: &str,
     first_player: &str,
+    tree_preset: &str,
 ) -> Result<FlopTreeRequest, String> {
     Ok(FlopTreeRequest {
         board: Board::from_str(flop)?,
@@ -990,8 +999,20 @@ fn flop_tree_request(
         oop_range: RangeSpec::from_str(oop_range)?,
         ip_range: RangeSpec::from_str(ip_range)?,
         first_player: parse_player(first_player)?,
-        action_abstraction: pokedr_core::ActionAbstraction::conservative_default(),
+        action_abstraction: parse_tree_preset(tree_preset)?,
     })
+}
+
+fn parse_tree_preset(value: &str) -> Result<pokedr_core::ActionAbstraction, String> {
+    match value {
+        "conservative" => Ok(pokedr_core::ActionAbstraction::conservative_default()),
+        "postflop-basic" | "postflop-solver-basic" => {
+            Ok(pokedr_core::ActionAbstraction::postflop_solver_basic())
+        }
+        other => Err(format!(
+            "unknown tree preset {other:?}; expected conservative or postflop-basic"
+        )),
+    }
 }
 
 struct WorkEstimate {
