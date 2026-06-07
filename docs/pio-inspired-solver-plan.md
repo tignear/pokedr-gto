@@ -258,6 +258,26 @@ Open blocker:
 - A valid design needs owner-computes state accumulation, board-local CFV
   reuse, or a two-level reduction with bounded scratch.
 
+Block-local experiment:
+
+- Added an experimental `POKEDR_REAL_CFR_TERMINAL_BLOCK_BOARD_MAJOR=1` path.
+- It processes each worker-owned terminal-state chunk in small tiles, sorts only
+  the tile's final-board tasks by `cache_index`, and accumulates back into
+  tile-local `TerminalAccumulator`s. This preserves owner-computes writes and
+  uses no locks or atomics.
+- On `As7h2c` UTG vs BU, `4` DCFR+ iterations, `16` threads:
+  - current state-major reference: about `7,827ms` terminal time in the most
+    recent comparable run
+  - tile `16`: about `8,644ms`
+  - tile `64`: about `7,877ms`
+  - tile `256`: about `8,464ms`
+  - tile `512`: about `7,712ms`
+  - tile `1024`: about `8,017ms`
+- Result: bounded block-local board-major is correct but only a small,
+  noise-sized improvement at best. It does not yet capture the `~15%` win seen
+  in pure terminal-board smoke, because per-state accumulation still dominates
+  enough to offset much of the board locality gain.
+
 ### D. Street/Subgame Streaming
 
 Current risk:

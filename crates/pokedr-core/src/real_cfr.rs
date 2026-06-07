@@ -176,7 +176,15 @@ struct TerminalBoardTask {
     cache_index: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LocalTerminalBoardTask {
+    local_slot: usize,
+    cache_index: usize,
+    pot: u32,
+}
+
 const TERMINAL_SPARSE_NONZERO_LIMIT: usize = 64;
+const TERMINAL_BOARD_MAJOR_TILE: usize = 64;
 
 #[derive(Debug, Clone)]
 struct TerminalAccumulator {
@@ -1064,6 +1072,8 @@ impl RealCfrSolver {
         }
         let threads = effective_worker_count(threads).min(terminal_len);
         let profile_terminal = std::env::var_os("POKEDR_REAL_CFR_TERMINAL_PROFILE").is_some();
+        let block_board_major =
+            std::env::var_os("POKEDR_REAL_CFR_TERMINAL_BLOCK_BOARD_MAJOR").is_some();
         let state_chunk_len = terminal_len.div_ceil(threads);
         let worker_scope_started = Instant::now();
         let profiles = values[terminal_start..]
@@ -1071,15 +1081,27 @@ impl RealCfrSolver {
             .enumerate()
             .map(|(worker_index, values_chunk)| {
                 let start_index = terminal_start + worker_index * state_chunk_len;
-                self.terminal_phase_worker(
-                    states,
-                    oop_reaches,
-                    ip_reaches,
-                    start_index,
-                    worker_index,
-                    values_chunk,
-                    profile_terminal,
-                )
+                if block_board_major {
+                    self.terminal_phase_worker_block_board_major(
+                        states,
+                        oop_reaches,
+                        ip_reaches,
+                        start_index,
+                        worker_index,
+                        values_chunk,
+                        profile_terminal,
+                    )
+                } else {
+                    self.terminal_phase_worker(
+                        states,
+                        oop_reaches,
+                        ip_reaches,
+                        start_index,
+                        worker_index,
+                        values_chunk,
+                        profile_terminal,
+                    )
+                }
             })
             .collect::<Result<Vec<_>, _>>()?;
         let worker_scope_ms = worker_scope_started.elapsed().as_secs_f64() * 1000.0;
@@ -1226,6 +1248,175 @@ impl RealCfrSolver {
                 }
             }
         }
+        profile.output_states = values_chunk.len();
+        profile.elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+        Ok(profile)
+    }
+
+    fn terminal_phase_worker_block_board_major(
+        &self,
+        states: &[PhaseState],
+        oop_reaches: &[Vec<f32>],
+        ip_reaches: &[Vec<f32>],
+        start_index: usize,
+        worker_index: usize,
+        values_chunk: &mut [Values],
+        profile_terminal: bool,
+    ) -> Result<TerminalWorkerProfile, String> {
+        let started = Instant::now();
+        let scratch_source = self
+            .terminal_cache
+            .first()
+            .ok_or_else(|| "terminal board cache is empty".to_string())?;
+        let combos = scratch_source.prepared.combos().len();
+        let mut scratch = TerminalCfvScratch::new(&scratch_source.prepared);
+        let mut oop_live = vec![0.0f32; combos];
+        let mut ip_live = vec![0.0f32; combos];
+        let mut oop_nonzero = Vec::new();
+        let mut ip_nonzero = Vec::new();
+        let sparse_nonzero_limit = terminal_sparse_nonzero_limit();
+        let tile_size = terminal_board_major_tile().min(values_chunk.len().max(1));
+        let mut accumulators = (0..tile_size)
+            .map(|_| TerminalAccumulator::zero(self.oop_combos.len(), self.ip_combos.len()))
+            .collect::<Vec<_>>();
+        let mut tasks = Vec::<LocalTerminalBoardTask>::new();
+        let mut active_slots = Vec::<usize>::new();
+        let mut profile = TerminalWorkerProfile {
+            worker_index,
+            ..TerminalWorkerProfile::default()
+        };
+
+        for tile_start in (0..values_chunk.len()).step_by(tile_size) {
+            let tile_end = (tile_start + tile_size).min(values_chunk.len());
+            tasks.clear();
+            active_slots.clear();
+
+            for local_index in tile_start..tile_end {
+                let state_index = start_index + local_index;
+                let state = &states[state_index];
+                let node = &self.tree.nodes[state.node_id];
+                let PublicNodeKind::Terminal { reason } = node.kind else {
+                    continue;
+                };
+                match reason {
+                    TerminalReason::Fold => {
+                        profile.terminal_states += 1;
+                        profile.fold_states += 1;
+                        let fold_started = profile_terminal.then(Instant::now);
+                        values_chunk[local_index] = self.fold_values(
+                            &state.board,
+                            node.state.pot,
+                            node.state.player,
+                            &oop_reaches[state_index],
+                            &ip_reaches[state_index],
+                        );
+                        if let Some(started) = fold_started {
+                            profile.fold_ms += started.elapsed().as_secs_f64() * 1000.0;
+                        }
+                    }
+                    TerminalReason::Showdown | TerminalReason::AllIn => {
+                        profile.terminal_states += 1;
+                        let local_slot = local_index - tile_start;
+                        accumulators[local_slot].reset();
+                        active_slots.push(local_slot);
+                        let terminal_boards = if profile_terminal {
+                            let started = Instant::now();
+                            let boards = terminal_boards(&state.board)?;
+                            profile.board_expand_ms += started.elapsed().as_secs_f64() * 1000.0;
+                            boards
+                        } else {
+                            terminal_boards(&state.board)?
+                        };
+                        for terminal_board in terminal_boards {
+                            let cache_index = self
+                                .terminal_cache_index_by_key
+                                .get(&unordered_board_key(&terminal_board))
+                                .copied()
+                                .ok_or_else(|| {
+                                    "terminal board is outside the solver board cache".to_string()
+                                })?;
+                            tasks.push(LocalTerminalBoardTask {
+                                local_slot,
+                                cache_index,
+                                pot: node.state.pot,
+                            });
+                        }
+                    }
+                }
+            }
+
+            tasks.sort_by_key(|task| (task.cache_index, task.local_slot));
+
+            for task in &tasks {
+                let local_index = tile_start + task.local_slot;
+                let state_index = start_index + local_index;
+                let cache = &self.terminal_cache[task.cache_index];
+                let reach_started = profile_terminal.then(Instant::now);
+                reach_on_prepared_board_targets_sparse_into(
+                    &cache.oop_targets,
+                    &oop_reaches[state_index],
+                    &mut oop_live,
+                    &mut oop_nonzero,
+                );
+                reach_on_prepared_board_targets_sparse_into(
+                    &cache.ip_targets,
+                    &ip_reaches[state_index],
+                    &mut ip_live,
+                    &mut ip_nonzero,
+                );
+                if let Some(started) = reach_started {
+                    profile.reach_map_ms += started.elapsed().as_secs_f64() * 1000.0;
+                }
+                profile.tasks += 1;
+                profile.oop_nonzero_sum += oop_nonzero.len();
+                profile.ip_nonzero_sum += ip_nonzero.len();
+                profile.oop_nonzero_max = profile.oop_nonzero_max.max(oop_nonzero.len());
+                profile.ip_nonzero_max = profile.ip_nonzero_max.max(ip_nonzero.len());
+
+                let cfv_started = profile_terminal.then(Instant::now);
+                if oop_nonzero.len() <= sparse_nonzero_limit
+                    && ip_nonzero.len() <= sparse_nonzero_limit
+                {
+                    profile.sparse_tasks += 1;
+                    terminal_cfv_sparse_board_targets_into(
+                        &cache.prepared,
+                        &oop_live,
+                        &ip_live,
+                        &oop_nonzero,
+                        &ip_nonzero,
+                        &cache.oop_board_targets,
+                        &cache.ip_board_targets,
+                        &mut scratch,
+                    )?;
+                } else {
+                    profile.prefix_tasks += 1;
+                    terminal_cfv_prefix_blocker_board_targets_into(
+                        &cache.prepared,
+                        &oop_live,
+                        &ip_live,
+                        &cache.oop_board_targets,
+                        &cache.ip_board_targets,
+                        &mut scratch,
+                    )?;
+                }
+                if let Some(started) = cfv_started {
+                    profile.cfv_ms += started.elapsed().as_secs_f64() * 1000.0;
+                }
+
+                let accumulator_started = profile_terminal.then(Instant::now);
+                accumulators[task.local_slot].add_board(cache, task.pot, &scratch);
+                if let Some(started) = accumulator_started {
+                    profile.accumulator_ms += started.elapsed().as_secs_f64() * 1000.0;
+                }
+            }
+
+            for local_slot in &active_slots {
+                let local_index = tile_start + *local_slot;
+                accumulators[*local_slot].finish();
+                values_chunk[local_index].copy_from(&accumulators[*local_slot].values);
+            }
+        }
+
         profile.output_states = values_chunk.len();
         profile.elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
         Ok(profile)
@@ -2895,6 +3086,14 @@ fn terminal_sparse_nonzero_limit() -> usize {
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(TERMINAL_SPARSE_NONZERO_LIMIT)
+}
+
+fn terminal_board_major_tile() -> usize {
+    std::env::var("POKEDR_REAL_CFR_TERMINAL_BOARD_MAJOR_TILE")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(TERMINAL_BOARD_MAJOR_TILE)
 }
 
 fn print_terminal_worker_profiles(
