@@ -235,6 +235,24 @@ struct RecursiveTerminalScratch {
     oop_nonzero: Vec<u16>,
     ip_nonzero: Vec<u16>,
     accumulator: TerminalAccumulator,
+    vectors: Vec<Vec<f32>>,
+}
+
+impl RecursiveTerminalScratch {
+    fn take_vec(&mut self, len: usize) -> Vec<f32> {
+        match self.vectors.pop() {
+            Some(mut values) => {
+                values.resize(len, 0.0);
+                values.fill(0.0);
+                values
+            }
+            None => vec![0.0; len],
+        }
+    }
+
+    fn release_vec(&mut self, values: Vec<f32>) {
+        self.vectors.push(values);
+    }
 }
 
 #[derive(Debug, Default)]
@@ -548,7 +566,9 @@ impl RealCfrSolver {
         config: RealCfrConfig,
         mut progress: impl FnMut(RealCfrIterationSummary),
     ) -> Result<RealCfrSummary, String> {
-        let mut root = Values::zero(self.oop_combos.len(), self.ip_combos.len());
+        let mut root_oop = vec![0.0; self.oop_combos.len()];
+        let mut root_ip = vec![0.0; self.ip_combos.len()];
+        let mut root_terminal_evals = 0usize;
         let scratch_source = self
             .terminal_cache
             .first()
@@ -561,6 +581,7 @@ impl RealCfrSolver {
             oop_nonzero: Vec::new(),
             ip_nonzero: Vec::new(),
             accumulator: TerminalAccumulator::zero(self.oop_combos.len(), self.ip_combos.len()),
+            vectors: Vec::new(),
         };
         let mut terminal_ref_cache = BTreeMap::new();
         let mut side_cache = TerminalSideValueCache::default();
@@ -589,7 +610,9 @@ impl RealCfrSolver {
             let board = self.flop_board.clone();
             self.completed_iterations += 1;
             let average_weight = self.completed_iterations as f32;
-            root = self.traverse(
+            root_terminal_evals = self.traverse_slices_into(
+                &mut root_oop,
+                &mut root_ip,
                 0,
                 &board,
                 &oop_reach,
@@ -619,19 +642,19 @@ impl RealCfrSolver {
             }
             progress(RealCfrIterationSummary {
                 iteration,
-                terminal_evals: root.terminal_evals,
+                terminal_evals: root_terminal_evals,
                 elapsed_ms: started.elapsed().as_secs_f64() * 1000.0,
                 root_oop_value: weighted_average(
-                    &root.oop,
+                    &root_oop,
                     &self.oop_combos,
                     oop_weight,
                     ip_weight,
                 ),
-                root_ip_value: weighted_average(&root.ip, &self.ip_combos, ip_weight, oop_weight),
+                root_ip_value: weighted_average(&root_ip, &self.ip_combos, ip_weight, oop_weight),
             });
         }
-        let root_oop_value = weighted_average(&root.oop, &self.oop_combos, oop_weight, ip_weight);
-        let root_ip_value = weighted_average(&root.ip, &self.ip_combos, ip_weight, oop_weight);
+        let root_oop_value = weighted_average(&root_oop, &self.oop_combos, oop_weight, ip_weight);
+        let root_ip_value = weighted_average(&root_ip, &self.ip_combos, ip_weight, oop_weight);
         let action_slots = self
             .infosets
             .iter()
@@ -647,7 +670,7 @@ impl RealCfrSolver {
             iterations: config.iterations,
             decision_nodes,
             action_slots,
-            terminal_evals: root.terminal_evals,
+            terminal_evals: root_terminal_evals,
             root_oop_value,
             root_ip_value,
         })
@@ -2337,8 +2360,11 @@ impl RealCfrSolver {
         Ok(())
     }
 
-    fn traverse(
+    #[allow(clippy::too_many_arguments)]
+    fn traverse_slices_into(
         &mut self,
+        out_oop: &mut [f32],
+        out_ip: &mut [f32],
         node_id: usize,
         board: &Board,
         oop_reach: &[f32],
@@ -2349,10 +2375,12 @@ impl RealCfrSolver {
         terminal_ref_cache: &mut BTreeMap<u64, Vec<TerminalCacheRef>>,
         side_cache: &mut TerminalSideValueCache,
         profile: &mut RecursiveCfrProfile,
-    ) -> Result<Values, String> {
+    ) -> Result<usize, String> {
         let node = self.tree.nodes[node_id].clone();
         match node.kind {
-            PublicNodeKind::Terminal { reason } => self.terminal_values(
+            PublicNodeKind::Terminal { reason } => self.terminal_slices_into(
+                out_oop,
+                out_ip,
                 board,
                 node.state.pot,
                 node.state.player,
@@ -2367,26 +2395,26 @@ impl RealCfrSolver {
             PublicNodeKind::Chance(_) => {
                 if profile.enabled {
                     profile.chance_calls += 1;
-                }
-                let Some(child) = node.children.first().copied() else {
-                    if profile.enabled {
-                        profile.values_zero += 1;
-                    }
-                    let values = Values::zero(self.oop_combos.len(), self.ip_combos.len());
-                    return Ok(values);
-                };
-                if profile.enabled {
                     profile.values_zero += 1;
                 }
-                let mut values = Values::zero(self.oop_combos.len(), self.ip_combos.len());
+                out_oop.fill(0.0);
+                out_ip.fill(0.0);
+                let Some(child) = node.children.first().copied() else {
+                    return Ok(0);
+                };
                 let next_cards = board.remaining_deck();
                 let chance_weight = 1.0f32 / next_cards.len() as f32;
                 if profile.enabled {
                     profile.chance_cards += next_cards.len() as u64;
                 }
+                let mut child_oop = terminal_scratch.take_vec(out_oop.len());
+                let mut child_ip = terminal_scratch.take_vec(out_ip.len());
+                let mut terminal_evals = 0usize;
                 for card in next_cards {
                     let next_board = board.push(card)?;
-                    let child_values = self.traverse(
+                    terminal_evals += self.traverse_slices_into(
+                        &mut child_oop,
+                        &mut child_ip,
                         child,
                         &next_board,
                         oop_reach,
@@ -2398,9 +2426,12 @@ impl RealCfrSolver {
                         side_cache,
                         profile,
                     )?;
-                    values.add_scaled(&child_values, chance_weight);
+                    add_scaled_slice(out_oop, &child_oop, chance_weight);
+                    add_scaled_slice(out_ip, &child_ip, chance_weight);
                 }
-                Ok(values)
+                terminal_scratch.release_vec(child_oop);
+                terminal_scratch.release_vec(child_ip);
+                Ok(terminal_evals)
             }
             PublicNodeKind::Decision { player, actions } => {
                 if profile.enabled {
@@ -2408,7 +2439,9 @@ impl RealCfrSolver {
                 }
                 let actions_len = actions.len();
                 if actions_len == 1 {
-                    return self.traverse(
+                    return self.traverse_slices_into(
+                        out_oop,
+                        out_ip,
                         node.children[0],
                         board,
                         oop_reach,
@@ -2444,12 +2477,17 @@ impl RealCfrSolver {
                 );
                 if profile.enabled {
                     profile.strategy_builds += 1;
+                    profile.values_zero += 1;
                 }
 
-                let mut action_values = Vec::with_capacity(actions_len);
+                let oop_len = out_oop.len();
+                let ip_len = out_ip.len();
+                let mut action_oop = terminal_scratch.take_vec(actions_len * oop_len);
+                let mut action_ip = terminal_scratch.take_vec(actions_len * ip_len);
+                let mut terminal_evals = 0usize;
                 match player {
                     Player::Oop => {
-                        let mut next_oop = vec![0.0; oop_reach.len()];
+                        let mut next_oop = terminal_scratch.take_vec(oop_reach.len());
                         for action_index in 0..actions_len {
                             strategy_reach_into(
                                 &mut next_oop,
@@ -2461,7 +2499,13 @@ impl RealCfrSolver {
                             if profile.enabled {
                                 profile.reach_scratch_writes += next_oop.len() as u64;
                             }
-                            action_values.push(self.traverse(
+                            let oop_row = &mut action_oop
+                                [action_index * oop_len..(action_index + 1) * oop_len];
+                            let ip_row =
+                                &mut action_ip[action_index * ip_len..(action_index + 1) * ip_len];
+                            terminal_evals += self.traverse_slices_into(
+                                oop_row,
+                                ip_row,
                                 node.children[action_index],
                                 board,
                                 &next_oop,
@@ -2472,11 +2516,12 @@ impl RealCfrSolver {
                                 terminal_ref_cache,
                                 side_cache,
                                 profile,
-                            )?);
+                            )?;
                         }
+                        terminal_scratch.release_vec(next_oop);
                     }
                     Player::Ip => {
-                        let mut next_ip = vec![0.0; ip_reach.len()];
+                        let mut next_ip = terminal_scratch.take_vec(ip_reach.len());
                         for action_index in 0..actions_len {
                             strategy_reach_into(
                                 &mut next_ip,
@@ -2488,7 +2533,13 @@ impl RealCfrSolver {
                             if profile.enabled {
                                 profile.reach_scratch_writes += next_ip.len() as u64;
                             }
-                            action_values.push(self.traverse(
+                            let oop_row = &mut action_oop
+                                [action_index * oop_len..(action_index + 1) * oop_len];
+                            let ip_row =
+                                &mut action_ip[action_index * ip_len..(action_index + 1) * ip_len];
+                            terminal_evals += self.traverse_slices_into(
+                                oop_row,
+                                ip_row,
                                 node.children[action_index],
                                 board,
                                 oop_reach,
@@ -2499,39 +2550,22 @@ impl RealCfrSolver {
                                 terminal_ref_cache,
                                 side_cache,
                                 profile,
-                            )?);
+                            )?;
                         }
+                        terminal_scratch.release_vec(next_ip);
                     }
                 }
 
-                if profile.enabled {
-                    profile.values_zero += 1;
-                }
-                let mut values = Values::zero(self.oop_combos.len(), self.ip_combos.len());
                 match player {
                     Player::Oop => {
-                        combine_acting_values(
-                            &mut values.oop,
-                            &action_values,
-                            &strategies,
-                            actions_len,
-                            Player::Oop,
-                        );
-                        combine_nonacting_values(&mut values.ip, &action_values, Player::Ip);
+                        combine_acting_flat_values(out_oop, &action_oop, &strategies, actions_len);
+                        combine_nonacting_flat_values(out_ip, &action_ip, actions_len);
                     }
                     Player::Ip => {
-                        combine_acting_values(
-                            &mut values.ip,
-                            &action_values,
-                            &strategies,
-                            actions_len,
-                            Player::Ip,
-                        );
-                        combine_nonacting_values(&mut values.oop, &action_values, Player::Oop);
+                        combine_acting_flat_values(out_ip, &action_ip, &strategies, actions_len);
+                        combine_nonacting_flat_values(out_oop, &action_oop, actions_len);
                     }
                 }
-                values.terminal_evals =
-                    action_values.iter().map(|value| value.terminal_evals).sum();
 
                 let own_reach = match player {
                     Player::Oop => oop_reach,
@@ -2539,13 +2573,13 @@ impl RealCfrSolver {
                 };
                 for combo in 0..acting_combos {
                     let node_value = match player {
-                        Player::Oop => values.oop[combo],
-                        Player::Ip => values.ip[combo],
+                        Player::Oop => out_oop[combo],
+                        Player::Ip => out_ip[combo],
                     };
                     for action_index in 0..actions_len {
                         let action_value = match player {
-                            Player::Oop => action_values[action_index].oop[combo],
-                            Player::Ip => action_values[action_index].ip[combo],
+                            Player::Oop => action_oop[action_index * oop_len + combo],
+                            Player::Ip => action_ip[action_index * ip_len + combo],
                         };
                         let local_slot = combo * actions_len + action_index;
                         let slot = slot_start + local_slot;
@@ -2559,7 +2593,9 @@ impl RealCfrSolver {
                         );
                     }
                 }
-                Ok(values)
+                terminal_scratch.release_vec(action_oop);
+                terminal_scratch.release_vec(action_ip);
+                Ok(terminal_evals)
             }
         }
     }
@@ -2579,56 +2615,6 @@ impl RealCfrSolver {
                 .ok_or_else(|| "river board is outside the solver board index".to_string()),
             other => Err(format!("invalid public board length {other}")),
         }
-    }
-
-    fn terminal_values(
-        &self,
-        board: &Board,
-        pot: u32,
-        folding_player: Player,
-        reason: TerminalReason,
-        oop_reach: &[f32],
-        ip_reach: &[f32],
-        terminal_scratch: &mut RecursiveTerminalScratch,
-        terminal_ref_cache: &mut BTreeMap<u64, Vec<TerminalCacheRef>>,
-        side_cache: &mut TerminalSideValueCache,
-        profile: &mut RecursiveCfrProfile,
-    ) -> Result<Values, String> {
-        if profile.enabled {
-            profile.terminal_calls += 1;
-        }
-        match reason {
-            TerminalReason::Fold => {
-                if profile.enabled {
-                    profile.fold_calls += 1;
-                    profile.values_zero += 1;
-                }
-                Ok(self.fold_values(board, pot, folding_player, oop_reach, ip_reach))
-            }
-            TerminalReason::Showdown | TerminalReason::AllIn => self.showdown_values_cached(
-                board,
-                pot,
-                oop_reach,
-                ip_reach,
-                terminal_scratch,
-                terminal_ref_cache,
-                side_cache,
-                profile,
-            ),
-        }
-    }
-
-    fn fold_values(
-        &self,
-        board: &Board,
-        pot: u32,
-        folding_player: Player,
-        oop_reach: &[f32],
-        ip_reach: &[f32],
-    ) -> Values {
-        let mut values = Values::zero(self.oop_combos.len(), self.ip_combos.len());
-        self.fold_values_into(&mut values, board, pot, folding_player, oop_reach, ip_reach);
-        values
     }
 
     fn fold_values_into(
@@ -2674,83 +2660,156 @@ impl RealCfrSolver {
         values.terminal_evals = 0;
     }
 
-    fn showdown_values_cached(
+    #[allow(clippy::too_many_arguments)]
+    fn terminal_slices_into(
         &self,
+        out_oop: &mut [f32],
+        out_ip: &mut [f32],
         board: &Board,
         pot: u32,
+        folding_player: Player,
+        reason: TerminalReason,
         oop_reach: &[f32],
         ip_reach: &[f32],
-        scratch: &mut RecursiveTerminalScratch,
+        terminal_scratch: &mut RecursiveTerminalScratch,
         terminal_ref_cache: &mut BTreeMap<u64, Vec<TerminalCacheRef>>,
         side_cache: &mut TerminalSideValueCache,
         profile: &mut RecursiveCfrProfile,
-    ) -> Result<Values, String> {
+    ) -> Result<usize, String> {
         if profile.enabled {
-            profile.showdown_calls += 1;
+            profile.terminal_calls += 1;
         }
-        let key = ordered_board_key(board);
-        let terminal_refs = if let Some(cached) = terminal_ref_cache.get(&key) {
-            cached.clone()
-        } else {
-            let refs = self.terminal_cache_refs_for_board(board)?;
-            terminal_ref_cache.insert(key, refs.clone());
-            refs
-        };
-        let sparse_nonzero_limit = terminal_sparse_nonzero_limit();
-        scratch.accumulator.reset();
-        for terminal_ref in &terminal_refs {
-            let cache = &self.terminal_cache[terminal_ref.cache_index];
-            reach_on_prepared_board_targets_sparse_into(
-                &cache.oop_targets,
-                oop_reach,
-                &mut scratch.oop_live,
-                &mut scratch.oop_nonzero,
-            );
-            reach_on_prepared_board_targets_sparse_into(
-                &cache.ip_targets,
-                ip_reach,
-                &mut scratch.ip_live,
-                &mut scratch.ip_nonzero,
-            );
-            let use_sparse = scratch.oop_nonzero.len() <= sparse_nonzero_limit
-                && scratch.ip_nonzero.len() <= sparse_nonzero_limit;
-            let hero_values = terminal_side_cached_values(
-                side_cache,
-                cache,
-                terminal_ref.cache_index,
-                TerminalSideValue::OopValue,
-                &scratch.ip_live,
-                &scratch.ip_nonzero,
-                &cache.oop_targets,
-                &cache.oop_board_targets,
-                self.oop_combos.len(),
-                use_sparse,
-                &mut scratch.cfv,
-            )?;
-            let villain_values = terminal_side_cached_values(
-                side_cache,
-                cache,
-                terminal_ref.cache_index,
-                TerminalSideValue::IpValue,
-                &scratch.oop_live,
-                &scratch.oop_nonzero,
-                &cache.ip_targets,
-                &cache.ip_board_targets,
-                self.ip_combos.len(),
-                use_sparse,
-                &mut scratch.cfv,
-            )?;
-            self.add_terminal_ref_compact_values(
-                &mut scratch.accumulator,
-                terminal_ref,
-                cache,
-                pot,
-                &hero_values,
-                &villain_values,
-            )?;
+        match reason {
+            TerminalReason::Fold => {
+                if profile.enabled {
+                    profile.fold_calls += 1;
+                }
+                self.fold_slices_into(
+                    out_oop,
+                    out_ip,
+                    board,
+                    pot,
+                    folding_player,
+                    oop_reach,
+                    ip_reach,
+                );
+                Ok(0)
+            }
+            TerminalReason::Showdown | TerminalReason::AllIn => {
+                if profile.enabled {
+                    profile.showdown_calls += 1;
+                }
+                let key = ordered_board_key(board);
+                let terminal_refs = if let Some(cached) = terminal_ref_cache.get(&key) {
+                    cached.clone()
+                } else {
+                    let refs = self.terminal_cache_refs_for_board(board)?;
+                    terminal_ref_cache.insert(key, refs.clone());
+                    refs
+                };
+                let sparse_nonzero_limit = terminal_sparse_nonzero_limit();
+                terminal_scratch.accumulator.reset();
+                for terminal_ref in &terminal_refs {
+                    let cache = &self.terminal_cache[terminal_ref.cache_index];
+                    reach_on_prepared_board_targets_sparse_into(
+                        &cache.oop_targets,
+                        oop_reach,
+                        &mut terminal_scratch.oop_live,
+                        &mut terminal_scratch.oop_nonzero,
+                    );
+                    reach_on_prepared_board_targets_sparse_into(
+                        &cache.ip_targets,
+                        ip_reach,
+                        &mut terminal_scratch.ip_live,
+                        &mut terminal_scratch.ip_nonzero,
+                    );
+                    let use_sparse = terminal_scratch.oop_nonzero.len() <= sparse_nonzero_limit
+                        && terminal_scratch.ip_nonzero.len() <= sparse_nonzero_limit;
+                    let hero_values = terminal_side_cached_values(
+                        side_cache,
+                        cache,
+                        terminal_ref.cache_index,
+                        TerminalSideValue::OopValue,
+                        &terminal_scratch.ip_live,
+                        &terminal_scratch.ip_nonzero,
+                        &cache.oop_targets,
+                        &cache.oop_board_targets,
+                        self.oop_combos.len(),
+                        use_sparse,
+                        &mut terminal_scratch.cfv,
+                    )?;
+                    let villain_values = terminal_side_cached_values(
+                        side_cache,
+                        cache,
+                        terminal_ref.cache_index,
+                        TerminalSideValue::IpValue,
+                        &terminal_scratch.oop_live,
+                        &terminal_scratch.oop_nonzero,
+                        &cache.ip_targets,
+                        &cache.ip_board_targets,
+                        self.ip_combos.len(),
+                        use_sparse,
+                        &mut terminal_scratch.cfv,
+                    )?;
+                    self.add_terminal_ref_compact_values(
+                        &mut terminal_scratch.accumulator,
+                        terminal_ref,
+                        cache,
+                        pot,
+                        &hero_values,
+                        &villain_values,
+                    )?;
+                }
+                terminal_scratch.accumulator.finish();
+                out_oop.copy_from_slice(&terminal_scratch.accumulator.values.oop);
+                out_ip.copy_from_slice(&terminal_scratch.accumulator.values.ip);
+                Ok(terminal_scratch.accumulator.values.terminal_evals)
+            }
         }
-        scratch.accumulator.finish();
-        Ok(scratch.accumulator.values.clone())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn fold_slices_into(
+        &self,
+        out_oop: &mut [f32],
+        out_ip: &mut [f32],
+        board: &Board,
+        pot: u32,
+        folding_player: Player,
+        oop_reach: &[f32],
+        ip_reach: &[f32],
+    ) {
+        let pot = pot as f32;
+        opponent_weights_for_fast_into(
+            &self.oop_combos,
+            &self.ip_combos,
+            ip_reach,
+            &self.oop_same_ip_combo_indices,
+            board,
+            out_oop,
+        );
+        opponent_weights_for_fast_into(
+            &self.ip_combos,
+            &self.oop_combos,
+            oop_reach,
+            &self.ip_same_oop_combo_indices,
+            board,
+            out_ip,
+        );
+        for value in out_oop.iter_mut() {
+            *value = if folding_player == Player::Oop {
+                -pot
+            } else {
+                pot
+            } * *value;
+        }
+        for value in out_ip.iter_mut() {
+            *value = if folding_player == Player::Ip {
+                -pot
+            } else {
+                pot
+            } * *value;
+        }
     }
 }
 
@@ -3090,6 +3149,12 @@ fn strategy_reach_into(
     }
 }
 
+fn add_scaled_slice(out: &mut [f32], input: &[f32], scale: f32) {
+    for (out, input) in out.iter_mut().zip(input) {
+        *out += *input * scale;
+    }
+}
+
 fn add_reach(out: &mut [f32], input: &[f32]) {
     for (out, input) in out.iter_mut().zip(input) {
         *out += *input;
@@ -3099,6 +3164,33 @@ fn add_reach(out: &mut [f32], input: &[f32]) {
 fn add_scaled_reach(out: &mut [f32], input: &[f32], scale: f32) {
     for (out, input) in out.iter_mut().zip(input) {
         *out += *input * scale;
+    }
+}
+
+fn combine_acting_flat_values(
+    out: &mut [f32],
+    action_values: &[f32],
+    strategies: &[f32],
+    actions: usize,
+) {
+    let combos = out.len();
+    for combo in 0..combos {
+        let mut value = 0.0f32;
+        for action in 0..actions {
+            value += strategies[combo * actions + action] * action_values[action * combos + combo];
+        }
+        out[combo] = value;
+    }
+}
+
+fn combine_nonacting_flat_values(out: &mut [f32], action_values: &[f32], actions: usize) {
+    let combos = out.len();
+    for combo in 0..combos {
+        let mut value = 0.0f32;
+        for action in 0..actions {
+            value += action_values[action * combos + combo];
+        }
+        out[combo] = value;
     }
 }
 

@@ -162,6 +162,122 @@ places where this implementation may still be structurally worse than a mature
 postflop solver. Each item should be treated as a hypothesis until measured or
 proved.
 
+## 2026-06-07 Structural Diagnosis
+
+The current speed gap is unlikely to be explained by a single missing micro
+optimization. The largest structural difference is the direction of the
+calculation.
+
+### OSS Check
+
+Two OSS solvers were inspected locally:
+
+- `b-inary/postflop-solver`
+- `bupticybee/TexasSolver`
+
+This corrected an earlier hypothesis. These OSS solvers are not obviously using
+a full final-board-major batched terminal operator. Both expose a recursive CFR
+shape where terminal evaluation is called from the recursive solve.
+
+The important differences are still structural:
+
+- They solve one player at a time / alternating-style, so a recursive pass
+  carries one opponent reach vector and returns one player's CFV vector. The
+  hot terminal evaluator does not build both players' terminal values for every
+  call.
+- Terminal showdown evaluation is a rank-sorted two-pass scan using one scalar
+  opponent reach sum plus a `52`-entry card blocker sum. This is exactly
+  `O(live_hands)` for a terminal board, not pair-quadratic.
+- Chance isomorphism is built into the tree traversal. `postflop-solver`
+  explicitly skips isomorphic turn/river chances and applies hand swaps when
+  summing the skipped chance values. TexasSolver has a similar suit/color
+  isomorphism path for chance nodes.
+- The public tree is schematic with chance nodes sharing an action child rather
+  than storing independent action trees per card.
+- State is node-local and compact. `postflop-solver` can store regrets,
+  strategies, and chance CFVs in compressed `i16` plus scale form.
+- Hot loops intentionally use unsafe/index-specialized code and avoid allocator
+  churn. `postflop-solver` even has a custom stack allocator feature for solve
+  recursion.
+
+Implication: before inventing a more complex board-major batched design, the
+first thing to match is the simpler proven structure:
+
+```text
+schematic betting tree with isomorphic chance folding
+alternating CFR pass
+  opponent reach vector only
+  one player CFV vector only
+  terminal showdown as sorted O(H) scan with 52-card blocker sums
+  exact chance isomorphism
+  no per-terminal both-side Values object
+```
+
+The tree side is probably the first-order issue. If chance-equivalent turn/river
+cards are expanded as independent states, every later optimization pays the same
+work multiple times. The solver should first make the public tree schematic and
+isomorphism-aware, then simplify the CFR pass to the one-player shape above.
+Batched final-board operators may still be useful later, but they are not
+required to explain why the current implementation is slower than OSS CPU
+solvers.
+
+Current real-CFR shape:
+
+```text
+for each public terminal state/path:
+  build that path's live reach vectors
+  for each final board under that terminal:
+    compute exact terminal CFV for one reach column
+  backup values through that path
+```
+
+This is exact, but it repeats the same final-board strength/blocker machinery
+for many independent reach columns. Because each path has different reach, a
+naive cache is not valid beyond special cases such as the uniform first
+iteration.
+
+The production-solver-like target shape should be:
+
+```text
+for each street block / final board class:
+  collect many reach columns that share board tables and action skeleton
+  evaluate terminal CFV as a batched exact operator
+  scatter/reduce the resulting counterfactual columns into owned parent blocks
+```
+
+In symbols, the scalar terminal call computes one column:
+
+```text
+v_h = T_b(h, r_opp)
+```
+
+where `b` is a final board and `r_opp` is the opponent reach column for one
+terminal path. The missing structural optimization is not caching `v_h`, because
+`r_opp` changes by path. It is evaluating many columns
+
+```text
+V_b[:, j] = T_b(R_opp[:, j])
+```
+
+with shared board-local strength order, tie groups, live-combo maps, and blocker
+tables, while keeping the exact blocker correction. A CPU implementation that
+simply stores columns side by side was already tested and did not help; the
+useful version needs board-major ownership and a memory layout where the batched
+columns are consumed by the backup without writing large temporary surfaces.
+
+Practical implications:
+
+- CFR variant tuning cannot close a 7x-20x implementation gap by itself.
+- More per-call terminal CFV micro-kernels are unlikely to produce 10x if the
+  tree still duplicates isomorphic chance work.
+- Exact suit/chance isomorphism is not a cosmetic compression pass; it changes
+  how much tree is solved per iteration.
+- The next exact solver architecture should be board/street/block-major, not
+  path-state-major.
+- The main validation target is unchanged: the batched operator must match the
+  scalar exact terminal CFV on small trees and preserve root profile values and
+  exploitability.
+
 ### A. State Representation Density
 
 Current risk:
