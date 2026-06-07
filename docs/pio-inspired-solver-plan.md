@@ -448,3 +448,55 @@ Validation requirement:
 
 - Track which proxy correlates with exact exploitability on fixed benchmark
   trees.
+
+### I. Exact Future-Board Suit Isomorphism
+
+Current risk:
+
+- Future turn/river cards are currently treated mostly as concrete boards.
+  That repeats equivalent chance branches on boards where suits are symmetric
+  under the public board and both input ranges.
+
+Possible production-solver difference:
+
+- Enumerate only representative future-card classes.
+- For omitted chance branches, add the representative branch after applying
+  the corresponding private-combo suit swap.
+- Keep multiplicity alone only for scalar diagnostics; it is not sufficient
+  for CFR values because private hand indices move under suit swaps.
+
+Correctness caveat:
+
+- A suit permutation is valid only when it preserves the public board as a set,
+  preserves both player ranges and preserves the action abstraction. Exact-suit
+  ranges intentionally reduce or eliminate suit symmetry.
+
+Validation requirement:
+
+- First validate class counts and multiplicity sums without changing CFR.
+- Then wire chance reduction into the solver and compare against the concrete
+  chance tree on small ranges for one or more full iterations.
+
+Initial measurement:
+
+- With full symmetric ranges across all `22100` concrete flops, ordered
+  turn-river events average `2093.120` representatives versus `2352` concrete
+  events, eliminating about `11.0%`.
+- The effect is highly board dependent. `As7h2c` keeps all `49` turn events
+  and only removes `36` ordered turn-river events after some turns, while
+  `AsKsQs` reduces turn events from `49` to `23` and ordered turn-river events
+  from `2352` to `1585`.
+
+Initial implementation:
+
+- Terminal runouts are now grouped by exact suit isomorphism before terminal
+  CFV evaluation. This is intentionally limited to showdown/all-in terminal
+  runouts; merging non-terminal chance states requires carrying swapped private
+  values through downstream decision nodes and is a separate change.
+- Each terminal class stores the representative board plus the suit
+  permutation for every concrete member. The terminal accumulator applies the
+  corresponding private-combo permutation when adding representative CFVs back
+  to the concrete value vectors.
+- Validation: isomorphism unit tests verify multiplicity preservation and
+  permutation mapping, and the ignored small-range recursive-vs-three-phase
+  CFR test still matches after the terminal runout grouping.

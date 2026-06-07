@@ -123,6 +123,21 @@ enum Command {
         #[arg(long, default_value_t = 0)]
         terminal_cfv_threads: usize,
     },
+    #[command(about = "Inspect exact future-board suit isomorphism for a fixed flop and ranges")]
+    BoardIsomorphism {
+        flop: String,
+        #[arg(long, default_value = "full")]
+        oop_range: String,
+        #[arg(long, default_value = "full")]
+        ip_range: String,
+        #[arg(long, default_value_t = 8)]
+        print_turns: usize,
+        #[arg(
+            long,
+            help = "Survey every unordered flop instead of only the supplied flop"
+        )]
+        survey_all_flops: bool,
+    },
 }
 
 fn main() -> Result<(), String> {
@@ -880,6 +895,79 @@ fn main() -> Result<(), String> {
                     "cost_benchmark_total iterations={} elapsed_ms={:.3}",
                     iterations,
                     total_started.elapsed().as_secs_f64() * 1000.0,
+                );
+            }
+        }
+        Command::BoardIsomorphism {
+            flop,
+            oop_range,
+            ip_range,
+            print_turns,
+            survey_all_flops,
+        } => {
+            let oop_range = RangeSpec::from_str(&oop_range)?;
+            let ip_range = RangeSpec::from_str(&ip_range)?;
+            if survey_all_flops {
+                let survey =
+                    pokedr_core::full_deck_future_board_isomorphism_survey(&oop_range, &ip_range)?;
+                println!("flops={}", survey.flops);
+                println!(
+                    "ordered_turn_river concrete_events_per_flop={} min_representative_events={} max_representative_events={} average_representative_events={:.3} average_eliminated_events={:.3} average_eliminated_fraction={:.6}",
+                    survey.ordered_turn_river_concrete_events_per_flop,
+                    survey.min_representative_events,
+                    survey.max_representative_events,
+                    survey.average_representative_events,
+                    survey.average_eliminated_events,
+                    survey.average_eliminated_fraction
+                );
+                return Ok(());
+            }
+            let flop = Board::from_str(&flop)?;
+            let report =
+                pokedr_core::fixed_flop_future_board_isomorphism(&flop, &oop_range, &ip_range)?;
+            println!("board={}", report.flop);
+            println!(
+                "valid_public_range_suit_permutations={}",
+                report.valid_permutations
+            );
+            println!(
+                "turn concrete_events={} classes={} eliminated={} multiplicity_sum={}",
+                report.turn.concrete_events,
+                report.turn.classes.len(),
+                report
+                    .turn
+                    .concrete_events
+                    .saturating_sub(report.turn.classes.len()),
+                report
+                    .turn
+                    .classes
+                    .iter()
+                    .map(|class| class.multiplicity)
+                    .sum::<usize>()
+            );
+            println!(
+                "ordered_turn_river concrete_events={} representative_events={} eliminated={}",
+                report.ordered_turn_river_concrete_events,
+                report.ordered_turn_river_representative_events,
+                report
+                    .ordered_turn_river_concrete_events
+                    .saturating_sub(report.ordered_turn_river_representative_events)
+            );
+            for (index, turn_class) in report.turn.classes.iter().take(print_turns).enumerate() {
+                let turn = turn_class
+                    .representative
+                    .first()
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| "-".to_string());
+                let river = &report.representative_turn_river_classes[index];
+                println!(
+                    "turn_class index={} card={} multiplicity={} river_concrete_events={} river_classes={} river_eliminated={}",
+                    index,
+                    turn,
+                    turn_class.multiplicity,
+                    river.concrete_events,
+                    river.classes.len(),
+                    river.concrete_events.saturating_sub(river.classes.len())
                 );
             }
         }

@@ -1,5 +1,6 @@
 pub mod cards;
 pub mod cfr;
+pub mod isomorphism;
 pub mod plan;
 pub mod range;
 pub mod real_cfr;
@@ -12,6 +13,13 @@ pub use cfr::{
     CfrStateAllocError, CfrStateIterationSummary, CfrStorageScenarioReport, CfrVariant,
     PublicStateDuplicateReport, SlotChunk, analyze_cfr_storage_scenarios,
     analyze_public_state_duplicates, build_action_slot_layout, dry_run_cfr_plus_iteration,
+};
+pub use isomorphism::{
+    ChanceClass, ChanceClassMember, ComboSwap, FutureBoardIsomorphismReport,
+    FutureBoardIsomorphismSurvey, NextCardIsomorphism, SuitPermutation, TerminalBoardClass,
+    TerminalBoardClassMember, all_suit_permutations, fixed_flop_future_board_isomorphism,
+    full_deck_future_board_isomorphism_survey, next_card_isomorphism,
+    private_combo_permutation_indices, private_combo_swap_list, terminal_board_isomorphism,
 };
 pub use plan::{CfrStorageConfig, CfrWorkPlan, StreetWorkPlan, TerminalWorkPlan, plan_cfr_work};
 pub use range::{ComboWeight, RangeSpec};

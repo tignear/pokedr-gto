@@ -1,4 +1,7 @@
 use crate::cards::{Board, Card};
+use crate::isomorphism::{
+    all_suit_permutations, private_combo_permutation_indices, terminal_board_isomorphism,
+};
 use crate::range::{ComboWeight, RangeSpec};
 use crate::terminal_cfv::{
     PreparedTerminalBoard, TerminalCfvScratch, terminal_cfv_prefix_blocker_board_targets_into,
@@ -157,6 +160,8 @@ pub struct TerminalBoardReuseRow {
 #[derive(Debug, Clone)]
 pub struct RealCfrSolver {
     tree: PublicTree,
+    oop_range: RangeSpec,
+    ip_range: RangeSpec,
     oop_combos: Vec<ComboWeight>,
     ip_combos: Vec<ComboWeight>,
     infosets: Vec<Option<RealInfoset>>,
@@ -168,6 +173,7 @@ pub struct RealCfrSolver {
     river_index_by_key: BTreeMap<u64, usize>,
     terminal_cache_index_by_key: BTreeMap<u64, usize>,
     terminal_cache: Vec<TerminalEvalCache>,
+    combo_permutations: BTreeMap<u8, ComboPermutationMaps>,
     oop_same_ip_combo_indices: Vec<Option<usize>>,
     ip_same_oop_combo_indices: Vec<Option<usize>>,
 }
@@ -317,6 +323,19 @@ struct PhaseState {
     board_slot: usize,
     children: Vec<usize>,
     terminal_cache_indices: Vec<usize>,
+    terminal_cache_refs: Vec<TerminalCacheRef>,
+}
+
+#[derive(Debug, Clone)]
+struct TerminalCacheRef {
+    cache_index: usize,
+    member_permutation_codes: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+struct ComboPermutationMaps {
+    oop_source_to_target: Vec<usize>,
+    ip_source_to_target: Vec<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -369,6 +388,22 @@ impl RealCfrSolver {
     ) -> Result<Self, String> {
         let oop_combos = oop_range.combos().to_vec();
         let ip_combos = ip_range.combos().to_vec();
+        let combo_permutations = all_suit_permutations()
+            .into_iter()
+            .filter_map(|permutation| {
+                let oop_source_to_target =
+                    private_combo_permutation_indices(&oop_combos, permutation)?;
+                let ip_source_to_target =
+                    private_combo_permutation_indices(&ip_combos, permutation)?;
+                Some((
+                    permutation.code(),
+                    ComboPermutationMaps {
+                        oop_source_to_target,
+                        ip_source_to_target,
+                    },
+                ))
+            })
+            .collect::<BTreeMap<_, _>>();
         let oop_same_ip_combo_indices = same_combo_indices(&oop_combos, &ip_combos);
         let ip_same_oop_combo_indices = same_combo_indices(&ip_combos, &oop_combos);
         let flop_board = tree.spot.board.clone();
@@ -430,6 +465,8 @@ impl RealCfrSolver {
         }
         Ok(Self {
             tree,
+            oop_range,
+            ip_range,
             oop_combos,
             ip_combos,
             infosets,
@@ -441,6 +478,7 @@ impl RealCfrSolver {
             river_index_by_key,
             terminal_cache_index_by_key,
             terminal_cache,
+            combo_permutations,
             oop_same_ip_combo_indices,
             ip_same_oop_combo_indices,
         })
@@ -995,12 +1033,14 @@ impl RealCfrSolver {
         index_by_key.insert(key, state_index);
         let board_slot = self.board_slot(board)?;
         let terminal_cache_indices = self.phase_state_terminal_cache_indices(node_id, board)?;
+        let terminal_cache_refs = self.phase_state_terminal_cache_refs(node_id, board)?;
         states.push(PhaseState {
             node_id,
             board: board.clone(),
             board_slot,
             children: Vec::new(),
             terminal_cache_indices,
+            terminal_cache_refs,
         });
 
         let node = &self.tree.nodes[node_id];
@@ -1054,6 +1094,39 @@ impl RealCfrSolver {
                     .get(&unordered_board_key(&terminal_board))
                     .copied()
                     .ok_or_else(|| "terminal board is outside the solver board cache".to_string())
+            })
+            .collect()
+    }
+
+    fn phase_state_terminal_cache_refs(
+        &self,
+        node_id: usize,
+        board: &Board,
+    ) -> Result<Vec<TerminalCacheRef>, String> {
+        let PublicNodeKind::Terminal { reason } = self.tree.nodes[node_id].kind else {
+            return Ok(Vec::new());
+        };
+        if !matches!(reason, TerminalReason::Showdown | TerminalReason::AllIn) {
+            return Ok(Vec::new());
+        }
+        terminal_board_isomorphism(board, &self.oop_range, &self.ip_range)?
+            .into_iter()
+            .map(|class| {
+                let cache_index = self
+                    .terminal_cache_index_by_key
+                    .get(&unordered_board_key(&class.representative_board))
+                    .copied()
+                    .ok_or_else(|| {
+                        "terminal board is outside the solver board cache".to_string()
+                    })?;
+                Ok(TerminalCacheRef {
+                    cache_index,
+                    member_permutation_codes: class
+                        .members
+                        .iter()
+                        .map(|member| member.permutation_to_representative.code())
+                        .collect(),
+                })
             })
             .collect()
     }
@@ -1562,8 +1635,8 @@ impl RealCfrSolver {
                 TerminalReason::Showdown | TerminalReason::AllIn => {
                     profile.terminal_states += 1;
                     accumulator.reset();
-                    for cache_index in &state.terminal_cache_indices {
-                        let cache = &self.terminal_cache[*cache_index];
+                    for terminal_ref in &state.terminal_cache_refs {
+                        let cache = &self.terminal_cache[terminal_ref.cache_index];
                         let reach_started = profile_terminal.then(Instant::now);
                         reach_on_prepared_board_targets_sparse_into(
                             &cache.oop_targets,
@@ -1592,7 +1665,7 @@ impl RealCfrSolver {
                             let hero_values = terminal_side_cached_values(
                                 &mut side_cache,
                                 cache,
-                                *cache_index,
+                                terminal_ref.cache_index,
                                 TerminalSideValue::OopValue,
                                 &ip_live,
                                 &ip_nonzero,
@@ -1603,7 +1676,7 @@ impl RealCfrSolver {
                             let villain_values = terminal_side_cached_values(
                                 &mut side_cache,
                                 cache,
-                                *cache_index,
+                                terminal_ref.cache_index,
                                 TerminalSideValue::IpValue,
                                 &oop_live,
                                 &oop_nonzero,
@@ -1611,12 +1684,14 @@ impl RealCfrSolver {
                                 use_sparse,
                                 &mut scratch,
                             )?;
-                            accumulator.add_board_values(
+                            self.add_terminal_ref_values(
+                                &mut accumulator,
+                                terminal_ref,
                                 cache,
                                 node.state.pot,
                                 &hero_values,
                                 &villain_values,
-                            );
+                            )?;
                         } else if use_sparse {
                             profile.sparse_tasks += 1;
                             terminal_cfv_sparse_board_targets_into(
@@ -1645,7 +1720,14 @@ impl RealCfrSolver {
                         }
                         if !use_side_cache {
                             let accumulator_started = profile_terminal.then(Instant::now);
-                            accumulator.add_board(cache, node.state.pot, &scratch);
+                            self.add_terminal_ref_values(
+                                &mut accumulator,
+                                terminal_ref,
+                                cache,
+                                node.state.pot,
+                                scratch.hero_values(),
+                                scratch.villain_values(),
+                            )?;
                             if let Some(started) = accumulator_started {
                                 profile.accumulator_ms += started.elapsed().as_secs_f64() * 1000.0;
                             }
@@ -1664,6 +1746,34 @@ impl RealCfrSolver {
         profile.output_states = values_chunk.len();
         profile.elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
         Ok(profile)
+    }
+
+    fn add_terminal_ref_values(
+        &self,
+        accumulator: &mut TerminalAccumulator,
+        terminal_ref: &TerminalCacheRef,
+        cache: &TerminalEvalCache,
+        pot: u32,
+        hero_values: &[f32],
+        villain_values: &[f32],
+    ) -> Result<(), String> {
+        for permutation_code in &terminal_ref.member_permutation_codes {
+            let maps = self
+                .combo_permutations
+                .get(permutation_code)
+                .ok_or_else(|| {
+                    "terminal isomorphism permutation is missing combo maps".to_string()
+                })?;
+            accumulator.add_board_values_permuted(
+                cache,
+                pot,
+                hero_values,
+                villain_values,
+                &maps.oop_source_to_target,
+                &maps.ip_source_to_target,
+            );
+        }
+        Ok(())
     }
 
     fn backup_phase(
@@ -2388,27 +2498,27 @@ impl TerminalAccumulator {
         self.ip_counts.fill(0.0);
     }
 
-    fn add_board(&mut self, cache: &TerminalEvalCache, pot: u32, scratch: &TerminalCfvScratch) {
-        self.add_board_values(cache, pot, scratch.hero_values(), scratch.villain_values());
-    }
-
-    fn add_board_values(
+    fn add_board_values_permuted(
         &mut self,
         cache: &TerminalEvalCache,
         pot: u32,
         hero_values: &[f32],
         villain_values: &[f32],
+        oop_source_to_target: &[usize],
+        ip_source_to_target: &[usize],
     ) {
         let pot = pot as f32;
-        for target in &cache.oop_targets {
-            let index = target.range_index;
-            self.values.oop[index] += hero_values[target.board_index as usize] * pot;
-            self.oop_counts[index] += 1.0;
+        for (source_index, target_index) in oop_source_to_target.iter().enumerate() {
+            if let Some(board_index) = cache.oop_combo_indices[*target_index] {
+                self.values.oop[source_index] += hero_values[board_index] * pot;
+                self.oop_counts[source_index] += 1.0;
+            }
         }
-        for target in &cache.ip_targets {
-            let index = target.range_index;
-            self.values.ip[index] += villain_values[target.board_index as usize] * pot;
-            self.ip_counts[index] += 1.0;
+        for (source_index, target_index) in ip_source_to_target.iter().enumerate() {
+            if let Some(board_index) = cache.ip_combo_indices[*target_index] {
+                self.values.ip[source_index] += villain_values[board_index] * pot;
+                self.ip_counts[source_index] += 1.0;
+            }
         }
         self.values.terminal_evals += 1;
     }
@@ -3523,7 +3633,7 @@ fn terminal_phase_partitions(
 }
 
 fn terminal_phase_state_weight(state: &PhaseState) -> usize {
-    state.terminal_cache_indices.len().max(1)
+    state.terminal_cache_refs.len().max(1)
 }
 
 fn average_usize(sum: usize, count: usize) -> f64 {
@@ -4105,6 +4215,7 @@ mod tests {
                 board_slot: 0,
                 children: vec![1],
                 terminal_cache_indices: Vec::new(),
+                terminal_cache_refs: Vec::new(),
             },
             PhaseState {
                 node_id: 1,
@@ -4112,6 +4223,7 @@ mod tests {
                 board_slot: 0,
                 children: Vec::new(),
                 terminal_cache_indices: vec![0],
+                terminal_cache_refs: terminal_cache_refs_for_test(1),
             },
             PhaseState {
                 node_id: 2,
@@ -4119,6 +4231,7 @@ mod tests {
                 board_slot: 0,
                 children: Vec::new(),
                 terminal_cache_indices: vec![0, 1, 2],
+                terminal_cache_refs: terminal_cache_refs_for_test(3),
             },
             PhaseState {
                 node_id: 3,
@@ -4126,6 +4239,7 @@ mod tests {
                 board_slot: 0,
                 children: Vec::new(),
                 terminal_cache_indices: vec![0, 1],
+                terminal_cache_refs: terminal_cache_refs_for_test(2),
             },
         ];
 
@@ -4150,6 +4264,17 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(weights.iter().sum::<usize>(), 6);
         assert!(weights.iter().all(|weight| *weight <= 4), "{weights:?}");
+    }
+
+    fn terminal_cache_refs_for_test(len: usize) -> Vec<TerminalCacheRef> {
+        (0..len)
+            .map(|cache_index| TerminalCacheRef {
+                cache_index,
+                member_permutation_codes: vec![
+                    crate::isomorphism::SuitPermutation::identity().code(),
+                ],
+            })
+            .collect()
     }
 
     #[test]
