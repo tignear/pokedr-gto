@@ -1,228 +1,8 @@
 # Optimization Attempts
 
 This file records optimization attempts that failed, were reverted, or were too
-small to count as a strategic direction. Add entries before retrying similar
-ideas.
-
-## 2026-06-07: Sparse clear for prepared-board live reach
-
-- Tried: replace `out.fill(0.0)` in `reach_on_prepared_board_sparse_into` with
-  clearing only the indices recorded in the previous `nonzero` list.
-- Expected: reduce per-terminal live-reach writes from two full prepared-board
-  combo arrays to only the actually live OOP/IP combos.
-- Result: slower on the practical UTG vs BU range. On `As7h2c`, `iterations=1`,
-  `16` threads, terminal time moved from about `19.0s` to about `21.7s`.
-  Small sparse-only ranges improved only marginally, about `37.9ms` to
-  `36.1ms`.
-- Decision: reverted. The prefix path is dominated elsewhere; scattered clears
-  and `Vec::drain` do not beat the sequential `fill`. Do not retry this shape
-  unless the live-reach representation changes enough to eliminate the dense
-  prefix input entirely.
-
-## 2026-06-07: Real CFR level-major backup scratch
-
-- Tried: replace the flat state-indexed `Vec<Values>` backup scratch with
-  `Vec<Vec<Values>>` grouped by dependency level. Terminal phase wrote level
-  zero directly, and backup read lower levels immutably while writing the
-  current level. This was meant to make safe layer-parallel backup possible
-  without locks or unsafe code.
-- Expected: preserve the same values while opening a path to parallel decision
-  updates across each backup level.
-- Result: slower in the single measurement used at the time. On UTG vs BU `As7h2c`,
-  `iterations=4`, `16` threads, DCFR+, the previous path was about
-  `35.6s` elapsed with `13.6s` backup. The level-major scratch path produced
-  the same root values but regressed to about `56.5s` elapsed with `22.4s`
-  backup and `15.9s` terminal. Later repeated baseline runs on the same clean
-  HEAD were much slower (`~54s` to `~62s`), so the `35.6s` baseline was likely
-  an outlier.
-- Decision: reverted. Do not retry `Vec<Vec<Values>>` level-major scratch
-  without repeated baseline measurements. If backup is parallelized, keep the
-  flat contiguous value storage or use a level plan that writes into contiguous
-  ranges without fragmenting the value arrays.
-
-## 2026-06-07: Real CFR acting-combo board-blocker skip
-
-- Tried: in real CFR decision backup, skip regret and strategy-sum updates for
-  acting combos whose private cards collide with the current public board,
-  setting that combo's acting value to zero.
-- Expected: remove work for impossible combo rows without changing the game
-  values.
-- Result: slower on the practical benchmark. On UTG vs BU `As7h2c`,
-  `iterations=4`, `16` threads, DCFR+, the previous path was about `35.6s`
-  elapsed with `13.6s` backup. The blocker-skip path produced the same root
-  values but regressed to about `55.9s` elapsed with `20.6s` backup. The extra
-  branch in the hot combo loop costs more than the skipped blocked rows.
-- Decision: reverted. Do not retry per-combo board-blocker branches in the
-  backup hot loop. If impossible combos are skipped, use precomputed compact
-  live combo ranges/lists so the loop shape is branch-free.
-
-## 2026-06-07: Physical topological phase-state reorder
-
-- Tried: reorder real-CFR `PhaseState`s so root-to-terminal topological order is
-  also backup-level contiguous, then route terminal evaluation over the terminal
-  suffix instead of all state chunks. This keeps `child_index > parent_index`
-  and is the standard setup for owner-computes level-parallel backup.
-- Expected: preserve values and provide contiguous backup level ranges without
-  the `Vec<Vec<Values>>` locality loss.
-- Result: values matched, but performance looked worse against the single
-  baseline used at the time. On UTG vs BU
-  `As7h2c`, `iterations=4`, `16` threads, DCFR+, the previous path was about
-  `35.6s` elapsed with `13.6s` backup. Physical topological reorder was about
-  `41.5s` elapsed with `14.9s` backup and `11.6s` terminal. Later repeated
-  baseline runs were `~54s` to `~62s`, so this may have been an improvement
-  rather than a regression.
-- Decision: reverted, but classification is uncertain. Re-test with repeated
-  baseline and variant runs before rejecting physical topological order. The
-  idea is still valid as metadata; prefer keeping DFS order unless physical
-  reorder also improves repeated measurements.
-
-## 2026-06-07: Global flat real-CFR action storage
-
-- Tried: move each `RealInfoset`'s `regrets` and `strategy_sum` vectors into
-  solver-wide flat `Vec<f32>` arrays with per-infoset slot ranges. This was
-  intended as a first step toward splitting regret/strategy rows by owned
-  ranges for lock-free parallel backup.
-- Expected: preserve values and make future row ownership explicit.
-- Result: values matched, but the benchmark looked worse against the single
-  baseline used at the time. On
-  UTG vs BU `As7h2c`, `iterations=4`, `16` threads, DCFR+, the previous path
-  was about `35.6s` elapsed with `13.6s` backup. Flat global action storage was
-  about `41.2s` elapsed with `15.0s` backup. Later repeated baseline runs were
-  `~54s` to `~62s`, so this may have been an improvement rather than a
-  regression.
-- Decision: reverted, but classification is uncertain. Re-test with repeated
-  baseline and variant runs before rejecting global flat action storage. If
-  action rows are flattened, the same patch should still aim at parallel
-  owner-computes update to make the layout change pay off.
-
-## 2026-06-06: CPU terminal CFV card-prefix blocker correction
-
-- Tried: replace the per-combo blocker-neighbor loop in CPU terminal CFV with
-  per-card strength-order prefixes, so each combo's blocker correction can be
-  read from the two private-card prefix arrays.
-- Expected: remove the random blocker-neighbor reads and make each side's value
-  loop close to `O(combo_count)`.
-- Result: much slower. On `As7h2c` with two-combo ranges,
-  `1608768` terminal CFV calls on `16` threads moved from about `11.5s` to
-  about `37.0s`. The `52 * (combo_count + 1)` prefix construction writes far
-  more data per call than the blocker-neighbor loop reads.
-- Decision: reverted. Do not retry full per-card combo-position prefixes on CPU.
-  Any card-prefix direction needs a smaller strength-group representation or a
-  batched formulation that amortizes prefix construction across many reach
-  columns.
-
-## 2026-06-06: CPU terminal CFV two-side fused pass
-
-- Tried: build hero and villain prefixes together and compute both output sides
-  in one outer combo loop.
-- Expected: reduce duplicated prefix/order passes in
-  `terminal_cfv_prefix_blocker_into`.
-- Result: slower. On `As7h2c` with two-combo ranges,
-  `1608768` terminal CFV calls on `16` threads moved from about `11.5s` to
-  about `19.6s`. The extra prefix buffer and helper-layer shape hurt optimizer
-  and memory behavior more than the saved loop helped.
-- Decision: reverted. Keep the simple two-call side pass unless a fused version
-  also reduces blocker work or batches several terminal columns.
-
-## 2026-06-06: CPU terminal board phase scratch/index reuse
-
-- Tried: precompute final-board cache indices and range-combo indices, reuse one
-  `TerminalCfvScratch` and live reach buffers per worker, and assign contiguous
-  chunks to workers instead of strided tasks.
-- Expected: remove per-task map lookup and allocation overhead around terminal
-  CFV.
-- Result: modest improvement. On `As7h2c` with two-combo ranges,
-  `1608768` terminal board evaluations on `16` threads improved from about
-  `11.2s` to about `9.4s`. Sorting tasks by board cache index was also tried
-  and was slower, around `10.5s`.
-- Decision: keep scratch/index reuse and contiguous chunks. This does not solve
-  terminal CFV throughput; it only removes avoidable scaffolding overhead.
-
-## 2026-06-06: Resident compact regret plus resident reach context
-
-- Tried: allocate all compact regret chunks for the full `As7h2c` tree and run
-  compact reach propagation using the normal resident public-tree context.
-- Expected: `44` compact chunks should fit as roughly `5.44GiB` of f32 regrets,
-  leaving enough room for reach buffers.
-- Result: OOM on D3D12/DZN. Removing terminal/value buffers from the reach smoke
-  context was not enough; one-shot submission of all sliced reach buffers also
-  OOMed because temporary edge/group buffers stayed alive until submit.
-- Decision: do not require all compact regret chunks and all reach work buffers
-  to be resident together. Use chunk streaming and batched submits for compact
-  reach, then extend the same streaming design to the real solver path.
-
-## 2026-06-06: Protect reach-tile public ranges in compact chunks
-
-- Tried: choose compact private CFR chunk boundaries so every reach-edge tile's
-  public-infoset range fits inside a single chunk.
-- Expected: allow compact reach propagation to bind one regret chunk per tile
-  without splitting reach tiles.
-- Result: failed as a layout direction. On the full `As7h2c` tree, the normal
-  compact regret-only plan is `44` chunks with about `1.46B` action slots. The
-  protected-boundary plan exploded to `465823` chunks because reach-tile ranges
-  overlap densely across adjacent public infosets. Total slot count did not
-  change, but the buffer/bind-group count would be unusable.
-- Decision: keep compact state chunks coarse and split reach-edge work at chunk
-  boundaries instead. Do not retry protected chunk boundaries.
-
-## 2026-06-06: Dense resident chunking after natural tree expansion
-
-- Tried: remove the postflop `max_depth` cutoff and keep using the resident
-  dense CFR state, with chunking by public-infoset range as a workaround for
-  wgpu's single-buffer limit.
-- Expected: preserve the existing resident GPU path while allowing the natural
-  full public tree to run.
-- Result: failed as a strategic direction. `As7h2c` with the default action set
-  expanded to about `477k` public infosets / `633M` private infosets. The old
-  state layout tried to allocate `private_infosets * max_actions` slots for
-  legal actions and then regrets/prediction/strategy; the first failure was a
-  `resident legal actions` buffer around `10.1GB`. Chunking avoids a single
-  oversized binding, and disabling prediction/strategy-sum reduces memory for a
-  no-download timing run, but default `max_aggressive_actions=4` still OOMs on
-  D3D12/DZN even with only regret chunks. `max_aggressive_actions=1` completes
-  but is not an acceptable abstraction.
-- Decision: do not retry plain dense resident chunking as the main fix. The real
-  representation needs compact/sparse action state by actual public action edge
-  count, not dense `max_actions` slots for every private infoset.
-
-## 2026-06-06: Streamed strength-group card-prefix terminal CFV
-
-- Tried: add an optional `board_count == 1` river-terminal path that streams
-  `(terminal, card, strength_group)` prefix pairs through the existing terminal
-  scratch buffer, then consumes those prefixes immediately in reduce. This
-  avoided full materialization and replaced the blocker-neighbor loop with a
-  handful of card-prefix reads.
-- Expected: keep the algebraic blocker-correction win while staying within the
-  existing scratch budget.
-- Result: slower. On `As7h2c`, `depth=5`, `iterations=1`, baseline
-  `cfv_terminal` was about `965ms`; the streamed card/group path was about
-  `1055ms`. GPU smoke passed with the experimental path, so this was a
-  performance failure, not a validation failure. The likely reason is that the
-  partial pass becomes `53` serial scans per terminal and adds more dispatch and
-  scratch traffic than the saved blocker-neighbor reads are worth.
-- Decision: reverted. Do not retry this exact streamed card/group-prefix shape.
-  A viable blocker algebra change needs either better intra-workgroup parallel
-  prefix construction, a smaller set of blocker aggregates, or a different
-  board-table batching formulation.
-
-## 2026-06-06: Strength-group card-prefix sizing
-
-- Tried: quantify a smaller version of terminal card-prefix blocker correction
-  that indexes by showdown strength group instead of by all `1326` combo
-  positions.
-- Expected: preserve the algebraic win of replacing the blocker-neighbor loop
-  with two-card prefix reads while reducing the memory footprint enough for GPU
-  streaming.
-- Result: the unique-board static table is small enough, but the reach-dependent
-  terminal-weighted table is still too large if fully materialized. On
-  `As7h2c`, `depth=5`, `iterations=1`, trace showed `122598` showdown
-  terminals, `12857` unique final-board tables, `162564948` reduce lanes,
-  `14211160` terminal-weighted strength groups, and about `6.0GB` of f32-pair
-  cells for a full terminal/card/group prefix.
-- Decision: do not implement a fully materialized 52-card strength-group prefix.
-  The blocker loop still needs an algebraic replacement, but it must be
-  streamed/tiled so card prefixes are produced and consumed locally, or it must
-  batch terminal columns by board table without storing every card prefix.
+small to count as a strategic direction. Append entries at the bottom before
+retrying similar ideas, so attempts stay in chronological order.
 
 ## 2026-06-05: Terminal card-prefix blocker correction
 
@@ -436,6 +216,135 @@ ideas.
   optimized, change the dispatch/data layout rather than adding per-edge mask
   checks.
 
+## 2026-06-06: CPU terminal CFV card-prefix blocker correction
+
+- Tried: replace the per-combo blocker-neighbor loop in CPU terminal CFV with
+  per-card strength-order prefixes, so each combo's blocker correction can be
+  read from the two private-card prefix arrays.
+- Expected: remove the random blocker-neighbor reads and make each side's value
+  loop close to `O(combo_count)`.
+- Result: much slower. On `As7h2c` with two-combo ranges,
+  `1608768` terminal CFV calls on `16` threads moved from about `11.5s` to
+  about `37.0s`. The `52 * (combo_count + 1)` prefix construction writes far
+  more data per call than the blocker-neighbor loop reads.
+- Decision: reverted. Do not retry full per-card combo-position prefixes on CPU.
+  Any card-prefix direction needs a smaller strength-group representation or a
+  batched formulation that amortizes prefix construction across many reach
+  columns.
+
+## 2026-06-06: CPU terminal CFV two-side fused pass
+
+- Tried: build hero and villain prefixes together and compute both output sides
+  in one outer combo loop.
+- Expected: reduce duplicated prefix/order passes in
+  `terminal_cfv_prefix_blocker_into`.
+- Result: slower. On `As7h2c` with two-combo ranges,
+  `1608768` terminal CFV calls on `16` threads moved from about `11.5s` to
+  about `19.6s`. The extra prefix buffer and helper-layer shape hurt optimizer
+  and memory behavior more than the saved loop helped.
+- Decision: reverted. Keep the simple two-call side pass unless a fused version
+  also reduces blocker work or batches several terminal columns.
+
+## 2026-06-06: CPU terminal board phase scratch/index reuse
+
+- Tried: precompute final-board cache indices and range-combo indices, reuse one
+  `TerminalCfvScratch` and live reach buffers per worker, and assign contiguous
+  chunks to workers instead of strided tasks.
+- Expected: remove per-task map lookup and allocation overhead around terminal
+  CFV.
+- Result: modest improvement. On `As7h2c` with two-combo ranges,
+  `1608768` terminal board evaluations on `16` threads improved from about
+  `11.2s` to about `9.4s`. Sorting tasks by board cache index was also tried
+  and was slower, around `10.5s`.
+- Decision: keep scratch/index reuse and contiguous chunks. This does not solve
+  terminal CFV throughput; it only removes avoidable scaffolding overhead.
+
+## 2026-06-06: Resident compact regret plus resident reach context
+
+- Tried: allocate all compact regret chunks for the full `As7h2c` tree and run
+  compact reach propagation using the normal resident public-tree context.
+- Expected: `44` compact chunks should fit as roughly `5.44GiB` of f32 regrets,
+  leaving enough room for reach buffers.
+- Result: OOM on D3D12/DZN. Removing terminal/value buffers from the reach smoke
+  context was not enough; one-shot submission of all sliced reach buffers also
+  OOMed because temporary edge/group buffers stayed alive until submit.
+- Decision: do not require all compact regret chunks and all reach work buffers
+  to be resident together. Use chunk streaming and batched submits for compact
+  reach, then extend the same streaming design to the real solver path.
+
+## 2026-06-06: Protect reach-tile public ranges in compact chunks
+
+- Tried: choose compact private CFR chunk boundaries so every reach-edge tile's
+  public-infoset range fits inside a single chunk.
+- Expected: allow compact reach propagation to bind one regret chunk per tile
+  without splitting reach tiles.
+- Result: failed as a layout direction. On the full `As7h2c` tree, the normal
+  compact regret-only plan is `44` chunks with about `1.46B` action slots. The
+  protected-boundary plan exploded to `465823` chunks because reach-tile ranges
+  overlap densely across adjacent public infosets. Total slot count did not
+  change, but the buffer/bind-group count would be unusable.
+- Decision: keep compact state chunks coarse and split reach-edge work at chunk
+  boundaries instead. Do not retry protected chunk boundaries.
+
+## 2026-06-06: Dense resident chunking after natural tree expansion
+
+- Tried: remove the postflop `max_depth` cutoff and keep using the resident
+  dense CFR state, with chunking by public-infoset range as a workaround for
+  wgpu's single-buffer limit.
+- Expected: preserve the existing resident GPU path while allowing the natural
+  full public tree to run.
+- Result: failed as a strategic direction. `As7h2c` with the default action set
+  expanded to about `477k` public infosets / `633M` private infosets. The old
+  state layout tried to allocate `private_infosets * max_actions` slots for
+  legal actions and then regrets/prediction/strategy; the first failure was a
+  `resident legal actions` buffer around `10.1GB`. Chunking avoids a single
+  oversized binding, and disabling prediction/strategy-sum reduces memory for a
+  no-download timing run, but default `max_aggressive_actions=4` still OOMs on
+  D3D12/DZN even with only regret chunks. `max_aggressive_actions=1` completes
+  but is not an acceptable abstraction.
+- Decision: do not retry plain dense resident chunking as the main fix. The real
+  representation needs compact/sparse action state by actual public action edge
+  count, not dense `max_actions` slots for every private infoset.
+
+## 2026-06-06: Streamed strength-group card-prefix terminal CFV
+
+- Tried: add an optional `board_count == 1` river-terminal path that streams
+  `(terminal, card, strength_group)` prefix pairs through the existing terminal
+  scratch buffer, then consumes those prefixes immediately in reduce. This
+  avoided full materialization and replaced the blocker-neighbor loop with a
+  handful of card-prefix reads.
+- Expected: keep the algebraic blocker-correction win while staying within the
+  existing scratch budget.
+- Result: slower. On `As7h2c`, `depth=5`, `iterations=1`, baseline
+  `cfv_terminal` was about `965ms`; the streamed card/group path was about
+  `1055ms`. GPU smoke passed with the experimental path, so this was a
+  performance failure, not a validation failure. The likely reason is that the
+  partial pass becomes `53` serial scans per terminal and adds more dispatch and
+  scratch traffic than the saved blocker-neighbor reads are worth.
+- Decision: reverted. Do not retry this exact streamed card/group-prefix shape.
+  A viable blocker algebra change needs either better intra-workgroup parallel
+  prefix construction, a smaller set of blocker aggregates, or a different
+  board-table batching formulation.
+
+## 2026-06-06: Strength-group card-prefix sizing
+
+- Tried: quantify a smaller version of terminal card-prefix blocker correction
+  that indexes by showdown strength group instead of by all `1326` combo
+  positions.
+- Expected: preserve the algebraic win of replacing the blocker-neighbor loop
+  with two-card prefix reads while reducing the memory footprint enough for GPU
+  streaming.
+- Result: the unique-board static table is small enough, but the reach-dependent
+  terminal-weighted table is still too large if fully materialized. On
+  `As7h2c`, `depth=5`, `iterations=1`, trace showed `122598` showdown
+  terminals, `12857` unique final-board tables, `162564948` reduce lanes,
+  `14211160` terminal-weighted strength groups, and about `6.0GB` of f32-pair
+  cells for a full terminal/card/group prefix.
+- Decision: do not implement a fully materialized 52-card strength-group prefix.
+  The blocker loop still needs an algebraic replacement, but it must be
+  streamed/tiled so card prefixes are produced and consumed locally, or it must
+  batch terminal columns by board table without storing every card prefix.
+
 ## 2026-06-06: Full compact iteration streaming smoke
 
 - Tried: remove dense private action output materialization for the full default
@@ -492,6 +401,97 @@ ideas.
   step would be grouping identical river tree shapes so one dispatch sequence
   processes multiple boards/states instead of running each board as a separate
   solve.
+
+## 2026-06-07: Sparse clear for prepared-board live reach
+
+- Tried: replace `out.fill(0.0)` in `reach_on_prepared_board_sparse_into` with
+  clearing only the indices recorded in the previous `nonzero` list.
+- Expected: reduce per-terminal live-reach writes from two full prepared-board
+  combo arrays to only the actually live OOP/IP combos.
+- Result: slower on the practical UTG vs BU range. On `As7h2c`, `iterations=1`,
+  `16` threads, terminal time moved from about `19.0s` to about `21.7s`.
+  Small sparse-only ranges improved only marginally, about `37.9ms` to
+  `36.1ms`.
+- Decision: reverted. The prefix path is dominated elsewhere; scattered clears
+  and `Vec::drain` do not beat the sequential `fill`. Do not retry this shape
+  unless the live-reach representation changes enough to eliminate the dense
+  prefix input entirely.
+
+## 2026-06-07: Real CFR level-major backup scratch
+
+- Tried: replace the flat state-indexed `Vec<Values>` backup scratch with
+  `Vec<Vec<Values>>` grouped by dependency level. Terminal phase wrote level
+  zero directly, and backup read lower levels immutably while writing the
+  current level. This was meant to make safe layer-parallel backup possible
+  without locks or unsafe code.
+- Expected: preserve the same values while opening a path to parallel decision
+  updates across each backup level.
+- Result: slower in the single measurement used at the time. On UTG vs BU `As7h2c`,
+  `iterations=4`, `16` threads, DCFR+, the previous path was about
+  `35.6s` elapsed with `13.6s` backup. The level-major scratch path produced
+  the same root values but regressed to about `56.5s` elapsed with `22.4s`
+  backup and `15.9s` terminal. Later repeated baseline runs on the same clean
+  HEAD were much slower (`~54s` to `~62s`), so the `35.6s` baseline was likely
+  an outlier.
+- Decision: reverted. Do not retry `Vec<Vec<Values>>` level-major scratch
+  without repeated baseline measurements. If backup is parallelized, keep the
+  flat contiguous value storage or use a level plan that writes into contiguous
+  ranges without fragmenting the value arrays.
+
+## 2026-06-07: Real CFR acting-combo board-blocker skip
+
+- Tried: in real CFR decision backup, skip regret and strategy-sum updates for
+  acting combos whose private cards collide with the current public board,
+  setting that combo's acting value to zero.
+- Expected: remove work for impossible combo rows without changing the game
+  values.
+- Result: slower on the practical benchmark. On UTG vs BU `As7h2c`,
+  `iterations=4`, `16` threads, DCFR+, the previous path was about `35.6s`
+  elapsed with `13.6s` backup. The blocker-skip path produced the same root
+  values but regressed to about `55.9s` elapsed with `20.6s` backup. The extra
+  branch in the hot combo loop costs more than the skipped blocked rows.
+- Decision: reverted. Do not retry per-combo board-blocker branches in the
+  backup hot loop. If impossible combos are skipped, use precomputed compact
+  live combo ranges/lists so the loop shape is branch-free.
+
+## 2026-06-07: Physical topological phase-state reorder
+
+- Tried: reorder real-CFR `PhaseState`s so root-to-terminal topological order is
+  also backup-level contiguous, then route terminal evaluation over the terminal
+  suffix instead of all state chunks. This keeps `child_index > parent_index`
+  and is the standard setup for owner-computes level-parallel backup.
+- Expected: preserve values and provide contiguous backup level ranges without
+  the `Vec<Vec<Values>>` locality loss.
+- Result: values matched, but performance looked worse against the single
+  baseline used at the time. On UTG vs BU
+  `As7h2c`, `iterations=4`, `16` threads, DCFR+, the previous path was about
+  `35.6s` elapsed with `13.6s` backup. Physical topological reorder was about
+  `41.5s` elapsed with `14.9s` backup and `11.6s` terminal. Later repeated
+  baseline runs were `~54s` to `~62s`, so this may have been an improvement
+  rather than a regression.
+- Decision: reverted, but classification is uncertain. Re-test with repeated
+  baseline and variant runs before rejecting physical topological order. The
+  idea is still valid as metadata; prefer keeping DFS order unless physical
+  reorder also improves repeated measurements.
+
+## 2026-06-07: Global flat real-CFR action storage
+
+- Tried: move each `RealInfoset`'s `regrets` and `strategy_sum` vectors into
+  solver-wide flat `Vec<f32>` arrays with per-infoset slot ranges. This was
+  intended as a first step toward splitting regret/strategy rows by owned
+  ranges for lock-free parallel backup.
+- Expected: preserve values and make future row ownership explicit.
+- Result: values matched, but the benchmark looked worse against the single
+  baseline used at the time. On
+  UTG vs BU `As7h2c`, `iterations=4`, `16` threads, DCFR+, the previous path
+  was about `35.6s` elapsed with `13.6s` backup. Flat global action storage was
+  about `41.2s` elapsed with `15.0s` backup. Later repeated baseline runs were
+  `~54s` to `~62s`, so this may have been an improvement rather than a
+  regression.
+- Decision: reverted, but classification is uncertain. Re-test with repeated
+  baseline and variant runs before rejecting global flat action storage. If
+  action rows are flattened, the same patch should still aim at parallel
+  owner-computes update to make the layout change pay off.
 
 ## 2026-06-07: Fixed-board multi-column terminal CFV prefix
 
