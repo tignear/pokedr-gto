@@ -283,15 +283,16 @@ Open blocker:
   improvement. Exact side-value grouping is more promising than pair grouping,
   but the measured `2.6x-2.9x` after four iterations says it should be treated
   as a bounded terminal-CFV optimization, not the whole solver breakthrough.
-- Implemented an experimental per-worker exact side-value cache behind
-  `POKEDR_REAL_CFR_TERMINAL_SIDE_CACHE=1`. It keys by final board, value side,
-  and exact opponent reach signature, then reuses only the side values that are
-  mathematically independent of the acting side's own reach. On `As7h2c` UTG
-  vs BU, `4` DCFR+ iterations improved from about `24.97s` total / `8.23s`
-  terminal to about `21.29s` total / `5.14s` terminal after removing per-hit
-  signature allocation and reusing the terminal prefix scratch. This validates
-  the direction, but the total solver speedup is still modest because reach and
-  backup phases remain large.
+- Implemented a per-worker exact side-value cache and made it the default
+  terminal path. Set `POKEDR_REAL_CFR_TERMINAL_SIDE_CACHE=0` to force the old
+  no-cache path. It keys by final board, value side, and exact opponent reach
+  signature, then reuses only the side values that are mathematically
+  independent of the acting side's own reach. On `As7h2c` UTG vs BU, `4` DCFR+
+  iterations improved from about `24.97s` total / `8.23s` terminal to about
+  `21.29s` total / `5.14s` terminal after removing per-hit signature allocation
+  and reusing the terminal prefix scratch. This validates the direction, but
+  the total solver speedup is still modest because reach and backup phases
+  remain large.
 - A longer `16` iteration check still favored the side-value cache: baseline
   was about `72.71s` total / `35.41s` terminal, while the side cache was about
   `66.16s` total / `28.26s` terminal. The speedup persists, but it decays as
@@ -301,6 +302,10 @@ Open blocker:
   `1.4s-1.6s` near the end (`1.39s` on iteration `64`), so the cache path did
   not obviously degrade over a longer run. The container does not currently
   have `/usr/bin/time`, so max-RSS was not captured for this run.
+- After making the side cache default, an env-free `4` iteration run measured
+  about `22.15s` total / `5.53s` terminal, matching the previous opt-in cache
+  path. `POKEDR_REAL_CFR_TERMINAL_SIDE_CACHE=0` remains available for old-path
+  comparisons.
 
 Block-local experiment:
 

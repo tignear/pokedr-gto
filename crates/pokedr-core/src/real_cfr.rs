@@ -3305,7 +3305,14 @@ fn average_f64(sum: f64, count: usize) -> f64 {
 }
 
 fn terminal_side_cache_enabled() -> bool {
-    std::env::var_os("POKEDR_REAL_CFR_TERMINAL_SIDE_CACHE").is_some()
+    std::env::var("POKEDR_REAL_CFR_TERMINAL_SIDE_CACHE")
+        .map(|value| {
+            let value = value.trim();
+            !(value == "0"
+                || value.eq_ignore_ascii_case("false")
+                || value.eq_ignore_ascii_case("off"))
+        })
+        .unwrap_or(true)
 }
 
 fn terminal_side_cached_values(
