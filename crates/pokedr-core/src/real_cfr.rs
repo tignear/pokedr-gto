@@ -5,8 +5,10 @@ use crate::isomorphism::{
 use crate::range::{ComboWeight, RangeSpec};
 use crate::terminal_cfv::{
     PreparedTerminalBoard, TerminalCfvScratch, terminal_cfv_prefix_blocker_board_targets_into,
+    terminal_cfv_prefix_blocker_sorted_board_targets_into,
     terminal_cfv_prefix_blocker_targets_into, terminal_cfv_sparse_board_targets_into,
-    terminal_cfv_sparse_targets_into, terminal_side_values_prefix_blocker_board_targets_into,
+    terminal_cfv_sparse_targets_into,
+    terminal_side_values_prefix_blocker_sorted_board_targets_into,
     terminal_side_values_sparse_board_targets_into,
 };
 use crate::tree::{Player, PublicNodeKind, PublicTree, TerminalReason};
@@ -428,8 +430,10 @@ impl RealCfrSolver {
             let ip_combo_indices = prepared_combo_indices(&prepared, &ip_combos);
             let oop_targets = prepared_combo_targets(&oop_combo_indices);
             let ip_targets = prepared_combo_targets(&ip_combo_indices);
-            let oop_board_targets = prepared_board_targets(&oop_targets);
-            let ip_board_targets = prepared_board_targets(&ip_targets);
+            let mut oop_board_targets = prepared_board_targets(&oop_targets);
+            let mut ip_board_targets = prepared_board_targets(&ip_targets);
+            prepared.sort_indices_by_strength(&mut oop_board_targets);
+            prepared.sort_indices_by_strength(&mut ip_board_targets);
             terminal_cache_index_by_key.insert(unordered_board_key(board), terminal_cache.len());
             terminal_cache.push(TerminalEvalCache {
                 board: board.clone(),
@@ -448,6 +452,9 @@ impl RealCfrSolver {
             let PublicNodeKind::Decision { player, actions } = &node.kind else {
                 continue;
             };
+            if actions.len() <= 1 {
+                continue;
+            }
             let combos = match player {
                 Player::Oop => oop_combos.len(),
                 Player::Ip => ip_combos.len(),
@@ -1223,6 +1230,12 @@ impl RealCfrSolver {
                 }
                 PublicNodeKind::Decision { player, actions } => {
                     let actions_len = actions.len();
+                    if actions_len == 1 {
+                        let child = state.children[0];
+                        add_reach(&mut oop_reaches[child], &parent_oop_reach);
+                        add_reach(&mut ip_reaches[child], &parent_ip_reach);
+                        continue;
+                    }
                     let acting_combos = match player {
                         Player::Oop => self.oop_combos.len(),
                         Player::Ip => self.ip_combos.len(),
@@ -1374,6 +1387,25 @@ impl RealCfrSolver {
                 }
                 PublicNodeKind::Decision { player, actions } => {
                     let actions_len = actions.len();
+                    if actions_len == 1 {
+                        let child = state.children[0];
+                        let (parent_oop, child_oop_reaches) =
+                            split_reach_state_and_children(oop_reaches, state_index);
+                        let (parent_ip, child_ip_reaches) =
+                            split_reach_state_and_children(ip_reaches, state_index);
+                        add_reach(
+                            child_reach_mut(child_oop_reaches, state_index, child),
+                            parent_oop,
+                        );
+                        add_reach(
+                            child_reach_mut(child_ip_reaches, state_index, child),
+                            parent_ip,
+                        );
+                        if profile_reach {
+                            decision_edges += 1;
+                        }
+                        continue;
+                    }
                     let acting_combos = match player {
                         Player::Oop => self.oop_combos.len(),
                         Player::Ip => self.ip_combos.len(),
@@ -1744,7 +1776,7 @@ impl RealCfrSolver {
                             )?;
                         } else {
                             profile.prefix_tasks += 1;
-                            terminal_cfv_prefix_blocker_board_targets_into(
+                            terminal_cfv_prefix_blocker_sorted_board_targets_into(
                                 &cache.prepared,
                                 &oop_live,
                                 &ip_live,
@@ -1834,7 +1866,8 @@ impl RealCfrSolver {
         let worker_count = effective_worker_count(threads);
         for level in backup_plan.levels.iter().skip(1) {
             for run in level {
-                let decision_end = backup_run_decision_prefix_end(&self.tree, states, run);
+                let decision_end =
+                    backup_run_decision_prefix_end(&self.tree, &self.infosets, states, run);
                 if decision_end > run.start {
                     self.backup_decision_prefix(
                         states,
@@ -1969,6 +2002,10 @@ impl RealCfrSolver {
                 }
                 PublicNodeKind::Decision { player, actions } => {
                     let actions_len = actions.len();
+                    if actions_len == 1 {
+                        values[state_index] = values[state.children[0]].clone();
+                        continue;
+                    }
                     let acting_combos = match player {
                         Player::Oop => self.oop_combos.len(),
                         Player::Ip => self.ip_combos.len(),
@@ -2200,6 +2237,16 @@ impl RealCfrSolver {
             }
             PublicNodeKind::Decision { player, actions } => {
                 let actions_len = actions.len();
+                if actions_len == 1 {
+                    return self.traverse(
+                        node.children[0],
+                        board,
+                        oop_reach,
+                        ip_reach,
+                        average_weight,
+                        variant,
+                    );
+                }
                 let acting_combos = match player {
                     Player::Oop => self.oop_combos.len(),
                     Player::Ip => self.ip_combos.len(),
@@ -2984,6 +3031,7 @@ fn effective_worker_count(requested: usize) -> usize {
 
 fn backup_run_decision_prefix_end(
     tree: &PublicTree,
+    infosets: &[Option<RealInfoset>],
     states: &[PhaseState],
     run: &BackupRun,
 ) -> usize {
@@ -2993,7 +3041,7 @@ fn backup_run_decision_prefix_end(
             !matches!(
                 tree.nodes[state.node_id].kind,
                 PublicNodeKind::Decision { .. }
-            )
+            ) || infosets[state.node_id].is_none()
         })
         .map_or(run.end, |offset| run.start + offset)
 }
@@ -3064,8 +3112,17 @@ fn backup_chance_state(
             Ok(())
         }
         PublicNodeKind::Terminal { .. } => Ok(()),
+        PublicNodeKind::Decision { actions, .. } if actions.len() == 1 => {
+            let child = state
+                .children
+                .first()
+                .copied()
+                .ok_or_else(|| "single-action decision has no child".to_string())?;
+            values[state_index] = values[child].clone();
+            Ok(())
+        }
         PublicNodeKind::Decision { .. } => {
-            Err("decision state reached chance backup path".to_string())
+            Err("multi-action decision state reached chance backup path".to_string())
         }
     }
 }
@@ -3342,9 +3399,7 @@ fn backup_state_slot_range(
     let PublicNodeKind::Decision { .. } = &tree.nodes[state.node_id].kind else {
         return None;
     };
-    let infoset = infosets[state.node_id]
-        .as_ref()
-        .expect("decision node must have infoset");
+    let infoset = infosets[state.node_id].as_ref()?;
     let combos = match infoset.player {
         Player::Oop => oop_combos,
         Player::Ip => ip_combos,
@@ -3730,7 +3785,7 @@ fn terminal_side_cached_values(
     opponent_nonzero: &[u16],
     targets: &[u16],
     use_sparse: bool,
-    scratch: &mut TerminalCfvScratch,
+    _scratch: &mut TerminalCfvScratch,
 ) -> Result<Arc<[f32]>, String> {
     let reach_hash = hash_sparse_reach(opponent_reach, opponent_nonzero);
     let key = TerminalSideCacheKey {
@@ -3759,11 +3814,10 @@ fn terminal_side_cached_values(
             &mut values,
         )?;
     } else {
-        terminal_side_values_prefix_blocker_board_targets_into(
+        terminal_side_values_prefix_blocker_sorted_board_targets_into(
             &terminal.prepared,
             opponent_reach,
             targets,
-            scratch.prefix_mut(),
             &mut values,
         )?;
     }
@@ -4169,7 +4223,7 @@ mod tests {
             .filter_map(Option::as_ref)
             .map(|infoset| infoset.slots_len)
             .sum::<usize>();
-        assert_eq!(action_slots, 5_981_008);
+        assert_eq!(action_slots, 4_606_558);
         assert_eq!(solver.turn_index_by_key.len(), 49);
         assert_eq!(solver.river_index_by_key.len(), 49 * 48);
         assert_eq!(solver.terminal_cache.len(), 49 * 48 / 2);

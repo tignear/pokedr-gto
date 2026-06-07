@@ -31,11 +31,6 @@ pub struct PreparedTerminalBoard {
     combo_index_by_key: BTreeMap<u64, usize>,
     strengths: Vec<u64>,
     order: Vec<usize>,
-    group_bounds: Vec<(usize, usize)>,
-    weaker_blocker_ranges: Vec<(usize, usize)>,
-    weaker_blockers: Vec<u16>,
-    stronger_blocker_ranges: Vec<(usize, usize)>,
-    stronger_blockers: Vec<u16>,
 }
 
 #[derive(Debug, Clone)]
@@ -102,39 +97,20 @@ impl PreparedTerminalBoard {
         let strengths = combo_strengths(board, &combos);
         let mut order = (0..combos.len()).collect::<Vec<_>>();
         order.sort_unstable_by_key(|index| strengths[*index]);
-        let sorted_strengths = order
-            .iter()
-            .map(|combo_index| strengths[*combo_index])
-            .collect::<Vec<_>>();
-        let mut group_bounds = vec![(0usize, 0usize); combos.len()];
-        let mut lower = 0usize;
-        while lower < order.len() {
-            let strength = sorted_strengths[lower];
-            let mut upper = lower + 1;
-            while upper < order.len() && sorted_strengths[upper] == strength {
-                upper += 1;
-            }
-            for sorted_index in lower..upper {
-                group_bounds[order[sorted_index]] = (lower, upper);
-            }
-            lower = upper;
-        }
-        let split_blockers = split_blocker_tables(&combos, &strengths);
         Ok(Self {
             combos,
             combo_index_by_key,
             strengths,
             order,
-            group_bounds,
-            weaker_blocker_ranges: split_blockers.weaker_ranges,
-            weaker_blockers: split_blockers.weaker,
-            stronger_blocker_ranges: split_blockers.stronger_ranges,
-            stronger_blockers: split_blockers.stronger,
         })
     }
 
     pub fn combos(&self) -> &[PrivateCombo] {
         &self.combos
+    }
+
+    pub fn sort_indices_by_strength(&self, indices: &mut [u16]) {
+        indices.sort_unstable_by_key(|index| self.strengths[*index as usize]);
     }
 
     pub fn combo_index(&self, first: Card, second: Card) -> Option<usize> {
@@ -556,34 +532,12 @@ fn side_values_prefix_blocker_columns_into(
     values: &mut [f32],
 ) {
     let combos = prepared.combos.len();
-    let mut prefix = vec![0.0f32; (combos + 1) * columns];
-    for (sorted_index, combo_index) in prepared.order.iter().enumerate() {
-        let previous = sorted_index * columns;
-        let next = previous + columns;
-        for column in 0..columns {
-            prefix[next + column] =
-                prefix[previous + column] + opponent_reaches[column * combos + *combo_index];
-        }
-    }
-    let total_start = combos * columns;
-
-    for hero in 0..combos {
-        let (lower, upper) = prepared.group_bounds[hero];
-        let lower_start = lower * columns;
-        let upper_start = upper * columns;
-        let (weak_start, weak_end) = prepared.weaker_blocker_ranges[hero];
-        let (strong_start, strong_end) = prepared.stronger_blocker_ranges[hero];
-        for column in 0..columns {
-            let mut value = prefix[lower_start + column]
-                - (prefix[total_start + column] - prefix[upper_start + column]);
-            for blocker in &prepared.weaker_blockers[weak_start..weak_end] {
-                value -= opponent_reaches[column * combos + *blocker as usize];
-            }
-            for blocker in &prepared.stronger_blockers[strong_start..strong_end] {
-                value += opponent_reaches[column * combos + *blocker as usize];
-            }
-            values[column * combos + hero] = value;
-        }
+    for column in 0..columns {
+        side_values_strength_scan_into(
+            prepared,
+            &opponent_reaches[column * combos..(column + 1) * combos],
+            &mut values[column * combos..(column + 1) * combos],
+        );
     }
 }
 
@@ -764,6 +718,33 @@ pub fn terminal_cfv_prefix_blocker_board_targets_into(
     Ok(())
 }
 
+pub fn terminal_cfv_prefix_blocker_sorted_board_targets_into(
+    prepared: &PreparedTerminalBoard,
+    hero_reach: &[f32],
+    villain_reach: &[f32],
+    hero_targets_sorted_by_strength: &[u16],
+    villain_targets_sorted_by_strength: &[u16],
+    scratch: &mut TerminalCfvScratch,
+) -> Result<(), String> {
+    let combos = &prepared.combos;
+    if hero_reach.len() != combos.len() || villain_reach.len() != combos.len() {
+        return Err(format!("reach vectors must have {} entries", combos.len()));
+    }
+    side_values_strength_scan_sorted_targets_into(
+        prepared,
+        villain_reach,
+        hero_targets_sorted_by_strength,
+        &mut scratch.hero_values,
+    );
+    side_values_strength_scan_sorted_targets_into(
+        prepared,
+        hero_reach,
+        villain_targets_sorted_by_strength,
+        &mut scratch.villain_values,
+    );
+    Ok(())
+}
+
 pub fn terminal_cfv_sparse_targets_into(
     prepared: &PreparedTerminalBoard,
     hero_reach: &[f32],
@@ -880,35 +861,35 @@ pub fn terminal_side_values_prefix_blocker_board_targets_into(
     Ok(())
 }
 
+pub fn terminal_side_values_prefix_blocker_sorted_board_targets_into(
+    prepared: &PreparedTerminalBoard,
+    opponent_reach: &[f32],
+    targets_sorted_by_strength: &[u16],
+    values: &mut [f32],
+) -> Result<(), String> {
+    let combos = &prepared.combos;
+    if opponent_reach.len() != combos.len() {
+        return Err(format!("reach vector must have {} entries", combos.len()));
+    }
+    if values.len() != combos.len() {
+        return Err(format!("values vector must have {} entries", combos.len()));
+    }
+    side_values_strength_scan_sorted_targets_into(
+        prepared,
+        opponent_reach,
+        targets_sorted_by_strength,
+        values,
+    );
+    Ok(())
+}
+
 fn side_values_prefix_blocker_into(
     prepared: &PreparedTerminalBoard,
     opponent_reach: &[f32],
-    prefix: &mut [f32],
+    _prefix: &mut [f32],
     values: &mut [f32],
 ) {
-    let combos = &prepared.combos;
-    prefix[0] = 0.0f32;
-    for (sorted_index, combo_index) in prepared.order.iter().enumerate() {
-        prefix[sorted_index + 1] = prefix[sorted_index] + opponent_reach[*combo_index];
-    }
-    let total = prefix[combos.len()];
-
-    for hero in 0..combos.len() {
-        let (lower, upper) = prepared.group_bounds[hero];
-        let weaker = prefix[lower];
-        let stronger = total - prefix[upper];
-        let mut value = weaker - stronger;
-
-        let (weak_start, weak_end) = prepared.weaker_blocker_ranges[hero];
-        for blocker in &prepared.weaker_blockers[weak_start..weak_end] {
-            value -= opponent_reach[*blocker as usize];
-        }
-        let (strong_start, strong_end) = prepared.stronger_blocker_ranges[hero];
-        for blocker in &prepared.stronger_blockers[strong_start..strong_end] {
-            value += opponent_reach[*blocker as usize];
-        }
-        values[hero] = value;
-    }
+    side_values_strength_scan_into(prepared, opponent_reach, values);
 }
 
 fn side_values_sparse_targets_into(
@@ -962,120 +943,137 @@ fn side_values_sparse_board_targets_into(
 fn side_values_prefix_blocker_targets_into(
     prepared: &PreparedTerminalBoard,
     opponent_reach: &[f32],
-    targets: &[Option<usize>],
-    prefix: &mut [f32],
+    _targets: &[Option<usize>],
+    _prefix: &mut [f32],
     values: &mut [f32],
 ) {
-    let combos = &prepared.combos;
-    prefix[0] = 0.0f32;
-    for (sorted_index, combo_index) in prepared.order.iter().enumerate() {
-        prefix[sorted_index + 1] = prefix[sorted_index] + opponent_reach[*combo_index];
-    }
-    let total = prefix[combos.len()];
-
-    for target in targets.iter().flatten() {
-        let hero = *target;
-        let (lower, upper) = prepared.group_bounds[hero];
-        let weaker = prefix[lower];
-        let stronger = total - prefix[upper];
-        let mut value = weaker - stronger;
-
-        let (weak_start, weak_end) = prepared.weaker_blocker_ranges[hero];
-        for blocker in &prepared.weaker_blockers[weak_start..weak_end] {
-            value -= opponent_reach[*blocker as usize];
-        }
-        let (strong_start, strong_end) = prepared.stronger_blocker_ranges[hero];
-        for blocker in &prepared.stronger_blockers[strong_start..strong_end] {
-            value += opponent_reach[*blocker as usize];
-        }
-        values[hero] = value;
-    }
+    side_values_strength_scan_into(prepared, opponent_reach, values);
 }
 
 fn side_values_prefix_blocker_board_targets_into(
     prepared: &PreparedTerminalBoard,
     opponent_reach: &[f32],
-    targets: &[u16],
-    prefix: &mut [f32],
+    _targets: &[u16],
+    _prefix: &mut [f32],
     values: &mut [f32],
 ) {
-    let combos = &prepared.combos;
-    prefix[0] = 0.0f32;
-    for (sorted_index, combo_index) in prepared.order.iter().enumerate() {
-        prefix[sorted_index + 1] = prefix[sorted_index] + opponent_reach[*combo_index];
-    }
-    let total = prefix[combos.len()];
-
-    for target in targets {
-        let hero = *target as usize;
-        let (lower, upper) = prepared.group_bounds[hero];
-        let weaker = prefix[lower];
-        let stronger = total - prefix[upper];
-        let mut value = weaker - stronger;
-
-        let (weak_start, weak_end) = prepared.weaker_blocker_ranges[hero];
-        for blocker in &prepared.weaker_blockers[weak_start..weak_end] {
-            value -= opponent_reach[*blocker as usize];
-        }
-        let (strong_start, strong_end) = prepared.stronger_blocker_ranges[hero];
-        for blocker in &prepared.stronger_blockers[strong_start..strong_end] {
-            value += opponent_reach[*blocker as usize];
-        }
-        values[hero] = value;
-    }
+    side_values_strength_scan_into(prepared, opponent_reach, values);
 }
 
-fn card_combo_table(combos: &[PrivateCombo]) -> Vec<Vec<u16>> {
-    let mut card_lists = vec![Vec::new(); 52];
-    for (index, combo) in combos.iter().enumerate() {
-        card_lists[combo.first.index()].push(index as u16);
-        card_lists[combo.second.index()].push(index as u16);
-    }
-    card_lists
-}
+fn side_values_strength_scan_into(
+    prepared: &PreparedTerminalBoard,
+    opponent_reach: &[f32],
+    values: &mut [f32],
+) {
+    values.fill(0.0);
 
-struct SplitBlockerTables {
-    weaker_ranges: Vec<(usize, usize)>,
-    weaker: Vec<u16>,
-    stronger_ranges: Vec<(usize, usize)>,
-    stronger: Vec<u16>,
-}
-
-fn split_blocker_tables(combos: &[PrivateCombo], strengths: &[u64]) -> SplitBlockerTables {
-    let card_lists = card_combo_table(combos);
-    let mut weaker_ranges = Vec::with_capacity(combos.len());
-    let mut weaker = Vec::with_capacity(combos.len() * 46);
-    let mut stronger_ranges = Vec::with_capacity(combos.len());
-    let mut stronger = Vec::with_capacity(combos.len() * 46);
-
-    for (hero, combo) in combos.iter().enumerate() {
-        let hero_strength = strengths[hero];
-        let weaker_start = weaker.len();
-        let stronger_start = stronger.len();
-
-        for card in [combo.first, combo.second] {
-            for blocker in &card_lists[card.index()] {
-                if *blocker == hero as u16 {
-                    continue;
-                }
-                let villain = *blocker as usize;
-                match strengths[villain].cmp(&hero_strength) {
-                    Ordering::Less => weaker.push(*blocker),
-                    Ordering::Greater => stronger.push(*blocker),
-                    Ordering::Equal => {}
-                }
+    let mut reach_sum = 0.0f32;
+    let mut card_sums = [0.0f32; 52];
+    let mut opponent_cursor = 0usize;
+    for &hero in &prepared.order {
+        let hero_strength = prepared.strengths[hero];
+        while opponent_cursor < prepared.order.len() {
+            let opponent = prepared.order[opponent_cursor];
+            if prepared.strengths[opponent] >= hero_strength {
+                break;
             }
+            add_reach_to_card_sums(
+                prepared.combos[opponent],
+                opponent_reach[opponent],
+                &mut reach_sum,
+                &mut card_sums,
+            );
+            opponent_cursor += 1;
         }
-        weaker_ranges.push((weaker_start, weaker.len()));
-        stronger_ranges.push((stronger_start, stronger.len()));
+        values[hero] += non_blocked_reach(prepared.combos[hero], reach_sum, &card_sums);
     }
 
-    SplitBlockerTables {
-        weaker_ranges,
-        weaker,
-        stronger_ranges,
-        stronger,
+    reach_sum = 0.0;
+    card_sums = [0.0f32; 52];
+    opponent_cursor = prepared.order.len();
+    for &hero in prepared.order.iter().rev() {
+        let hero_strength = prepared.strengths[hero];
+        while opponent_cursor > 0 {
+            let opponent = prepared.order[opponent_cursor - 1];
+            if prepared.strengths[opponent] <= hero_strength {
+                break;
+            }
+            add_reach_to_card_sums(
+                prepared.combos[opponent],
+                opponent_reach[opponent],
+                &mut reach_sum,
+                &mut card_sums,
+            );
+            opponent_cursor -= 1;
+        }
+        values[hero] -= non_blocked_reach(prepared.combos[hero], reach_sum, &card_sums);
     }
+}
+
+fn side_values_strength_scan_sorted_targets_into(
+    prepared: &PreparedTerminalBoard,
+    opponent_reach: &[f32],
+    targets_sorted_by_strength: &[u16],
+    values: &mut [f32],
+) {
+    let mut reach_sum = 0.0f32;
+    let mut card_sums = [0.0f32; 52];
+    let mut opponent_cursor = 0usize;
+    for &hero_u16 in targets_sorted_by_strength {
+        let hero = hero_u16 as usize;
+        let hero_strength = prepared.strengths[hero];
+        while opponent_cursor < prepared.order.len() {
+            let opponent = prepared.order[opponent_cursor];
+            if prepared.strengths[opponent] >= hero_strength {
+                break;
+            }
+            add_reach_to_card_sums(
+                prepared.combos[opponent],
+                opponent_reach[opponent],
+                &mut reach_sum,
+                &mut card_sums,
+            );
+            opponent_cursor += 1;
+        }
+        values[hero] = non_blocked_reach(prepared.combos[hero], reach_sum, &card_sums);
+    }
+
+    reach_sum = 0.0;
+    card_sums = [0.0f32; 52];
+    opponent_cursor = prepared.order.len();
+    for &hero_u16 in targets_sorted_by_strength.iter().rev() {
+        let hero = hero_u16 as usize;
+        let hero_strength = prepared.strengths[hero];
+        while opponent_cursor > 0 {
+            let opponent = prepared.order[opponent_cursor - 1];
+            if prepared.strengths[opponent] <= hero_strength {
+                break;
+            }
+            add_reach_to_card_sums(
+                prepared.combos[opponent],
+                opponent_reach[opponent],
+                &mut reach_sum,
+                &mut card_sums,
+            );
+            opponent_cursor -= 1;
+        }
+        values[hero] -= non_blocked_reach(prepared.combos[hero], reach_sum, &card_sums);
+    }
+}
+
+fn add_reach_to_card_sums(
+    combo: PrivateCombo,
+    reach: f32,
+    reach_sum: &mut f32,
+    card_sums: &mut [f32; 52],
+) {
+    *reach_sum += reach;
+    card_sums[combo.first.index()] += reach;
+    card_sums[combo.second.index()] += reach;
+}
+
+fn non_blocked_reach(combo: PrivateCombo, reach_sum: f32, card_sums: &[f32; 52]) -> f32 {
+    reach_sum - card_sums[combo.first.index()] - card_sums[combo.second.index()]
 }
 
 fn validate_reach(input: &TerminalCfvInput, combos: usize) -> Result<(), String> {
