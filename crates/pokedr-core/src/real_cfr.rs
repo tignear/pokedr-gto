@@ -1,7 +1,8 @@
 use crate::cards::{Board, Card};
 use crate::range::{ComboWeight, RangeSpec};
 use crate::terminal_cfv::{
-    PreparedTerminalBoard, TerminalCfvScratch, terminal_cfv_prefix_blocker_targets_into,
+    PreparedTerminalBoard, TerminalCfvScratch, terminal_cfv_prefix_blocker_board_targets_into,
+    terminal_cfv_prefix_blocker_targets_into, terminal_cfv_sparse_board_targets_into,
     terminal_cfv_sparse_targets_into,
 };
 use crate::tree::{Player, PublicNodeKind, PublicTree, TerminalReason};
@@ -143,6 +144,16 @@ struct TerminalEvalCache {
     prepared: PreparedTerminalBoard,
     oop_combo_indices: Vec<Option<usize>>,
     ip_combo_indices: Vec<Option<usize>>,
+    oop_targets: Vec<PreparedComboTarget>,
+    ip_targets: Vec<PreparedComboTarget>,
+    oop_board_targets: Vec<u16>,
+    ip_board_targets: Vec<u16>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PreparedComboTarget {
+    range_index: usize,
+    board_index: u16,
 }
 
 #[derive(Debug, Clone)]
@@ -260,10 +271,20 @@ impl RealCfrSolver {
         let mut terminal_cache = Vec::with_capacity(terminal_boards.len());
         for board in &terminal_boards {
             let prepared = PreparedTerminalBoard::new(board)?;
+            let oop_combo_indices = prepared_combo_indices(&prepared, &oop_combos);
+            let ip_combo_indices = prepared_combo_indices(&prepared, &ip_combos);
+            let oop_targets = prepared_combo_targets(&oop_combo_indices);
+            let ip_targets = prepared_combo_targets(&ip_combo_indices);
+            let oop_board_targets = prepared_board_targets(&oop_targets);
+            let ip_board_targets = prepared_board_targets(&ip_targets);
             terminal_cache_index_by_key.insert(unordered_board_key(board), terminal_cache.len());
             terminal_cache.push(TerminalEvalCache {
-                oop_combo_indices: prepared_combo_indices(&prepared, &oop_combos),
-                ip_combo_indices: prepared_combo_indices(&prepared, &ip_combos),
+                oop_combo_indices,
+                ip_combo_indices,
+                oop_targets,
+                ip_targets,
+                oop_board_targets,
+                ip_board_targets,
                 prepared,
             });
         }
@@ -555,18 +576,22 @@ impl RealCfrSolver {
                 let mut ip_live = vec![0.0f32; combos];
                 for task in tasks {
                     let cache = &self.terminal_cache[task.cache_index];
-                    reach_on_prepared_board_into(
-                        &cache.oop_combo_indices,
+                    reach_on_prepared_board_targets_into(
+                        &cache.oop_targets,
                         &oop_reach,
                         &mut oop_live,
                     );
-                    reach_on_prepared_board_into(&cache.ip_combo_indices, &ip_reach, &mut ip_live);
-                    terminal_cfv_prefix_blocker_targets_into(
+                    reach_on_prepared_board_targets_into(
+                        &cache.ip_targets,
+                        &ip_reach,
+                        &mut ip_live,
+                    );
+                    terminal_cfv_prefix_blocker_board_targets_into(
                         &cache.prepared,
                         &oop_live,
                         &ip_live,
-                        &cache.oop_combo_indices,
-                        &cache.ip_combo_indices,
+                        &cache.oop_board_targets,
+                        &cache.ip_board_targets,
                         &mut scratch,
                     )?;
                     checksum += terminal_task_checksum(task, &cache.prepared, &scratch);
@@ -1059,14 +1084,14 @@ impl RealCfrSolver {
                             })?;
                         let cache = &self.terminal_cache[cache_index];
                         let reach_started = profile_terminal.then(Instant::now);
-                        reach_on_prepared_board_sparse_into(
-                            &cache.oop_combo_indices,
+                        reach_on_prepared_board_targets_sparse_into(
+                            &cache.oop_targets,
                             &oop_reaches[state_index],
                             &mut oop_live,
                             &mut oop_nonzero,
                         );
-                        reach_on_prepared_board_sparse_into(
-                            &cache.ip_combo_indices,
+                        reach_on_prepared_board_targets_sparse_into(
+                            &cache.ip_targets,
                             &ip_reaches[state_index],
                             &mut ip_live,
                             &mut ip_nonzero,
@@ -1084,24 +1109,24 @@ impl RealCfrSolver {
                             && ip_nonzero.len() <= sparse_nonzero_limit
                         {
                             profile.sparse_tasks += 1;
-                            terminal_cfv_sparse_targets_into(
+                            terminal_cfv_sparse_board_targets_into(
                                 &cache.prepared,
                                 &oop_live,
                                 &ip_live,
                                 &oop_nonzero,
                                 &ip_nonzero,
-                                &cache.oop_combo_indices,
-                                &cache.ip_combo_indices,
+                                &cache.oop_board_targets,
+                                &cache.ip_board_targets,
                                 &mut scratch,
                             )?;
                         } else {
                             profile.prefix_tasks += 1;
-                            terminal_cfv_prefix_blocker_targets_into(
+                            terminal_cfv_prefix_blocker_board_targets_into(
                                 &cache.prepared,
                                 &oop_live,
                                 &ip_live,
-                                &cache.oop_combo_indices,
-                                &cache.ip_combo_indices,
+                                &cache.oop_board_targets,
+                                &cache.ip_board_targets,
                                 &mut scratch,
                             )?;
                         }
@@ -1109,13 +1134,7 @@ impl RealCfrSolver {
                             profile.cfv_ms += started.elapsed().as_secs_f64() * 1000.0;
                         }
                         let accumulator_started = profile_terminal.then(Instant::now);
-                        accumulator.add_board(
-                            cache,
-                            node.state.pot,
-                            &scratch,
-                            self.oop_combos.len(),
-                            self.ip_combos.len(),
-                        );
+                        accumulator.add_board(cache, node.state.pot, &scratch);
                         if let Some(started) = accumulator_started {
                             profile.accumulator_ms += started.elapsed().as_secs_f64() * 1000.0;
                         }
@@ -1837,26 +1856,17 @@ impl TerminalAccumulator {
         self.ip_counts.fill(0.0);
     }
 
-    fn add_board(
-        &mut self,
-        cache: &TerminalEvalCache,
-        pot: u32,
-        scratch: &TerminalCfvScratch,
-        oop_combos: usize,
-        ip_combos: usize,
-    ) {
+    fn add_board(&mut self, cache: &TerminalEvalCache, pot: u32, scratch: &TerminalCfvScratch) {
         let pot = pot as f32;
-        for index in 0..oop_combos {
-            if let Some(board_index) = cache.oop_combo_indices[index] {
-                self.values.oop[index] += scratch.hero_values()[board_index] * pot;
-                self.oop_counts[index] += 1.0;
-            }
+        for target in &cache.oop_targets {
+            let index = target.range_index;
+            self.values.oop[index] += scratch.hero_values()[target.board_index as usize] * pot;
+            self.oop_counts[index] += 1.0;
         }
-        for index in 0..ip_combos {
-            if let Some(board_index) = cache.ip_combo_indices[index] {
-                self.values.ip[index] += scratch.villain_values()[board_index] * pot;
-                self.ip_counts[index] += 1.0;
-            }
+        for target in &cache.ip_targets {
+            let index = target.range_index;
+            self.values.ip[index] += scratch.villain_values()[target.board_index as usize] * pot;
+            self.ip_counts[index] += 1.0;
         }
         self.values.terminal_evals += 1;
     }
@@ -2723,14 +2733,33 @@ fn prepared_combo_indices(
         .collect()
 }
 
-fn reach_on_prepared_board_into(combo_indices: &[Option<usize>], reach: &[f32], out: &mut [f32]) {
+fn prepared_combo_targets(combo_indices: &[Option<usize>]) -> Vec<PreparedComboTarget> {
+    combo_indices
+        .iter()
+        .enumerate()
+        .filter_map(|(range_index, board_index)| {
+            board_index.map(|board_index| PreparedComboTarget {
+                range_index,
+                board_index: board_index as u16,
+            })
+        })
+        .collect()
+}
+
+fn prepared_board_targets(targets: &[PreparedComboTarget]) -> Vec<u16> {
+    targets.iter().map(|target| target.board_index).collect()
+}
+
+fn reach_on_prepared_board_targets_into(
+    targets: &[PreparedComboTarget],
+    reach: &[f32],
+    out: &mut [f32],
+) {
     out.fill(0.0);
-    for (index, reach) in combo_indices.iter().zip(reach) {
-        if *reach == 0.0 {
-            continue;
-        }
-        if let Some(index) = *index {
-            out[index] += *reach;
+    for target in targets {
+        let reach = reach[target.range_index];
+        if reach != 0.0 {
+            out[target.board_index as usize] += reach;
         }
     }
 }
@@ -2753,6 +2782,29 @@ fn reach_on_prepared_board_sparse_into(
             }
             out[index] += *reach;
         }
+    }
+}
+
+fn reach_on_prepared_board_targets_sparse_into(
+    targets: &[PreparedComboTarget],
+    reach: &[f32],
+    out: &mut [f32],
+    nonzero: &mut Vec<u16>,
+) {
+    for board_index in nonzero.iter() {
+        out[*board_index as usize] = 0.0;
+    }
+    nonzero.clear();
+    for target in targets {
+        let reach = reach[target.range_index];
+        if reach == 0.0 {
+            continue;
+        }
+        let board_index = target.board_index as usize;
+        if out[board_index] == 0.0 {
+            nonzero.push(target.board_index);
+        }
+        out[board_index] += reach;
     }
 }
 
