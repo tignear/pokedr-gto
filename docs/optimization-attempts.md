@@ -613,3 +613,29 @@ retrying similar ideas, so attempts stay in chronological order.
 - Decision: removed the experimental env path and tile worker code. The local
   sort/reduce shape does not pay for itself; a future board-major design needs a
   different state reduction scheme, not another tile-size sweep.
+
+## 2026-06-07: Terminal side-cache key-owner/shared-cache direction
+
+- Tried: diagnose whether the terminal side-value cache loses major reuse
+  because the same `(final_board, side, opponent_reach_signature)` key appears
+  in several worker-local caches. Added
+  `POKEDR_REAL_CFR_SIDE_CACHE_KEY_PROFILE=1` and
+  `POKEDR_REAL_CFR_PROFILE_START_ITER` so this can be measured after warmup
+  instead of on the special first uniform iteration.
+- Initial one-iteration result was misleading: worker-local keys were about
+  `177124`, global unique keys were about `34104`, and cross-worker extra
+  touches were about `143020`. That made a shared/key-owner cache look very
+  promising, but iteration 1 has uniform or near-uniform reach and is not a
+  representative CFR steady-state profile.
+- Warmed result: with `16` DCFR+ iterations and profile starting at iteration
+  `8`, worker-local misses were around `1.47M-1.57M`, while global unique keys
+  were around `1.44M-1.55M`. Cross-worker extra touches were only about
+  `27k-29k`, a small fraction of all misses.
+- Decision: do not build a mutable shared side cache. A shared mutable
+  `HashMap` requires synchronization even for reads because miss handling
+  inserts and may rehash; `RwLock`/sharded locks would likely trade CFV work for
+  lock contention. A lock-free immutable table or key-owner partition would only
+  be worth revisiting if warmed profiles show large cross-worker key reuse.
+- Rule: do not use one-iteration terminal side-cache profiles to justify
+  cache-layout changes. Measure at a later iteration with
+  `POKEDR_REAL_CFR_PROFILE_START_ITER` or use a repeated benchmark harness.
