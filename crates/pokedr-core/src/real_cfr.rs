@@ -341,6 +341,8 @@ impl RealCfrSolver {
         let mut root = Values::zero(self.oop_combos.len(), self.ip_combos.len());
         let mut values =
             vec![Values::zero(self.oop_combos.len(), self.ip_combos.len()); states.len()];
+        let mut oop_reaches = vec![vec![0.0f32; self.oop_combos.len()]; states.len()];
+        let mut ip_reaches = vec![vec![0.0f32; self.ip_combos.len()]; states.len()];
         let mut last_terminal_evals = 0usize;
         let mut total_reach_ms = 0.0;
         let mut total_terminal_ms = 0.0;
@@ -354,7 +356,7 @@ impl RealCfrSolver {
 
         for iteration in 1..=config.iterations {
             let reach_started = std::time::Instant::now();
-            let (oop_reaches, ip_reaches) = self.forward_reaches(&states)?;
+            self.forward_reaches_into(&states, &mut oop_reaches, &mut ip_reaches)?;
             let reach_ms = reach_started.elapsed().as_secs_f64() * 1000.0;
 
             let terminal_started = std::time::Instant::now();
@@ -613,11 +615,19 @@ impl RealCfrSolver {
         Ok(state_index)
     }
 
-    fn forward_reaches(
+    fn forward_reaches_into(
         &self,
         states: &[PhaseState],
-    ) -> Result<(Vec<Vec<f32>>, Vec<Vec<f32>>), String> {
-        self.forward_reaches_for_mode(states, EvaluationMode::Profile, StrategySource::Current)
+        oop_reaches: &mut [Vec<f32>],
+        ip_reaches: &mut [Vec<f32>],
+    ) -> Result<(), String> {
+        self.forward_reaches_for_mode_into(
+            states,
+            EvaluationMode::Profile,
+            StrategySource::Current,
+            oop_reaches,
+            ip_reaches,
+        )
     }
 
     fn forward_reaches_for_mode(
@@ -717,6 +727,136 @@ impl RealCfrSolver {
             }
         }
         Ok((oop_reaches, ip_reaches))
+    }
+
+    fn forward_reaches_for_mode_into(
+        &self,
+        states: &[PhaseState],
+        mode: EvaluationMode,
+        strategy_source: StrategySource,
+        oop_reaches: &mut [Vec<f32>],
+        ip_reaches: &mut [Vec<f32>],
+    ) -> Result<(), String> {
+        if oop_reaches.len() != states.len() || ip_reaches.len() != states.len() {
+            return Err("reach scratch length does not match state count".to_string());
+        }
+        for reach in oop_reaches.iter_mut() {
+            reach.fill(0.0);
+        }
+        for reach in ip_reaches.iter_mut() {
+            reach.fill(0.0);
+        }
+        for (index, combo) in self.oop_combos.iter().enumerate() {
+            oop_reaches[0][index] = combo.weight;
+        }
+        for (index, combo) in self.ip_combos.iter().enumerate() {
+            ip_reaches[0][index] = combo.weight;
+        }
+
+        for (state_index, state) in states.iter().enumerate() {
+            let node = &self.tree.nodes[state.node_id];
+            match &node.kind {
+                PublicNodeKind::Terminal { .. } => {}
+                PublicNodeKind::Chance(_) => {
+                    if state.children.is_empty() {
+                        continue;
+                    }
+                    let chance_weight = 1.0 / state.children.len() as f32;
+                    let (parent_oop, child_oop_reaches) =
+                        split_reach_state_and_children(oop_reaches, state_index);
+                    let (parent_ip, child_ip_reaches) =
+                        split_reach_state_and_children(ip_reaches, state_index);
+                    for child in &state.children {
+                        add_scaled_reach(
+                            child_reach_mut(child_oop_reaches, state_index, *child),
+                            parent_oop,
+                            chance_weight,
+                        );
+                        add_scaled_reach(
+                            child_reach_mut(child_ip_reaches, state_index, *child),
+                            parent_ip,
+                            chance_weight,
+                        );
+                    }
+                }
+                PublicNodeKind::Decision { player, actions } => {
+                    let actions_len = actions.len();
+                    let acting_combos = match player {
+                        Player::Oop => self.oop_combos.len(),
+                        Player::Ip => self.ip_combos.len(),
+                    };
+                    let board_slot = self.board_slot(&state.board)?;
+                    let row_len = acting_combos * actions_len;
+                    let row_start = board_slot * row_len;
+                    let row_end = row_start + row_len;
+                    let infoset = self.infosets[state.node_id]
+                        .as_ref()
+                        .expect("decision node must have infoset");
+                    let strategies = match strategy_source {
+                        StrategySource::Current => current_strategies(
+                            &infoset.regrets[row_start..row_end],
+                            acting_combos,
+                            actions_len,
+                        ),
+                        StrategySource::Average => average_strategies(
+                            &infoset.strategy_sum[row_start..row_end],
+                            acting_combos,
+                            actions_len,
+                        ),
+                    };
+                    let (parent_oop, child_oop_reaches) =
+                        split_reach_state_and_children(oop_reaches, state_index);
+                    let (parent_ip, child_ip_reaches) =
+                        split_reach_state_and_children(ip_reaches, state_index);
+                    for action_index in 0..actions_len {
+                        let child = state.children[action_index];
+                        match player {
+                            Player::Oop => {
+                                add_reach(
+                                    child_reach_mut(child_ip_reaches, state_index, child),
+                                    parent_ip,
+                                );
+                                if mode == EvaluationMode::OopBestResponse {
+                                    add_reach(
+                                        child_reach_mut(child_oop_reaches, state_index, child),
+                                        parent_oop,
+                                    );
+                                } else {
+                                    add_strategy_reach(
+                                        child_reach_mut(child_oop_reaches, state_index, child),
+                                        parent_oop,
+                                        &strategies,
+                                        actions_len,
+                                        action_index,
+                                    );
+                                }
+                            }
+                            Player::Ip => {
+                                add_reach(
+                                    child_reach_mut(child_oop_reaches, state_index, child),
+                                    parent_oop,
+                                );
+                                if mode == EvaluationMode::IpBestResponse {
+                                    add_reach(
+                                        child_reach_mut(child_ip_reaches, state_index, child),
+                                        parent_ip,
+                                    );
+                                } else {
+                                    add_strategy_reach(
+                                        child_reach_mut(child_ip_reaches, state_index, child),
+                                        parent_ip,
+                                        &strategies,
+                                        actions_len,
+                                        action_index,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     fn evaluate_states(
@@ -940,16 +1080,15 @@ impl RealCfrSolver {
     ) -> Result<usize, String> {
         for state_index in (0..states.len()).rev() {
             let state = &states[state_index];
-            let node = self.tree.nodes[state.node_id].clone();
-            match node.kind {
+            let node = &self.tree.nodes[state.node_id];
+            match &node.kind {
                 PublicNodeKind::Terminal { .. } => {}
                 PublicNodeKind::Chance(_) => {
-                    let mut state_values =
-                        Values::zero(self.oop_combos.len(), self.ip_combos.len());
+                    let (state_value, child_values) = split_state_and_children(values, state_index);
+                    state_value.reset();
                     for child in &state.children {
-                        state_values.add_scaled(&values[*child], 1.0);
+                        state_value.add_scaled(child_value(child_values, state_index, *child), 1.0);
                     }
-                    values[state_index] = state_values;
                 }
                 PublicNodeKind::Decision { player, actions } => {
                     let actions_len = actions.len();
@@ -961,55 +1100,55 @@ impl RealCfrSolver {
                     let row_len = acting_combos * actions_len;
                     let row_start = board_slot * row_len;
                     let row_end = row_start + row_len;
-                    let strategies = {
+                    let (state_value, child_values) = split_state_and_children(values, state_index);
+                    state_value.reset();
+                    {
                         let infoset = self.infosets[state.node_id]
                             .as_ref()
                             .expect("decision node must have infoset");
-                        current_strategies(
-                            &infoset.regrets[row_start..row_end],
-                            acting_combos,
-                            actions_len,
-                        )
-                    };
-                    let action_values = state
-                        .children
-                        .iter()
-                        .map(|child| values[*child].clone())
-                        .collect::<Vec<_>>();
-                    let mut state_values =
-                        Values::zero(self.oop_combos.len(), self.ip_combos.len());
-                    match player {
-                        Player::Oop => {
-                            combine_acting_values(
-                                &mut state_values.oop,
-                                &action_values,
-                                &strategies,
+                        let regrets = &infoset.regrets[row_start..row_end];
+                        match player {
+                            Player::Oop => combine_acting_child_values_from_regrets(
+                                &mut state_value.oop,
+                                child_values,
+                                state_index,
+                                &state.children,
+                                regrets,
                                 actions_len,
                                 Player::Oop,
-                            );
-                            combine_nonacting_values(
-                                &mut state_values.ip,
-                                &action_values,
-                                Player::Ip,
-                            );
-                        }
-                        Player::Ip => {
-                            combine_acting_values(
-                                &mut state_values.ip,
-                                &action_values,
-                                &strategies,
+                            )?,
+                            Player::Ip => combine_acting_child_values_from_regrets(
+                                &mut state_value.ip,
+                                child_values,
+                                state_index,
+                                &state.children,
+                                regrets,
                                 actions_len,
                                 Player::Ip,
-                            );
-                            combine_nonacting_values(
-                                &mut state_values.oop,
-                                &action_values,
-                                Player::Oop,
-                            );
+                            )?,
                         }
                     }
-                    state_values.terminal_evals =
-                        action_values.iter().map(|value| value.terminal_evals).sum();
+                    match player {
+                        Player::Oop => combine_nonacting_child_values(
+                            &mut state_value.ip,
+                            child_values,
+                            state_index,
+                            &state.children,
+                            Player::Ip,
+                        ),
+                        Player::Ip => combine_nonacting_child_values(
+                            &mut state_value.oop,
+                            child_values,
+                            state_index,
+                            &state.children,
+                            Player::Oop,
+                        ),
+                    }
+                    state_value.terminal_evals = state
+                        .children
+                        .iter()
+                        .map(|child| child_value(child_values, state_index, *child).terminal_evals)
+                        .sum();
 
                     let own_reach = match player {
                         Player::Oop => &oop_reaches[state_index],
@@ -1018,15 +1157,27 @@ impl RealCfrSolver {
                     let infoset = self.infosets[state.node_id]
                         .as_mut()
                         .expect("decision node must have infoset");
+                    let mut strategy_probs = [0.0f32; 8];
                     for combo in 0..acting_combos {
                         let node_value = match player {
-                            Player::Oop => state_values.oop[combo],
-                            Player::Ip => state_values.ip[combo],
+                            Player::Oop => state_value.oop[combo],
+                            Player::Ip => state_value.ip[combo],
                         };
+                        let local_row_start = combo * actions_len;
+                        fill_strategy_probs(
+                            &infoset.regrets[row_start + local_row_start
+                                ..row_start + local_row_start + actions_len],
+                            &mut strategy_probs,
+                        )?;
                         for action_index in 0..actions_len {
+                            let action_values = child_value(
+                                child_values,
+                                state_index,
+                                state.children[action_index],
+                            );
                             let action_value = match player {
-                                Player::Oop => action_values[action_index].oop[combo],
-                                Player::Ip => action_values[action_index].ip[combo],
+                                Player::Oop => action_values.oop[combo],
+                                Player::Ip => action_values.ip[combo],
                             };
                             let local_slot = combo * actions_len + action_index;
                             let slot = row_start + local_slot;
@@ -1034,13 +1185,12 @@ impl RealCfrSolver {
                                 &mut infoset.regrets[slot],
                                 &mut infoset.strategy_sum[slot],
                                 action_value - node_value,
-                                own_reach[combo] * strategies[local_slot],
+                                own_reach[combo] * strategy_probs[action_index],
                                 average_weight,
                                 variant,
                             );
                         }
                     }
-                    values[state_index] = state_values;
                 }
             }
         }
@@ -1568,6 +1718,12 @@ impl Values {
         }
     }
 
+    fn reset(&mut self) {
+        self.oop.fill(0.0);
+        self.ip.fill(0.0);
+        self.terminal_evals = 0;
+    }
+
     fn copy_from(&mut self, other: &Self) {
         self.oop.copy_from_slice(&other.oop);
         self.ip.copy_from_slice(&other.ip);
@@ -1750,6 +1906,23 @@ fn add_strategy_reach(
     }
 }
 
+fn split_reach_state_and_children(
+    reaches: &mut [Vec<f32>],
+    state_index: usize,
+) -> (&[f32], &mut [Vec<f32>]) {
+    let (parents, children) = reaches.split_at_mut(state_index + 1);
+    (&parents[state_index], children)
+}
+
+fn child_reach_mut(
+    child_reaches: &mut [Vec<f32>],
+    state_index: usize,
+    child_index: usize,
+) -> &mut [f32] {
+    debug_assert!(child_index > state_index);
+    &mut child_reaches[child_index - state_index - 1]
+}
+
 fn combine_acting_values(
     out: &mut [f32],
     action_values: &[Values],
@@ -1779,6 +1952,90 @@ fn combine_nonacting_values(out: &mut [f32], action_values: &[Values], player: P
                 Player::Ip => values.ip[combo],
             })
             .sum();
+    }
+}
+
+fn split_state_and_children(values: &mut [Values], state_index: usize) -> (&mut Values, &[Values]) {
+    let (parents, children) = values.split_at_mut(state_index + 1);
+    (&mut parents[state_index], children)
+}
+
+fn child_value(children: &[Values], state_index: usize, child_index: usize) -> &Values {
+    debug_assert!(child_index > state_index);
+    &children[child_index - state_index - 1]
+}
+
+fn combine_acting_child_values_from_regrets(
+    out: &mut [f32],
+    child_values: &[Values],
+    state_index: usize,
+    children: &[usize],
+    regrets: &[f32],
+    actions: usize,
+    player: Player,
+) -> Result<(), String> {
+    let mut strategy_probs = [0.0f32; 8];
+    for combo in 0..out.len() {
+        let row_start = combo * actions;
+        fill_strategy_probs(
+            &regrets[row_start..row_start + actions],
+            &mut strategy_probs,
+        )?;
+        let mut value = 0.0f32;
+        for (action, child) in children.iter().copied().enumerate() {
+            value += strategy_probs[action]
+                * match player {
+                    Player::Oop => child_value(child_values, state_index, child).oop[combo],
+                    Player::Ip => child_value(child_values, state_index, child).ip[combo],
+                };
+        }
+        out[combo] = value;
+    }
+    Ok(())
+}
+
+fn fill_strategy_probs(row: &[f32], out: &mut [f32; 8]) -> Result<(), String> {
+    if row.len() > out.len() {
+        return Err(format!(
+            "real CFR backup supports at most {} actions per node, got {}",
+            out.len(),
+            row.len()
+        ));
+    }
+    let positive_sum = row
+        .iter()
+        .copied()
+        .filter(|value| *value > 0.0)
+        .sum::<f32>();
+    if positive_sum > 0.0 {
+        for (index, value) in row.iter().copied().enumerate() {
+            out[index] = value.max(0.0) / positive_sum;
+        }
+    } else {
+        let uniform = 1.0 / row.len() as f32;
+        for index in 0..row.len() {
+            out[index] = uniform;
+        }
+    }
+    Ok(())
+}
+
+fn combine_nonacting_child_values(
+    out: &mut [f32],
+    child_values: &[Values],
+    state_index: usize,
+    children: &[usize],
+    player: Player,
+) {
+    for combo in 0..out.len() {
+        let mut value = 0.0f32;
+        for child in children {
+            value += match player {
+                Player::Oop => child_value(child_values, state_index, *child).oop[combo],
+                Player::Ip => child_value(child_values, state_index, *child).ip[combo],
+            };
+        }
+        out[combo] = value;
     }
 }
 
