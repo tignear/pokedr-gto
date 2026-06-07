@@ -1165,19 +1165,45 @@ impl RealCfrSolver {
         if oop_reaches.len() != states.len() || ip_reaches.len() != states.len() {
             return Err("reach scratch length does not match state count".to_string());
         }
+        let profile_reach = std::env::var_os("POKEDR_REAL_CFR_REACH_PROFILE").is_some();
+        let reach_started = if profile_reach {
+            Some(Instant::now())
+        } else {
+            None
+        };
+        let zero_started = if profile_reach {
+            Some(Instant::now())
+        } else {
+            None
+        };
         for reach in oop_reaches.iter_mut() {
             reach.fill(0.0);
         }
         for reach in ip_reaches.iter_mut() {
             reach.fill(0.0);
         }
+        let zero_ms = zero_started
+            .map(|started| started.elapsed().as_secs_f64() * 1000.0)
+            .unwrap_or(0.0);
+
+        let root_started = if profile_reach {
+            Some(Instant::now())
+        } else {
+            None
+        };
         for (index, combo) in self.oop_combos.iter().enumerate() {
             oop_reaches[0][index] = combo.weight;
         }
         for (index, combo) in self.ip_combos.iter().enumerate() {
             ip_reaches[0][index] = combo.weight;
         }
+        let root_ms = root_started
+            .map(|started| started.elapsed().as_secs_f64() * 1000.0)
+            .unwrap_or(0.0);
 
+        let mut propagate_ms = 0.0;
+        let mut chance_edges = 0usize;
+        let mut decision_edges = 0usize;
         for (state_index, state) in states.iter().enumerate() {
             let node = &self.tree.nodes[state.node_id];
             match &node.kind {
@@ -1191,6 +1217,11 @@ impl RealCfrSolver {
                         split_reach_state_and_children(oop_reaches, state_index);
                     let (parent_ip, child_ip_reaches) =
                         split_reach_state_and_children(ip_reaches, state_index);
+                    let propagate_started = if profile_reach {
+                        Some(Instant::now())
+                    } else {
+                        None
+                    };
                     for child in &state.children {
                         add_scaled_reach(
                             child_reach_mut(child_oop_reaches, state_index, *child),
@@ -1202,6 +1233,10 @@ impl RealCfrSolver {
                             parent_ip,
                             chance_weight,
                         );
+                    }
+                    if let Some(propagate_started) = propagate_started {
+                        chance_edges += state.children.len();
+                        propagate_ms += propagate_started.elapsed().as_secs_f64() * 1000.0;
                     }
                 }
                 PublicNodeKind::Decision { player, actions } => {
@@ -1219,69 +1254,113 @@ impl RealCfrSolver {
                         .expect("decision node must have infoset");
                     let slot_start = infoset.slots_start + row_start;
                     let slot_end = infoset.slots_start + row_end;
-                    let strategies = match strategy_source {
-                        StrategySource::Current => current_strategies(
-                            &self.regrets[slot_start..slot_end],
-                            acting_combos,
-                            actions_len,
-                        ),
-                        StrategySource::Average => average_strategies(
-                            &self.strategy_sum[slot_start..slot_end],
-                            acting_combos,
-                            actions_len,
-                        ),
-                    };
                     let (parent_oop, child_oop_reaches) =
                         split_reach_state_and_children(oop_reaches, state_index);
                     let (parent_ip, child_ip_reaches) =
                         split_reach_state_and_children(ip_reaches, state_index);
-                    for action_index in 0..actions_len {
-                        let child = state.children[action_index];
-                        match player {
-                            Player::Oop => {
+                    let propagate_started = if profile_reach {
+                        Some(Instant::now())
+                    } else {
+                        None
+                    };
+                    match player {
+                        Player::Oop => {
+                            for action_index in 0..actions_len {
+                                let child = state.children[action_index];
                                 add_reach(
                                     child_reach_mut(child_ip_reaches, state_index, child),
                                     parent_ip,
                                 );
-                                if mode == EvaluationMode::OopBestResponse {
+                            }
+                            if mode == EvaluationMode::OopBestResponse {
+                                for action_index in 0..actions_len {
+                                    let child = state.children[action_index];
                                     add_reach(
                                         child_reach_mut(child_oop_reaches, state_index, child),
                                         parent_oop,
                                     );
-                                } else {
-                                    add_strategy_reach(
-                                        child_reach_mut(child_oop_reaches, state_index, child),
+                                }
+                            } else {
+                                match strategy_source {
+                                    StrategySource::Current => add_current_strategy_reaches(
+                                        child_oop_reaches,
+                                        state_index,
+                                        &state.children,
                                         parent_oop,
-                                        &strategies,
+                                        &self.regrets[slot_start..slot_end],
                                         actions_len,
-                                        action_index,
-                                    );
+                                    ),
+                                    StrategySource::Average => add_average_strategy_reaches(
+                                        child_oop_reaches,
+                                        state_index,
+                                        &state.children,
+                                        parent_oop,
+                                        &self.strategy_sum[slot_start..slot_end],
+                                        actions_len,
+                                    ),
                                 }
                             }
-                            Player::Ip => {
+                        }
+                        Player::Ip => {
+                            for action_index in 0..actions_len {
+                                let child = state.children[action_index];
                                 add_reach(
                                     child_reach_mut(child_oop_reaches, state_index, child),
                                     parent_oop,
                                 );
-                                if mode == EvaluationMode::IpBestResponse {
+                            }
+                            if mode == EvaluationMode::IpBestResponse {
+                                for action_index in 0..actions_len {
+                                    let child = state.children[action_index];
                                     add_reach(
                                         child_reach_mut(child_ip_reaches, state_index, child),
                                         parent_ip,
                                     );
-                                } else {
-                                    add_strategy_reach(
-                                        child_reach_mut(child_ip_reaches, state_index, child),
+                                }
+                            } else {
+                                match strategy_source {
+                                    StrategySource::Current => add_current_strategy_reaches(
+                                        child_ip_reaches,
+                                        state_index,
+                                        &state.children,
                                         parent_ip,
-                                        &strategies,
+                                        &self.regrets[slot_start..slot_end],
                                         actions_len,
-                                        action_index,
-                                    );
+                                    ),
+                                    StrategySource::Average => add_average_strategy_reaches(
+                                        child_ip_reaches,
+                                        state_index,
+                                        &state.children,
+                                        parent_ip,
+                                        &self.strategy_sum[slot_start..slot_end],
+                                        actions_len,
+                                    ),
                                 }
                             }
                         }
                     }
+                    if let Some(propagate_started) = propagate_started {
+                        decision_edges += actions_len;
+                        propagate_ms += propagate_started.elapsed().as_secs_f64() * 1000.0;
+                    }
                 }
             }
+        }
+        if profile_reach {
+            eprintln!(
+                "real_cfr_reach_profile states={} chance_edges={} decision_edges={} zero_ms={:.3} root_ms={:.3} propagate_ms={:.3} total_ms={:.3}",
+                states.len(),
+                chance_edges,
+                decision_edges,
+                zero_ms,
+                root_ms,
+                propagate_ms,
+                reach_started
+                    .expect("reach profile timer must exist")
+                    .elapsed()
+                    .as_secs_f64()
+                    * 1000.0
+            );
         }
         Ok(())
     }
@@ -2297,26 +2376,39 @@ impl TerminalAccumulator {
 }
 
 fn current_strategies(regrets: &[f32], combos: usize, actions: usize) -> Vec<f32> {
-    let mut strategies = vec![0.0; regrets.len()];
+    let mut strategies = Vec::new();
+    current_strategies_into(regrets, combos, actions, &mut strategies);
+    strategies
+}
+
+fn current_strategies_into(
+    regrets: &[f32],
+    combos: usize,
+    actions: usize,
+    strategies: &mut Vec<f32>,
+) {
+    strategies.resize(regrets.len(), 0.0);
     for combo in 0..combos {
-        let row = &regrets[combo * actions..(combo + 1) * actions];
-        let positive_sum = row
-            .iter()
-            .copied()
-            .filter(|value| *value > 0.0)
-            .sum::<f32>();
+        let row_start = combo * actions;
+        let mut positive_sum = 0.0;
+        for action in 0..actions {
+            let value = regrets[row_start + action];
+            if value > 0.0 {
+                positive_sum += value;
+            }
+        }
         if positive_sum > 0.0 {
             for action in 0..actions {
-                strategies[combo * actions + action] = row[action].max(0.0) / positive_sum;
+                strategies[row_start + action] =
+                    regrets[row_start + action].max(0.0) / positive_sum;
             }
         } else {
             let uniform = 1.0 / actions as f32;
             for action in 0..actions {
-                strategies[combo * actions + action] = uniform;
+                strategies[row_start + action] = uniform;
             }
         }
     }
-    strategies
 }
 
 fn apply_real_cfr_update(
@@ -2425,22 +2517,35 @@ fn dcfr_strategy_discount(iteration: f32, gamma: f32) -> f32 {
 }
 
 fn average_strategies(strategy_sum: &[f32], combos: usize, actions: usize) -> Vec<f32> {
-    let mut strategies = vec![0.0; strategy_sum.len()];
+    let mut strategies = Vec::new();
+    average_strategies_into(strategy_sum, combos, actions, &mut strategies);
+    strategies
+}
+
+fn average_strategies_into(
+    strategy_sum: &[f32],
+    combos: usize,
+    actions: usize,
+    strategies: &mut Vec<f32>,
+) {
+    strategies.resize(strategy_sum.len(), 0.0);
     for combo in 0..combos {
-        let row = &strategy_sum[combo * actions..(combo + 1) * actions];
-        let total = row.iter().sum::<f32>();
+        let row_start = combo * actions;
+        let mut total = 0.0;
+        for action in 0..actions {
+            total += strategy_sum[row_start + action];
+        }
         if total > 0.0 {
             for action in 0..actions {
-                strategies[combo * actions + action] = row[action] / total;
+                strategies[row_start + action] = strategy_sum[row_start + action] / total;
             }
         } else {
             let uniform = 1.0 / actions as f32;
             for action in 0..actions {
-                strategies[combo * actions + action] = uniform;
+                strategies[row_start + action] = uniform;
             }
         }
     }
-    strategies
 }
 
 fn apply_strategy_to_reach(reach: &mut [f32], strategies: &[f32], actions: usize, action: usize) {
@@ -2470,6 +2575,75 @@ fn add_strategy_reach(
 ) {
     for (combo, (out, input)) in out.iter_mut().zip(input).enumerate() {
         *out += *input * strategies[combo * actions + action];
+    }
+}
+
+fn add_current_strategy_reaches(
+    child_reaches: &mut [Vec<f32>],
+    state_index: usize,
+    children: &[usize],
+    input: &[f32],
+    regrets: &[f32],
+    actions: usize,
+) {
+    debug_assert_eq!(children.len(), actions);
+    for (combo, input_value) in input.iter().copied().enumerate() {
+        if input_value == 0.0 {
+            continue;
+        }
+        let row_start = combo * actions;
+        let mut positive_sum = 0.0;
+        for action in 0..actions {
+            let value = regrets[row_start + action];
+            if value > 0.0 {
+                positive_sum += value;
+            }
+        }
+        if positive_sum > 0.0 {
+            let scale = input_value / positive_sum;
+            for action in 0..actions {
+                let child = children[action] - state_index - 1;
+                child_reaches[child][combo] += regrets[row_start + action].max(0.0) * scale;
+            }
+        } else {
+            let value = input_value / actions as f32;
+            for child in children {
+                child_reaches[*child - state_index - 1][combo] += value;
+            }
+        }
+    }
+}
+
+fn add_average_strategy_reaches(
+    child_reaches: &mut [Vec<f32>],
+    state_index: usize,
+    children: &[usize],
+    input: &[f32],
+    strategy_sum: &[f32],
+    actions: usize,
+) {
+    debug_assert_eq!(children.len(), actions);
+    for (combo, input_value) in input.iter().copied().enumerate() {
+        if input_value == 0.0 {
+            continue;
+        }
+        let row_start = combo * actions;
+        let mut total = 0.0;
+        for action in 0..actions {
+            total += strategy_sum[row_start + action];
+        }
+        if total > 0.0 {
+            let scale = input_value / total;
+            for action in 0..actions {
+                let child = children[action] - state_index - 1;
+                child_reaches[child][combo] += strategy_sum[row_start + action] * scale;
+            }
+        } else {
+            let value = input_value / actions as f32;
+            for child in children {
+                child_reaches[*child - state_index - 1][combo] += value;
+            }
+        }
     }
 }
 
