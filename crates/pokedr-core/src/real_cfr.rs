@@ -834,6 +834,7 @@ impl RealCfrSolver {
         let mut ip_live = vec![0.0f32; combos];
         let mut oop_nonzero = Vec::new();
         let mut ip_nonzero = Vec::new();
+        let sparse_nonzero_limit = terminal_sparse_nonzero_limit();
         let mut accumulator =
             TerminalAccumulator::zero(self.oop_combos.len(), self.ip_combos.len());
         let mut profile = TerminalWorkerProfile {
@@ -885,8 +886,8 @@ impl RealCfrSolver {
                         profile.ip_nonzero_sum += ip_nonzero.len();
                         profile.oop_nonzero_max = profile.oop_nonzero_max.max(oop_nonzero.len());
                         profile.ip_nonzero_max = profile.ip_nonzero_max.max(ip_nonzero.len());
-                        if oop_nonzero.len() <= TERMINAL_SPARSE_NONZERO_LIMIT
-                            && ip_nonzero.len() <= TERMINAL_SPARSE_NONZERO_LIMIT
+                        if oop_nonzero.len() <= sparse_nonzero_limit
+                            && ip_nonzero.len() <= sparse_nonzero_limit
                         {
                             profile.sparse_tasks += 1;
                             terminal_cfv_sparse_targets_into(
@@ -1482,6 +1483,7 @@ impl RealCfrSolver {
         let mut values = Values::zero(self.oop_combos.len(), self.ip_combos.len());
         let mut oop_counts = vec![0.0f32; self.oop_combos.len()];
         let mut ip_counts = vec![0.0f32; self.ip_combos.len()];
+        let sparse_nonzero_limit = terminal_sparse_nonzero_limit();
         for final_board in &terminal_boards {
             let cache_index = self
                 .terminal_cache_index_by_key
@@ -1507,8 +1509,7 @@ impl RealCfrSolver {
                 &mut ip_live,
                 &mut ip_nonzero,
             );
-            if oop_nonzero.len() <= TERMINAL_SPARSE_NONZERO_LIMIT
-                && ip_nonzero.len() <= TERMINAL_SPARSE_NONZERO_LIMIT
+            if oop_nonzero.len() <= sparse_nonzero_limit && ip_nonzero.len() <= sparse_nonzero_limit
             {
                 terminal_cfv_sparse_targets_into(
                     &cache.prepared,
@@ -1868,6 +1869,13 @@ fn reach_on_prepared_board_sparse_into(
             out[index] += *reach;
         }
     }
+}
+
+fn terminal_sparse_nonzero_limit() -> usize {
+    std::env::var("POKEDR_REAL_CFR_SPARSE_NONZERO_LIMIT")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(TERMINAL_SPARSE_NONZERO_LIMIT)
 }
 
 fn print_terminal_worker_profiles(
