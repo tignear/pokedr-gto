@@ -53,6 +53,10 @@ function App() {
   const solutionCombos = useSolutionCombos();
   const actingCombos =
     selectedNode?.strategy?.player === "oop" ? solutionCombos.oop : solutionCombos.ip;
+  const actionBreakdown = useMemo(
+    () => actionFrequencies(selectedNode, actingCombos),
+    [actingCombos, selectedNode]
+  );
 
   if (error) {
     return <div className="fatal">viewer error: {error}</div>;
@@ -108,24 +112,32 @@ function App() {
                 <button
                   key={candidate.index}
                   className={candidate.index === selectedAction ? "active" : ""}
+                  style={
+                    {
+                      "--action-freq": actionBreakdown[candidate.index] ?? 0
+                    } as React.CSSProperties
+                  }
                   onClick={() => {
                     setSelectedAction(candidate.index);
                     setSelectedCell(null);
                   }}
                 >
-                  {candidate.label}
+                  <span>{candidate.label}</span>
+                  <strong>{((actionBreakdown[candidate.index] ?? 0) * 100).toFixed(1)}%</strong>
                 </button>
               ))}
             </div>
           </div>
 
           {selectedNode.strategy ? (
-            <HandMatrix
-              node={selectedNode}
-              combos={actingCombos}
-              actionIndex={selectedAction}
-              onSelect={setSelectedCell}
-            />
+            <div className="matrixShell">
+              <HandMatrix
+                node={selectedNode}
+                combos={actingCombos}
+                actionIndex={selectedAction}
+                onSelect={setSelectedCell}
+              />
+            </div>
           ) : (
             <div className="emptyNode">No strategy at this node.</div>
           )}
@@ -194,6 +206,25 @@ function useSolutionCombos() {
   }, []);
 
   return combos;
+}
+
+function actionFrequencies(node: ViewerNode | null, combos: ViewerCombo[]) {
+  const strategy = node?.strategy;
+  if (!node || !strategy || combos.length === 0) {
+    return [];
+  }
+  const totalWeight = combos.reduce((sum, combo) => sum + combo.weight, 0);
+  if (totalWeight <= 0) {
+    return [];
+  }
+  return node.actions.map((action) => {
+    let weighted = 0;
+    for (const combo of combos) {
+      const value = strategy.action_major[action.index * strategy.combos + combo.index] ?? 0;
+      weighted += value * combo.weight;
+    }
+    return weighted / totalWeight;
+  });
 }
 
 function TreePanel({

@@ -107,8 +107,6 @@ pub struct NodeLocalCfrSolver {
     terminal_cache: Vec<NodeLocalTerminalCache>,
     fold_cache_index_by_key: BTreeMap<u64, usize>,
     fold_cache: Vec<NodeLocalFoldCache>,
-    allin_oracle_index_by_key: BTreeMap<u64, usize>,
-    allin_oracles: Vec<NodeLocalAllInOracle>,
     combo_permutations: BTreeMap<u8, ComboPermutationMaps>,
     oop_same_ip_combo_indices: Vec<Option<usize>>,
     ip_same_oop_combo_indices: Vec<Option<usize>>,
@@ -194,13 +192,14 @@ struct NodeLocalNode {
     public_node: usize,
     board: Board,
     pot: u32,
+    oop_total_commit: u32,
+    ip_total_commit: u32,
     kind: NodeLocalKind,
     children: Vec<usize>,
     chance_concrete_events: usize,
     chance_permutation_codes: Vec<Vec<u8>>,
     terminal_cache_indices: Vec<usize>,
     fold_cache_index: Option<usize>,
-    allin_oracle_index: Option<usize>,
     regrets: Vec<f32>,
     strategy_sum: Vec<f32>,
 }
@@ -237,14 +236,6 @@ struct PreparedComboTarget {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct PreparedRiverTarget {
-    strength: u64,
-    range_index: u16,
-    first_card: u8,
-    second_card: u8,
-}
-
-#[derive(Debug, Clone, Copy)]
 struct PreparedLiveTarget {
     range_index: u16,
     first_card: u8,
@@ -273,8 +264,6 @@ struct NodeLocalTerminalCache {
     ip_targets: Vec<PreparedComboTarget>,
     oop_targets_sorted: Vec<PreparedComboTarget>,
     ip_targets_sorted: Vec<PreparedComboTarget>,
-    oop_river_targets_sorted: Vec<PreparedRiverTarget>,
-    ip_river_targets_sorted: Vec<PreparedRiverTarget>,
     oop_board_targets_sorted: Vec<u16>,
     ip_board_targets_sorted: Vec<u16>,
 }
@@ -283,16 +272,6 @@ struct NodeLocalTerminalCache {
 struct NodeLocalFoldCache {
     oop_live_targets: Vec<PreparedLiveTarget>,
     ip_live_targets: Vec<PreparedLiveTarget>,
-}
-
-#[derive(Debug, Clone)]
-struct NodeLocalAllInOracle {
-    oop_payoffs: Vec<f32>,
-    ip_payoffs: Vec<f32>,
-    oop_live_indices: Vec<usize>,
-    ip_live_indices: Vec<usize>,
-    oop_divisor: f32,
-    ip_divisor: f32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -395,8 +374,15 @@ impl NodeLocalCfrSolver {
         oop_range: RangeSpec,
         ip_range: RangeSpec,
     ) -> Result<Self, String> {
+        let oop_range = oop_range.without_board_conflicts(&tree.spot.board);
+        let ip_range = ip_range.without_board_conflicts(&tree.spot.board);
         let oop_combos = oop_range.combos().to_vec();
         let ip_combos = ip_range.combos().to_vec();
+        if oop_combos.is_empty() || ip_combos.is_empty() {
+            return Err(
+                "node-local CFR ranges must contain live combos on the public board".into(),
+            );
+        }
         let combo_permutations = all_suit_permutations()
             .into_iter()
             .filter_map(|permutation| {
@@ -426,8 +412,6 @@ impl NodeLocalCfrSolver {
             let mut ip_targets_sorted = ip_targets.clone();
             sort_combo_targets_by_strength(&prepared, &mut oop_targets_sorted);
             sort_combo_targets_by_strength(&prepared, &mut ip_targets_sorted);
-            let oop_river_targets_sorted = prepared_river_targets(&prepared, &oop_targets_sorted);
-            let ip_river_targets_sorted = prepared_river_targets(&prepared, &ip_targets_sorted);
             let mut oop_board_targets_sorted = prepared_board_targets(&oop_targets);
             let mut ip_board_targets_sorted = prepared_board_targets(&ip_targets);
             prepared.sort_indices_by_strength(&mut oop_board_targets_sorted);
@@ -439,8 +423,6 @@ impl NodeLocalCfrSolver {
                 ip_targets,
                 oop_targets_sorted,
                 ip_targets_sorted,
-                oop_river_targets_sorted,
-                ip_river_targets_sorted,
                 oop_board_targets_sorted,
                 ip_board_targets_sorted,
             });
@@ -457,8 +439,6 @@ impl NodeLocalCfrSolver {
             terminal_cache,
             fold_cache_index_by_key: BTreeMap::new(),
             fold_cache: Vec::new(),
-            allin_oracle_index_by_key: BTreeMap::new(),
-            allin_oracles: Vec::new(),
             combo_permutations,
             oop_same_ip_combo_indices,
             ip_same_oop_combo_indices,
@@ -1662,6 +1642,8 @@ impl NodeLocalCfrSolver {
             public_node,
             board: board.clone(),
             pot: 0,
+            oop_total_commit: 0,
+            ip_total_commit: 0,
             kind: NodeLocalKind::Terminal {
                 reason: TerminalReason::Showdown,
                 folding_player: Player::Oop,
@@ -1671,7 +1653,6 @@ impl NodeLocalCfrSolver {
             chance_permutation_codes: Vec::new(),
             terminal_cache_indices: Vec::new(),
             fold_cache_index: None,
-            allin_oracle_index: None,
             regrets: Vec::new(),
             strategy_sum: Vec::new(),
         }));
@@ -1689,7 +1670,6 @@ impl NodeLocalCfrSolver {
         let mut chance_permutation_codes = Vec::new();
         let mut terminal_cache_indices = Vec::new();
         let mut fold_cache_index = None;
-        let mut allin_oracle_index = None;
         let mut regrets = Vec::new();
         let mut strategy_sum = Vec::new();
 
@@ -1714,16 +1694,13 @@ impl NodeLocalCfrSolver {
                         }
                     }
                     TerminalReason::AllIn => {
-                        allin_oracle_index = self.allin_oracle_index(board)?;
-                        if allin_oracle_index.is_none() {
-                            for terminal_board in terminal_boards(board)? {
-                                let index = self
-                                    .terminal_cache_index_by_key
-                                    .get(&unordered_board_key(&terminal_board))
-                                    .copied()
-                                    .ok_or_else(|| "terminal board is outside cache".to_string())?;
-                                terminal_cache_indices.push(index);
-                            }
+                        for terminal_board in terminal_boards(board)? {
+                            let index = self
+                                .terminal_cache_index_by_key
+                                .get(&unordered_board_key(&terminal_board))
+                                .copied()
+                                .ok_or_else(|| "terminal board is outside cache".to_string())?;
+                            terminal_cache_indices.push(index);
                         }
                     }
                 }
@@ -1774,13 +1751,14 @@ impl NodeLocalCfrSolver {
 
         let node = self.nodes[index].get_mut();
         node.pot = public.state.pot;
+        node.oop_total_commit = self.tree.spot.effective_stack - public.state.oop_stack;
+        node.ip_total_commit = self.tree.spot.effective_stack - public.state.ip_stack;
         node.kind = kind;
         node.children = children;
         node.chance_concrete_events = chance_concrete_events;
         node.chance_permutation_codes = chance_permutation_codes;
         node.terminal_cache_indices = terminal_cache_indices;
         node.fold_cache_index = fold_cache_index;
-        node.allin_oracle_index = allin_oracle_index;
         node.regrets = regrets;
         node.strategy_sum = strategy_sum;
         Ok(index)
@@ -1798,33 +1776,6 @@ impl NodeLocalCfrSolver {
             ip_live_targets: live_combo_targets(&self.ip_combos, board),
         });
         index
-    }
-
-    fn allin_oracle_index(&mut self, board: &Board) -> Result<Option<usize>, String> {
-        if board.cards().len() != 3 {
-            return Ok(None);
-        }
-        let key = ordered_board_key(board);
-        if let Some(index) = self.allin_oracle_index_by_key.get(&key) {
-            return Ok(Some(*index));
-        }
-        let cells = self.oop_combos.len() * self.ip_combos.len();
-        let bytes = cells * 2 * std::mem::size_of::<f32>();
-        let limit_mib = std::env::var("POKEDR_NODE_CFR_ALLIN_ORACLE_LIMIT_MIB")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(0);
-        if limit_mib == 0 {
-            return Ok(None);
-        }
-        if bytes > limit_mib * 1024 * 1024 {
-            return Ok(None);
-        }
-        let index = self.allin_oracles.len();
-        let oracle = build_allin_oracle(board, &self.oop_combos, &self.ip_combos)?;
-        self.allin_oracle_index_by_key.insert(key, index);
-        self.allin_oracles.push(oracle);
-        Ok(Some(index))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1897,39 +1848,15 @@ impl NodeLocalCfrSolver {
                     }
                 }
                 let started = self.profile_enabled.then(Instant::now);
-                let result = if matches!(reason, TerminalReason::AllIn) {
-                    if let Some(oracle_index) = node.allin_oracle_index {
-                        self.allin_oracle_side_into(
-                            oracle_index,
-                            node.pot,
-                            update_player,
-                            oop_reach,
-                            ip_reach,
-                            out,
-                        );
-                        Ok(0)
-                    } else {
-                        self.showdown_side_into(
-                            node_index,
-                            node.pot,
-                            update_player,
-                            oop_reach,
-                            ip_reach,
-                            out,
-                            scratch,
-                        )
-                    }
-                } else {
-                    self.showdown_side_into(
-                        node_index,
-                        node.pot,
-                        update_player,
-                        oop_reach,
-                        ip_reach,
-                        out,
-                        scratch,
-                    )
-                };
+                let result = self.showdown_side_into(
+                    node_index,
+                    node.pot,
+                    update_player,
+                    oop_reach,
+                    ip_reach,
+                    out,
+                    scratch,
+                );
                 if let Some(started) = started {
                     let elapsed_ns = started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
                     self.profile
@@ -1972,44 +1899,6 @@ impl NodeLocalCfrSolver {
         }
     }
 
-    fn allin_oracle_side_into(
-        &self,
-        oracle_index: usize,
-        pot: u32,
-        update_player: Player,
-        oop_reach: &[f32],
-        ip_reach: &[f32],
-        out: &mut [f32],
-    ) {
-        out.fill(0.0);
-        let oracle = &self.allin_oracles[oracle_index];
-        let pot = pot as f32;
-        match update_player {
-            Player::Oop => {
-                allin_oracle_matrix_vector_into(
-                    &oracle.oop_payoffs,
-                    self.ip_combos.len(),
-                    ip_reach,
-                    &oracle.oop_live_indices,
-                    &oracle.ip_live_indices,
-                    pot / oracle.oop_divisor,
-                    out,
-                );
-            }
-            Player::Ip => {
-                allin_oracle_matrix_vector_into(
-                    &oracle.ip_payoffs,
-                    self.oop_combos.len(),
-                    oop_reach,
-                    &oracle.ip_live_indices,
-                    &oracle.oop_live_indices,
-                    pot / oracle.ip_divisor,
-                    out,
-                );
-            }
-        }
-    }
-
     fn fold_side_into(
         &self,
         node: &NodeLocalNode,
@@ -2020,15 +1909,18 @@ impl NodeLocalCfrSolver {
         ip_reach: &[f32],
         out: &mut [f32],
     ) {
-        let pot = pot as f32;
         let fold_cache = node
             .fold_cache_index
             .and_then(|index| self.fold_cache.get(index))
             .expect("fold terminal node is missing fold cache");
-        let sign = if folding_player == update_player {
-            -pot
+        let update_commit = match update_player {
+            Player::Oop => node.oop_total_commit,
+            Player::Ip => node.ip_total_commit,
+        } as f32;
+        let payoff = if folding_player == update_player {
+            -update_commit
         } else {
-            pot
+            pot as f32 - update_commit
         };
         match update_player {
             Player::Oop => opponent_weights_for_fast_into(
@@ -2036,7 +1928,7 @@ impl NodeLocalCfrSolver {
                 &self.oop_same_ip_combo_indices,
                 &fold_cache.oop_live_targets,
                 &fold_cache.ip_live_targets,
-                sign,
+                payoff,
                 out,
             ),
             Player::Ip => opponent_weights_for_fast_into(
@@ -2044,7 +1936,7 @@ impl NodeLocalCfrSolver {
                 &self.ip_same_oop_combo_indices,
                 &fold_cache.ip_live_targets,
                 &fold_cache.oop_live_targets,
-                sign,
+                payoff,
                 out,
             ),
         }
@@ -2064,6 +1956,12 @@ impl NodeLocalCfrSolver {
         let node = self.nodes[node_index].get();
         let cache_indices = &node.terminal_cache_indices;
         let pot = pot as f32;
+        let own_commit = match update_player {
+            Player::Oop => node.oop_total_commit,
+            Player::Ip => node.ip_total_commit,
+        } as f32;
+        let outcome_scale = pot * 0.5;
+        let net_offset = pot * 0.5 - own_commit;
         if self.terminal_side_cache_enabled {
             scratch.terminal_counts.resize(out.len(), 0.0);
             scratch.terminal_counts.fill(0.0);
@@ -2117,9 +2015,20 @@ impl NodeLocalCfrSolver {
                 )?;
                 for target in own_targets {
                     out[target.range_index] +=
-                        scratch.terminal_values[target.board_index as usize] * pot;
+                        scratch.terminal_values[target.board_index as usize] * outcome_scale;
                     scratch.terminal_counts[target.range_index] += 1.0;
                 }
+                add_terminal_net_offset(
+                    prepared,
+                    opponent_reach,
+                    match update_player {
+                        Player::Oop => &cache.ip_targets,
+                        Player::Ip => &cache.oop_targets,
+                    },
+                    own_targets,
+                    net_offset,
+                    out,
+                );
             }
             for (value, count) in out.iter_mut().zip(&scratch.terminal_counts) {
                 if *count > 0.0 {
@@ -2127,49 +2036,45 @@ impl NodeLocalCfrSolver {
                 }
             }
         } else {
-            if node.board.cards().len() == 5 {
-                let cache_index = cache_indices
-                    .first()
-                    .copied()
-                    .ok_or_else(|| "river terminal node is missing terminal cache".to_string())?;
-                let cache = &self.terminal_cache[cache_index];
+            for cache_index in cache_indices {
+                let cache = &self.terminal_cache[*cache_index];
+                let prepared = &cache.prepared;
                 match update_player {
-                    Player::Oop => terminal_side_river_targets_sorted_accumulate(
-                        &cache.ip_river_targets_sorted,
-                        ip_reach,
-                        &cache.oop_river_targets_sorted,
-                        pot,
-                        out,
-                    ),
-                    Player::Ip => terminal_side_river_targets_sorted_accumulate(
-                        &cache.oop_river_targets_sorted,
-                        oop_reach,
-                        &cache.ip_river_targets_sorted,
-                        pot,
-                        out,
-                    ),
-                }
-            } else {
-                for cache_index in cache_indices {
-                    let cache = &self.terminal_cache[*cache_index];
-                    let prepared = &cache.prepared;
-                    match update_player {
-                        Player::Oop => terminal_side_range_targets_sorted_accumulate(
+                    Player::Oop => {
+                        terminal_side_range_targets_sorted_accumulate(
                             prepared,
                             &cache.ip_targets_sorted,
                             ip_reach,
                             &cache.oop_targets_sorted,
-                            pot,
+                            outcome_scale,
                             out,
-                        ),
-                        Player::Ip => terminal_side_range_targets_sorted_accumulate(
+                        );
+                        add_terminal_net_offset(
+                            prepared,
+                            ip_reach,
+                            &cache.ip_targets,
+                            &cache.oop_targets,
+                            net_offset,
+                            out,
+                        );
+                    }
+                    Player::Ip => {
+                        terminal_side_range_targets_sorted_accumulate(
                             prepared,
                             &cache.oop_targets_sorted,
                             oop_reach,
                             &cache.ip_targets_sorted,
-                            pot,
+                            outcome_scale,
                             out,
-                        ),
+                        );
+                        add_terminal_net_offset(
+                            prepared,
+                            oop_reach,
+                            &cache.oop_targets,
+                            &cache.ip_targets,
+                            net_offset,
+                            out,
+                        );
                     }
                 }
             }
@@ -2630,16 +2535,6 @@ fn prepared_combo_targets(
         .collect()
 }
 
-fn live_combo_indices(combos: &[ComboWeight], board: &Board) -> Vec<usize> {
-    combos
-        .iter()
-        .enumerate()
-        .filter_map(|(index, combo)| {
-            (!board.contains(combo.first) && !board.contains(combo.second)).then_some(index)
-        })
-        .collect()
-}
-
 fn live_combo_targets(combos: &[ComboWeight], board: &Board) -> Vec<PreparedLiveTarget> {
     combos
         .iter()
@@ -2676,35 +2571,6 @@ fn sort_combo_targets_by_strength(
     targets: &mut [PreparedComboTarget],
 ) {
     targets.sort_unstable_by_key(|target| prepared.strength(target.board_index as usize));
-}
-
-fn prepared_river_targets(
-    prepared: &PreparedTerminalBoard,
-    targets_sorted: &[PreparedComboTarget],
-) -> Vec<PreparedRiverTarget> {
-    targets_sorted
-        .iter()
-        .map(|target| {
-            let combo = prepared.combo(target.board_index as usize);
-            PreparedRiverTarget {
-                strength: prepared.strength(target.board_index as usize),
-                range_index: target
-                    .range_index
-                    .try_into()
-                    .expect("range has more than u16::MAX private combos"),
-                first_card: combo
-                    .first
-                    .index()
-                    .try_into()
-                    .expect("card index does not fit in u8"),
-                second_card: combo
-                    .second
-                    .index()
-                    .try_into()
-                    .expect("card index does not fit in u8"),
-            }
-        })
-        .collect()
 }
 
 fn reach_on_targets_into(targets: &[PreparedComboTarget], reach: &[f32], out: &mut [f32]) {
@@ -2775,133 +2641,6 @@ fn terminal_side_range_targets_sorted_accumulate(
     }
 }
 
-fn terminal_side_river_targets_sorted_accumulate(
-    opponent_targets_sorted: &[PreparedRiverTarget],
-    opponent_reach: &[f32],
-    own_targets_sorted: &[PreparedRiverTarget],
-    pot: f32,
-    out: &mut [f32],
-) {
-    let mut reach_sum = 0.0f32;
-    let mut card_sums = [0.0f32; 52];
-    let mut opponent_cursor = 0usize;
-    for own_target in own_targets_sorted {
-        while opponent_cursor < opponent_targets_sorted.len() {
-            let opponent_target = opponent_targets_sorted[opponent_cursor];
-            if opponent_target.strength >= own_target.strength {
-                break;
-            }
-            add_river_target_reach_to_card_sums(
-                opponent_target,
-                opponent_reach,
-                &mut reach_sum,
-                &mut card_sums,
-            );
-            opponent_cursor += 1;
-        }
-        out[own_target.range_index as usize] +=
-            non_blocked_river_target_reach(*own_target, reach_sum, &card_sums) * pot;
-    }
-
-    reach_sum = 0.0;
-    card_sums = [0.0f32; 52];
-    opponent_cursor = opponent_targets_sorted.len();
-    for own_target in own_targets_sorted.iter().rev() {
-        while opponent_cursor > 0 {
-            let opponent_target = opponent_targets_sorted[opponent_cursor - 1];
-            if opponent_target.strength <= own_target.strength {
-                break;
-            }
-            add_river_target_reach_to_card_sums(
-                opponent_target,
-                opponent_reach,
-                &mut reach_sum,
-                &mut card_sums,
-            );
-            opponent_cursor -= 1;
-        }
-        out[own_target.range_index as usize] -=
-            non_blocked_river_target_reach(*own_target, reach_sum, &card_sums) * pot;
-    }
-}
-
-fn build_allin_oracle(
-    board: &Board,
-    oop_combos: &[ComboWeight],
-    ip_combos: &[ComboWeight],
-) -> Result<NodeLocalAllInOracle, String> {
-    let oop_live_indices = live_combo_indices(oop_combos, board);
-    let ip_live_indices = live_combo_indices(ip_combos, board);
-    let oop_cols = ip_combos.len();
-    let ip_cols = oop_combos.len();
-    let mut oop_payoffs = vec![0.0f32; oop_combos.len() * oop_cols];
-    let mut ip_payoffs = vec![0.0f32; ip_combos.len() * ip_cols];
-    for terminal_board in terminal_boards(board)? {
-        let prepared = PreparedTerminalBoard::new(&terminal_board)?;
-        let oop_targets = prepared_combo_targets(&prepared, oop_combos);
-        let ip_targets = prepared_combo_targets(&prepared, ip_combos);
-        for oop_target in &oop_targets {
-            let oop_combo = prepared.combo(oop_target.board_index as usize);
-            let oop_strength = prepared.strength(oop_target.board_index as usize);
-            for ip_target in &ip_targets {
-                let ip_combo = prepared.combo(ip_target.board_index as usize);
-                if combos_overlap(oop_combo, ip_combo) {
-                    continue;
-                }
-                let ip_strength = prepared.strength(ip_target.board_index as usize);
-                let oop_outcome = if oop_strength > ip_strength {
-                    1.0
-                } else if oop_strength < ip_strength {
-                    -1.0
-                } else {
-                    0.0
-                };
-                oop_payoffs[oop_target.range_index * oop_cols + ip_target.range_index] +=
-                    oop_outcome;
-                ip_payoffs[ip_target.range_index * ip_cols + oop_target.range_index] -= oop_outcome;
-            }
-        }
-    }
-    let divisor = terminal_runout_count_for_live_combo(board.cards().len());
-    Ok(NodeLocalAllInOracle {
-        oop_payoffs,
-        ip_payoffs,
-        oop_live_indices,
-        ip_live_indices,
-        oop_divisor: divisor,
-        ip_divisor: divisor,
-    })
-}
-
-fn allin_oracle_matrix_vector_into(
-    payoffs: &[f32],
-    cols: usize,
-    opponent_reach: &[f32],
-    own_live_indices: &[usize],
-    opponent_live_indices: &[usize],
-    scale: f32,
-    out: &mut [f32],
-) {
-    for own_index in own_live_indices.iter().copied() {
-        let row = &payoffs[own_index * cols..(own_index + 1) * cols];
-        let mut value = 0.0f32;
-        for opponent_index in opponent_live_indices.iter().copied() {
-            value += row[opponent_index] * opponent_reach[opponent_index];
-        }
-        out[own_index] = value * scale;
-    }
-}
-
-fn combos_overlap(
-    first: crate::terminal_cfv::PrivateCombo,
-    second: crate::terminal_cfv::PrivateCombo,
-) -> bool {
-    first.first == second.first
-        || first.first == second.second
-        || first.second == second.first
-        || first.second == second.second
-}
-
 fn add_target_reach_to_card_sums(
     prepared: &PreparedTerminalBoard,
     target: PreparedComboTarget,
@@ -2919,19 +2658,32 @@ fn add_target_reach_to_card_sums(
     card_sums[combo.second.index()] += value;
 }
 
-fn add_river_target_reach_to_card_sums(
-    target: PreparedRiverTarget,
-    reach: &[f32],
-    reach_sum: &mut f32,
-    card_sums: &mut [f32; 52],
+fn add_terminal_net_offset(
+    prepared: &PreparedTerminalBoard,
+    opponent_reach: &[f32],
+    opponent_targets: &[PreparedComboTarget],
+    own_targets: &[PreparedComboTarget],
+    offset: f32,
+    out: &mut [f32],
 ) {
-    let value = reach[target.range_index as usize];
-    if value == 0.0 {
+    if offset == 0.0 {
         return;
     }
-    *reach_sum += value;
-    card_sums[target.first_card as usize] += value;
-    card_sums[target.second_card as usize] += value;
+    let mut reach_sum = 0.0;
+    let mut card_sums = [0.0f32; 52];
+    for target in opponent_targets {
+        add_target_reach_to_card_sums(
+            prepared,
+            *target,
+            opponent_reach,
+            &mut reach_sum,
+            &mut card_sums,
+        );
+    }
+    for target in own_targets {
+        let combo = prepared.combo(target.board_index as usize);
+        out[target.range_index] += non_blocked_target_reach(combo, reach_sum, &card_sums) * offset;
+    }
 }
 
 fn non_blocked_target_reach(
@@ -2940,14 +2692,6 @@ fn non_blocked_target_reach(
     card_sums: &[f32; 52],
 ) -> f32 {
     reach_sum - card_sums[combo.first.index()] - card_sums[combo.second.index()]
-}
-
-fn non_blocked_river_target_reach(
-    target: PreparedRiverTarget,
-    reach_sum: f32,
-    card_sums: &[f32; 52],
-) -> f32 {
-    reach_sum - card_sums[target.first_card as usize] - card_sums[target.second_card as usize]
 }
 
 fn terminal_runout_count_for_live_combo(board_cards: usize) -> f32 {
@@ -3092,8 +2836,8 @@ mod tests {
     use crate::RealCfrAverageStrategy;
     use crate::legacy::real_cfr::ArenaAlternatingCfrSolver;
     use crate::tree::{
-        ActionAbstraction, ChanceExpansion, RaisePolicy, Spot, StreetTemplate, TreeBuilder,
-        TreeTemplate,
+        ActionAbstraction, BetSizeSpec, ChanceExpansion, RaisePolicy, Spot, StreetTemplate,
+        TreeBuilder, TreeTemplate,
     };
     use std::str::FromStr;
 
@@ -3122,6 +2866,97 @@ mod tests {
         let node = NodeLocalCfrSolver::new(tree, oop_range, ip_range).unwrap();
         assert_eq!(node.summary().states, arena.state_count());
         assert_eq!(node.summary().action_slots, arena.regret_len());
+    }
+
+    #[test]
+    fn node_local_cfr_filters_public_board_dead_combos() {
+        let board = Board::from_str("As7h2c").unwrap();
+        let oop_range = RangeSpec::from_str("AsAh,AcAd,KcKd").unwrap();
+        let ip_range = RangeSpec::from_str("AsKh,QcQd,JcJd").unwrap();
+        let tree = TreeBuilder::new(TreeTemplate {
+            action_abstraction: tiny_checkdown_abstraction(),
+            chance_expansion: ChanceExpansion::Enumerate,
+        })
+        .unwrap()
+        .build(Spot {
+            board,
+            pot: 200,
+            effective_stack: 900,
+            oop_range: oop_range.clone(),
+            ip_range: ip_range.clone(),
+            first_player: Player::Oop,
+        })
+        .unwrap();
+        let solver = NodeLocalCfrSolver::new(tree, oop_range, ip_range).unwrap();
+        let snapshot = solver.solution_snapshot();
+        assert_eq!(
+            snapshot
+                .oop_combos
+                .iter()
+                .map(|combo| format!("{}{}", combo.first, combo.second))
+                .collect::<Vec<_>>(),
+            vec!["AcAd", "KcKd"]
+        );
+        assert_eq!(
+            snapshot
+                .ip_combos
+                .iter()
+                .map(|combo| format!("{}{}", combo.first, combo.second))
+                .collect::<Vec<_>>(),
+            vec!["QcQd", "JcJd"]
+        );
+    }
+
+    #[test]
+    fn fold_payoff_subtracts_total_commit_across_streets() {
+        let board = Board::from_str("As7h2c").unwrap();
+        let oop_range = RangeSpec::from_str("AcAd").unwrap();
+        let ip_range = RangeSpec::from_str("QcQd").unwrap();
+        let tree = TreeBuilder::new(TreeTemplate {
+            action_abstraction: two_street_bet_fold_abstraction(),
+            chance_expansion: ChanceExpansion::Enumerate,
+        })
+        .unwrap()
+        .build(Spot {
+            board,
+            pot: 200,
+            effective_stack: 900,
+            oop_range: oop_range.clone(),
+            ip_range: ip_range.clone(),
+            first_player: Player::Oop,
+        })
+        .unwrap();
+        let solver = NodeLocalCfrSolver::new(tree, oop_range, ip_range).unwrap();
+        let fold_node = solver
+            .nodes
+            .iter()
+            .map(|cell| cell.get())
+            .find(|node| {
+                matches!(
+                    node.kind,
+                    NodeLocalKind::Terminal {
+                        reason: TerminalReason::Fold,
+                        folding_player: Player::Ip,
+                    }
+                ) && node.board.cards().len() == 4
+                    && node.oop_total_commit > 100
+                    && !node.board.contains(Card::from_str("Ac").unwrap())
+                    && !node.board.contains(Card::from_str("Ad").unwrap())
+                    && !node.board.contains(Card::from_str("Qc").unwrap())
+                    && !node.board.contains(Card::from_str("Qd").unwrap())
+            })
+            .expect("expected a turn fold after flop bet-call");
+        let mut out = vec![0.0; solver.oop_combos.len()];
+        solver.fold_side_into(
+            fold_node,
+            fold_node.pot,
+            Player::Oop,
+            Player::Ip,
+            &[1.0],
+            &[1.0],
+            &mut out,
+        );
+        assert_eq!(out[0], (fold_node.pot - fold_node.oop_total_commit) as f32);
     }
 
     #[test]
@@ -3198,69 +3033,6 @@ mod tests {
         assert!(exploitability.ip_gain >= 0.0);
     }
 
-    #[test]
-    fn river_fast_path_matches_sorted_terminal_path() {
-        let board = Board::from_str("As7h2cTd9d").unwrap();
-        let prepared = PreparedTerminalBoard::new(&board).unwrap();
-        let oop_range = RangeSpec::from_str("AcAd,KcKd,QcQd,JcJd,TcTh").unwrap();
-        let ip_range = RangeSpec::from_str("AhKh,QhJh,9c9h,8c8h,7c7d").unwrap();
-        let mut oop_targets = prepared_combo_targets(&prepared, oop_range.combos());
-        let mut ip_targets = prepared_combo_targets(&prepared, ip_range.combos());
-        sort_combo_targets_by_strength(&prepared, &mut oop_targets);
-        sort_combo_targets_by_strength(&prepared, &mut ip_targets);
-        let oop_river_targets = prepared_river_targets(&prepared, &oop_targets);
-        let ip_river_targets = prepared_river_targets(&prepared, &ip_targets);
-        let oop_reach = oop_range
-            .combos()
-            .iter()
-            .enumerate()
-            .map(|(index, combo)| combo.weight * (index as f32 + 1.0))
-            .collect::<Vec<_>>();
-        let ip_reach = ip_range
-            .combos()
-            .iter()
-            .enumerate()
-            .map(|(index, combo)| combo.weight * (index as f32 + 0.5))
-            .collect::<Vec<_>>();
-        let mut generic_oop = vec![0.0; oop_range.combos().len()];
-        let mut fast_oop = vec![0.0; oop_range.combos().len()];
-        terminal_side_range_targets_sorted_accumulate(
-            &prepared,
-            &ip_targets,
-            &ip_reach,
-            &oop_targets,
-            200.0,
-            &mut generic_oop,
-        );
-        terminal_side_river_targets_sorted_accumulate(
-            &ip_river_targets,
-            &ip_reach,
-            &oop_river_targets,
-            200.0,
-            &mut fast_oop,
-        );
-        assert_eq!(generic_oop, fast_oop);
-
-        let mut generic_ip = vec![0.0; ip_range.combos().len()];
-        let mut fast_ip = vec![0.0; ip_range.combos().len()];
-        terminal_side_range_targets_sorted_accumulate(
-            &prepared,
-            &oop_targets,
-            &oop_reach,
-            &ip_targets,
-            200.0,
-            &mut generic_ip,
-        );
-        terminal_side_river_targets_sorted_accumulate(
-            &oop_river_targets,
-            &oop_reach,
-            &ip_river_targets,
-            200.0,
-            &mut fast_ip,
-        );
-        assert_eq!(generic_ip, fast_ip);
-    }
-
     fn tiny_checkdown_abstraction() -> ActionAbstraction {
         ActionAbstraction {
             min_bet: 2,
@@ -3270,6 +3042,34 @@ mod tests {
             },
             turn: StreetTemplate {
                 first_bet_sizes: Vec::new(),
+                donk_bet_sizes: Vec::new(),
+            },
+            river: StreetTemplate {
+                first_bet_sizes: Vec::new(),
+                donk_bet_sizes: Vec::new(),
+            },
+            raise: RaisePolicy {
+                raise_multiplier: 2.0,
+                raise_sizes: Vec::new(),
+                max_raises_per_street: 0,
+                shove_spr_threshold: 0.0,
+                shove_commit_fraction: 1.0,
+                add_all_in_threshold: 0.0,
+                force_all_in_threshold: 0.0,
+                merging_threshold: 0.0,
+            },
+        }
+    }
+
+    fn two_street_bet_fold_abstraction() -> ActionAbstraction {
+        ActionAbstraction {
+            min_bet: 100,
+            flop: StreetTemplate {
+                first_bet_sizes: vec![BetSizeSpec::PotFraction(0.50)],
+                donk_bet_sizes: Vec::new(),
+            },
+            turn: StreetTemplate {
+                first_bet_sizes: vec![BetSizeSpec::PotFraction(0.25)],
                 donk_bet_sizes: Vec::new(),
             },
             river: StreetTemplate {

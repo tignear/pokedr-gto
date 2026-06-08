@@ -1,4 +1,4 @@
-use crate::cards::{Card, Rank, Suit};
+use crate::cards::{Board, Card, Rank, Suit};
 use std::str::FromStr;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -43,6 +43,17 @@ impl RangeSpec {
 
     pub fn combos(&self) -> &[ComboWeight] {
         &self.combos
+    }
+
+    pub fn without_board_conflicts(&self, board: &Board) -> Self {
+        Self {
+            combos: self
+                .combos
+                .iter()
+                .copied()
+                .filter(|combo| !board.contains(combo.first) && !board.contains(combo.second))
+                .collect(),
+        }
     }
 }
 
