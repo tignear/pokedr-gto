@@ -1006,35 +1006,65 @@ fn solve_for_viewer(
     let started = Instant::now();
     let mut solver =
         NodeLocalCfrSolver::new(tree, request.oop_range.clone(), request.ip_range.clone())?;
-    let summary = solver.run_with_progress(
-        RealCfrConfig {
-            iterations: options.iterations,
-            variant: options.variant,
-            average_strategy: options.average_strategy,
-        },
-        |progress| {
-            if options.log_interval > 0
-                && (progress.iteration == 1
-                    || progress.iteration == options.iterations
-                    || progress.iteration % options.log_interval == 0)
-            {
-                info!(
-                    iteration = progress.iteration,
-                    terminal_evals = progress.terminal_evals,
-                    iteration_ms = progress.elapsed_ms,
-                    oop_pass_value = progress.oop_update_pass_value,
-                    ip_pass_value = progress.ip_update_pass_value,
-                    "viewer_solve_progress"
-                );
-            }
-        },
-    )?;
-    let exploitability =
-        if options.exploitability_interval > 0 || options.target_exploitability_bb100.is_some() {
-            Some(solver.exploitability(options.threads)?)
+    let interval = if options.exploitability_interval > 0 {
+        options.exploitability_interval
+    } else if options.target_exploitability_bb100.is_some() {
+        options.log_interval.max(16)
+    } else {
+        0
+    };
+    let mut completed = 0u32;
+    let mut summary = solver.summary();
+    let mut exploitability = None;
+    while completed < options.iterations {
+        let remaining = options.iterations - completed;
+        let chunk = if interval > 0 {
+            remaining.min(interval)
         } else {
-            None
+            remaining
         };
+        let chunk_start = completed;
+        summary = solver.run_with_progress(
+            RealCfrConfig {
+                iterations: chunk,
+                variant: options.variant,
+                average_strategy: options.average_strategy,
+            },
+            |progress| {
+                let global_iteration = chunk_start + progress.iteration;
+                if options.log_interval > 0
+                    && (global_iteration == 1
+                        || global_iteration == options.iterations
+                        || global_iteration % options.log_interval == 0)
+                {
+                    info!(
+                        iteration = global_iteration,
+                        terminal_evals = progress.terminal_evals,
+                        iteration_ms = progress.elapsed_ms,
+                        oop_pass_value = progress.oop_update_pass_value,
+                        ip_pass_value = progress.ip_update_pass_value,
+                        "viewer_solve_progress"
+                    );
+                }
+            },
+        )?;
+        completed = summary.iterations;
+        if interval > 0 {
+            let current = solver.exploitability(options.threads)?;
+            info!(
+                iteration = completed,
+                exploitability_bb_per_100 = current.exploitability_bb_per_100,
+                "viewer_solve_exploitability"
+            );
+            let reached_target = options
+                .target_exploitability_bb100
+                .is_some_and(|target| current.exploitability_bb_per_100 <= target);
+            exploitability = Some(current);
+            if reached_target {
+                break;
+            }
+        }
+    }
     let snapshot = solver.solution_snapshot();
     info!(
         iterations = summary.iterations,
