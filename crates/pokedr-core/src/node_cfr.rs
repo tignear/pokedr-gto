@@ -201,6 +201,13 @@ struct PreparedRiverTarget {
     second_card: u8,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct PreparedLiveTarget {
+    range_index: u16,
+    first_card: u8,
+    second_card: u8,
+}
+
 #[derive(Debug)]
 struct NodeLocalScratch {
     strategies: Vec<f32>,
@@ -231,8 +238,8 @@ struct NodeLocalTerminalCache {
 
 #[derive(Debug, Clone)]
 struct NodeLocalFoldCache {
-    oop_live_indices: Vec<usize>,
-    ip_live_indices: Vec<usize>,
+    oop_live_targets: Vec<PreparedLiveTarget>,
+    ip_live_targets: Vec<PreparedLiveTarget>,
 }
 
 #[derive(Debug, Clone)]
@@ -1298,8 +1305,8 @@ impl NodeLocalCfrSolver {
         let index = self.fold_cache.len();
         self.fold_cache_index_by_key.insert(key, index);
         self.fold_cache.push(NodeLocalFoldCache {
-            oop_live_indices: live_combo_indices(&self.oop_combos, board),
-            ip_live_indices: live_combo_indices(&self.ip_combos, board),
+            oop_live_targets: live_combo_targets(&self.oop_combos, board),
+            ip_live_targets: live_combo_targets(&self.ip_combos, board),
         });
         index
     }
@@ -1529,33 +1536,28 @@ impl NodeLocalCfrSolver {
             .fold_cache_index
             .and_then(|index| self.fold_cache.get(index))
             .expect("fold terminal node is missing fold cache");
-        match update_player {
-            Player::Oop => opponent_weights_for_fast_into(
-                &self.oop_combos,
-                &self.ip_combos,
-                ip_reach,
-                &self.oop_same_ip_combo_indices,
-                &fold_cache.oop_live_indices,
-                &fold_cache.ip_live_indices,
-                out,
-            ),
-            Player::Ip => opponent_weights_for_fast_into(
-                &self.ip_combos,
-                &self.oop_combos,
-                oop_reach,
-                &self.ip_same_oop_combo_indices,
-                &fold_cache.ip_live_indices,
-                &fold_cache.oop_live_indices,
-                out,
-            ),
-        }
         let sign = if folding_player == update_player {
             -pot
         } else {
             pot
         };
-        for value in out {
-            *value *= sign;
+        match update_player {
+            Player::Oop => opponent_weights_for_fast_into(
+                ip_reach,
+                &self.oop_same_ip_combo_indices,
+                &fold_cache.oop_live_targets,
+                &fold_cache.ip_live_targets,
+                sign,
+                out,
+            ),
+            Player::Ip => opponent_weights_for_fast_into(
+                oop_reach,
+                &self.ip_same_oop_combo_indices,
+                &fold_cache.ip_live_targets,
+                &fold_cache.oop_live_targets,
+                sign,
+                out,
+            ),
         }
     }
 
@@ -2011,34 +2013,34 @@ fn dcfr_strategy_discount(iteration: f32, gamma: f32) -> f32 {
 }
 
 fn opponent_weights_for_fast_into(
-    own_combos: &[ComboWeight],
-    opponent_combos: &[ComboWeight],
     opponent_reach: &[f32],
     same_combo_indices: &[Option<usize>],
-    own_live_indices: &[usize],
-    opponent_live_indices: &[usize],
+    own_live_targets: &[PreparedLiveTarget],
+    opponent_live_targets: &[PreparedLiveTarget],
+    scale: f32,
     out: &mut [f32],
 ) {
     let mut total = 0.0f32;
     let mut card_totals = [0.0f32; 52];
-    for opponent_index in opponent_live_indices.iter().copied() {
-        let reach = opponent_reach[opponent_index];
+    for opponent in opponent_live_targets {
+        let reach = opponent_reach[opponent.range_index as usize];
         if reach == 0.0 {
             continue;
         }
-        let combo = &opponent_combos[opponent_index];
         total += reach;
-        card_totals[combo.first.index()] += reach;
-        card_totals[combo.second.index()] += reach;
+        card_totals[opponent.first_card as usize] += reach;
+        card_totals[opponent.second_card as usize] += reach;
     }
     out.fill(0.0);
-    for own_index in own_live_indices.iter().copied() {
-        let own = &own_combos[own_index];
+    for own in own_live_targets {
+        let own_index = own.range_index as usize;
         let same_reach = same_combo_indices[own_index]
             .map(|index| opponent_reach[index])
             .unwrap_or(0.0);
         out[own_index] =
-            total - card_totals[own.first.index()] - card_totals[own.second.index()] + same_reach;
+            (total - card_totals[own.first_card as usize] - card_totals[own.second_card as usize]
+                + same_reach)
+                * scale;
     }
 }
 
@@ -2089,6 +2091,33 @@ fn live_combo_indices(combos: &[ComboWeight], board: &Board) -> Vec<usize> {
         .enumerate()
         .filter_map(|(index, combo)| {
             (!board.contains(combo.first) && !board.contains(combo.second)).then_some(index)
+        })
+        .collect()
+}
+
+fn live_combo_targets(combos: &[ComboWeight], board: &Board) -> Vec<PreparedLiveTarget> {
+    combos
+        .iter()
+        .enumerate()
+        .filter_map(|(index, combo)| {
+            if board.contains(combo.first) || board.contains(combo.second) {
+                return None;
+            }
+            Some(PreparedLiveTarget {
+                range_index: index
+                    .try_into()
+                    .expect("range has more than u16::MAX private combos"),
+                first_card: combo
+                    .first
+                    .index()
+                    .try_into()
+                    .expect("card index does not fit in u8"),
+                second_card: combo
+                    .second
+                    .index()
+                    .try_into()
+                    .expect("card index does not fit in u8"),
+            })
         })
         .collect()
 }

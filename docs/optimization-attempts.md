@@ -1234,3 +1234,25 @@ retrying similar ideas, so attempts stay in chronological order.
   `1.22x` to roughly `1.08x` on this benchmark. Remaining differences are now
   likely traversal/action-row storage overhead and non-river terminal work,
   not a single large terminal-CFV bottleneck.
+
+## 2026-06-08: Fold terminal scale and live-target fast path
+
+- Changed fold terminal evaluation to apply signed pot scale inside
+  `opponent_weights_for_fast_into`, removing the separate final multiply pass
+  over the output vector.
+- Also changed fold caches from live range indices to compact live targets
+  (`u16 range_index`, `u8/u8 cards`), avoiding repeated `ComboWeight` lookups in
+  the fold hot path.
+- Correctness smoke: `cargo check -p pokedr-core -p pokedr-cli`,
+  `cargo test -p pokedr-core node_local_cfr -- --nocapture`, and
+  `cargo test -p pokedr-core river_fast_path_matches_sorted_terminal_path -- --nocapture`
+  pass.
+- Result on the same reference-comparison setup (`Td9d6h`, postflop-basic,
+  pot `200`, effective `900`, expanded UTG-vs-BU ranges, 16 release
+  iterations):
+  - after river fast path: `node_cfr elapsed_ms=1308.894`;
+  - fold scale-only run: `node_cfr elapsed_ms=1240.905`;
+  - compact fold live targets rerun: `node_cfr elapsed_ms=1213.419`.
+- Takeaway: this brings the benchmark to effectively the reference solver's
+  current measured runtime (`postflop-solver solve_ms=1210.231`) while keeping
+  exact terminal values.
