@@ -104,7 +104,7 @@ enum Command {
         real_cfr_exploitability_interval: u32,
         #[arg(long)]
         real_cfr_target_exploitability_bb100: Option<f32>,
-        #[arg(long, default_value = "cfr-plus")]
+        #[arg(long, default_value = "dcfr-plus")]
         real_cfr_variant: String,
         #[arg(long, default_value_t = 1.5)]
         dcfr_alpha: f32,
