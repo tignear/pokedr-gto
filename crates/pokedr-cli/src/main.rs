@@ -1100,19 +1100,6 @@ struct ViewerNode {
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct ViewerNodeListItem {
-    id: usize,
-    public_node: usize,
-    board: String,
-    street: String,
-    pot_bb: f32,
-    player: String,
-    kind: String,
-    children: Vec<usize>,
-    actions: Vec<ViewerAction>,
-}
-
-#[derive(Debug, Clone, Serialize)]
 struct ViewerAction {
     index: usize,
     label: String,
@@ -1249,10 +1236,8 @@ fn serve_viewer(
         solution: Arc::new(solution),
     };
     let api = Router::new()
-        .route("/solution", get(api_solution))
         .route("/combos", get(api_combos))
         .route("/summary", get(api_summary))
-        .route("/nodes", get(api_nodes))
         .route("/node/{id}", get(api_node))
         .with_state(state);
     let app = Router::new().nest("/api", api).fallback_service(
@@ -1278,36 +1263,11 @@ async fn api_summary(State(state): State<ViewerState>) -> Json<ViewerSummary> {
     Json(state.solution.summary.clone())
 }
 
-async fn api_solution(State(state): State<ViewerState>) -> Json<ViewerSolution> {
-    Json((*state.solution).clone())
-}
-
 async fn api_combos(State(state): State<ViewerState>) -> Json<ViewerCombos> {
     Json(ViewerCombos {
         oop: state.solution.oop_combos.clone(),
         ip: state.solution.ip_combos.clone(),
     })
-}
-
-async fn api_nodes(State(state): State<ViewerState>) -> Json<Vec<ViewerNodeListItem>> {
-    Json(
-        state
-            .solution
-            .nodes
-            .iter()
-            .map(|node| ViewerNodeListItem {
-                id: node.id,
-                public_node: node.public_node,
-                board: node.board.clone(),
-                street: node.street.clone(),
-                pot_bb: node.pot_bb,
-                player: node.player.clone(),
-                kind: node.kind.clone(),
-                children: node.children.clone(),
-                actions: node.actions.clone(),
-            })
-            .collect(),
-    )
 }
 
 async fn api_node(Path(id): Path<usize>, State(state): State<ViewerState>) -> impl IntoResponse {

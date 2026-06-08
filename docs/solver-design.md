@@ -29,7 +29,9 @@ CLI configuration:
 - Solver logs use `tracing` and can be controlled with `--log-level` or
   `[logging].level`.
 - `solver-config.example.toml` is the practical viewer starter config.
-  `solver-config.smoke.toml` is intentionally tiny for quick checks, and
+  `solver-config.viewer.toml` is the quick interactive viewer config with the
+  postflop-solver basic tree and an exploitability check. `solver-config.smoke.toml`
+  is intentionally tiny for API/process checks, and
   `solver-config.ranges-wide.toml` can be layered on top when memory is not a
   concern.
 - `[solver].threads = 0` means auto-detect available CPU parallelism. If

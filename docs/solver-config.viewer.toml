@@ -1,4 +1,10 @@
-# Tiny config for CLI/API smoke checks. This is not a meaningful poker spot.
+# Starter config for the interactive solution viewer.
+#
+# This intentionally keeps the postflop-solver basic action tree shape:
+# - bet sizes: 60%, geometric, all-in
+# - raise size: 2.5x previous bet
+# - turn donk uses the regular bet sizes
+# - river donk is 50%
 
 [spot]
 flop = "As7h2c"
@@ -13,10 +19,10 @@ preset = "postflop-basic"
 enumerate_chance = false
 
 [solver]
-iterations = 1
+iterations = 16
 threads = 0 # auto: use available CPU parallelism
-log_interval = 1
-exploitability_interval = 0
+log_interval = 4
+exploitability_interval = 16
 variant = "dcfr-plus"
 average_strategy = "reach-weighted"
 dcfr_alpha = 1.5

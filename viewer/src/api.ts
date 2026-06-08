@@ -58,10 +58,6 @@ export async function fetchSummary(): Promise<ViewerSummary> {
   return fetchJson("/api/summary");
 }
 
-export async function fetchNodes(): Promise<ViewerNodeListItem[]> {
-  return fetchJson("/api/nodes");
-}
-
 export async function fetchNode(id: number): Promise<ViewerNode> {
   return fetchJson(`/api/node/${id}`);
 }

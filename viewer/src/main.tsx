@@ -2,7 +2,6 @@ import React, { useEffect, useMemo, useState } from "react";
 import { createRoot } from "react-dom/client";
 import {
   fetchNode,
-  fetchNodes,
   fetchSummary,
   fetchCombos,
   type ViewerCombo,
@@ -26,7 +25,7 @@ type ComboAggregate = {
 
 function App() {
   const [summary, setSummary] = useState<ViewerSummary | null>(null);
-  const [nodes, setNodes] = useState<ViewerNodeListItem[]>([]);
+  const [nodesById, setNodesById] = useState<Map<number, ViewerNodeListItem>>(() => new Map());
   const [selectedNodeId, setSelectedNodeId] = useState(0);
   const [selectedNode, setSelectedNode] = useState<ViewerNode | null>(null);
   const [selectedAction, setSelectedAction] = useState(0);
@@ -34,11 +33,8 @@ function App() {
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    Promise.all([fetchSummary(), fetchNodes()])
-      .then(([summary, nodes]) => {
-        setSummary(summary);
-        setNodes(nodes);
-      })
+    fetchSummary()
+      .then((summary) => setSummary(summary))
       .catch((error: Error) => setError(error.message));
   }, []);
 
@@ -46,6 +42,11 @@ function App() {
     fetchNode(selectedNodeId)
       .then((node) => {
         setSelectedNode(node);
+        setNodesById((previous) => {
+          const next = new Map(previous);
+          next.set(node.id, nodeListItem(node));
+          return next;
+        });
         setSelectedAction(0);
         setSelectedCell(null);
       })
@@ -55,6 +56,10 @@ function App() {
   const solutionCombos = useSolutionCombos();
   const actingCombos =
     selectedNode?.strategy?.player === "oop" ? solutionCombos.oop : solutionCombos.ip;
+  const nodes = useMemo(
+    () => Array.from(nodesById.values()).sort((left, right) => left.id - right.id),
+    [nodesById]
+  );
 
   if (error) {
     return <div className="fatal">viewer error: {error}</div>;
@@ -162,6 +167,11 @@ function App() {
       </section>
     </main>
   );
+}
+
+function nodeListItem(node: ViewerNode): ViewerNodeListItem {
+  const { strategy: _strategy, ...item } = node;
+  return item;
 }
 
 function useSolutionCombos() {
