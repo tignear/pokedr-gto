@@ -13,7 +13,7 @@ use std::cell::UnsafeCell;
 use std::collections::{BTreeMap, HashMap};
 use std::ops::{Deref, DerefMut};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -30,6 +30,12 @@ pub struct NodeLocalCfrSummary {
     pub scratch_allocations: usize,
     pub terminal_cache_hits: usize,
     pub terminal_cache_misses: usize,
+    pub terminal_calls: usize,
+    pub terminal_ns: u64,
+    pub fold_calls: usize,
+    pub fold_ns: u64,
+    pub showdown_calls: usize,
+    pub showdown_ns: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -61,6 +67,7 @@ pub struct NodeLocalCfrSolver {
     profile_enabled: bool,
     profile: NodeLocalProfile,
     scratch_pools: Vec<Mutex<Vec<NodeLocalScratch>>>,
+    terminal_side_cache_enabled: bool,
 }
 
 #[derive(Debug, Default)]
@@ -68,6 +75,12 @@ struct NodeLocalProfile {
     scratch_allocations: AtomicUsize,
     terminal_cache_hits: AtomicUsize,
     terminal_cache_misses: AtomicUsize,
+    terminal_calls: AtomicUsize,
+    terminal_ns: AtomicU64,
+    fold_calls: AtomicUsize,
+    fold_ns: AtomicU64,
+    showdown_calls: AtomicUsize,
+    showdown_ns: AtomicU64,
 }
 
 impl NodeLocalProfile {
@@ -75,6 +88,12 @@ impl NodeLocalProfile {
         self.scratch_allocations.store(0, Ordering::Relaxed);
         self.terminal_cache_hits.store(0, Ordering::Relaxed);
         self.terminal_cache_misses.store(0, Ordering::Relaxed);
+        self.terminal_calls.store(0, Ordering::Relaxed);
+        self.terminal_ns.store(0, Ordering::Relaxed);
+        self.fold_calls.store(0, Ordering::Relaxed);
+        self.fold_ns.store(0, Ordering::Relaxed);
+        self.showdown_calls.store(0, Ordering::Relaxed);
+        self.showdown_ns.store(0, Ordering::Relaxed);
     }
 }
 
@@ -323,6 +342,8 @@ impl NodeLocalCfrSolver {
             scratch_pools: (0..rayon::current_num_threads())
                 .map(|_| Mutex::new(Vec::new()))
                 .collect(),
+            terminal_side_cache_enabled: std::env::var_os("POKEDR_NODE_CFR_TERMINAL_SIDE_CACHE")
+                .is_some_and(|value| value == "1"),
         };
         let board = solver.tree.spot.board.clone();
         solver.collect_node(0, &board)?;
@@ -351,6 +372,12 @@ impl NodeLocalCfrSolver {
             scratch_allocations: self.profile.scratch_allocations.load(Ordering::Relaxed),
             terminal_cache_hits: self.profile.terminal_cache_hits.load(Ordering::Relaxed),
             terminal_cache_misses: self.profile.terminal_cache_misses.load(Ordering::Relaxed),
+            terminal_calls: self.profile.terminal_calls.load(Ordering::Relaxed),
+            terminal_ns: self.profile.terminal_ns.load(Ordering::Relaxed),
+            fold_calls: self.profile.fold_calls.load(Ordering::Relaxed),
+            fold_ns: self.profile.fold_ns.load(Ordering::Relaxed),
+            showdown_calls: self.profile.showdown_calls.load(Ordering::Relaxed),
+            showdown_ns: self.profile.showdown_ns.load(Ordering::Relaxed),
         }
     }
 
@@ -497,6 +524,12 @@ impl NodeLocalCfrSolver {
             scratch_allocations: self.profile.scratch_allocations.load(Ordering::Relaxed),
             terminal_cache_hits: self.profile.terminal_cache_hits.load(Ordering::Relaxed),
             terminal_cache_misses: self.profile.terminal_cache_misses.load(Ordering::Relaxed),
+            terminal_calls: self.profile.terminal_calls.load(Ordering::Relaxed),
+            terminal_ns: self.profile.terminal_ns.load(Ordering::Relaxed),
+            fold_calls: self.profile.fold_calls.load(Ordering::Relaxed),
+            fold_ns: self.profile.fold_ns.load(Ordering::Relaxed),
+            showdown_calls: self.profile.showdown_calls.load(Ordering::Relaxed),
+            showdown_ns: self.profile.showdown_ns.load(Ordering::Relaxed),
         })
     }
 
@@ -517,16 +550,38 @@ impl NodeLocalCfrSolver {
             NodeLocalKind::Terminal {
                 reason,
                 folding_player,
-            } => self.terminal_side_into(
-                node_index,
-                update_player,
-                reason,
-                folding_player,
-                oop_reach,
-                ip_reach,
-                out,
-                scratch,
-            ),
+            } => {
+                if self.profile_enabled {
+                    self.profile.terminal_calls.fetch_add(1, Ordering::Relaxed);
+                    let started = Instant::now();
+                    let result = self.terminal_side_into(
+                        node_index,
+                        update_player,
+                        reason,
+                        folding_player,
+                        oop_reach,
+                        ip_reach,
+                        out,
+                        scratch,
+                    );
+                    self.profile.terminal_ns.fetch_add(
+                        started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64,
+                        Ordering::Relaxed,
+                    );
+                    result
+                } else {
+                    self.terminal_side_into(
+                        node_index,
+                        update_player,
+                        reason,
+                        folding_player,
+                        oop_reach,
+                        ip_reach,
+                        out,
+                        scratch,
+                    )
+                }
+            }
             NodeLocalKind::Chance => {
                 out.fill(0.0);
                 let chance_weight = 1.0 / node.chance_concrete_events as f32;
@@ -1133,6 +1188,10 @@ impl NodeLocalCfrSolver {
         let node = self.nodes[node_index].get();
         match reason {
             TerminalReason::Fold => {
+                if self.profile_enabled {
+                    self.profile.fold_calls.fetch_add(1, Ordering::Relaxed);
+                }
+                let started = self.profile_enabled.then(Instant::now);
                 self.fold_side_into(
                     &node.board,
                     node.pot,
@@ -1142,17 +1201,36 @@ impl NodeLocalCfrSolver {
                     ip_reach,
                     out,
                 );
+                if let Some(started) = started {
+                    self.profile.fold_ns.fetch_add(
+                        started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64,
+                        Ordering::Relaxed,
+                    );
+                }
                 Ok(0)
             }
-            TerminalReason::Showdown | TerminalReason::AllIn => self.showdown_side_into(
-                node_index,
-                node.pot,
-                update_player,
-                oop_reach,
-                ip_reach,
-                out,
-                scratch,
-            ),
+            TerminalReason::Showdown | TerminalReason::AllIn => {
+                if self.profile_enabled {
+                    self.profile.showdown_calls.fetch_add(1, Ordering::Relaxed);
+                }
+                let started = self.profile_enabled.then(Instant::now);
+                let result = self.showdown_side_into(
+                    node_index,
+                    node.pot,
+                    update_player,
+                    oop_reach,
+                    ip_reach,
+                    out,
+                    scratch,
+                );
+                if let Some(started) = started {
+                    self.profile.showdown_ns.fetch_add(
+                        started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64,
+                        Ordering::Relaxed,
+                    );
+                }
+                result
+            }
         }
     }
 
@@ -1245,19 +1323,29 @@ impl NodeLocalCfrSolver {
                     )
                 }
             };
-            terminal_side_cached_values(
-                &mut scratch.side_cache,
-                *cache_index,
-                match update_player {
-                    Player::Oop => NodeLocalTerminalSide::Oop,
-                    Player::Ip => NodeLocalTerminalSide::Ip,
-                },
-                prepared,
-                opponent_reach,
-                board_targets,
-                &mut scratch.terminal_values,
-                self.profile_enabled.then_some(&self.profile),
-            )?;
+            if self.terminal_side_cache_enabled {
+                terminal_side_cached_values(
+                    &mut scratch.side_cache,
+                    *cache_index,
+                    match update_player {
+                        Player::Oop => NodeLocalTerminalSide::Oop,
+                        Player::Ip => NodeLocalTerminalSide::Ip,
+                    },
+                    prepared,
+                    opponent_reach,
+                    board_targets,
+                    &mut scratch.terminal_values,
+                    self.profile_enabled.then_some(&self.profile),
+                )?;
+            } else {
+                scratch.terminal_values.resize(prepared.combos().len(), 0.0);
+                terminal_side_values_prefix_blocker_sorted_board_targets_into(
+                    prepared,
+                    opponent_reach,
+                    board_targets,
+                    &mut scratch.terminal_values,
+                )?;
+            }
             for target in own_targets {
                 out[target.range_index] +=
                     scratch.terminal_values[target.board_index as usize] * pot;

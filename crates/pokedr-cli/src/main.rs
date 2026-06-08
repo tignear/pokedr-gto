@@ -539,10 +539,16 @@ fn main() -> Result<(), String> {
                 );
                 if std::env::var_os("POKEDR_NODE_CFR_PROFILE").is_some() {
                     println!(
-                        "node_cfr_profile scratch_allocations={} terminal_cache_hits={} terminal_cache_misses={}",
+                        "node_cfr_profile scratch_allocations={} terminal_cache_hits={} terminal_cache_misses={} terminal_calls={} terminal_ms={:.3} fold_calls={} fold_ms={:.3} showdown_calls={} showdown_ms={:.3}",
                         summary.scratch_allocations,
                         summary.terminal_cache_hits,
                         summary.terminal_cache_misses,
+                        summary.terminal_calls,
+                        summary.terminal_ns as f64 / 1_000_000.0,
+                        summary.fold_calls,
+                        summary.fold_ns as f64 / 1_000_000.0,
+                        summary.showdown_calls,
+                        summary.showdown_ns as f64 / 1_000_000.0,
                     );
                 }
                 return Ok(());

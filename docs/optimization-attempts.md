@@ -1043,3 +1043,25 @@ retrying similar ideas, so attempts stay in chronological order.
   improves side-cache locality, but only buys about 9-10% wall time. The
   remaining bottleneck is not scratch construction; it is terminal-side work
   plus fine-grained recursive task/reduce overhead.
+
+## 2026-06-08: Disable node-local terminal side cache by default
+
+- Rechecked the reference benchmark:
+  `/tmp/postflop-solver/examples/bench_flop_16.rs` on `Td9d6h`, UTG vs BU,
+  pot `200`, effective `900`, same `60%, e, a` / `2.5x` tree, reports
+  `solve_ms=1025.455`, `per_iter_ms=64.091`.
+- Added node-local profile counters for terminal time, fold time, and
+  showdown/all-in time. With the side cache enabled, 16 iterations showed about
+  `7.53M` terminal calls, `3.29M` fold calls, `4.23M` showdown calls,
+  `terminal_ms=54194` aggregate CPU time, with showdown dominating
+  (`showdown_ms=40660`). The side cache had more misses than hits:
+  `terminal_cache_hits=1832327`, `terminal_cache_misses=3852281`.
+- Result: on the same 16-iteration run, forcing the side cache on took
+  `4477ms`; disabling it took `3343ms`; default-off after the change took
+  `3319ms`. The current signature/hash/entry clone cache is a net slowdown for
+  this workload.
+- Changed default: node-local terminal side cache is now disabled unless
+  `POKEDR_NODE_CFR_TERMINAL_SIDE_CACHE=1` is set.
+- Takeaway: the remaining gap to the reference solver is about `3.2x` on this
+  benchmark. The next target is the terminal evaluation kernel itself, not
+  cache lookup plumbing.
