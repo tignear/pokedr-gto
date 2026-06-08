@@ -661,6 +661,61 @@ impl ArenaAlternatingCfrSolver {
         self.states.len()
     }
 
+    pub fn exploitability(&self, threads: usize) -> Result<RealCfrExploitability, String> {
+        let mut evaluator = RealCfrSolver::new(
+            self.tree.clone(),
+            self.oop_range.clone(),
+            self.ip_range.clone(),
+        )?;
+        if evaluator.strategy_sum.len() != self.strategy_sum.len() {
+            return Err(format!(
+                "arena/evaluator strategy storage length mismatch: arena={} evaluator={}",
+                self.strategy_sum.len(),
+                evaluator.strategy_sum.len()
+            ));
+        }
+        for state in &self.states {
+            let Some(arena_infoset) = state.infoset else {
+                continue;
+            };
+            let evaluator_infoset = evaluator.infosets[state.node_id]
+                .as_ref()
+                .ok_or_else(|| "arena decision state is missing evaluator infoset".to_string())?;
+            if evaluator_infoset.player != arena_infoset.player
+                || evaluator_infoset.actions != arena_infoset.actions
+            {
+                return Err("arena/evaluator infoset shape mismatch".to_string());
+            }
+            let board_index = match state.board.cards().len() {
+                3 => 0,
+                4 => *evaluator
+                    .turn_index_by_key
+                    .get(&ordered_board_key(&state.board))
+                    .ok_or_else(|| "arena turn board is missing evaluator index".to_string())?,
+                5 => *evaluator
+                    .river_index_by_key
+                    .get(&ordered_board_key(&state.board))
+                    .ok_or_else(|| "arena river board is missing evaluator index".to_string())?,
+                other => return Err(format!("invalid arena board length {other}")),
+            };
+            if board_index >= evaluator_infoset.board_count {
+                return Err("arena board index is outside evaluator infoset".to_string());
+            }
+            let combos = match arena_infoset.player {
+                Player::Oop => self.oop_combos.len(),
+                Player::Ip => self.ip_combos.len(),
+            };
+            let board_slots = combos * arena_infoset.actions;
+            let source_start = arena_infoset.slots_start;
+            let source_end = source_start + board_slots;
+            let target_start = evaluator_infoset.slots_start + board_index * board_slots;
+            let target_end = target_start + board_slots;
+            evaluator.strategy_sum[target_start..target_end]
+                .copy_from_slice(&self.strategy_sum[source_start..source_end]);
+        }
+        evaluator.exploitability(threads)
+    }
+
     pub fn run_with_progress(
         &mut self,
         config: RealCfrConfig,
@@ -3595,12 +3650,13 @@ impl RealCfrSolver {
             match &node.kind {
                 PublicNodeKind::Terminal { .. } => {}
                 PublicNodeKind::Chance(_) => {
-                    let mut state_values =
-                        Values::zero(self.oop_combos.len(), self.ip_combos.len());
-                    for child in &state.children {
-                        state_values.add_scaled(&values[*child], 1.0);
-                    }
-                    values[state_index] = state_values;
+                    backup_chance_state(
+                        &self.tree,
+                        states,
+                        values,
+                        state_index,
+                        &self.combo_permutations,
+                    )?;
                 }
                 PublicNodeKind::Decision { player, actions } => {
                     let actions_len = actions.len();
@@ -4295,15 +4351,6 @@ impl Values {
         self.terminal_evals = other.terminal_evals;
     }
 
-    fn add_scaled(&mut self, other: &Self, scale: f32) {
-        for (left, right) in self.oop.iter_mut().zip(&other.oop) {
-            *left += *right * scale;
-        }
-        for (left, right) in self.ip.iter_mut().zip(&other.ip) {
-            *left += *right * scale;
-        }
-        self.terminal_evals += other.terminal_evals;
-    }
 }
 
 impl TerminalAccumulator {
@@ -6300,6 +6347,76 @@ mod tests {
             (recursive_summary.root_oop_value - arena_summary.oop_update_pass_value).abs() < 0.001,
             "{recursive_summary:?} != {arena_summary:?}"
         );
+    }
+
+    #[test]
+    fn arena_cfr_exploitability_profile_is_zero_sum_on_small_ranges() {
+        let board = Board::from_str("Td9d6h").unwrap();
+        let action_abstraction = ActionAbstraction {
+            min_bet: 1,
+            flop: StreetTemplate {
+                first_bet_sizes: vec![BetSizeSpec::PotFraction(0.50)],
+                donk_bet_sizes: Vec::new(),
+            },
+            turn: StreetTemplate {
+                first_bet_sizes: vec![BetSizeSpec::PotFraction(0.50)],
+                donk_bet_sizes: Vec::new(),
+            },
+            river: StreetTemplate {
+                first_bet_sizes: vec![BetSizeSpec::PotFraction(0.50)],
+                donk_bet_sizes: Vec::new(),
+            },
+            raise: RaisePolicy {
+                raise_multiplier: 2.5,
+                raise_sizes: Vec::new(),
+                max_raises_per_street: 0,
+                shove_spr_threshold: 0.0,
+                shove_commit_fraction: 1.0,
+                add_all_in_threshold: 0.0,
+                force_all_in_threshold: 0.0,
+                merging_threshold: 0.1,
+            },
+        };
+        let tree = TreeBuilder::new(TreeTemplate {
+            action_abstraction,
+            chance_expansion: ChanceExpansion::TemplateOnly,
+        })
+        .unwrap()
+        .build(Spot {
+            board,
+            pot: 200,
+            effective_stack: 900,
+            oop_range: RangeSpec::from_str("AsAh,KsKh").unwrap(),
+            ip_range: RangeSpec::from_str("QsQh,JsJh").unwrap(),
+            first_player: Player::Oop,
+        })
+        .unwrap();
+        let mut arena = ArenaAlternatingCfrSolver::new(
+            tree,
+            RangeSpec::from_str("AsAh,KsKh").unwrap(),
+            RangeSpec::from_str("QsQh,JsJh").unwrap(),
+        )
+        .unwrap();
+        arena
+            .run_with_progress_threads(
+                RealCfrConfig {
+                    iterations: 1,
+                    variant: RealCfrVariant::CfrPlus,
+                },
+                1,
+                |_| {},
+            )
+            .unwrap();
+
+        let exploitability = arena.exploitability(1).unwrap();
+
+        assert!(
+            (exploitability.profile_oop_value + exploitability.profile_ip_value).abs() < 0.001,
+            "{exploitability:?}"
+        );
+        assert!(exploitability.oop_gain >= 0.0, "{exploitability:?}");
+        assert!(exploitability.ip_gain >= 0.0, "{exploitability:?}");
+        assert!(exploitability.nash_conv_chips >= 0.0, "{exploitability:?}");
     }
 
     #[test]

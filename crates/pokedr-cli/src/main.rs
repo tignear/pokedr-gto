@@ -455,6 +455,25 @@ fn main() -> Result<(), String> {
                     solver.strategy_sum_len(),
                     solver.storage_gib(),
                 );
+                if real_cfr_exploitability_interval > 0
+                    || real_cfr_target_exploitability_bb100.is_some()
+                {
+                    let exploitability = solver.exploitability(state_threads)?;
+                    println!(
+                        "arena_cfr_exploitability iteration={} profile_oop={:.6} profile_ip={:.6} zero_sum_delta={:.6} oop_br={:.6} ip_br={:.6} oop_gain={:.6} ip_gain={:.6} nash_conv_chips={:.6} exploitability_chips={:.6} exploitability_bb_per_100={:.6}",
+                        iterations,
+                        exploitability.profile_oop_value,
+                        exploitability.profile_ip_value,
+                        exploitability.profile_oop_value + exploitability.profile_ip_value,
+                        exploitability.oop_best_response_value,
+                        exploitability.ip_best_response_value,
+                        exploitability.oop_gain,
+                        exploitability.ip_gain,
+                        exploitability.nash_conv_chips,
+                        exploitability.exploitability_chips,
+                        exploitability.exploitability_bb_per_100,
+                    );
+                }
                 return Ok(());
             }
             let config = CfrStorageConfig {
