@@ -58,6 +58,8 @@ pub struct NodeLocalCfrSolver {
     node_by_key: BTreeMap<(usize, u64), usize>,
     terminal_cache_index_by_key: BTreeMap<u64, usize>,
     terminal_cache: Vec<NodeLocalTerminalCache>,
+    fold_cache_index_by_key: BTreeMap<u64, usize>,
+    fold_cache: Vec<NodeLocalFoldCache>,
     combo_permutations: BTreeMap<u8, ComboPermutationMaps>,
     oop_same_ip_combo_indices: Vec<Option<usize>>,
     ip_same_oop_combo_indices: Vec<Option<usize>>,
@@ -128,6 +130,7 @@ struct NodeLocalNode {
     chance_concrete_events: usize,
     chance_permutation_codes: Vec<Vec<u8>>,
     terminal_cache_indices: Vec<usize>,
+    fold_cache_index: Option<usize>,
     regrets: Vec<f32>,
     strategy_sum: Vec<f32>,
 }
@@ -181,6 +184,12 @@ struct NodeLocalTerminalCache {
     ip_targets_sorted: Vec<PreparedComboTarget>,
     oop_board_targets_sorted: Vec<u16>,
     ip_board_targets_sorted: Vec<u16>,
+}
+
+#[derive(Debug, Clone)]
+struct NodeLocalFoldCache {
+    oop_live_indices: Vec<usize>,
+    ip_live_indices: Vec<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -339,6 +348,8 @@ impl NodeLocalCfrSolver {
             node_by_key: BTreeMap::new(),
             terminal_cache_index_by_key,
             terminal_cache,
+            fold_cache_index_by_key: BTreeMap::new(),
+            fold_cache: Vec::new(),
             combo_permutations,
             oop_same_ip_combo_indices,
             ip_same_oop_combo_indices,
@@ -1091,6 +1102,7 @@ impl NodeLocalCfrSolver {
             chance_concrete_events: 0,
             chance_permutation_codes: Vec::new(),
             terminal_cache_indices: Vec::new(),
+            fold_cache_index: None,
             regrets: Vec::new(),
             strategy_sum: Vec::new(),
         }));
@@ -1107,6 +1119,7 @@ impl NodeLocalCfrSolver {
         let mut chance_concrete_events = 0usize;
         let mut chance_permutation_codes = Vec::new();
         let mut terminal_cache_indices = Vec::new();
+        let mut fold_cache_index = None;
         let mut regrets = Vec::new();
         let mut strategy_sum = Vec::new();
 
@@ -1116,13 +1129,20 @@ impl NodeLocalCfrSolver {
                     reason,
                     folding_player: public.state.player,
                 };
-                for terminal_board in terminal_boards(board)? {
-                    let index = self
-                        .terminal_cache_index_by_key
-                        .get(&unordered_board_key(&terminal_board))
-                        .copied()
-                        .ok_or_else(|| "terminal board is outside cache".to_string())?;
-                    terminal_cache_indices.push(index);
+                match reason {
+                    TerminalReason::Fold => {
+                        fold_cache_index = Some(self.fold_cache_index(board));
+                    }
+                    TerminalReason::Showdown | TerminalReason::AllIn => {
+                        for terminal_board in terminal_boards(board)? {
+                            let index = self
+                                .terminal_cache_index_by_key
+                                .get(&unordered_board_key(&terminal_board))
+                                .copied()
+                                .ok_or_else(|| "terminal board is outside cache".to_string())?;
+                            terminal_cache_indices.push(index);
+                        }
+                    }
                 }
             }
             PublicNodeKind::Chance(_) => {
@@ -1176,9 +1196,24 @@ impl NodeLocalCfrSolver {
         node.chance_concrete_events = chance_concrete_events;
         node.chance_permutation_codes = chance_permutation_codes;
         node.terminal_cache_indices = terminal_cache_indices;
+        node.fold_cache_index = fold_cache_index;
         node.regrets = regrets;
         node.strategy_sum = strategy_sum;
         Ok(index)
+    }
+
+    fn fold_cache_index(&mut self, board: &Board) -> usize {
+        let key = ordered_board_key(board);
+        if let Some(index) = self.fold_cache_index_by_key.get(&key) {
+            return *index;
+        }
+        let index = self.fold_cache.len();
+        self.fold_cache_index_by_key.insert(key, index);
+        self.fold_cache.push(NodeLocalFoldCache {
+            oop_live_indices: live_combo_indices(&self.oop_combos, board),
+            ip_live_indices: live_combo_indices(&self.ip_combos, board),
+        });
+        index
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1201,7 +1236,7 @@ impl NodeLocalCfrSolver {
                 }
                 let started = self.profile_enabled.then(Instant::now);
                 self.fold_side_into(
-                    &node.board,
+                    node,
                     node.pot,
                     update_player,
                     folding_player,
@@ -1244,7 +1279,7 @@ impl NodeLocalCfrSolver {
 
     fn fold_side_into(
         &self,
-        board: &Board,
+        node: &NodeLocalNode,
         pot: u32,
         update_player: Player,
         folding_player: Player,
@@ -1253,13 +1288,18 @@ impl NodeLocalCfrSolver {
         out: &mut [f32],
     ) {
         let pot = pot as f32;
+        let fold_cache = node
+            .fold_cache_index
+            .and_then(|index| self.fold_cache.get(index))
+            .expect("fold terminal node is missing fold cache");
         match update_player {
             Player::Oop => opponent_weights_for_fast_into(
                 &self.oop_combos,
                 &self.ip_combos,
                 ip_reach,
                 &self.oop_same_ip_combo_indices,
-                board,
+                &fold_cache.oop_live_indices,
+                &fold_cache.ip_live_indices,
                 out,
             ),
             Player::Ip => opponent_weights_for_fast_into(
@@ -1267,7 +1307,8 @@ impl NodeLocalCfrSolver {
                 &self.oop_combos,
                 oop_reach,
                 &self.ip_same_oop_combo_indices,
-                board,
+                &fold_cache.ip_live_indices,
+                &fold_cache.oop_live_indices,
                 out,
             ),
         }
@@ -1292,14 +1333,14 @@ impl NodeLocalCfrSolver {
         scratch: &mut NodeLocalScratch,
     ) -> Result<usize, String> {
         out.fill(0.0);
-        scratch.terminal_counts.resize(out.len(), 0.0);
-        scratch.terminal_counts.fill(0.0);
         let cache_indices = &self.nodes[node_index].get().terminal_cache_indices;
         let pot = pot as f32;
-        for cache_index in cache_indices {
-            let cache = &self.terminal_cache[*cache_index];
-            let prepared = &cache.prepared;
-            if self.terminal_side_cache_enabled {
+        if self.terminal_side_cache_enabled {
+            scratch.terminal_counts.resize(out.len(), 0.0);
+            scratch.terminal_counts.fill(0.0);
+            for cache_index in cache_indices {
+                let cache = &self.terminal_cache[*cache_index];
+                let prepared = &cache.prepared;
                 let (opponent_reach, own_targets, board_targets) = match update_player {
                     Player::Oop => {
                         scratch
@@ -1350,7 +1391,16 @@ impl NodeLocalCfrSolver {
                         scratch.terminal_values[target.board_index as usize] * pot;
                     scratch.terminal_counts[target.range_index] += 1.0;
                 }
-            } else {
+            }
+            for (value, count) in out.iter_mut().zip(&scratch.terminal_counts) {
+                if *count > 0.0 {
+                    *value /= *count;
+                }
+            }
+        } else {
+            for cache_index in cache_indices {
+                let cache = &self.terminal_cache[*cache_index];
+                let prepared = &cache.prepared;
                 match update_player {
                     Player::Oop => terminal_side_range_targets_sorted_accumulate(
                         prepared,
@@ -1359,7 +1409,6 @@ impl NodeLocalCfrSolver {
                         &cache.oop_targets_sorted,
                         pot,
                         out,
-                        &mut scratch.terminal_counts,
                     ),
                     Player::Ip => terminal_side_range_targets_sorted_accumulate(
                         prepared,
@@ -1368,14 +1417,14 @@ impl NodeLocalCfrSolver {
                         &cache.ip_targets_sorted,
                         pot,
                         out,
-                        &mut scratch.terminal_counts,
                     ),
                 }
             }
-        }
-        for (value, count) in out.iter_mut().zip(&scratch.terminal_counts) {
-            if *count > 0.0 {
-                *value /= *count;
+            let divisor = terminal_runout_count_for_live_combo(
+                self.nodes[node_index].get().board.cards().len(),
+            );
+            for value in out {
+                *value /= divisor;
             }
         }
         Ok(cache_indices.len())
@@ -1594,36 +1643,29 @@ fn opponent_weights_for_fast_into(
     opponent_combos: &[ComboWeight],
     opponent_reach: &[f32],
     same_combo_indices: &[Option<usize>],
-    board: &Board,
+    own_live_indices: &[usize],
+    opponent_live_indices: &[usize],
     out: &mut [f32],
 ) {
     let mut total = 0.0f32;
     let mut card_totals = [0.0f32; 52];
-    for (combo, reach) in opponent_combos.iter().zip(opponent_reach) {
-        if *reach == 0.0 || board.contains(combo.first) || board.contains(combo.second) {
+    for opponent_index in opponent_live_indices.iter().copied() {
+        let reach = opponent_reach[opponent_index];
+        if reach == 0.0 {
             continue;
         }
-        total += *reach;
-        card_totals[combo.first.index()] += *reach;
-        card_totals[combo.second.index()] += *reach;
+        let combo = &opponent_combos[opponent_index];
+        total += reach;
+        card_totals[combo.first.index()] += reach;
+        card_totals[combo.second.index()] += reach;
     }
-    for ((own, same_index), out) in own_combos
-        .iter()
-        .zip(same_combo_indices)
-        .zip(out.iter_mut())
-    {
-        if board.contains(own.first) || board.contains(own.second) {
-            *out = 0.0;
-            continue;
-        }
-        let same_reach = same_index
-            .and_then(|index| {
-                let opponent = &opponent_combos[index];
-                (!board.contains(opponent.first) && !board.contains(opponent.second))
-                    .then_some(opponent_reach[index])
-            })
+    out.fill(0.0);
+    for own_index in own_live_indices.iter().copied() {
+        let own = &own_combos[own_index];
+        let same_reach = same_combo_indices[own_index]
+            .map(|index| opponent_reach[index])
             .unwrap_or(0.0);
-        *out =
+        out[own_index] =
             total - card_totals[own.first.index()] - card_totals[own.second.index()] + same_reach;
     }
 }
@@ -1669,6 +1711,16 @@ fn prepared_combo_targets(
         .collect()
 }
 
+fn live_combo_indices(combos: &[ComboWeight], board: &Board) -> Vec<usize> {
+    combos
+        .iter()
+        .enumerate()
+        .filter_map(|(index, combo)| {
+            (!board.contains(combo.first) && !board.contains(combo.second)).then_some(index)
+        })
+        .collect()
+}
+
 fn prepared_board_targets(targets: &[PreparedComboTarget]) -> Vec<u16> {
     targets.iter().map(|target| target.board_index).collect()
 }
@@ -1694,7 +1746,6 @@ fn terminal_side_range_targets_sorted_accumulate(
     own_targets_sorted: &[PreparedComboTarget],
     pot: f32,
     out: &mut [f32],
-    counts: &mut [f32],
 ) {
     let mut reach_sum = 0.0f32;
     let mut card_sums = [0.0f32; 52];
@@ -1720,7 +1771,6 @@ fn terminal_side_range_targets_sorted_accumulate(
         let own_combo = prepared.combo(own_board_index);
         out[own_target.range_index] +=
             non_blocked_target_reach(own_combo, reach_sum, &card_sums) * pot;
-        counts[own_target.range_index] += 1.0;
     }
 
     reach_sum = 0.0;
@@ -1773,6 +1823,15 @@ fn non_blocked_target_reach(
     card_sums: &[f32; 52],
 ) -> f32 {
     reach_sum - card_sums[combo.first.index()] - card_sums[combo.second.index()]
+}
+
+fn terminal_runout_count_for_live_combo(board_cards: usize) -> f32 {
+    match board_cards {
+        3 => 47.0 * 46.0 / 2.0,
+        4 => 46.0,
+        5 => 1.0,
+        _ => 1.0,
+    }
 }
 
 fn terminal_side_cached_values(

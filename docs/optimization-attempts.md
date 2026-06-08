@@ -1092,3 +1092,33 @@ retrying similar ideas, so attempts stay in chronological order.
   piece was terminal evaluation layout. The remaining gap to the reference
   solver is about `1.9x`; the next candidate is fold-terminal evaluation and
   residual recursive task/reduce overhead.
+
+## 2026-06-08: Shared fold live-index cache and constant showdown runout counts
+
+- Changed fold terminals to use a solver-owned board-keyed live-index cache
+  instead of checking `board.contains` inside every fold terminal call. A first
+  attempt stored live indices on every fold terminal node; that was the wrong
+  locality shape for the large public tree, because it duplicated range-sized
+  vectors across many nodes. The committed shape stores each board's OOP/IP live
+  indices once and lets fold nodes reference the shared cache.
+- Changed the default direct showdown path to stop maintaining a per-combo
+  terminal runout count buffer. For a live private combo on a board with `k`
+  public cards, the legal terminal runout count is constant:
+  `C(50-k, 5-k)`. The direct path now divides by that constant and avoids
+  writing `terminal_counts` for every target/runout.
+- Correctness smoke: `cargo check -p pokedr-core -p pokedr-cli` and
+  `cargo test -p pokedr-core node_local_cfr -- --nocapture` pass.
+- Result on the current `As7h2c` node-local CLI smoke, OOP/IP ranges from
+  `/tmp/oop_range.txt` and `/tmp/ip_range.txt`, 16 release iterations:
+  - before shared fold cache: `node_cfr elapsed_ms=12709.636`;
+  - after shared fold cache: `node_cfr elapsed_ms=11018.545`;
+  - after constant showdown counts: `node_cfr elapsed_ms=10577.800`.
+- Profile after both changes on the same run:
+  `terminal_calls=81684736`, `fold_calls=38040960`,
+  `showdown_calls=43643776`, `terminal_ms=98416.106`,
+  `fold_ms=23379.306`, `showdown_ms=65383.114`.
+- Takeaway: fold board-validity checks were worth removing but are not the main
+  bottleneck. Eliminating showdown count writes is exact and helps, but
+  showdown terminal evaluation still dominates. The next high-impact work must
+  either reduce showdown target traversal further or reduce recursive
+  task/reduce overhead.
