@@ -971,3 +971,32 @@ retrying similar ideas, so attempts stay in chronological order.
 - Takeaway: this path is now executable but not competitive. The next necessary
   step is reference-style pre-river child parallelism in the node-local solver,
   not more arena changes.
+
+## 2026-06-08: Node-local pre-river child parallelism
+
+- Changed: split pre-river chance nodes and multi-action decision children
+  across Rayon tasks in the node-local traversal. Each task owns its output
+  vector and scratch space; the parent reduces child values and applies the
+  current-node regret/strategy update once, so the CFR update equation is
+  unchanged.
+- Correctness smoke: focused node-local tests pass. The first full-range
+  iteration still matches the arena pass values:
+  `oop_pass_value=201.607941`, `ip_pass_value=-525.215759`.
+- Result on `Td9d6h`, UTG vs BU, pot `200`, effective `900`,
+  `postflop-basic`:
+  - previous sequential node-local after terminal side cache: `1197ms/iter`;
+  - parallel node-local, `1` release iteration: `303ms/iter`;
+  - parallel node-local, `16` release iterations: `4473ms` solve time, with
+    per-logged iteration times around `260-310ms`.
+- Takeaway: node-local parallel recursion is the right direction and is already
+  materially faster than the arena path. The remaining gap to the reference
+  solver is no longer tree size; it is hot traversal/cache structure and
+  terminal-side work inside the recursive solver.
+- Failed follow-up: adding a subtree terminal-count cutoff
+  (`>=4096` represented terminal board evaluations) made the same 16-iteration
+  run slower, `5996ms` solve time. Small pre-river child parallelism is still
+  contributing enough to keep; do not reintroduce this simple cutoff.
+- Failed follow-up: replacing the exact reach-signature cache key with a
+  bit-mixed fingerprint key also slowed the same 16-iteration run to `6318ms`.
+  The key construction is not the current 3x gap; keep the exact signature path
+  until a broader cache layout change is made.
