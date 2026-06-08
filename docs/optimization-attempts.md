@@ -1065,3 +1065,30 @@ retrying similar ideas, so attempts stay in chronological order.
 - Takeaway: the remaining gap to the reference solver is about `3.2x` on this
   benchmark. The next target is the terminal evaluation kernel itself, not
   cache lookup plumbing.
+
+## 2026-06-08: Direct range-target showdown terminal evaluation
+
+- Changed: node-local showdown/all-in terminal evaluation no longer materializes
+  a full live-board opponent reach vector by default. Each terminal board now
+  stores OOP/IP `PreparedComboTarget` lists sorted by terminal hand strength,
+  and the evaluator runs the same two-pass blocker scan directly over range
+  targets. The old live-board side-cache path remains opt-in via
+  `POKEDR_NODE_CFR_TERMINAL_SIDE_CACHE=1`.
+- Correctness smoke: the new direct path and old cache path match the first
+  full-range iteration up to f32 accumulation order:
+  - new/default: `oop_pass_value=201.607971`, `ip_pass_value=-525.215820`;
+  - old/cache: `oop_pass_value=201.607941`, `ip_pass_value=-525.215759`.
+- Result on `Td9d6h`, UTG vs BU, pot `200`, effective `900`,
+  `postflop-basic`, 16 release iterations:
+  - before direct target scan, side cache disabled: `3319ms`;
+  - after direct target scan: `1936ms`, about `121ms/iter`.
+  - reference `postflop-solver` `bench_flop_16`: `1025ms`, about
+    `64ms/iter`.
+- Profile after the change: aggregate CPU time dropped sharply for showdown
+  (`showdown_ms` about `40660ms` before the direct target scan, about
+  `11502ms` after). Fold terminals are now a similar-sized remaining target
+  (`fold_ms` about `9315ms`).
+- Takeaway: the main 5x gap was not unavoidable traversal overhead. A large
+  piece was terminal evaluation layout. The remaining gap to the reference
+  solver is about `1.9x`; the next candidate is fold-terminal evaluation and
+  residual recursive task/reduce overhead.

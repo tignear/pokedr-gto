@@ -177,6 +177,8 @@ struct NodeLocalTerminalCache {
     prepared: PreparedTerminalBoard,
     oop_targets: Vec<PreparedComboTarget>,
     ip_targets: Vec<PreparedComboTarget>,
+    oop_targets_sorted: Vec<PreparedComboTarget>,
+    ip_targets_sorted: Vec<PreparedComboTarget>,
     oop_board_targets_sorted: Vec<u16>,
     ip_board_targets_sorted: Vec<u16>,
 }
@@ -308,6 +310,10 @@ impl NodeLocalCfrSolver {
             let prepared = PreparedTerminalBoard::new(board)?;
             let oop_targets = prepared_combo_targets(&prepared, &oop_combos);
             let ip_targets = prepared_combo_targets(&prepared, &ip_combos);
+            let mut oop_targets_sorted = oop_targets.clone();
+            let mut ip_targets_sorted = ip_targets.clone();
+            sort_combo_targets_by_strength(&prepared, &mut oop_targets_sorted);
+            sort_combo_targets_by_strength(&prepared, &mut ip_targets_sorted);
             let mut oop_board_targets_sorted = prepared_board_targets(&oop_targets);
             let mut ip_board_targets_sorted = prepared_board_targets(&ip_targets);
             prepared.sort_indices_by_strength(&mut oop_board_targets_sorted);
@@ -317,6 +323,8 @@ impl NodeLocalCfrSolver {
                 prepared,
                 oop_targets,
                 ip_targets,
+                oop_targets_sorted,
+                ip_targets_sorted,
                 oop_board_targets_sorted,
                 ip_board_targets_sorted,
             });
@@ -1291,39 +1299,39 @@ impl NodeLocalCfrSolver {
         for cache_index in cache_indices {
             let cache = &self.terminal_cache[*cache_index];
             let prepared = &cache.prepared;
-            let (opponent_reach, own_targets, board_targets) = match update_player {
-                Player::Oop => {
-                    scratch
-                        .terminal_ip_live
-                        .resize(prepared.combos().len(), 0.0);
-                    reach_on_targets_into(
-                        &cache.ip_targets,
-                        ip_reach,
-                        &mut scratch.terminal_ip_live,
-                    );
-                    (
-                        &scratch.terminal_ip_live,
-                        &cache.oop_targets,
-                        &cache.oop_board_targets_sorted,
-                    )
-                }
-                Player::Ip => {
-                    scratch
-                        .terminal_oop_live
-                        .resize(prepared.combos().len(), 0.0);
-                    reach_on_targets_into(
-                        &cache.oop_targets,
-                        oop_reach,
-                        &mut scratch.terminal_oop_live,
-                    );
-                    (
-                        &scratch.terminal_oop_live,
-                        &cache.ip_targets,
-                        &cache.ip_board_targets_sorted,
-                    )
-                }
-            };
             if self.terminal_side_cache_enabled {
+                let (opponent_reach, own_targets, board_targets) = match update_player {
+                    Player::Oop => {
+                        scratch
+                            .terminal_ip_live
+                            .resize(prepared.combos().len(), 0.0);
+                        reach_on_targets_into(
+                            &cache.ip_targets,
+                            ip_reach,
+                            &mut scratch.terminal_ip_live,
+                        );
+                        (
+                            &scratch.terminal_ip_live,
+                            &cache.oop_targets,
+                            &cache.oop_board_targets_sorted,
+                        )
+                    }
+                    Player::Ip => {
+                        scratch
+                            .terminal_oop_live
+                            .resize(prepared.combos().len(), 0.0);
+                        reach_on_targets_into(
+                            &cache.oop_targets,
+                            oop_reach,
+                            &mut scratch.terminal_oop_live,
+                        );
+                        (
+                            &scratch.terminal_oop_live,
+                            &cache.ip_targets,
+                            &cache.ip_board_targets_sorted,
+                        )
+                    }
+                };
                 terminal_side_cached_values(
                     &mut scratch.side_cache,
                     *cache_index,
@@ -1337,19 +1345,32 @@ impl NodeLocalCfrSolver {
                     &mut scratch.terminal_values,
                     self.profile_enabled.then_some(&self.profile),
                 )?;
+                for target in own_targets {
+                    out[target.range_index] +=
+                        scratch.terminal_values[target.board_index as usize] * pot;
+                    scratch.terminal_counts[target.range_index] += 1.0;
+                }
             } else {
-                scratch.terminal_values.resize(prepared.combos().len(), 0.0);
-                terminal_side_values_prefix_blocker_sorted_board_targets_into(
-                    prepared,
-                    opponent_reach,
-                    board_targets,
-                    &mut scratch.terminal_values,
-                )?;
-            }
-            for target in own_targets {
-                out[target.range_index] +=
-                    scratch.terminal_values[target.board_index as usize] * pot;
-                scratch.terminal_counts[target.range_index] += 1.0;
+                match update_player {
+                    Player::Oop => terminal_side_range_targets_sorted_accumulate(
+                        prepared,
+                        &cache.ip_targets_sorted,
+                        ip_reach,
+                        &cache.oop_targets_sorted,
+                        pot,
+                        out,
+                        &mut scratch.terminal_counts,
+                    ),
+                    Player::Ip => terminal_side_range_targets_sorted_accumulate(
+                        prepared,
+                        &cache.oop_targets_sorted,
+                        oop_reach,
+                        &cache.ip_targets_sorted,
+                        pot,
+                        out,
+                        &mut scratch.terminal_counts,
+                    ),
+                }
             }
         }
         for (value, count) in out.iter_mut().zip(&scratch.terminal_counts) {
@@ -1652,11 +1673,106 @@ fn prepared_board_targets(targets: &[PreparedComboTarget]) -> Vec<u16> {
     targets.iter().map(|target| target.board_index).collect()
 }
 
+fn sort_combo_targets_by_strength(
+    prepared: &PreparedTerminalBoard,
+    targets: &mut [PreparedComboTarget],
+) {
+    targets.sort_unstable_by_key(|target| prepared.strength(target.board_index as usize));
+}
+
 fn reach_on_targets_into(targets: &[PreparedComboTarget], reach: &[f32], out: &mut [f32]) {
     out.fill(0.0);
     for target in targets {
         out[target.board_index as usize] = reach[target.range_index];
     }
+}
+
+fn terminal_side_range_targets_sorted_accumulate(
+    prepared: &PreparedTerminalBoard,
+    opponent_targets_sorted: &[PreparedComboTarget],
+    opponent_reach: &[f32],
+    own_targets_sorted: &[PreparedComboTarget],
+    pot: f32,
+    out: &mut [f32],
+    counts: &mut [f32],
+) {
+    let mut reach_sum = 0.0f32;
+    let mut card_sums = [0.0f32; 52];
+    let mut opponent_cursor = 0usize;
+    for own_target in own_targets_sorted {
+        let own_board_index = own_target.board_index as usize;
+        let own_strength = prepared.strength(own_board_index);
+        while opponent_cursor < opponent_targets_sorted.len() {
+            let opponent_target = opponent_targets_sorted[opponent_cursor];
+            let opponent_board_index = opponent_target.board_index as usize;
+            if prepared.strength(opponent_board_index) >= own_strength {
+                break;
+            }
+            add_target_reach_to_card_sums(
+                prepared,
+                opponent_target,
+                opponent_reach,
+                &mut reach_sum,
+                &mut card_sums,
+            );
+            opponent_cursor += 1;
+        }
+        let own_combo = prepared.combo(own_board_index);
+        out[own_target.range_index] +=
+            non_blocked_target_reach(own_combo, reach_sum, &card_sums) * pot;
+        counts[own_target.range_index] += 1.0;
+    }
+
+    reach_sum = 0.0;
+    card_sums = [0.0f32; 52];
+    opponent_cursor = opponent_targets_sorted.len();
+    for own_target in own_targets_sorted.iter().rev() {
+        let own_board_index = own_target.board_index as usize;
+        let own_strength = prepared.strength(own_board_index);
+        while opponent_cursor > 0 {
+            let opponent_target = opponent_targets_sorted[opponent_cursor - 1];
+            let opponent_board_index = opponent_target.board_index as usize;
+            if prepared.strength(opponent_board_index) <= own_strength {
+                break;
+            }
+            add_target_reach_to_card_sums(
+                prepared,
+                opponent_target,
+                opponent_reach,
+                &mut reach_sum,
+                &mut card_sums,
+            );
+            opponent_cursor -= 1;
+        }
+        let own_combo = prepared.combo(own_board_index);
+        out[own_target.range_index] -=
+            non_blocked_target_reach(own_combo, reach_sum, &card_sums) * pot;
+    }
+}
+
+fn add_target_reach_to_card_sums(
+    prepared: &PreparedTerminalBoard,
+    target: PreparedComboTarget,
+    reach: &[f32],
+    reach_sum: &mut f32,
+    card_sums: &mut [f32; 52],
+) {
+    let value = reach[target.range_index];
+    if value == 0.0 {
+        return;
+    }
+    let combo = prepared.combo(target.board_index as usize);
+    *reach_sum += value;
+    card_sums[combo.first.index()] += value;
+    card_sums[combo.second.index()] += value;
+}
+
+fn non_blocked_target_reach(
+    combo: crate::terminal_cfv::PrivateCombo,
+    reach_sum: f32,
+    card_sums: &[f32; 52],
+) -> f32 {
+    reach_sum - card_sums[combo.first.index()] - card_sums[combo.second.index()]
 }
 
 fn terminal_side_cached_values(

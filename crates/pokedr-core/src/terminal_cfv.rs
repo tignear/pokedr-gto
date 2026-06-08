@@ -109,6 +109,14 @@ impl PreparedTerminalBoard {
         &self.combos
     }
 
+    pub fn combo(&self, index: usize) -> PrivateCombo {
+        self.combos[index]
+    }
+
+    pub fn strength(&self, index: usize) -> u64 {
+        self.strengths[index]
+    }
+
     pub fn sort_indices_by_strength(&self, indices: &mut [u16]) {
         indices.sort_unstable_by_key(|index| self.strengths[*index as usize]);
     }
