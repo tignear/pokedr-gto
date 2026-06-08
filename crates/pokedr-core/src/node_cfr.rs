@@ -11,6 +11,8 @@ use crate::tree::{Player, PublicNodeKind, PublicTree, TerminalReason};
 use rayon::prelude::*;
 use std::cell::UnsafeCell;
 use std::collections::{BTreeMap, HashMap};
+use std::ops::{Deref, DerefMut};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
@@ -58,6 +60,7 @@ pub struct NodeLocalCfrSolver {
     decision_states: usize,
     profile_enabled: bool,
     profile: NodeLocalProfile,
+    scratch_pools: Vec<Mutex<Vec<NodeLocalScratch>>>,
 }
 
 #[derive(Debug, Default)]
@@ -135,6 +138,7 @@ struct PreparedComboTarget {
     board_index: u16,
 }
 
+#[derive(Debug)]
 struct NodeLocalScratch {
     strategies: Vec<f32>,
     denominators: Vec<f32>,
@@ -182,20 +186,60 @@ struct NodeLocalTerminalSideCache {
     entries: HashMap<NodeLocalTerminalSideCacheKey, Vec<NodeLocalTerminalSideCacheEntry>>,
 }
 
-struct NodeLocalChanceAccumulator {
+struct PooledNodeLocalScratch<'a> {
+    solver: &'a NodeLocalCfrSolver,
+    scratch: Option<NodeLocalScratch>,
+}
+
+impl<'a> PooledNodeLocalScratch<'a> {
+    fn new(solver: &'a NodeLocalCfrSolver) -> Self {
+        Self {
+            solver,
+            scratch: Some(solver.take_worker_scratch()),
+        }
+    }
+}
+
+impl Deref for PooledNodeLocalScratch<'_> {
+    type Target = NodeLocalScratch;
+
+    fn deref(&self) -> &Self::Target {
+        self.scratch
+            .as_ref()
+            .expect("pooled node-local scratch was already returned")
+    }
+}
+
+impl DerefMut for PooledNodeLocalScratch<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.scratch
+            .as_mut()
+            .expect("pooled node-local scratch was already returned")
+    }
+}
+
+impl Drop for PooledNodeLocalScratch<'_> {
+    fn drop(&mut self) {
+        if let Some(scratch) = self.scratch.take() {
+            self.solver.return_worker_scratch(scratch);
+        }
+    }
+}
+
+struct NodeLocalChanceAccumulator<'a> {
     out: Vec<f32>,
     child_values: Vec<f32>,
-    scratch: NodeLocalScratch,
+    scratch: Option<PooledNodeLocalScratch<'a>>,
     terminal_evals: usize,
     error: Option<String>,
 }
 
-impl NodeLocalChanceAccumulator {
-    fn new(solver: &NodeLocalCfrSolver, value_len: usize) -> Self {
+impl<'a> NodeLocalChanceAccumulator<'a> {
+    fn new(solver: &'a NodeLocalCfrSolver, value_len: usize) -> Self {
         Self {
             out: vec![0.0; value_len],
             child_values: vec![0.0; value_len],
-            scratch: NodeLocalScratch::new(solver),
+            scratch: Some(PooledNodeLocalScratch::new(solver)),
             terminal_evals: 0,
             error: None,
         }
@@ -205,19 +249,7 @@ impl NodeLocalChanceAccumulator {
         Self {
             out: vec![0.0; value_len],
             child_values: Vec::new(),
-            scratch: NodeLocalScratch {
-                strategies: Vec::new(),
-                denominators: Vec::new(),
-                child_values: Vec::new(),
-                action_values: Vec::new(),
-                next_oop: Vec::new(),
-                next_ip: Vec::new(),
-                terminal_oop_live: Vec::new(),
-                terminal_ip_live: Vec::new(),
-                terminal_values: Vec::new(),
-                terminal_counts: Vec::new(),
-                side_cache: NodeLocalTerminalSideCache::default(),
-            },
+            scratch: None,
             terminal_evals: 0,
             error: None,
         }
@@ -288,6 +320,9 @@ impl NodeLocalCfrSolver {
             decision_states: 0,
             profile_enabled: std::env::var_os("POKEDR_NODE_CFR_PROFILE").is_some(),
             profile: NodeLocalProfile::default(),
+            scratch_pools: (0..rayon::current_num_threads())
+                .map(|_| Mutex::new(Vec::new()))
+                .collect(),
         };
         let board = solver.tree.spot.board.clone();
         solver.collect_node(0, &board)?;
@@ -324,6 +359,45 @@ impl NodeLocalCfrSolver {
             / (1024.0 * 1024.0 * 1024.0)
     }
 
+    fn worker_scratch_pool_index(&self) -> usize {
+        if self.scratch_pools.is_empty() {
+            return 0;
+        }
+        rayon::current_thread_index().unwrap_or(0) % self.scratch_pools.len()
+    }
+
+    fn take_worker_scratch(&self) -> NodeLocalScratch {
+        let pool_index = self.worker_scratch_pool_index();
+        if let Some(scratch) = self.scratch_pools[pool_index]
+            .lock()
+            .expect("node-local scratch pool lock was poisoned")
+            .pop()
+        {
+            scratch
+        } else {
+            NodeLocalScratch::new(self)
+        }
+    }
+
+    fn return_worker_scratch(&self, scratch: NodeLocalScratch) {
+        let pool_index = self.worker_scratch_pool_index();
+        self.scratch_pools[pool_index]
+            .lock()
+            .expect("node-local scratch pool lock was poisoned")
+            .push(scratch);
+    }
+
+    fn clear_worker_terminal_side_caches(&self) {
+        for pool in &self.scratch_pools {
+            let mut scratches = pool
+                .lock()
+                .expect("node-local scratch pool lock was poisoned");
+            for scratch in scratches.iter_mut() {
+                scratch.side_cache.entries.clear();
+            }
+        }
+    }
+
     pub fn run_with_progress(
         &mut self,
         config: RealCfrConfig,
@@ -351,10 +425,15 @@ impl NodeLocalCfrSolver {
             .collect::<Vec<_>>();
         let mut root_oop = vec![0.0; self.oop_combos.len()];
         let mut root_ip = vec![0.0; self.ip_combos.len()];
+        let mut root_oop_scratch = NodeLocalScratch::new(self);
+        let mut root_ip_scratch = NodeLocalScratch::new(self);
         let mut terminal_evals = 0usize;
         for iteration in 1..=config.iterations {
             let started = Instant::now();
             self.completed_iterations += 1;
+            self.clear_worker_terminal_side_caches();
+            root_oop_scratch.side_cache.entries.clear();
+            root_ip_scratch.side_cache.entries.clear();
             terminal_evals = 0;
             let average_weight = self.completed_iterations as f32;
             terminal_evals += self.traverse_update_side_into(
@@ -365,7 +444,7 @@ impl NodeLocalCfrSolver {
                 average_weight,
                 config,
                 &mut root_oop,
-                &mut NodeLocalScratch::new(self),
+                &mut root_oop_scratch,
             )?;
             terminal_evals += self.traverse_update_side_into(
                 0,
@@ -375,7 +454,7 @@ impl NodeLocalCfrSolver {
                 average_weight,
                 config,
                 &mut root_ip,
-                &mut NodeLocalScratch::new(self),
+                &mut root_ip_scratch,
             )?;
             progress(NodeLocalCfrIterationSummary {
                 iteration,
@@ -465,6 +544,11 @@ impl NodeLocalCfrSolver {
                                     return accumulator;
                                 }
                                 accumulator.child_values.resize(target_len, 0.0);
+                                let Some(local_scratch) = accumulator.scratch.as_mut() else {
+                                    accumulator.error =
+                                        Some("chance accumulator scratch is missing".to_string());
+                                    return accumulator;
+                                };
                                 match self.traverse_update_side_into(
                                     child,
                                     update_player,
@@ -473,7 +557,7 @@ impl NodeLocalCfrSolver {
                                     average_weight,
                                     config,
                                     &mut accumulator.child_values,
-                                    &mut accumulator.scratch,
+                                    local_scratch,
                                 ) {
                                     Ok(terminal_evals) => {
                                         accumulator.terminal_evals += terminal_evals;
@@ -590,7 +674,7 @@ impl NodeLocalCfrSolver {
                             Player::Oop => (0..actions)
                                 .into_par_iter()
                                 .map_init(
-                                    || NodeLocalScratch::new(self),
+                                    || PooledNodeLocalScratch::new(self),
                                     |local_scratch, action| {
                                         let mut child_values = vec![0.0; target_len];
                                         let mut next_oop = vec![0.0; oop_reach.len()];
@@ -619,7 +703,7 @@ impl NodeLocalCfrSolver {
                             Player::Ip => (0..actions)
                                 .into_par_iter()
                                 .map_init(
-                                    || NodeLocalScratch::new(self),
+                                    || PooledNodeLocalScratch::new(self),
                                     |local_scratch, action| {
                                         let mut child_values = vec![0.0; target_len];
                                         let mut next_ip = vec![0.0; ip_reach.len()];
@@ -728,7 +812,7 @@ impl NodeLocalCfrSolver {
                             .par_chunks_mut(target_len)
                             .enumerate()
                             .map_init(
-                                || NodeLocalScratch::new(self),
+                                || PooledNodeLocalScratch::new(self),
                                 |local_scratch, (action, action_out)| {
                                     let next_oop = if config.average_strategy
                                         == RealCfrAverageStrategy::ReachWeighted
@@ -772,7 +856,7 @@ impl NodeLocalCfrSolver {
                             .par_chunks_mut(target_len)
                             .enumerate()
                             .map_init(
-                                || NodeLocalScratch::new(self),
+                                || PooledNodeLocalScratch::new(self),
                                 |local_scratch, (action, action_out)| {
                                     let next_ip = if config.average_strategy
                                         == RealCfrAverageStrategy::ReachWeighted

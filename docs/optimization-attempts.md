@@ -1022,3 +1022,24 @@ retrying similar ideas, so attempts stay in chronological order.
   and `16` took `6348ms`. This is real parallel speedup but only about 6x at
   16 threads, so the next candidate is coarser, locality-aware scheduling or a
   persistent worker scratch/cache layout, not more tiny Rayon overlays.
+
+## 2026-06-08: Persistent node-local worker scratch pool
+
+- Changed: replaced per-task `NodeLocalScratch::new` in parallel node-local CFR
+  sections with a solver-owned worker scratch pool. A pooled scratch is taken at
+  task start and returned on drop; terminal side caches are retained within an
+  iteration but cleared at iteration boundaries to avoid unbounded cache growth.
+- Correctness smoke: `cargo check -p pokedr-core -p pokedr-cli` and focused
+  `cargo test -p pokedr-core node_local_cfr -- --nocapture` pass.
+- Result on `Td9d6h`, UTG vs BU, pot `200`, effective `900`,
+  `postflop-basic`, 16 release iterations:
+  - before pool: normal run about `6348ms`, profile run about `5911ms`, with
+    `scratch_allocations=931863`, `terminal_cache_hits=1356101`,
+    `terminal_cache_misses=4328507`;
+  - after pool: normal run about `5788ms`, profile run about `5336ms`, with
+    `scratch_allocations=188`, `terminal_cache_hits=1834167`,
+    `terminal_cache_misses=3850441`.
+- Takeaway: persistent worker scratch/cache fixes the allocator churn and
+  improves side-cache locality, but only buys about 9-10% wall time. The
+  remaining bottleneck is not scratch construction; it is terminal-side work
+  plus fine-grained recursive task/reduce overhead.
