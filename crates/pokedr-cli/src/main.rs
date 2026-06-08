@@ -2,10 +2,11 @@ use clap::{Parser, Subcommand};
 use pokedr_agent::{FlopTreeRequest, build_flop_tree};
 use pokedr_core::{
     ActionKind, ArenaAlternatingCfrSolver, Board, CfrPlusState, CfrStorageConfig, ChanceExpansion,
-    ParallelCfrSolver, Player, PreparedTerminalCfvSmoke, PublicNodeKind, RangeSpec,
-    RealCfrAverageStrategy, RealCfrConfig, RealCfrSolver, RealCfrVariant, Street, TreeTemplate,
-    analyze_cfr_storage_scenarios, analyze_public_state_duplicates, build_action_slot_layout,
-    dry_run_cfr_plus_iteration, plan_cfr_work, terminal_cfv_parallel_smoke,
+    NodeLocalCfrSolver, ParallelCfrSolver, Player, PreparedTerminalCfvSmoke, PublicNodeKind,
+    RangeSpec, RealCfrAverageStrategy, RealCfrConfig, RealCfrSolver, RealCfrVariant, Street,
+    TreeTemplate, analyze_cfr_storage_scenarios, analyze_public_state_duplicates,
+    build_action_slot_layout, dry_run_cfr_plus_iteration, plan_cfr_work,
+    terminal_cfv_parallel_smoke,
 };
 use std::str::FromStr;
 use std::time::Instant;
@@ -94,6 +95,8 @@ enum Command {
         run_real_cfr: bool,
         #[arg(long)]
         run_arena_cfr: bool,
+        #[arg(long)]
+        run_node_cfr: bool,
         #[arg(long)]
         parallel_cfr_plan: bool,
         #[arg(long)]
@@ -353,6 +356,7 @@ fn main() -> Result<(), String> {
             terminal_cfv_tree_pass,
             run_real_cfr,
             run_arena_cfr,
+            run_node_cfr,
             parallel_cfr_plan,
             run_real_cfr_three_phase,
             real_cfr_log_interval,
@@ -481,6 +485,24 @@ fn main() -> Result<(), String> {
                         exploitability.exploitability_bb_per_100,
                     );
                 }
+                return Ok(());
+            }
+            if run_node_cfr {
+                let started = Instant::now();
+                let solver = NodeLocalCfrSolver::new(
+                    tree.clone(),
+                    RangeSpec::from_str(&oop_range)?,
+                    RangeSpec::from_str(&ip_range)?,
+                )?;
+                let summary = solver.summary();
+                println!(
+                    "node_cfr_state_allocated=true states={} decision_states={} action_slots={} storage_gib={:.3} build_ms={:.3}",
+                    summary.states,
+                    summary.decision_states,
+                    summary.action_slots,
+                    summary.storage_gib,
+                    started.elapsed().as_secs_f64() * 1000.0,
+                );
                 return Ok(());
             }
             let config = CfrStorageConfig {

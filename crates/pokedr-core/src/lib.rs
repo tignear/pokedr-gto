@@ -1,6 +1,7 @@
 pub mod cards;
 pub mod cfr;
 pub mod isomorphism;
+pub mod node_cfr;
 pub mod parallel_cfr;
 pub mod plan;
 pub mod range;
@@ -22,6 +23,7 @@ pub use isomorphism::{
     full_deck_future_board_isomorphism_survey, next_card_isomorphism,
     private_combo_permutation_indices, private_combo_swap_list, terminal_board_isomorphism,
 };
+pub use node_cfr::{NodeLocalCfrSolver, NodeLocalCfrSummary};
 pub use parallel_cfr::{ParallelCfrSolver, ParallelCfrStorageReport};
 pub use plan::{CfrStorageConfig, CfrWorkPlan, StreetWorkPlan, TerminalWorkPlan, plan_cfr_work};
 pub use range::{ComboWeight, RangeSpec};

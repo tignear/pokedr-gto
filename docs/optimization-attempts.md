@@ -937,3 +937,19 @@ retrying similar ideas, so attempts stay in chronological order.
   child-row parallelism with a node-local allocator/traversal model. To pursue
   this direction, build a separate node-owned recursive solver shape instead
   of patching the arena traversal.
+
+## 2026-06-08: Node-local CFR rewrite start
+
+- Direction: stop patching the arena traversal for reference-style recursive
+  CFR. The tree/action-slot counts already match the reference solver, so the
+  remaining gap is traversal/storage shape.
+- Added: a separate `NodeLocalCfrSolver` skeleton with node-owned
+  `regrets/strategy_sum` rows and an unsafe cell wrapper matching the reference
+  model more closely. It currently builds storage and reports counts; it does
+  not solve yet.
+- Validation: on `Td9d6h`, UTG vs BU ranges, pot `200`, effective stack `900`,
+  `postflop-basic`, the node-local skeleton reports `399291` states, `163287`
+  decision states, and `82064240` action slots, matching the arena/reference
+  comparison. Storage is `0.611GiB` for f32 regret+strategy rows.
+- Takeaway: this is the correct base for pursuing reference-style recursion.
+  Do not add more action-parallel overlays to `ArenaAlternatingCfrSolver`.
