@@ -456,6 +456,9 @@ impl TreeBuilder {
                 for raise in self.raise_actions(state) {
                     push_unique_action(&mut actions, raise);
                 }
+                if let Some(all_in) = self.threshold_all_in_raise_response(state) {
+                    push_unique_action(&mut actions, all_in);
+                }
                 let opponent_commit = commit_for(state, state.player.other());
                 actions = merge_bet_actions(
                     sort_and_dedup_response_actions(actions),
@@ -599,6 +602,28 @@ impl TreeBuilder {
     fn add_threshold_all_in_allowed(&self, state: &PublicState) -> bool {
         let threshold = self.template.action_abstraction.raise.add_all_in_threshold;
         threshold > 0.0 && stack_for(state, state.player) as f32 <= state.pot as f32 * threshold
+    }
+
+    fn threshold_all_in_raise_response(&self, state: &PublicState) -> Option<ActionKind> {
+        let threshold = self.template.action_abstraction.raise.add_all_in_threshold;
+        if threshold <= 0.0 {
+            return None;
+        }
+        let actor_commit = commit_for(state, state.player);
+        let opponent_commit = commit_for(state, state.player.other());
+        let stack = stack_for(state, state.player);
+        let to_call = opponent_commit.saturating_sub(actor_commit);
+        if stack <= to_call {
+            return None;
+        }
+        let max_to = actor_commit + stack;
+        let pot_after_call = state.pot.saturating_add(to_call.min(stack));
+        let threshold_to = opponent_commit + ((pot_after_call as f32) * threshold).round() as u32;
+        if max_to <= threshold_to {
+            Some(ActionKind::AllIn { to: max_to })
+        } else {
+            None
+        }
     }
 
     fn force_all_in_if_close(&self, state: &PublicState, action: ActionKind) -> ActionKind {
@@ -1052,6 +1077,76 @@ mod tests {
             actions
                 .iter()
                 .any(|action| matches!(action, ActionKind::Bet { .. })),
+            "{actions:?}"
+        );
+    }
+
+    #[test]
+    fn postflop_basic_raise_response_keeps_threshold_all_in_after_call_pot() {
+        let builder = TreeBuilder::new(TreeTemplate {
+            action_abstraction: ActionAbstraction::postflop_solver_basic(),
+            chance_expansion: ChanceExpansion::TemplateOnly,
+        })
+        .unwrap();
+        let tree = builder
+            .build(Spot {
+                board: Board::from_str("Td9d6h").unwrap(),
+                pot: 200,
+                effective_stack: 900,
+                oop_range: RangeSpec::full_deck_uniform(),
+                ip_range: RangeSpec::full_deck_uniform(),
+                first_player: Player::Oop,
+            })
+            .unwrap();
+        let root = &tree.nodes[0];
+        let PublicNodeKind::Decision { actions, .. } = &root.kind else {
+            panic!("root must be decision");
+        };
+        let check_child = actions
+            .iter()
+            .position(|action| matches!(action, ActionKind::Check))
+            .and_then(|index| root.children.get(index))
+            .copied()
+            .expect("root should include check");
+        let after_check = &tree.nodes[check_child];
+        let PublicNodeKind::Decision { actions, .. } = &after_check.kind else {
+            panic!("after-check node must be decision");
+        };
+        let check_check_child = actions
+            .iter()
+            .position(|action| matches!(action, ActionKind::Check))
+            .and_then(|index| after_check.children.get(index))
+            .copied()
+            .expect("IP should include check after OOP check");
+        let chance = &tree.nodes[check_check_child];
+        let turn_child = *chance
+            .children
+            .first()
+            .expect("turn chance should have template child");
+        let turn = &tree.nodes[turn_child];
+        let PublicNodeKind::Decision { actions, .. } = &turn.kind else {
+            panic!("turn child must be decision");
+        };
+        let geometric_bet_child = actions
+            .iter()
+            .position(|action| matches!(action, ActionKind::Bet { amount: 216 }))
+            .and_then(|index| turn.children.get(index))
+            .copied()
+            .expect("turn should include geometric bet");
+        let response = &tree.nodes[geometric_bet_child];
+        let PublicNodeKind::Decision { actions, .. } = &response.kind else {
+            panic!("turn bet response must be decision");
+        };
+        assert!(
+            actions
+                .iter()
+                .any(|action| matches!(action, ActionKind::Raise { to: 540 })),
+            "{actions:?}"
+        );
+        assert!(
+            actions
+                .iter()
+                .any(|action| matches!(action, ActionKind::AllIn { to: 900 })),
             "{actions:?}"
         );
     }
