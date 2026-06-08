@@ -785,9 +785,9 @@ mod tests {
         let layout = build_action_slot_layout(&tree, config);
         assert_eq!(layout.records.len(), tree.stats().decisions);
         assert_eq!(layout.flop_slots(), 39_984);
-        assert_eq!(layout.turn_slots(), 14_481_264);
-        assert_eq!(layout.river_slots(), 3_218_820_192);
-        assert_eq!(layout.total_action_slots, 3_233_341_440);
+        assert_eq!(layout.turn_slots(), 11_607_120);
+        assert_eq!(layout.river_slots(), 2_478_949_200);
+        assert_eq!(layout.total_action_slots, 2_490_596_304);
         assert_eq!(layout.records.first().unwrap().start, 0);
         let last = layout.records.last().unwrap();
         assert_eq!(last.start + last.len, layout.total_action_slots);

@@ -212,8 +212,8 @@ mod tests {
             .unwrap();
         let plan = plan_cfr_work(&tree, CfrStorageConfig::default());
         assert_eq!(plan.street[street_index(Street::Flop)].decisions, 12);
-        assert_eq!(plan.street[street_index(Street::Turn)].decisions, 88);
-        assert_eq!(plan.street[street_index(Street::River)].decisions, 428);
+        assert_eq!(plan.street[street_index(Street::Turn)].decisions, 74);
+        assert_eq!(plan.street[street_index(Street::River)].decisions, 338);
         assert!(
             plan.street[street_index(Street::River)].action_slots > plan.total_action_slots / 2
         );

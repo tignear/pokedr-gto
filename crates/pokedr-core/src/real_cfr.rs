@@ -378,6 +378,8 @@ struct PhaseState {
     board: Board,
     board_slot: usize,
     children: Vec<usize>,
+    chance_member_permutation_codes: Vec<Vec<u8>>,
+    chance_concrete_events: usize,
     terminal_cache_indices: Vec<usize>,
     terminal_cache_refs: Vec<TerminalCacheRef>,
 }
@@ -1187,12 +1189,16 @@ impl RealCfrSolver {
             board: board.clone(),
             board_slot,
             children: Vec::new(),
+            chance_member_permutation_codes: Vec::new(),
+            chance_concrete_events: 0,
             terminal_cache_indices,
             terminal_cache_refs,
         });
 
         let node = &self.tree.nodes[node_id];
         let mut children = Vec::new();
+        let mut chance_member_permutation_codes = Vec::new();
+        let mut chance_concrete_events = 0usize;
         match &node.kind {
             PublicNodeKind::Terminal { .. } => {}
             PublicNodeKind::Chance(_) => {
@@ -1200,7 +1206,13 @@ impl RealCfrSolver {
                     states[state_index].children = children;
                     return Ok(state_index);
                 };
-                for card in board.remaining_deck() {
+                let chance_classes = next_card_isomorphism(board, &self.oop_range, &self.ip_range);
+                chance_concrete_events = chance_classes.concrete_events;
+                for chance_class in chance_classes.classes {
+                    let card = *chance_class
+                        .representative
+                        .first()
+                        .ok_or_else(|| "chance class has no representative card".to_string())?;
                     children.push(self.collect_phase_state_from(
                         child,
                         &board.push(card)?,
@@ -1208,6 +1220,13 @@ impl RealCfrSolver {
                         index_by_key,
                         terminal_ref_cache,
                     )?);
+                    chance_member_permutation_codes.push(
+                        chance_class
+                            .members
+                            .iter()
+                            .map(|member| member.permutation_to_representative.code())
+                            .collect(),
+                    );
                 }
             }
             PublicNodeKind::Decision { .. } => {
@@ -1223,6 +1242,8 @@ impl RealCfrSolver {
             }
         }
         states[state_index].children = children;
+        states[state_index].chance_member_permutation_codes = chance_member_permutation_codes;
+        states[state_index].chance_concrete_events = chance_concrete_events;
         Ok(state_index)
     }
 
@@ -1350,14 +1371,9 @@ impl RealCfrSolver {
                     if state.children.is_empty() {
                         continue;
                     }
-                    let chance_weight = 1.0 / state.children.len() as f32;
                     for child in &state.children {
-                        add_scaled_reach(
-                            &mut oop_reaches[*child],
-                            &parent_oop_reach,
-                            chance_weight,
-                        );
-                        add_scaled_reach(&mut ip_reaches[*child], &parent_ip_reach, chance_weight);
+                        add_reach(&mut oop_reaches[*child], &parent_oop_reach);
+                        add_reach(&mut ip_reaches[*child], &parent_ip_reach);
                     }
                 }
                 PublicNodeKind::Decision { player, actions } => {
@@ -1490,7 +1506,6 @@ impl RealCfrSolver {
                     if state.children.is_empty() {
                         continue;
                     }
-                    let chance_weight = 1.0 / state.children.len() as f32;
                     let (parent_oop, child_oop_reaches) =
                         split_reach_state_and_children(oop_reaches, state_index);
                     let (parent_ip, child_ip_reaches) =
@@ -1501,15 +1516,13 @@ impl RealCfrSolver {
                         None
                     };
                     for child in &state.children {
-                        add_scaled_reach(
+                        add_reach(
                             child_reach_mut(child_oop_reaches, state_index, *child),
                             parent_oop,
-                            chance_weight,
                         );
-                        add_scaled_reach(
+                        add_reach(
                             child_reach_mut(child_ip_reaches, state_index, *child),
                             parent_ip,
-                            chance_weight,
                         );
                     }
                     if let Some(propagate_started) = propagate_started {
@@ -2053,7 +2066,13 @@ impl RealCfrSolver {
                     )?;
                 }
                 for state_index in decision_end..run.end {
-                    backup_chance_state(&self.tree, states, values, state_index)?;
+                    backup_chance_state(
+                        &self.tree,
+                        states,
+                        values,
+                        state_index,
+                        &self.combo_permutations,
+                    )?;
                 }
             }
         }
@@ -3191,15 +3210,20 @@ fn add_permuted_scaled_slice(
     }
 }
 
+fn add_permuted_scaled_values(
+    out: &mut Values,
+    input: &Values,
+    maps: &ComboPermutationMaps,
+    scale: f32,
+) {
+    add_permuted_scaled_slice(&mut out.oop, &input.oop, &maps.oop_source_to_target, scale);
+    add_permuted_scaled_slice(&mut out.ip, &input.ip, &maps.ip_source_to_target, scale);
+    out.terminal_evals += input.terminal_evals;
+}
+
 fn add_reach(out: &mut [f32], input: &[f32]) {
     for (out, input) in out.iter_mut().zip(input) {
         *out += *input;
-    }
-}
-
-fn add_scaled_reach(out: &mut [f32], input: &[f32], scale: f32) {
-    for (out, input) in out.iter_mut().zip(input) {
-        *out += *input * scale;
     }
 }
 
@@ -3493,14 +3517,32 @@ fn backup_chance_state(
     states: &[PhaseState],
     values: &mut [Values],
     state_index: usize,
+    combo_permutations: &BTreeMap<u8, ComboPermutationMaps>,
 ) -> Result<(), String> {
     let state = &states[state_index];
     match &tree.nodes[state.node_id].kind {
         PublicNodeKind::Chance(_) => {
+            if state.chance_concrete_events == 0 {
+                return Err("chance state has no concrete events".to_string());
+            }
+            if state.children.len() != state.chance_member_permutation_codes.len() {
+                return Err("chance state member classes do not match children".to_string());
+            }
+            let chance_weight = 1.0 / state.chance_concrete_events as f32;
             let (state_value, child_values) = split_state_and_children(values, state_index);
             state_value.reset();
-            for child in &state.children {
-                state_value.add_scaled(child_value(child_values, state_index, *child), 1.0);
+            for (child, permutation_codes) in state
+                .children
+                .iter()
+                .zip(&state.chance_member_permutation_codes)
+            {
+                let child_value = child_value(child_values, state_index, *child);
+                for permutation_code in permutation_codes {
+                    let maps = combo_permutations.get(permutation_code).ok_or_else(|| {
+                        "chance isomorphism permutation is missing combo maps".to_string()
+                    })?;
+                    add_permuted_scaled_values(state_value, child_value, maps, chance_weight);
+                }
             }
             Ok(())
         }
@@ -4758,6 +4800,8 @@ mod tests {
                 board: board.clone(),
                 board_slot: 0,
                 children: vec![1],
+                chance_member_permutation_codes: Vec::new(),
+                chance_concrete_events: 0,
                 terminal_cache_indices: Vec::new(),
                 terminal_cache_refs: Vec::new(),
             },
@@ -4766,6 +4810,8 @@ mod tests {
                 board: board.clone(),
                 board_slot: 0,
                 children: Vec::new(),
+                chance_member_permutation_codes: Vec::new(),
+                chance_concrete_events: 0,
                 terminal_cache_indices: vec![0],
                 terminal_cache_refs: terminal_cache_refs_for_test(1),
             },
@@ -4774,6 +4820,8 @@ mod tests {
                 board: board.clone(),
                 board_slot: 0,
                 children: Vec::new(),
+                chance_member_permutation_codes: Vec::new(),
+                chance_concrete_events: 0,
                 terminal_cache_indices: vec![0, 1, 2],
                 terminal_cache_refs: terminal_cache_refs_for_test(3),
             },
@@ -4782,6 +4830,8 @@ mod tests {
                 board,
                 board_slot: 0,
                 children: Vec::new(),
+                chance_member_permutation_codes: Vec::new(),
+                chance_concrete_events: 0,
                 terminal_cache_indices: vec![0, 1],
                 terminal_cache_refs: terminal_cache_refs_for_test(2),
             },

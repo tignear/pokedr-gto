@@ -660,3 +660,28 @@ retrying similar ideas, so attempts stay in chronological order.
   bottleneck. The current CLI planner still prints the older full-expansion
   layout estimate, so the next cleanup should make planner output report the
   same representative-board storage used by real CFR.
+
+## 2026-06-08: Representative chance boards in the phase CFR path
+
+- Tried: apply the same exact chance-board isomorphism to the three-phase CFR
+  state graph. `PhaseState` now stores representative chance children plus the
+  concrete member suit permutations. Reach propagation follows the recursive
+  solver shape: representative children receive unscaled private reach, and the
+  chance probability is applied only when backing values up through the chance
+  state while permuting representative private-combo values back to each
+  concrete member.
+- Expected: reduce phase-state count, regret/strategy storage, and backup work
+  without changing the solved game.
+- Result: kept. On `Td9d6h` UTG vs BU with `--run-real-cfr-three-phase`,
+  `4` release iterations reported `states=1,478,837`,
+  `action_slots=262,856,062`, and `storage_gib=1.96`. Iteration 4 was about
+  `2.24s` total across reach, terminal, and backup phases. The CLI's old
+  planner estimate still prints full ordered-board storage first and needs to
+  be aligned with the real phase solver.
+- Validation: `cargo check --workspace`, the representative-state allocation
+  test, and the ignored recursive-vs-three-phase one-iteration equality test
+  passed. The equality test caught an important mistake: chance reach must not
+  be divided during forward propagation because recursive CFR applies chance
+  probability only during chance backup.
+- Decision: keep. The next tree-side cleanup is planner/reporting consistency,
+  then more structural reduction in the action tree itself.
