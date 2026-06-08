@@ -1122,3 +1122,32 @@ retrying similar ideas, so attempts stay in chronological order.
   showdown terminal evaluation still dominates. The next high-impact work must
   either reduce showdown target traversal further or reduce recursive
   task/reduce overhead.
+
+## 2026-06-08: All-in showdown oracle experiment
+
+- Added profile split for node-local terminal showdown work:
+  `showdown_only_calls/showdown_only_ms` and `allin_calls/allin_ms`.
+- Baseline profile on the current `As7h2c` node-local CLI smoke, OOP/IP ranges
+  from `/tmp/oop_range.txt` and `/tmp/ip_range.txt`, 16 release iterations:
+  `showdown_calls=43643776`, `showdown_ms=66439.937`,
+  `showdown_only_calls=24234624`, `showdown_only_ms=35776.406`,
+  `allin_calls=19409152`, `allin_ms=30663.531`. All-in is large enough to be
+  worth investigating.
+- Tried an exact dense all-in oracle. For a public all-in board, it precomputes
+  `M[h,v] = sum_runout sign(strength_h - strength_v)` and evaluates each
+  terminal call as `M * opponent_reach`, scaled by pot and the exact live-combo
+  runout count. This is exact for all-in terminals because there are no future
+  decisions after the all-in.
+- Result: not useful in this form.
+  - oracle disabled: 1 iteration `iteration_ms=668.615`,
+    `oop_pass_value=590.676758`, `ip_pass_value=-2963.563721`;
+  - oracle on for flop/turn/river all-ins: 1 iteration `iteration_ms=1449.158`,
+    values matched within f32 order;
+  - oracle on for flop/turn only: 1 iteration `iteration_ms=676.897`;
+  - oracle on for flop only: 1 iteration `iteration_ms=695.480`.
+- Takeaway: the dense matrix oracle reduces terminal runout traversal but
+  replaces it with less cache-friendly matrix-vector work. River all-ins are
+  especially bad because the existing direct path has only one terminal board.
+  The code path is opt-in with `POKEDR_NODE_CFR_ALLIN_ORACLE_LIMIT_MIB`; the
+  default is disabled. A useful all-in oracle would need a more structured or
+  sparse/blocker-aware layout, not a dense payoff matrix.

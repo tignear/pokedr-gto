@@ -36,6 +36,10 @@ pub struct NodeLocalCfrSummary {
     pub fold_ns: u64,
     pub showdown_calls: usize,
     pub showdown_ns: u64,
+    pub showdown_only_calls: usize,
+    pub showdown_only_ns: u64,
+    pub allin_calls: usize,
+    pub allin_ns: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -60,6 +64,8 @@ pub struct NodeLocalCfrSolver {
     terminal_cache: Vec<NodeLocalTerminalCache>,
     fold_cache_index_by_key: BTreeMap<u64, usize>,
     fold_cache: Vec<NodeLocalFoldCache>,
+    allin_oracle_index_by_key: BTreeMap<u64, usize>,
+    allin_oracles: Vec<NodeLocalAllInOracle>,
     combo_permutations: BTreeMap<u8, ComboPermutationMaps>,
     oop_same_ip_combo_indices: Vec<Option<usize>>,
     ip_same_oop_combo_indices: Vec<Option<usize>>,
@@ -83,6 +89,10 @@ struct NodeLocalProfile {
     fold_ns: AtomicU64,
     showdown_calls: AtomicUsize,
     showdown_ns: AtomicU64,
+    showdown_only_calls: AtomicUsize,
+    showdown_only_ns: AtomicU64,
+    allin_calls: AtomicUsize,
+    allin_ns: AtomicU64,
 }
 
 impl NodeLocalProfile {
@@ -96,6 +106,10 @@ impl NodeLocalProfile {
         self.fold_ns.store(0, Ordering::Relaxed);
         self.showdown_calls.store(0, Ordering::Relaxed);
         self.showdown_ns.store(0, Ordering::Relaxed);
+        self.showdown_only_calls.store(0, Ordering::Relaxed);
+        self.showdown_only_ns.store(0, Ordering::Relaxed);
+        self.allin_calls.store(0, Ordering::Relaxed);
+        self.allin_ns.store(0, Ordering::Relaxed);
     }
 }
 
@@ -131,6 +145,7 @@ struct NodeLocalNode {
     chance_permutation_codes: Vec<Vec<u8>>,
     terminal_cache_indices: Vec<usize>,
     fold_cache_index: Option<usize>,
+    allin_oracle_index: Option<usize>,
     regrets: Vec<f32>,
     strategy_sum: Vec<f32>,
 }
@@ -190,6 +205,16 @@ struct NodeLocalTerminalCache {
 struct NodeLocalFoldCache {
     oop_live_indices: Vec<usize>,
     ip_live_indices: Vec<usize>,
+}
+
+#[derive(Debug, Clone)]
+struct NodeLocalAllInOracle {
+    oop_payoffs: Vec<f32>,
+    ip_payoffs: Vec<f32>,
+    oop_live_indices: Vec<usize>,
+    ip_live_indices: Vec<usize>,
+    oop_divisor: f32,
+    ip_divisor: f32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -350,6 +375,8 @@ impl NodeLocalCfrSolver {
             terminal_cache,
             fold_cache_index_by_key: BTreeMap::new(),
             fold_cache: Vec::new(),
+            allin_oracle_index_by_key: BTreeMap::new(),
+            allin_oracles: Vec::new(),
             combo_permutations,
             oop_same_ip_combo_indices,
             ip_same_oop_combo_indices,
@@ -397,6 +424,10 @@ impl NodeLocalCfrSolver {
             fold_ns: self.profile.fold_ns.load(Ordering::Relaxed),
             showdown_calls: self.profile.showdown_calls.load(Ordering::Relaxed),
             showdown_ns: self.profile.showdown_ns.load(Ordering::Relaxed),
+            showdown_only_calls: self.profile.showdown_only_calls.load(Ordering::Relaxed),
+            showdown_only_ns: self.profile.showdown_only_ns.load(Ordering::Relaxed),
+            allin_calls: self.profile.allin_calls.load(Ordering::Relaxed),
+            allin_ns: self.profile.allin_ns.load(Ordering::Relaxed),
         }
     }
 
@@ -549,6 +580,10 @@ impl NodeLocalCfrSolver {
             fold_ns: self.profile.fold_ns.load(Ordering::Relaxed),
             showdown_calls: self.profile.showdown_calls.load(Ordering::Relaxed),
             showdown_ns: self.profile.showdown_ns.load(Ordering::Relaxed),
+            showdown_only_calls: self.profile.showdown_only_calls.load(Ordering::Relaxed),
+            showdown_only_ns: self.profile.showdown_only_ns.load(Ordering::Relaxed),
+            allin_calls: self.profile.allin_calls.load(Ordering::Relaxed),
+            allin_ns: self.profile.allin_ns.load(Ordering::Relaxed),
         })
     }
 
@@ -1103,6 +1138,7 @@ impl NodeLocalCfrSolver {
             chance_permutation_codes: Vec::new(),
             terminal_cache_indices: Vec::new(),
             fold_cache_index: None,
+            allin_oracle_index: None,
             regrets: Vec::new(),
             strategy_sum: Vec::new(),
         }));
@@ -1120,6 +1156,7 @@ impl NodeLocalCfrSolver {
         let mut chance_permutation_codes = Vec::new();
         let mut terminal_cache_indices = Vec::new();
         let mut fold_cache_index = None;
+        let mut allin_oracle_index = None;
         let mut regrets = Vec::new();
         let mut strategy_sum = Vec::new();
 
@@ -1133,7 +1170,7 @@ impl NodeLocalCfrSolver {
                     TerminalReason::Fold => {
                         fold_cache_index = Some(self.fold_cache_index(board));
                     }
-                    TerminalReason::Showdown | TerminalReason::AllIn => {
+                    TerminalReason::Showdown => {
                         for terminal_board in terminal_boards(board)? {
                             let index = self
                                 .terminal_cache_index_by_key
@@ -1141,6 +1178,19 @@ impl NodeLocalCfrSolver {
                                 .copied()
                                 .ok_or_else(|| "terminal board is outside cache".to_string())?;
                             terminal_cache_indices.push(index);
+                        }
+                    }
+                    TerminalReason::AllIn => {
+                        allin_oracle_index = self.allin_oracle_index(board)?;
+                        if allin_oracle_index.is_none() {
+                            for terminal_board in terminal_boards(board)? {
+                                let index = self
+                                    .terminal_cache_index_by_key
+                                    .get(&unordered_board_key(&terminal_board))
+                                    .copied()
+                                    .ok_or_else(|| "terminal board is outside cache".to_string())?;
+                                terminal_cache_indices.push(index);
+                            }
                         }
                     }
                 }
@@ -1197,6 +1247,7 @@ impl NodeLocalCfrSolver {
         node.chance_permutation_codes = chance_permutation_codes;
         node.terminal_cache_indices = terminal_cache_indices;
         node.fold_cache_index = fold_cache_index;
+        node.allin_oracle_index = allin_oracle_index;
         node.regrets = regrets;
         node.strategy_sum = strategy_sum;
         Ok(index)
@@ -1214,6 +1265,33 @@ impl NodeLocalCfrSolver {
             ip_live_indices: live_combo_indices(&self.ip_combos, board),
         });
         index
+    }
+
+    fn allin_oracle_index(&mut self, board: &Board) -> Result<Option<usize>, String> {
+        if board.cards().len() != 3 {
+            return Ok(None);
+        }
+        let key = ordered_board_key(board);
+        if let Some(index) = self.allin_oracle_index_by_key.get(&key) {
+            return Ok(Some(*index));
+        }
+        let cells = self.oop_combos.len() * self.ip_combos.len();
+        let bytes = cells * 2 * std::mem::size_of::<f32>();
+        let limit_mib = std::env::var("POKEDR_NODE_CFR_ALLIN_ORACLE_LIMIT_MIB")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(0);
+        if limit_mib == 0 {
+            return Ok(None);
+        }
+        if bytes > limit_mib * 1024 * 1024 {
+            return Ok(None);
+        }
+        let index = self.allin_oracles.len();
+        let oracle = build_allin_oracle(board, &self.oop_combos, &self.ip_combos)?;
+        self.allin_oracle_index_by_key.insert(key, index);
+        self.allin_oracles.push(oracle);
+        Ok(Some(index))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1255,24 +1333,110 @@ impl NodeLocalCfrSolver {
             TerminalReason::Showdown | TerminalReason::AllIn => {
                 if self.profile_enabled {
                     self.profile.showdown_calls.fetch_add(1, Ordering::Relaxed);
+                    match reason {
+                        TerminalReason::Showdown => {
+                            self.profile
+                                .showdown_only_calls
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
+                        TerminalReason::AllIn => {
+                            self.profile.allin_calls.fetch_add(1, Ordering::Relaxed);
+                        }
+                        TerminalReason::Fold => {}
+                    }
                 }
                 let started = self.profile_enabled.then(Instant::now);
-                let result = self.showdown_side_into(
-                    node_index,
-                    node.pot,
-                    update_player,
-                    oop_reach,
-                    ip_reach,
-                    out,
-                    scratch,
-                );
+                let result = if matches!(reason, TerminalReason::AllIn) {
+                    if let Some(oracle_index) = node.allin_oracle_index {
+                        self.allin_oracle_side_into(
+                            oracle_index,
+                            node.pot,
+                            update_player,
+                            oop_reach,
+                            ip_reach,
+                            out,
+                        );
+                        Ok(0)
+                    } else {
+                        self.showdown_side_into(
+                            node_index,
+                            node.pot,
+                            update_player,
+                            oop_reach,
+                            ip_reach,
+                            out,
+                            scratch,
+                        )
+                    }
+                } else {
+                    self.showdown_side_into(
+                        node_index,
+                        node.pot,
+                        update_player,
+                        oop_reach,
+                        ip_reach,
+                        out,
+                        scratch,
+                    )
+                };
                 if let Some(started) = started {
-                    self.profile.showdown_ns.fetch_add(
-                        started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64,
-                        Ordering::Relaxed,
-                    );
+                    let elapsed_ns = started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
+                    self.profile
+                        .showdown_ns
+                        .fetch_add(elapsed_ns, Ordering::Relaxed);
+                    match reason {
+                        TerminalReason::Showdown => {
+                            self.profile
+                                .showdown_only_ns
+                                .fetch_add(elapsed_ns, Ordering::Relaxed);
+                        }
+                        TerminalReason::AllIn => {
+                            self.profile
+                                .allin_ns
+                                .fetch_add(elapsed_ns, Ordering::Relaxed);
+                        }
+                        TerminalReason::Fold => {}
+                    }
                 }
                 result
+            }
+        }
+    }
+
+    fn allin_oracle_side_into(
+        &self,
+        oracle_index: usize,
+        pot: u32,
+        update_player: Player,
+        oop_reach: &[f32],
+        ip_reach: &[f32],
+        out: &mut [f32],
+    ) {
+        out.fill(0.0);
+        let oracle = &self.allin_oracles[oracle_index];
+        let pot = pot as f32;
+        match update_player {
+            Player::Oop => {
+                allin_oracle_matrix_vector_into(
+                    &oracle.oop_payoffs,
+                    self.ip_combos.len(),
+                    ip_reach,
+                    &oracle.oop_live_indices,
+                    &oracle.ip_live_indices,
+                    pot / oracle.oop_divisor,
+                    out,
+                );
+            }
+            Player::Ip => {
+                allin_oracle_matrix_vector_into(
+                    &oracle.ip_payoffs,
+                    self.oop_combos.len(),
+                    oop_reach,
+                    &oracle.ip_live_indices,
+                    &oracle.oop_live_indices,
+                    pot / oracle.ip_divisor,
+                    out,
+                );
             }
         }
     }
@@ -1798,6 +1962,83 @@ fn terminal_side_range_targets_sorted_accumulate(
         out[own_target.range_index] -=
             non_blocked_target_reach(own_combo, reach_sum, &card_sums) * pot;
     }
+}
+
+fn build_allin_oracle(
+    board: &Board,
+    oop_combos: &[ComboWeight],
+    ip_combos: &[ComboWeight],
+) -> Result<NodeLocalAllInOracle, String> {
+    let oop_live_indices = live_combo_indices(oop_combos, board);
+    let ip_live_indices = live_combo_indices(ip_combos, board);
+    let oop_cols = ip_combos.len();
+    let ip_cols = oop_combos.len();
+    let mut oop_payoffs = vec![0.0f32; oop_combos.len() * oop_cols];
+    let mut ip_payoffs = vec![0.0f32; ip_combos.len() * ip_cols];
+    for terminal_board in terminal_boards(board)? {
+        let prepared = PreparedTerminalBoard::new(&terminal_board)?;
+        let oop_targets = prepared_combo_targets(&prepared, oop_combos);
+        let ip_targets = prepared_combo_targets(&prepared, ip_combos);
+        for oop_target in &oop_targets {
+            let oop_combo = prepared.combo(oop_target.board_index as usize);
+            let oop_strength = prepared.strength(oop_target.board_index as usize);
+            for ip_target in &ip_targets {
+                let ip_combo = prepared.combo(ip_target.board_index as usize);
+                if combos_overlap(oop_combo, ip_combo) {
+                    continue;
+                }
+                let ip_strength = prepared.strength(ip_target.board_index as usize);
+                let oop_outcome = if oop_strength > ip_strength {
+                    1.0
+                } else if oop_strength < ip_strength {
+                    -1.0
+                } else {
+                    0.0
+                };
+                oop_payoffs[oop_target.range_index * oop_cols + ip_target.range_index] +=
+                    oop_outcome;
+                ip_payoffs[ip_target.range_index * ip_cols + oop_target.range_index] -= oop_outcome;
+            }
+        }
+    }
+    let divisor = terminal_runout_count_for_live_combo(board.cards().len());
+    Ok(NodeLocalAllInOracle {
+        oop_payoffs,
+        ip_payoffs,
+        oop_live_indices,
+        ip_live_indices,
+        oop_divisor: divisor,
+        ip_divisor: divisor,
+    })
+}
+
+fn allin_oracle_matrix_vector_into(
+    payoffs: &[f32],
+    cols: usize,
+    opponent_reach: &[f32],
+    own_live_indices: &[usize],
+    opponent_live_indices: &[usize],
+    scale: f32,
+    out: &mut [f32],
+) {
+    for own_index in own_live_indices.iter().copied() {
+        let row = &payoffs[own_index * cols..(own_index + 1) * cols];
+        let mut value = 0.0f32;
+        for opponent_index in opponent_live_indices.iter().copied() {
+            value += row[opponent_index] * opponent_reach[opponent_index];
+        }
+        out[own_index] = value * scale;
+    }
+}
+
+fn combos_overlap(
+    first: crate::terminal_cfv::PrivateCombo,
+    second: crate::terminal_cfv::PrivateCombo,
+) -> bool {
+    first.first == second.first
+        || first.first == second.second
+        || first.second == second.first
+        || first.second == second.second
 }
 
 fn add_target_reach_to_card_sums(
