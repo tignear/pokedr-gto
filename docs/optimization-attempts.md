@@ -858,20 +858,21 @@ retrying similar ideas, so attempts stay in chronological order.
   `strategy_sum += own_reach * strategy_probability` to local unweighted
   `strategy_sum += strategy_probability`. This is a practical/reference-style
   experiment, not the standard average-strategy definition.
-- Important limitation: this implementation only changes the contribution
-  written to `strategy_sum`. It still propagates update-player own reach through
-  the traversal because the same code path supports the standard mode. That
-  means it does not remove the expensive reach bookkeeping that would be the
-  real speed cheat.
+- Follow-up: added a dedicated arena current-player branch for `local` that
+  skips update-player own-reach propagation. Alternating CFR terminal values
+  only need opponent reach for the updating side, and local averaging does not
+  need own reach for deeper average-strategy accumulation.
 - Result on `Td9d6h`, UTG vs BU ranges, pot `200`, effective stack `900`,
   `postflop-basic`, DCFR+, `16` release arena iterations with `16` threads:
-  reach-weighted runs were about `6328-6543ms`; local runs were about
-  `6294-6571ms`. The difference is noise-level.
+  reach-weighted was about `6331ms`; local was about `6381ms`. A `4` iteration
+  arena profile showed the intended micro-effect: `reach_scratch_writes` fell
+  from `164,128,480` to `82,064,240`, and typical `reach_ms` fell from about
+  `106-108ms` to about `59-61ms`. End-to-end time did not improve because the
+  remaining cost is dominated by child traversal, terminal evaluation,
+  strategy build, and update materialization.
 - Exploitability check at `16` iterations was also essentially tied:
   reach-weighted `6.694 bb/100`, local `6.593 bb/100`.
 - Takeaway: keep the mode for controlled comparison, but do not count it as a
-  speed optimization in the current arena traversal. A real reference-style
-  speed experiment needs a separate local-average traversal that never
-  propagates own reach for the updating player. That is a structural change and
-  must be validated against zero-sum profile values and exploitability before
-  becoming default.
+  speed optimization in the current arena traversal. The practical cheat
+  removes exactly the reach work it was supposed to remove, but that work is not
+  large enough to close the reference gap.
