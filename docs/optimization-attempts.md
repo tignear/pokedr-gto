@@ -913,3 +913,27 @@ retrying similar ideas, so attempts stay in chronological order.
   fills per-node `cfv_actions` rows in parallel for nodes before the river is
   dealt, while the arena path still relies mostly on chance-subtree splitting
   and recursive scratch/cache reuse.
+
+## 2026-06-08: Arena unsafe current-player action-row parallelism
+
+- Tried: add a reference-style current-player decision path that fills each
+  action row in parallel. The implementation validated child subtree storage
+  ranges as disjoint, then used a narrow raw-pointer wrapper to hand each worker
+  only its child `regrets/strategy_sum` slice. Parent regret/strategy updates
+  still happened after all child action values returned.
+- Correctness: `cargo test -p pokedr-core arena_cfr -- --nocapture` passed.
+- Result: reverted. On `Td9d6h`, UTG vs BU ranges from
+  `/tmp/postflop_flop_ranges.txt`, pot `200`, effective stack `900`,
+  `postflop-basic`, `16` threads, `16` release arena iterations, the run was
+  `9584ms`. The action-major arena baseline is about `6030-6450ms` for the same
+  command.
+- Reason: even with direct action-row writes, the arena traversal still needs
+  worker-local terminal scratch and `TerminalSideValueCache` instances. That
+  splits terminal side-value reuse across action workers. The saved child-row
+  write/copy work is much smaller than the duplicated terminal side-cache
+  misses and extra worker scratch setup.
+- Takeaway: do not retry current-player action-row parallelism as an arena
+  overlay, safe or unsafe. The reference solver's speed comes from pairing
+  child-row parallelism with a node-local allocator/traversal model. To pursue
+  this direction, build a separate node-owned recursive solver shape instead
+  of patching the arena traversal.
