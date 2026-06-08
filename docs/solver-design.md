@@ -1,17 +1,34 @@
 # Solver Design
 
-The previous solver is intentionally discarded. The replacement targets a dense,
-GPU-portable CFR layout:
+The active solver is the node-local full-range public-tree CFR implementation:
 
-- fixed public tree IDs
-- dense private range indices
-- dense `infoset x private_bucket x action` regret and strategy arrays
-- public chance sampling or public chance batching, not private external sampling
-- observed action likelihood computed for the whole range
-- no dynamic `HashMap` node allocation in the hot solver path
+- public tree shape comes from `pokedr-agent::build_flop_tree`;
+- exact representative public chance nodes are expanded inside
+  `NodeLocalCfrSolver`;
+- each node owns its regret and strategy-sum rows in action-major order;
+- terminal values are exact and use the optimized fold, river, all-in, and
+  prefix-blocker paths from `node_cfr` and `terminal_cfv`;
+- exploitability is computed by exact profile and best-response traversals over
+  the same node-local tree.
 
-Detailed postflop GPU CFR math and the showdown reuse boundary are documented
-in [postflop-gpu-cfr.md](postflop-gpu-cfr.md).
+The public CLI exposes one solving path: `solve-flop`, backed by
+`NodeLocalCfrSolver`. Old arena, three-phase, storage-layout, and parallel-plan
+experiments are kept under the crate-internal `legacy` namespace for tests and
+historical comparison only. They should not be wired back into user-facing CLI
+flags unless they are promoted as the single active solver.
+
+The replacement target remains a layout that can later be made GPU-portable, but
+the current correctness and performance baseline is the node-local CPU solver,
+not the old dense phase solver:
+
+- fixed public tree IDs;
+- dense private range indices;
+- exact public chance isomorphism;
+- dense action-major regret and strategy rows per decision node;
+- no user-facing choice among multiple CFR engines.
+
+Detailed postflop GPU CFR math and the showdown reuse boundary are documented in
+[postflop-gpu-cfr.md](postflop-gpu-cfr.md).
 
 Research anchors:
 

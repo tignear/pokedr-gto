@@ -3,13 +3,11 @@ use crate::isomorphism::{
     all_suit_permutations, next_card_isomorphism, private_combo_permutation_indices,
 };
 use crate::range::{ComboWeight, RangeSpec};
-use crate::real_cfr::{
-    RealCfrAverageStrategy, RealCfrConfig, RealCfrExploitability, RealCfrVariant,
-};
 use crate::terminal_cfv::{
     PreparedTerminalBoard, terminal_side_values_prefix_blocker_sorted_board_targets_into,
 };
 use crate::tree::{Player, PublicNodeKind, PublicTree, TerminalReason};
+use crate::{RealCfrAverageStrategy, RealCfrConfig, RealCfrExploitability, RealCfrVariant};
 use rayon::prelude::*;
 use std::cell::UnsafeCell;
 use std::collections::{BTreeMap, HashMap};
@@ -2987,7 +2985,8 @@ fn weighted_average(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::real_cfr::{ArenaAlternatingCfrSolver, RealCfrAverageStrategy};
+    use crate::RealCfrAverageStrategy;
+    use crate::legacy::real_cfr::ArenaAlternatingCfrSolver;
     use crate::tree::{
         ActionAbstraction, ChanceExpansion, RaisePolicy, Spot, StreetTemplate, TreeBuilder,
         TreeTemplate,
