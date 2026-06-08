@@ -28,6 +28,12 @@ CLI configuration:
   `[logging]`; see [solver-config.example.toml](solver-config.example.toml).
 - Solver logs use `tracing` and can be controlled with `--log-level` or
   `[logging].level`.
+- `solver-config.example.toml` is the practical viewer starter config.
+  `solver-config.smoke.toml` is intentionally tiny for quick checks, and
+  `solver-config.ranges-wide.toml` can be layered on top when memory is not a
+  concern.
+- `[solver].threads = 0` means auto-detect available CPU parallelism. If
+  `threads` is omitted, the CLI also uses auto-detect.
 
 Range input:
 

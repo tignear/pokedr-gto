@@ -1,23 +1,33 @@
+# Practical starter config for the solution viewer.
+#
 # Later --config files override earlier files field-by-field.
 # Command line arguments override every config file.
+#
+# This spot is intentionally not a full loose blind-defense range. The current
+# viewer keeps a full solution snapshot in memory, so start with tight ranges
+# while inspecting strategy quality.
 
 [spot]
 flop = "As7h2c"
-pot = 200
-effective_stack = 900
+pot = 650
+effective_stack = 9700
 first_player = "oop"
-oop_range = "99+,ATs+,KQs,AJo+"
-ip_range = "TT+,A2s+,KTs+,QJs,ATo+"
+
+# OOP: approximate UTG continuing range on a dry A-high flop.
+oop_range = "88+,AJs+,KQs,AQo+,ATs:0.5,KJs:0.5,QJs:0.5,JTs:0.5"
+
+# IP: approximate BU/CO flat or caller range after preflop filtering.
+ip_range = "66+,A2s+,KTs+,QTs+,JTs,T9s,98s,AJo+,KQo,ATo:0.5,KJo:0.5,QJo:0.5"
 
 [tree]
 preset = "postflop-basic"
 enumerate_chance = false
 
 [solver]
-iterations = 4
-threads = 1
-log_interval = 1
-exploitability_interval = 2
+iterations = 256
+threads = 0 # auto: use available CPU parallelism
+log_interval = 16
+exploitability_interval = 64
 target_exploitability_bb100 = 1.0
 variant = "dcfr-plus"
 average_strategy = "reach-weighted"

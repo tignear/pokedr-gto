@@ -1,0 +1,12 @@
+# Optional wider ranges for stress testing. Merge this after the base config:
+#
+# cargo run -p pokedr-cli -- viewer \
+#   --config docs/solver-config.example.toml \
+#   --config docs/solver-config.ranges-wide.toml
+#
+# The current viewer snapshots every node strategy, so this can use much more
+# memory than the starter config.
+
+[spot]
+oop_range = "22+,A2s+,K7s+,Q8s+,J8s+,T8s+,98s,87s,76s,65s,A9o+,KTo+,QTo+,JTo"
+ip_range = "22+,A2s+,K2s+,Q6s+,J7s+,T7s+,97s+,86s+,75s+,65s,A2o+,K9o+,Q9o+,J9o+,T9o"

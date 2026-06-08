@@ -733,7 +733,8 @@ fn resolve_solver_options(
     let threads = cli
         .threads
         .or_else(|| solver.and_then(|solver| solver.threads))
-        .unwrap_or(1);
+        .map(resolve_thread_count)
+        .unwrap_or_else(default_thread_count);
     let log_interval = cli
         .log_interval
         .or_else(|| solver.and_then(|solver| solver.log_interval))
@@ -774,6 +775,20 @@ fn resolve_solver_options(
         variant: parse_cfr_variant(&variant, dcfr_alpha, dcfr_beta, dcfr_gamma)?,
         average_strategy: parse_average_strategy(&average_strategy)?,
     })
+}
+
+fn resolve_thread_count(threads: usize) -> usize {
+    if threads == 0 {
+        default_thread_count()
+    } else {
+        threads
+    }
+}
+
+fn default_thread_count() -> usize {
+    std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
 }
 
 fn log_config(source: Option<&str>, spot: &SpotOptions, tree: &TreeOptions) {
