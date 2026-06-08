@@ -1333,16 +1333,19 @@ fn arena_traverse_update_side_into(
                 return Err("arena storage slice does not cover subtree infoset".to_string());
             }
             let mut strategies = terminal_scratch.take_vec_dirty(infoset.slots_len);
+            let mut strategy_denominators = terminal_scratch.take_vec_dirty(acting_combos);
             let started = profile.enabled.then(Instant::now);
-            current_strategies_into(
+            current_strategies_storage_action_major_into(
                 &regrets[local_slot_start..local_slot_end],
                 acting_combos,
                 actions_len,
                 &mut strategies,
+                &mut strategy_denominators,
             );
             if let Some(started) = started {
                 profile.strategy_ns += started.elapsed().as_nanos();
             }
+            terminal_scratch.release_vec(strategy_denominators);
             if profile.enabled {
                 profile.strategy_builds += 1;
                 profile.values_zero += 1;
@@ -1357,10 +1360,11 @@ fn arena_traverse_update_side_into(
                         let mut next_oop = terminal_scratch.take_vec_dirty(oop_reach.len());
                         for action_index in 0..actions_len {
                             let started = profile.enabled.then(Instant::now);
-                            strategy_reach_into(
+                            strategy_reach_action_major_into(
                                 &mut next_oop,
                                 oop_reach,
                                 &strategies,
+                                acting_combos,
                                 actions_len,
                                 action_index,
                             );
@@ -1400,10 +1404,11 @@ fn arena_traverse_update_side_into(
                         let mut next_ip = terminal_scratch.take_vec_dirty(ip_reach.len());
                         for action_index in 0..actions_len {
                             let started = profile.enabled.then(Instant::now);
-                            strategy_reach_into(
+                            strategy_reach_action_major_into(
                                 &mut next_ip,
                                 ip_reach,
                                 &strategies,
+                                acting_combos,
                                 actions_len,
                                 action_index,
                             );
@@ -1478,10 +1483,11 @@ fn arena_traverse_update_side_into(
                         let mut next_oop = terminal_scratch.take_vec_dirty(oop_reach.len());
                         for action_index in 0..actions_len {
                             let started = profile.enabled.then(Instant::now);
-                            strategy_reach_into(
+                            strategy_reach_action_major_into(
                                 &mut next_oop,
                                 oop_reach,
                                 &strategies,
+                                acting_combos,
                                 actions_len,
                                 action_index,
                             );
@@ -1549,10 +1555,11 @@ fn arena_traverse_update_side_into(
                         let mut next_ip = terminal_scratch.take_vec_dirty(ip_reach.len());
                         for action_index in 0..actions_len {
                             let started = profile.enabled.then(Instant::now);
-                            strategy_reach_into(
+                            strategy_reach_action_major_into(
                                 &mut next_ip,
                                 ip_reach,
                                 &strategies,
+                                acting_combos,
                                 actions_len,
                                 action_index,
                             );
@@ -1591,7 +1598,7 @@ fn arena_traverse_update_side_into(
                 }
             }
             let started = profile.enabled.then(Instant::now);
-            combine_acting_flat_values(out, &action_values, &strategies, actions_len);
+            combine_acting_action_major_values(out, &action_values, &strategies, actions_len);
             let own_reach = match player {
                 Player::Oop => oop_reach,
                 Player::Ip => ip_reach,
@@ -1602,7 +1609,7 @@ fn arena_traverse_update_side_into(
                 let node_value = out[combo];
                 for action_index in 0..actions_len {
                     let action_value = action_values[action_index * target_len + combo];
-                    let local_slot = local_slot_start + combo * actions_len + action_index;
+                    let local_slot = local_slot_start + action_index * acting_combos + combo;
                     apply_real_cfr_update_with_factors(
                         &mut regrets[local_slot],
                         &mut strategy_sum[local_slot],
@@ -1610,7 +1617,7 @@ fn arena_traverse_update_side_into(
                         average_strategy_delta(
                             average_strategy,
                             own_reach[combo],
-                            strategies[combo * actions_len + action_index],
+                            strategies[action_index * acting_combos + combo],
                         ),
                         &update_factors,
                     );
@@ -1735,12 +1742,15 @@ fn arena_evaluate_side_into(
                 return Err("arena strategy sum slice does not cover infoset".to_string());
             }
             let mut strategies = terminal_scratch.take_vec_dirty(infoset.slots_len);
-            average_strategies_into(
+            let mut strategy_denominators = terminal_scratch.take_vec_dirty(acting_combos);
+            average_strategies_storage_action_major_into(
                 &strategy_sum[slot_start..slot_end],
                 acting_combos,
                 actions_len,
                 &mut strategies,
+                &mut strategy_denominators,
             );
+            terminal_scratch.release_vec(strategy_denominators);
 
             let target_len = out.len();
             let mut action_values = terminal_scratch.take_vec_dirty(actions_len * target_len);
@@ -1764,7 +1774,12 @@ fn arena_evaluate_side_into(
                 }
                 match mode {
                     ArenaEvaluationMode::Profile => {
-                        combine_acting_flat_values(out, &action_values, &strategies, actions_len);
+                        combine_acting_action_major_values(
+                            out,
+                            &action_values,
+                            &strategies,
+                            actions_len,
+                        );
                     }
                     ArenaEvaluationMode::BestResponse => {
                         combine_best_response_flat_values(out, &action_values, actions_len);
@@ -1773,10 +1788,11 @@ fn arena_evaluate_side_into(
             } else {
                 let mut next_opponent = terminal_scratch.take_vec_dirty(opponent_reach.len());
                 for action_index in 0..actions_len {
-                    strategy_reach_into(
+                    strategy_reach_action_major_into(
                         &mut next_opponent,
                         opponent_reach,
                         &strategies,
+                        acting_combos,
                         actions_len,
                         action_index,
                     );
@@ -5045,6 +5061,38 @@ fn current_strategies_into(
     }
 }
 
+fn current_strategies_storage_action_major_into(
+    regrets: &[f32],
+    combos: usize,
+    actions: usize,
+    strategies: &mut Vec<f32>,
+    denominators: &mut Vec<f32>,
+) {
+    strategies.resize(regrets.len(), 0.0);
+    denominators.resize(combos, 0.0);
+    denominators.fill(0.0);
+    for (strategy, regret) in strategies.iter_mut().zip(regrets) {
+        *strategy = regret.max(0.0);
+    }
+    for action in 0..actions {
+        let row = &strategies[action * combos..(action + 1) * combos];
+        for (denominator, value) in denominators.iter_mut().zip(row) {
+            *denominator += *value;
+        }
+    }
+    let uniform = 1.0 / actions as f32;
+    for action in 0..actions {
+        let row = &mut strategies[action * combos..(action + 1) * combos];
+        for (strategy, denominator) in row.iter_mut().zip(denominators.iter().copied()) {
+            if denominator > 0.0 {
+                *strategy /= denominator;
+            } else {
+                *strategy = uniform;
+            }
+        }
+    }
+}
+
 fn apply_real_cfr_update(
     regret: &mut f32,
     strategy_sum: &mut f32,
@@ -5199,6 +5247,36 @@ fn average_strategies_into(
     }
 }
 
+fn average_strategies_storage_action_major_into(
+    strategy_sum: &[f32],
+    combos: usize,
+    actions: usize,
+    strategies: &mut Vec<f32>,
+    denominators: &mut Vec<f32>,
+) {
+    strategies.resize(strategy_sum.len(), 0.0);
+    denominators.resize(combos, 0.0);
+    denominators.fill(0.0);
+    strategies.copy_from_slice(strategy_sum);
+    for action in 0..actions {
+        let row = &strategies[action * combos..(action + 1) * combos];
+        for (denominator, value) in denominators.iter_mut().zip(row) {
+            *denominator += *value;
+        }
+    }
+    let uniform = 1.0 / actions as f32;
+    for action in 0..actions {
+        let row = &mut strategies[action * combos..(action + 1) * combos];
+        for (strategy, denominator) in row.iter_mut().zip(denominators.iter().copied()) {
+            if denominator > 0.0 {
+                *strategy /= denominator;
+            } else {
+                *strategy = uniform;
+            }
+        }
+    }
+}
+
 fn strategy_reach_into(
     out: &mut [f32],
     input: &[f32],
@@ -5208,6 +5286,23 @@ fn strategy_reach_into(
 ) {
     for (combo, (out, input)) in out.iter_mut().zip(input).enumerate() {
         *out = *input * strategies[combo * actions + action];
+    }
+}
+
+fn strategy_reach_action_major_into(
+    out: &mut [f32],
+    input: &[f32],
+    strategies: &[f32],
+    combos: usize,
+    actions: usize,
+    action: usize,
+) {
+    debug_assert_eq!(out.len(), combos);
+    debug_assert_eq!(input.len(), combos);
+    debug_assert!(action < actions);
+    let strategy_row = &strategies[action * combos..(action + 1) * combos];
+    for ((out, input), strategy) in out.iter_mut().zip(input).zip(strategy_row) {
+        *out = *input * *strategy;
     }
 }
 
@@ -5252,6 +5347,25 @@ fn combine_acting_flat_values(
             value += strategies[combo * actions + action] * action_values[action * combos + combo];
         }
         out[combo] = value;
+    }
+}
+
+fn combine_acting_action_major_values(
+    out: &mut [f32],
+    action_values: &[f32],
+    strategies: &[f32],
+    actions: usize,
+) {
+    let combos = out.len();
+    out.fill(0.0);
+    for action in 0..actions {
+        let action_values_row = &action_values[action * combos..(action + 1) * combos];
+        let strategy_row = &strategies[action * combos..(action + 1) * combos];
+        for ((out, action_value), strategy) in
+            out.iter_mut().zip(action_values_row).zip(strategy_row)
+        {
+            *out += *strategy * *action_value;
+        }
     }
 }
 

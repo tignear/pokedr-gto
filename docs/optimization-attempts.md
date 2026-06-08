@@ -803,6 +803,13 @@ retrying similar ideas, so attempts stay in chronological order.
   action-row indexing bug, but performance was much worse. On `Td9d6h` UTG vs
   BU, `4` release arena iterations with `16` threads moved from about
   `1.47s` to about `4.85s`; iteration 1 was about `1.41s`.
+- Follow-up after action-major storage: a safe `split_at_mut` version that
+  directly filled disjoint action rows and split child subtree
+  `regrets/strategy_sum` slices was also slower. With broad pre-river decision
+  splitting, `16` release iterations moved to about `10971ms`; restricted to
+  only very large update-player child subtrees, it was still about `6967ms`.
+  The same binary with `--real-cfr-average-strategy local` was about
+  `6943ms`, so the slowdown was not caused by reach-weighted averaging alone.
 - Reason: this implementation created fresh terminal scratch, side caches, and
   child value buffers per decision task. That destroys terminal side-value
   reuse and adds allocator/task overhead at many small branching points. The
@@ -876,3 +883,33 @@ retrying similar ideas, so attempts stay in chronological order.
   speed optimization in the current arena traversal. The practical cheat
   removes exactly the reach work it was supposed to remove, but that work is not
   large enough to close the reference gap.
+
+## 2026-06-08: Arena action-major strategy/regret rows
+
+- Reference check: `/tmp/postflop-solver/examples/debug_flop_storage.rs` and the
+  local arena solver agree on the key storage count for the `Td9d6h` UTG vs BU
+  comparison: both use `82,064,240` regret/strategy f32 slots. The large speed
+  gap is therefore not explained by solving a larger regret table.
+- Tried: make the arena CFR storage semantics match the reference solver's
+  action-major row layout. Arena infoset slots are now read and updated as
+  `action * combos + combo` for the alternating arena path. Current and average
+  strategy construction also uses row-contiguous normalization with a reusable
+  denominator buffer, matching the reference shape more closely than the older
+  combo-major loops.
+- Correctness: `cargo test -p pokedr-core arena_cfr -- --nocapture` passed, as
+  did the full `cargo test -p pokedr-core -p pokedr-cli` suite.
+- Result: on `Td9d6h`, UTG vs BU ranges from
+  `/tmp/postflop_flop_ranges.txt`, pot `200`, effective stack `900`,
+  `postflop-basic`, `16` threads, `16` release arena iterations, the clean run
+  improved from the recent reach-weighted baseline around `6331ms` to
+  `6030ms`.
+- Intermediate failure: action-major temporary strategy without changing the
+  backing arena storage was slower. It reduced `reach_ms`, but made the overall
+  traversal worse because the storage and update layout still fought the row
+  traversal.
+- Takeaway: row layout matters, but this only closes a small part of the gap to
+  `postflop-solver` (`~1128ms / 16` on the same comparison). The remaining
+  structural gap is the recursive/node-local parallel traversal: the reference
+  fills per-node `cfv_actions` rows in parallel for nodes before the river is
+  dealt, while the arena path still relies mostly on chance-subtree splitting
+  and recursive scratch/cache reuse.
