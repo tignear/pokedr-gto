@@ -39,6 +39,19 @@ Range input:
   the first token keeps ownership of that combo. For example `TT+,88+:0.7`
   keeps TT+ at weight `1.0` and adds only 88-99 at weight `0.7`.
 
+Solution viewer:
+
+- `pokedr-cli viewer --config <spot.toml>` solves the configured flop spot, keeps
+  the solution in memory, and serves a local HTTP viewer.
+- The default bind address is `http://127.0.0.1:5174`.
+- The viewer frontend lives under `viewer/` and is built with Vite + React +
+  TypeScript. During frontend development, run `npm run dev` in `viewer/`; it
+  proxies `/api` to the Rust server.
+- `npm run build` writes `viewer/dist`, which the Rust server serves by default.
+- API shape is intentionally small: `/api/summary`, `/api/combos`,
+  `/api/nodes`, and `/api/node/{id}`. Node strategy is loaded only for the
+  selected node.
+
 The replacement target remains a layout that can later be made GPU-portable, but
 the current correctness and performance baseline is the node-local CPU solver,
 not the old dense phase solver:

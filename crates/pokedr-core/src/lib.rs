@@ -19,7 +19,10 @@ pub use isomorphism::{
 pub use legacy::real_cfr::{
     RealCfrAverageStrategy, RealCfrConfig, RealCfrExploitability, RealCfrVariant,
 };
-pub use node_cfr::{NodeLocalCfrSolver, NodeLocalCfrSummary};
+pub use node_cfr::{
+    NodeLocalCfrSolver, NodeLocalCfrSummary, NodeLocalSolutionNode, NodeLocalSolutionNodeKind,
+    NodeLocalSolutionSnapshot, NodeLocalStrategySnapshot,
+};
 pub use plan::{CfrStorageConfig, CfrWorkPlan, StreetWorkPlan, TerminalWorkPlan, plan_cfr_work};
 pub use range::{ComboWeight, RangeSpec};
 pub use terminal_cfv::{

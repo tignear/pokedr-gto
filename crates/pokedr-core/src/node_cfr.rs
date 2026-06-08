@@ -6,7 +6,7 @@ use crate::range::{ComboWeight, RangeSpec};
 use crate::terminal_cfv::{
     PreparedTerminalBoard, terminal_side_values_prefix_blocker_sorted_board_targets_into,
 };
-use crate::tree::{Player, PublicNodeKind, PublicTree, TerminalReason};
+use crate::tree::{ActionKind, Player, PublicNodeKind, PublicTree, Street, TerminalReason};
 use crate::{RealCfrAverageStrategy, RealCfrConfig, RealCfrExploitability, RealCfrVariant};
 use rayon::prelude::*;
 use std::cell::UnsafeCell;
@@ -55,6 +55,43 @@ pub struct NodeLocalCfrIterationSummary {
     pub elapsed_ms: f64,
     pub oop_update_pass_value: f32,
     pub ip_update_pass_value: f32,
+}
+
+#[derive(Debug, Clone)]
+pub struct NodeLocalSolutionSnapshot {
+    pub iterations: u32,
+    pub oop_combos: Vec<ComboWeight>,
+    pub ip_combos: Vec<ComboWeight>,
+    pub nodes: Vec<NodeLocalSolutionNode>,
+}
+
+#[derive(Debug, Clone)]
+pub struct NodeLocalSolutionNode {
+    pub id: usize,
+    pub public_node: usize,
+    pub board: Board,
+    pub street: Street,
+    pub pot: u32,
+    pub player: Player,
+    pub kind: NodeLocalSolutionNodeKind,
+    pub children: Vec<usize>,
+    pub actions: Vec<ActionKind>,
+    pub strategy: Option<NodeLocalStrategySnapshot>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NodeLocalSolutionNodeKind {
+    Decision,
+    Chance,
+    Terminal { reason: TerminalReason },
+}
+
+#[derive(Debug, Clone)]
+pub struct NodeLocalStrategySnapshot {
+    pub player: Player,
+    pub combos: usize,
+    pub actions: usize,
+    pub action_major: Vec<f32>,
 }
 
 #[derive(Debug)]
@@ -485,6 +522,73 @@ impl NodeLocalCfrSolver {
     pub fn storage_gib(&self) -> f64 {
         self.action_slots as f64 * 2.0 * std::mem::size_of::<f32>() as f64
             / (1024.0 * 1024.0 * 1024.0)
+    }
+
+    pub fn solution_snapshot(&self) -> NodeLocalSolutionSnapshot {
+        let mut nodes = Vec::with_capacity(self.nodes.len());
+        for (id, node_cell) in self.nodes.iter().enumerate() {
+            let node = node_cell.get();
+            let public_node = &self.tree.nodes[node.public_node];
+            let (kind, actions, strategy) = match &node.kind {
+                NodeLocalKind::Decision { player, actions } => {
+                    let public_actions = match &public_node.kind {
+                        PublicNodeKind::Decision { actions, .. } => actions.clone(),
+                        _ => Vec::new(),
+                    };
+                    let combos = match player {
+                        Player::Oop => self.oop_combos.len(),
+                        Player::Ip => self.ip_combos.len(),
+                    };
+                    let mut action_major = Vec::new();
+                    if *actions == 1 {
+                        action_major.resize(combos, 1.0);
+                    } else {
+                        let mut denominators = Vec::new();
+                        average_strategies_action_major_into(
+                            &node.strategy_sum,
+                            combos,
+                            *actions,
+                            &mut action_major,
+                            &mut denominators,
+                        );
+                    }
+                    (
+                        NodeLocalSolutionNodeKind::Decision,
+                        public_actions,
+                        Some(NodeLocalStrategySnapshot {
+                            player: *player,
+                            combos,
+                            actions: *actions,
+                            action_major,
+                        }),
+                    )
+                }
+                NodeLocalKind::Chance => (NodeLocalSolutionNodeKind::Chance, Vec::new(), None),
+                NodeLocalKind::Terminal { reason, .. } => (
+                    NodeLocalSolutionNodeKind::Terminal { reason: *reason },
+                    Vec::new(),
+                    None,
+                ),
+            };
+            nodes.push(NodeLocalSolutionNode {
+                id,
+                public_node: node.public_node,
+                board: node.board.clone(),
+                street: public_node.state.street,
+                pot: node.pot,
+                player: public_node.state.player,
+                kind,
+                children: node.children.clone(),
+                actions,
+                strategy,
+            });
+        }
+        NodeLocalSolutionSnapshot {
+            iterations: self.completed_iterations,
+            oop_combos: self.oop_combos.clone(),
+            ip_combos: self.ip_combos.clone(),
+            nodes,
+        }
     }
 
     fn worker_scratch_pool_index(&self) -> usize {

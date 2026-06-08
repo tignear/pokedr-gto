@@ -1,15 +1,25 @@
+use axum::{
+    Json, Router,
+    extract::{Path, State},
+    http::StatusCode,
+    response::IntoResponse,
+    routing::get,
+};
 use clap::{Parser, Subcommand};
 use pokedr_agent::{FlopTreeRequest, build_flop_tree};
 use pokedr_core::{
-    ActionAbstraction, ActionKind, Board, CfrStorageConfig, ChanceExpansion, NodeLocalCfrSolver,
-    Player, PublicNodeKind, PublicTree, RangeSpec, RealCfrAverageStrategy, RealCfrConfig,
-    RealCfrVariant, Spot, Street, TreeBuilder, TreeTemplate, fixed_flop_future_board_isomorphism,
+    ActionAbstraction, ActionKind, Board, CfrStorageConfig, ChanceExpansion, ComboWeight,
+    NodeLocalCfrSolver, NodeLocalSolutionNodeKind, NodeLocalSolutionSnapshot, Player,
+    PublicNodeKind, PublicTree, RangeSpec, RealCfrAverageStrategy, RealCfrConfig, RealCfrVariant,
+    Spot, Street, TreeBuilder, TreeTemplate, fixed_flop_future_board_isomorphism,
     full_deck_future_board_isomorphism_survey, plan_cfr_work,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::Instant;
+use tower_http::services::{ServeDir, ServeFile};
 use tracing::info;
 
 #[derive(Debug, Parser)]
@@ -93,6 +103,53 @@ enum Command {
         dcfr_beta: Option<f32>,
         #[arg(long)]
         dcfr_gamma: Option<f32>,
+    },
+    #[command(about = "Solve a fixed flop and serve an interactive solution viewer")]
+    Viewer {
+        #[arg(required_unless_present = "config")]
+        flop: Option<String>,
+        #[arg(long)]
+        config: Vec<PathBuf>,
+        #[arg(long)]
+        pot: Option<u32>,
+        #[arg(long)]
+        effective_stack: Option<u32>,
+        #[arg(long)]
+        oop_range: Option<String>,
+        #[arg(long)]
+        ip_range: Option<String>,
+        #[arg(long)]
+        first_player: Option<String>,
+        #[arg(long)]
+        tree_preset: Option<String>,
+        #[arg(long)]
+        enumerate_chance: bool,
+        #[arg(long)]
+        iterations: Option<u32>,
+        #[arg(long)]
+        threads: Option<usize>,
+        #[arg(long)]
+        log_interval: Option<u32>,
+        #[arg(long)]
+        exploitability_interval: Option<u32>,
+        #[arg(long)]
+        target_exploitability_bb100: Option<f32>,
+        #[arg(long)]
+        variant: Option<String>,
+        #[arg(long)]
+        average_strategy: Option<String>,
+        #[arg(long)]
+        dcfr_alpha: Option<f32>,
+        #[arg(long)]
+        dcfr_beta: Option<f32>,
+        #[arg(long)]
+        dcfr_gamma: Option<f32>,
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+        #[arg(long, default_value_t = 5174)]
+        port: u16,
+        #[arg(long, default_value = "viewer/dist")]
+        assets: PathBuf,
     },
     #[command(about = "Inspect exact future-board suit isomorphism for a fixed flop and ranges")]
     BoardIsomorphism {
@@ -228,6 +285,67 @@ fn main() -> Result<(), String> {
                     average_strategy: solver_options.average_strategy,
                 },
             )?;
+        }
+        Command::Viewer {
+            flop,
+            config,
+            pot,
+            effective_stack,
+            oop_range,
+            ip_range,
+            first_player,
+            tree_preset,
+            enumerate_chance,
+            iterations,
+            threads,
+            log_interval,
+            exploitability_interval,
+            target_exploitability_bb100,
+            variant,
+            average_strategy,
+            dcfr_alpha,
+            dcfr_beta,
+            dcfr_gamma,
+            host,
+            port,
+            assets,
+        } => {
+            let config = load_config(&config)?;
+            init_logging(log_level.as_deref(), &config)?;
+            let spot = resolve_spot_options(
+                &config,
+                SpotCliOverrides {
+                    flop,
+                    pot,
+                    effective_stack,
+                    oop_range,
+                    ip_range,
+                    first_player,
+                },
+            )?;
+            let tree_options = resolve_tree_options(&config, tree_preset, enumerate_chance);
+            let solver_options = resolve_solver_options(
+                &config,
+                SolverCliOverrides {
+                    iterations,
+                    threads,
+                    log_interval,
+                    exploitability_interval,
+                    target_exploitability_bb100,
+                    variant,
+                    average_strategy,
+                    dcfr_alpha,
+                    dcfr_beta,
+                    dcfr_gamma,
+                },
+            )?;
+            let request = flop_tree_request(&spot, &tree_options.tree_preset)?;
+            log_config(config.source.as_deref(), &spot, &tree_options);
+            log_solver_config(&solver_options);
+            let tree = build_tree(request.clone(), tree_options.enumerate_chance)?;
+            log_tree_summary(&tree, &request);
+            let solution = solve_for_viewer(tree, request, &solver_options)?;
+            serve_viewer(solution, host, port, assets)?;
         }
         Command::BoardIsomorphism {
             flop,
@@ -813,6 +931,338 @@ fn solve_flop(
     Ok(())
 }
 
+fn solve_for_viewer(
+    tree: PublicTree,
+    request: FlopTreeRequest,
+    options: &SolverOptions,
+) -> Result<ViewerSolution, String> {
+    info!(
+        flop = %tree.spot.board,
+        variant = %format_cfr_variant(options.variant),
+        average_strategy = format_average_strategy(options.average_strategy),
+        iterations = options.iterations,
+        threads = options.threads,
+        "viewer_solve_start"
+    );
+    let started = Instant::now();
+    let mut solver =
+        NodeLocalCfrSolver::new(tree, request.oop_range.clone(), request.ip_range.clone())?;
+    let summary = solver.run_with_progress(
+        RealCfrConfig {
+            iterations: options.iterations,
+            variant: options.variant,
+            average_strategy: options.average_strategy,
+        },
+        |progress| {
+            if options.log_interval > 0
+                && (progress.iteration == 1
+                    || progress.iteration == options.iterations
+                    || progress.iteration % options.log_interval == 0)
+            {
+                info!(
+                    iteration = progress.iteration,
+                    terminal_evals = progress.terminal_evals,
+                    iteration_ms = progress.elapsed_ms,
+                    oop_pass_value = progress.oop_update_pass_value,
+                    ip_pass_value = progress.ip_update_pass_value,
+                    "viewer_solve_progress"
+                );
+            }
+        },
+    )?;
+    let exploitability =
+        if options.exploitability_interval > 0 || options.target_exploitability_bb100.is_some() {
+            Some(solver.exploitability(options.threads)?)
+        } else {
+            None
+        };
+    let snapshot = solver.solution_snapshot();
+    info!(
+        iterations = summary.iterations,
+        nodes = snapshot.nodes.len(),
+        storage_gib = summary.storage_gib,
+        total_elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+        "viewer_solve_finish"
+    );
+    Ok(viewer_solution_from_snapshot(
+        snapshot,
+        request,
+        summary,
+        exploitability.map(|value| value.exploitability_bb_per_100),
+        started.elapsed().as_secs_f64() * 1000.0,
+    ))
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ViewerSolution {
+    summary: ViewerSummary,
+    oop_combos: Vec<ViewerCombo>,
+    ip_combos: Vec<ViewerCombo>,
+    nodes: Vec<ViewerNode>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ViewerSummary {
+    board: String,
+    pot_bb: f32,
+    effective_stack_bb: f32,
+    first_player: String,
+    iterations: u32,
+    solver_elapsed_ms: f64,
+    storage_gib: f64,
+    exploitability_bb_per_100: Option<f32>,
+    nodes: usize,
+    decision_states: usize,
+    action_slots: usize,
+    oop_combos: usize,
+    ip_combos: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ViewerCombo {
+    index: usize,
+    label: String,
+    class: String,
+    weight: f32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ViewerNode {
+    id: usize,
+    public_node: usize,
+    board: String,
+    street: String,
+    pot_bb: f32,
+    player: String,
+    kind: String,
+    children: Vec<usize>,
+    actions: Vec<ViewerAction>,
+    strategy: Option<ViewerStrategy>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ViewerNodeListItem {
+    id: usize,
+    public_node: usize,
+    board: String,
+    street: String,
+    pot_bb: f32,
+    player: String,
+    kind: String,
+    children: Vec<usize>,
+    actions: Vec<ViewerAction>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ViewerAction {
+    index: usize,
+    label: String,
+    child: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ViewerStrategy {
+    player: String,
+    combos: usize,
+    actions: usize,
+    action_major: Vec<f32>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ViewerCombos {
+    oop: Vec<ViewerCombo>,
+    ip: Vec<ViewerCombo>,
+}
+
+fn viewer_solution_from_snapshot(
+    snapshot: NodeLocalSolutionSnapshot,
+    request: FlopTreeRequest,
+    summary: pokedr_core::NodeLocalCfrSummary,
+    exploitability_bb_per_100: Option<f32>,
+    solver_elapsed_ms: f64,
+) -> ViewerSolution {
+    let oop_combos = viewer_combos(&snapshot.oop_combos);
+    let ip_combos = viewer_combos(&snapshot.ip_combos);
+    let nodes = snapshot
+        .nodes
+        .into_iter()
+        .map(|node| {
+            let actions = node
+                .actions
+                .iter()
+                .enumerate()
+                .map(|(index, action)| ViewerAction {
+                    index,
+                    label: format_action(action),
+                    child: node.children.get(index).copied(),
+                })
+                .collect::<Vec<_>>();
+            let kind = match node.kind {
+                NodeLocalSolutionNodeKind::Decision => "decision".to_string(),
+                NodeLocalSolutionNodeKind::Chance => "chance".to_string(),
+                NodeLocalSolutionNodeKind::Terminal { reason } => {
+                    format!("terminal:{reason:?}").to_ascii_lowercase()
+                }
+            };
+            ViewerNode {
+                id: node.id,
+                public_node: node.public_node,
+                board: node.board.to_string(),
+                street: format!("{:?}", node.street).to_ascii_lowercase(),
+                pot_bb: node.pot as f32 / 100.0,
+                player: format_player(node.player),
+                kind,
+                children: node.children,
+                actions,
+                strategy: node.strategy.map(|strategy| ViewerStrategy {
+                    player: format_player(strategy.player),
+                    combos: strategy.combos,
+                    actions: strategy.actions,
+                    action_major: strategy.action_major,
+                }),
+            }
+        })
+        .collect::<Vec<_>>();
+    ViewerSolution {
+        summary: ViewerSummary {
+            board: request.board.to_string(),
+            pot_bb: request.pot as f32 / 100.0,
+            effective_stack_bb: request.effective_stack as f32 / 100.0,
+            first_player: format_player(request.first_player),
+            iterations: snapshot.iterations,
+            solver_elapsed_ms,
+            storage_gib: summary.storage_gib,
+            exploitability_bb_per_100,
+            nodes: nodes.len(),
+            decision_states: summary.decision_states,
+            action_slots: summary.action_slots,
+            oop_combos: oop_combos.len(),
+            ip_combos: ip_combos.len(),
+        },
+        oop_combos,
+        ip_combos,
+        nodes,
+    }
+}
+
+fn viewer_combos(combos: &[ComboWeight]) -> Vec<ViewerCombo> {
+    combos
+        .iter()
+        .enumerate()
+        .map(|(index, combo)| ViewerCombo {
+            index,
+            label: format!("{}{}", combo.first, combo.second),
+            class: combo_class(combo),
+            weight: combo.weight,
+        })
+        .collect()
+}
+
+fn combo_class(combo: &ComboWeight) -> String {
+    let (high, low) = if combo.first.rank.index() >= combo.second.rank.index() {
+        (combo.first, combo.second)
+    } else {
+        (combo.second, combo.first)
+    };
+    let high_rank = high.to_string().chars().next().unwrap_or('?');
+    let low_rank = low.to_string().chars().next().unwrap_or('?');
+    if high.rank == low.rank {
+        format!("{high_rank}{low_rank}")
+    } else if high.suit == low.suit {
+        format!("{high_rank}{low_rank}s")
+    } else {
+        format!("{high_rank}{low_rank}o")
+    }
+}
+
+#[derive(Clone)]
+struct ViewerState {
+    solution: Arc<ViewerSolution>,
+}
+
+fn serve_viewer(
+    solution: ViewerSolution,
+    host: String,
+    port: u16,
+    assets: PathBuf,
+) -> Result<(), String> {
+    let state = ViewerState {
+        solution: Arc::new(solution),
+    };
+    let api = Router::new()
+        .route("/solution", get(api_solution))
+        .route("/combos", get(api_combos))
+        .route("/summary", get(api_summary))
+        .route("/nodes", get(api_nodes))
+        .route("/node/{id}", get(api_node))
+        .with_state(state);
+    let app = Router::new().nest("/api", api).fallback_service(
+        ServeDir::new(&assets).not_found_service(ServeFile::new(assets.join("index.html"))),
+    );
+    let address = format!("{host}:{port}");
+    info!(url = %format!("http://{address}"), assets = %assets.display(), "viewer_listen");
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| format!("failed to create tokio runtime: {error}"))?;
+    runtime.block_on(async move {
+        let listener = tokio::net::TcpListener::bind(&address)
+            .await
+            .map_err(|error| format!("failed to bind viewer server at {address}: {error}"))?;
+        axum::serve(listener, app)
+            .await
+            .map_err(|error| format!("viewer server failed: {error}"))
+    })
+}
+
+async fn api_summary(State(state): State<ViewerState>) -> Json<ViewerSummary> {
+    Json(state.solution.summary.clone())
+}
+
+async fn api_solution(State(state): State<ViewerState>) -> Json<ViewerSolution> {
+    Json((*state.solution).clone())
+}
+
+async fn api_combos(State(state): State<ViewerState>) -> Json<ViewerCombos> {
+    Json(ViewerCombos {
+        oop: state.solution.oop_combos.clone(),
+        ip: state.solution.ip_combos.clone(),
+    })
+}
+
+async fn api_nodes(State(state): State<ViewerState>) -> Json<Vec<ViewerNodeListItem>> {
+    Json(
+        state
+            .solution
+            .nodes
+            .iter()
+            .map(|node| ViewerNodeListItem {
+                id: node.id,
+                public_node: node.public_node,
+                board: node.board.clone(),
+                street: node.street.clone(),
+                pot_bb: node.pot_bb,
+                player: node.player.clone(),
+                kind: node.kind.clone(),
+                children: node.children.clone(),
+                actions: node.actions.clone(),
+            })
+            .collect(),
+    )
+}
+
+async fn api_node(Path(id): Path<usize>, State(state): State<ViewerState>) -> impl IntoResponse {
+    if let Some(node) = state.solution.nodes.get(id) {
+        Json(node.clone()).into_response()
+    } else {
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": format!("unknown node {id}") })),
+        )
+            .into_response()
+    }
+}
+
 fn build_tree(request: FlopTreeRequest, enumerate_chance: bool) -> Result<PublicTree, String> {
     if enumerate_chance {
         let template = TreeTemplate {
@@ -1009,6 +1459,14 @@ fn parse_player(value: &str) -> Result<Player, String> {
         "ip" => Ok(Player::Ip),
         _ => Err(format!("invalid player {value:?}; expected oop or ip")),
     }
+}
+
+fn format_player(player: Player) -> String {
+    match player {
+        Player::Oop => "oop",
+        Player::Ip => "ip",
+    }
+    .to_string()
 }
 
 fn parse_cfr_variant(
