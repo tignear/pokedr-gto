@@ -494,22 +494,39 @@ fn main() -> Result<(), String> {
                     RangeSpec::from_str(&oop_range)?,
                     RangeSpec::from_str(&ip_range)?,
                 )?;
-                let summary = if iterations > 0 {
-                    solver.run_with_progress(
+                let mut completed = 0u32;
+                let exploitability_interval = if real_cfr_exploitability_interval > 0 {
+                    real_cfr_exploitability_interval
+                } else if real_cfr_target_exploitability_bb100.is_some() {
+                    real_cfr_log_interval.max(16)
+                } else {
+                    0
+                };
+                let mut summary = solver.summary();
+                while completed < iterations {
+                    let remaining = iterations - completed;
+                    let chunk = if exploitability_interval > 0 {
+                        remaining.min(exploitability_interval)
+                    } else {
+                        remaining
+                    };
+                    let chunk_start = completed;
+                    summary = solver.run_with_progress(
                         RealCfrConfig {
-                            iterations,
+                            iterations: chunk,
                             variant: real_cfr_variant,
                             average_strategy: real_cfr_average_strategy,
                         },
                         |progress| {
+                            let global_iteration = chunk_start + progress.iteration;
                             if real_cfr_log_interval > 0
-                                && (progress.iteration == 1
-                                    || progress.iteration == iterations
-                                    || progress.iteration % real_cfr_log_interval == 0)
+                                && (global_iteration == 1
+                                    || global_iteration == iterations
+                                    || global_iteration % real_cfr_log_interval == 0)
                             {
                                 println!(
                                     "node_cfr_progress iteration={} terminal_evals={} iteration_ms={:.3} oop_pass_value={:.6} ip_pass_value={:.6}",
-                                    progress.iteration,
+                                    global_iteration,
                                     progress.terminal_evals,
                                     progress.elapsed_ms,
                                     progress.oop_update_pass_value,
@@ -517,10 +534,31 @@ fn main() -> Result<(), String> {
                                 );
                             }
                         },
-                    )?
-                } else {
-                    solver.summary()
-                };
+                    )?;
+                    completed = summary.iterations;
+                    if exploitability_interval > 0 {
+                        let exploitability = solver.exploitability(state_threads)?;
+                        println!(
+                            "node_cfr_exploitability iteration={} profile_oop={:.6} profile_ip={:.6} zero_sum_delta={:.6} oop_br={:.6} ip_br={:.6} oop_gain={:.6} ip_gain={:.6} nash_conv_chips={:.6} exploitability_chips={:.6} exploitability_bb_per_100={:.6}",
+                            completed,
+                            exploitability.profile_oop_value,
+                            exploitability.profile_ip_value,
+                            exploitability.profile_oop_value + exploitability.profile_ip_value,
+                            exploitability.oop_best_response_value,
+                            exploitability.ip_best_response_value,
+                            exploitability.oop_gain,
+                            exploitability.ip_gain,
+                            exploitability.nash_conv_chips,
+                            exploitability.exploitability_chips,
+                            exploitability.exploitability_bb_per_100,
+                        );
+                        if real_cfr_target_exploitability_bb100.is_some_and(|target| {
+                            exploitability.exploitability_bb_per_100 <= target
+                        }) {
+                            break;
+                        }
+                    }
+                }
                 println!(
                     "node_cfr iterations={} states={} decision_states={} action_slots={} terminal_evals={} elapsed_ms={:.3} oop_pass_value={:.6} ip_pass_value={:.6}",
                     summary.iterations,

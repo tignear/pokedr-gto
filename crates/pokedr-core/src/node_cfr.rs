@@ -3,7 +3,9 @@ use crate::isomorphism::{
     all_suit_permutations, next_card_isomorphism, private_combo_permutation_indices,
 };
 use crate::range::{ComboWeight, RangeSpec};
-use crate::real_cfr::{RealCfrAverageStrategy, RealCfrConfig, RealCfrVariant};
+use crate::real_cfr::{
+    RealCfrAverageStrategy, RealCfrConfig, RealCfrExploitability, RealCfrVariant,
+};
 use crate::terminal_cfv::{
     PreparedTerminalBoard, terminal_side_values_prefix_blocker_sorted_board_targets_into,
 };
@@ -179,6 +181,12 @@ enum NodeLocalKind {
         player: Player,
         actions: usize,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NodeLocalEvaluationMode {
+    Profile,
+    BestResponse,
 }
 
 #[derive(Debug, Clone)]
@@ -635,6 +643,90 @@ impl NodeLocalCfrSolver {
             allin_turn_ns: self.profile.allin_turn_ns.load(Ordering::Relaxed),
             allin_river_calls: self.profile.allin_river_calls.load(Ordering::Relaxed),
             allin_river_ns: self.profile.allin_river_ns.load(Ordering::Relaxed),
+        })
+    }
+
+    pub fn exploitability(&self, _threads: usize) -> Result<RealCfrExploitability, String> {
+        let oop_root_reach = self
+            .oop_combos
+            .iter()
+            .map(|combo| combo.weight)
+            .collect::<Vec<_>>();
+        let ip_root_reach = self
+            .ip_combos
+            .iter()
+            .map(|combo| combo.weight)
+            .collect::<Vec<_>>();
+        let mut scratch = NodeLocalScratch::new(self);
+        let mut profile_oop = vec![0.0; self.oop_combos.len()];
+        let mut profile_ip = vec![0.0; self.ip_combos.len()];
+        let mut oop_br = vec![0.0; self.oop_combos.len()];
+        let mut ip_br = vec![0.0; self.ip_combos.len()];
+
+        self.evaluate_side_into(
+            0,
+            Player::Oop,
+            &ip_root_reach,
+            NodeLocalEvaluationMode::Profile,
+            &mut profile_oop,
+            &mut scratch,
+        )?;
+        scratch.side_cache.entries.clear();
+        self.evaluate_side_into(
+            0,
+            Player::Ip,
+            &oop_root_reach,
+            NodeLocalEvaluationMode::Profile,
+            &mut profile_ip,
+            &mut scratch,
+        )?;
+        scratch.side_cache.entries.clear();
+        self.evaluate_side_into(
+            0,
+            Player::Oop,
+            &ip_root_reach,
+            NodeLocalEvaluationMode::BestResponse,
+            &mut oop_br,
+            &mut scratch,
+        )?;
+        scratch.side_cache.entries.clear();
+        self.evaluate_side_into(
+            0,
+            Player::Ip,
+            &oop_root_reach,
+            NodeLocalEvaluationMode::BestResponse,
+            &mut ip_br,
+            &mut scratch,
+        )?;
+
+        let oop_weight = self
+            .oop_combos
+            .iter()
+            .map(|combo| combo.weight)
+            .sum::<f32>();
+        let ip_weight = self.ip_combos.iter().map(|combo| combo.weight).sum::<f32>();
+        let profile_oop_value =
+            weighted_average(&profile_oop, &self.oop_combos, oop_weight, ip_weight);
+        let profile_ip_value =
+            weighted_average(&profile_ip, &self.ip_combos, ip_weight, oop_weight);
+        let oop_best_response_value =
+            weighted_average(&oop_br, &self.oop_combos, oop_weight, ip_weight);
+        let ip_best_response_value =
+            weighted_average(&ip_br, &self.ip_combos, ip_weight, oop_weight);
+        let oop_gain = (oop_best_response_value - profile_oop_value).max(0.0);
+        let ip_gain = (ip_best_response_value - profile_ip_value).max(0.0);
+        let nash_conv_chips = oop_gain + ip_gain;
+        let exploitability_chips = nash_conv_chips * 0.5;
+        Ok(RealCfrExploitability {
+            profile_oop_value,
+            profile_ip_value,
+            oop_best_response_value,
+            ip_best_response_value,
+            oop_gain,
+            ip_gain,
+            nash_conv_chips,
+            exploitability_chips,
+            exploitability_bb_per_100: exploitability_chips,
         })
     }
 
@@ -1153,6 +1245,161 @@ impl NodeLocalCfrSolver {
                     actions,
                     &factors,
                 );
+                scratch.action_values = action_values;
+                scratch.strategies = strategies;
+                scratch.denominators = denominators;
+                Ok(terminal_evals)
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn evaluate_side_into(
+        &self,
+        node_index: usize,
+        value_player: Player,
+        opponent_reach: &[f32],
+        mode: NodeLocalEvaluationMode,
+        out: &mut [f32],
+        scratch: &mut NodeLocalScratch,
+    ) -> Result<usize, String> {
+        let node = self.nodes[node_index].get();
+        match node.kind {
+            NodeLocalKind::Terminal {
+                reason,
+                folding_player,
+            } => {
+                let empty_own: &[f32] = &[];
+                let (oop_reach, ip_reach) = match value_player {
+                    Player::Oop => (empty_own, opponent_reach),
+                    Player::Ip => (opponent_reach, empty_own),
+                };
+                self.terminal_side_into(
+                    node_index,
+                    value_player,
+                    reason,
+                    folding_player,
+                    oop_reach,
+                    ip_reach,
+                    out,
+                    scratch,
+                )
+            }
+            NodeLocalKind::Chance => {
+                out.fill(0.0);
+                let chance_weight = 1.0 / node.chance_concrete_events as f32;
+                let mut child_values = std::mem::take(&mut scratch.child_values);
+                child_values.resize(out.len(), 0.0);
+                let mut terminal_evals = 0usize;
+                for (action_index, child) in node.children.iter().copied().enumerate() {
+                    terminal_evals += self.evaluate_side_into(
+                        child,
+                        value_player,
+                        opponent_reach,
+                        mode,
+                        &mut child_values,
+                        scratch,
+                    )?;
+                    for code in &node.chance_permutation_codes[action_index] {
+                        let maps = self.combo_permutations.get(code).ok_or_else(|| {
+                            "chance isomorphism permutation is missing combo maps".to_string()
+                        })?;
+                        let source_to_target = match value_player {
+                            Player::Oop => &maps.oop_source_to_target,
+                            Player::Ip => &maps.ip_source_to_target,
+                        };
+                        add_permuted_scaled_slice(
+                            out,
+                            &child_values,
+                            source_to_target,
+                            chance_weight,
+                        );
+                    }
+                }
+                scratch.child_values = child_values;
+                Ok(terminal_evals)
+            }
+            NodeLocalKind::Decision { player, actions } => {
+                if actions == 1 {
+                    return self.evaluate_side_into(
+                        node.children[0],
+                        value_player,
+                        opponent_reach,
+                        mode,
+                        out,
+                        scratch,
+                    );
+                }
+                let acting_combos = match player {
+                    Player::Oop => self.oop_combos.len(),
+                    Player::Ip => self.ip_combos.len(),
+                };
+                let mut strategies = std::mem::take(&mut scratch.strategies);
+                let mut denominators = std::mem::take(&mut scratch.denominators);
+                average_strategies_action_major_into(
+                    &node.strategy_sum,
+                    acting_combos,
+                    actions,
+                    &mut strategies,
+                    &mut denominators,
+                );
+
+                let target_len = out.len();
+                let mut action_values = std::mem::take(&mut scratch.action_values);
+                action_values.resize(actions * target_len, 0.0);
+                let mut terminal_evals = 0usize;
+                if player == value_player {
+                    for action in 0..actions {
+                        terminal_evals += self.evaluate_side_into(
+                            node.children[action],
+                            value_player,
+                            opponent_reach,
+                            mode,
+                            &mut action_values[action * target_len..(action + 1) * target_len],
+                            scratch,
+                        )?;
+                    }
+                    match mode {
+                        NodeLocalEvaluationMode::Profile => combine_acting_action_major_values(
+                            out,
+                            &action_values,
+                            &strategies,
+                            actions,
+                        ),
+                        NodeLocalEvaluationMode::BestResponse => {
+                            combine_best_response_action_major_values(out, &action_values, actions)
+                        }
+                    }
+                } else {
+                    let mut next_opponent = match player {
+                        Player::Oop => std::mem::take(&mut scratch.next_oop),
+                        Player::Ip => std::mem::take(&mut scratch.next_ip),
+                    };
+                    next_opponent.resize(opponent_reach.len(), 0.0);
+                    for action in 0..actions {
+                        strategy_reach_action_major_into(
+                            &mut next_opponent,
+                            opponent_reach,
+                            &strategies,
+                            acting_combos,
+                            actions,
+                            action,
+                        );
+                        terminal_evals += self.evaluate_side_into(
+                            node.children[action],
+                            value_player,
+                            &next_opponent,
+                            mode,
+                            &mut action_values[action * target_len..(action + 1) * target_len],
+                            scratch,
+                        )?;
+                    }
+                    combine_nonacting_action_major_values(out, &action_values, actions);
+                    match player {
+                        Player::Oop => scratch.next_oop = next_opponent,
+                        Player::Ip => scratch.next_ip = next_opponent,
+                    }
+                }
                 scratch.action_values = action_values;
                 scratch.strategies = strategies;
                 scratch.denominators = denominators;
@@ -1765,6 +2012,36 @@ fn current_strategies_action_major_into(
     }
 }
 
+fn average_strategies_action_major_into(
+    strategy_sum: &[f32],
+    combos: usize,
+    actions: usize,
+    strategies: &mut Vec<f32>,
+    denominators: &mut Vec<f32>,
+) {
+    strategies.resize(strategy_sum.len(), 0.0);
+    denominators.resize(combos, 0.0);
+    denominators.fill(0.0);
+    strategies.copy_from_slice(strategy_sum);
+    for action in 0..actions {
+        let row = &strategies[action * combos..(action + 1) * combos];
+        for (denominator, value) in denominators.iter_mut().zip(row) {
+            *denominator += *value;
+        }
+    }
+    let uniform = 1.0 / actions as f32;
+    for action in 0..actions {
+        let row = &mut strategies[action * combos..(action + 1) * combos];
+        for (strategy, denominator) in row.iter_mut().zip(denominators.iter().copied()) {
+            if denominator > 0.0 {
+                *strategy /= denominator;
+            } else {
+                *strategy = uniform;
+            }
+        }
+    }
+}
+
 fn strategy_reach_action_major_into(
     out: &mut [f32],
     reach: &[f32],
@@ -1793,6 +2070,32 @@ fn combine_acting_action_major_values(
         for ((out, value), strategy) in out.iter_mut().zip(value_row).zip(strategy_row) {
             *out += *value * *strategy;
         }
+    }
+}
+
+fn combine_best_response_action_major_values(
+    out: &mut [f32],
+    action_values: &[f32],
+    actions: usize,
+) {
+    let combos = out.len();
+    for combo in 0..combos {
+        let mut best = f32::NEG_INFINITY;
+        for action in 0..actions {
+            best = best.max(action_values[action * combos + combo]);
+        }
+        out[combo] = best;
+    }
+}
+
+fn combine_nonacting_action_major_values(out: &mut [f32], action_values: &[f32], actions: usize) {
+    let combos = out.len();
+    for combo in 0..combos {
+        let mut value = 0.0;
+        for action in 0..actions {
+            value += action_values[action * combos + combo];
+        }
+        out[combo] = value;
     }
 }
 
@@ -2612,6 +2915,44 @@ mod tests {
         assert!(summary.terminal_evals > 0);
         assert!(summary.oop_update_pass_value.is_finite());
         assert!(summary.ip_update_pass_value.is_finite());
+    }
+
+    #[test]
+    fn node_local_exploitability_runs_on_small_ranges() {
+        let board = Board::from_str("As7h2c").unwrap();
+        let oop_range = RangeSpec::from_str("AcAd,KcKd").unwrap();
+        let ip_range = RangeSpec::from_str("QcQd,JcJd").unwrap();
+        let tree = TreeBuilder::new(TreeTemplate {
+            action_abstraction: tiny_checkdown_abstraction(),
+            chance_expansion: ChanceExpansion::Enumerate,
+        })
+        .unwrap()
+        .build(Spot {
+            board,
+            pot: 200,
+            effective_stack: 900,
+            oop_range: oop_range.clone(),
+            ip_range: ip_range.clone(),
+            first_player: Player::Oop,
+        })
+        .unwrap();
+        let mut solver = NodeLocalCfrSolver::new(tree, oop_range, ip_range).unwrap();
+        solver
+            .run_with_progress(
+                RealCfrConfig {
+                    iterations: 1,
+                    variant: RealCfrVariant::CfrPlus,
+                    average_strategy: RealCfrAverageStrategy::ReachWeighted,
+                },
+                |_| {},
+            )
+            .unwrap();
+        let exploitability = solver.exploitability(1).unwrap();
+        assert!(exploitability.profile_oop_value.is_finite());
+        assert!(exploitability.profile_ip_value.is_finite());
+        assert!(exploitability.exploitability_bb_per_100.is_finite());
+        assert!(exploitability.oop_gain >= 0.0);
+        assert!(exploitability.ip_gain >= 0.0);
     }
 
     #[test]

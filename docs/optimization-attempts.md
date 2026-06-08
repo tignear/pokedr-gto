@@ -1256,3 +1256,28 @@ retrying similar ideas, so attempts stay in chronological order.
 - Takeaway: this brings the benchmark to effectively the reference solver's
   current measured runtime (`postflop-solver solve_ms=1210.231`) while keeping
   exact terminal values.
+
+## 2026-06-08: Node-local target exploitability timing
+
+- Added exact node-local profile/BR exploitability evaluation and wired
+  `solve-flop --run-node-cfr` to run in chunks with
+  `--real-cfr-exploitability-interval` and stop at
+  `--real-cfr-target-exploitability-bb100`.
+- Correctness smoke: `cargo check -p pokedr-core -p pokedr-cli` and
+  `cargo test -p pokedr-core node_local_exploitability_runs_on_small_ranges`
+  pass.
+- Result on the reference-comparison setup (`Td9d6h`, postflop-basic,
+  pot `200`, effective `900`, expanded UTG-vs-BU ranges from
+  `/tmp/postflop_flop_ranges.txt`, `dcfr-plus`, exploitability checked every
+  16 iterations):
+  - iteration 16: `exploitability_bb_per_100=6.725761`;
+  - iteration 32: `exploitability_bb_per_100=2.155312`;
+  - iteration 48: `exploitability_bb_per_100=0.946308`.
+- Time to the 1BB/100 target with the already-built release binary:
+  `total_elapsed_ms=8115.863`. The last 16-iteration CFR chunk reported
+  `node_cfr elapsed_ms=1267.226`; the rest is solver construction plus three
+  exact exploitability evaluations.
+- Takeaway: this setup reaches 1BB/100 in 48 iterations and about 8.1s wall
+  time including exact BR checks. Exploitability evaluation is currently serial
+  in the node-local path, so it is now part of the measurement overhead if the
+  interval is small.
