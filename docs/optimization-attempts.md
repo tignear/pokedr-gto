@@ -790,3 +790,47 @@ retrying similar ideas, so attempts stay in chronological order.
   bypass. Cache lookup/hash/`Arc` overhead is not the current reference gap.
   The remaining gap is more likely action tree/state shape and node-local
   traversal overhead than the terminal blocker-subtraction math itself.
+
+## 2026-06-08: Arena decision-child parallel recursion
+
+- Tried: copy the reference solver's broad child-parallel idea by splitting
+  flop/turn decision children into disjoint subtree storage ranges and running
+  them with `rayon::join`. Parent regret/strategy updates stayed after child
+  values returned, so the math was intended to be exact.
+- Expected: close part of the gap to `postflop-solver`, whose
+  `for_each_child` runs nodes with undealt river cards in parallel.
+- Result: reverted. Correctness was repairable after fixing a local
+  action-row indexing bug, but performance was much worse. On `Td9d6h` UTG vs
+  BU, `4` release arena iterations with `16` threads moved from about
+  `1.47s` to about `4.85s`; iteration 1 was about `1.41s`.
+- Reason: this implementation created fresh terminal scratch, side caches, and
+  child value buffers per decision task. That destroys terminal side-value
+  reuse and adds allocator/task overhead at many small branching points. The
+  reference implementation's parallel child traversal is paired with its
+  node-local storage and allocator model; copying the split point alone is not
+  enough.
+- Takeaway: do not retry decision-child parallel recursion in the arena shape.
+  If broad child parallelism is revisited, it needs worker-local persistent
+  scratch/cache and a traversal layout designed around that from the start.
+
+## 2026-06-08: Arena vs `postflop-solver` reference gap
+
+- Baseline: `Td9d6h`, UTG vs BU ranges from `postflop-solver`, pot `200`,
+  effective stack `900`, `postflop-basic`, uncompressed f32 storage.
+- Reference (`/tmp/postflop-solver/examples/bench_flop_16.rs`):
+  - `RAYON_NUM_THREADS=1`: `7724.364ms / 16 = 482.773ms/iter`.
+  - default rayon threads: `1127.811ms / 16 = 70.488ms/iter`.
+  - reported memory: `0.671631 GiB` f32.
+- Current arena CFR:
+  - `--state-threads 1`, `4` iterations: first/last iteration about
+    `1687ms` / `2205ms`.
+  - `--state-threads 16`, `16` iterations: `6716.006ms / 16 =
+    419.750ms/iter`.
+  - reported storage: `0.611 GiB`, `399291` states, `163287` decision states,
+    `82064240` action slots, `355288` terminal evals per iteration.
+- Interpretation: this is not just a missing thread-count knob. Single-thread
+  arena traversal is roughly `3-4x` slower than the reference, and parallel
+  scaling is also weaker. The profile shows large repeated decision work:
+  `326574` strategy builds and `164128480` reach scratch writes per iteration.
+  The next structural target is reducing decision-local strategy/reach/action
+  value materialization, not another terminal-cache variant.

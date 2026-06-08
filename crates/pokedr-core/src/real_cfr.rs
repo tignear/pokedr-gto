@@ -349,6 +349,16 @@ impl RecursiveTerminalScratch {
         }
     }
 
+    fn take_vec_dirty(&mut self, len: usize) -> Vec<f32> {
+        match self.vectors.pop() {
+            Some(mut values) => {
+                values.resize(len, 0.0);
+                values
+            }
+            None => vec![0.0; len],
+        }
+    }
+
     fn release_vec(&mut self, values: Vec<f32>) {
         self.vectors.push(values);
     }
@@ -366,6 +376,11 @@ struct RecursiveCfrProfile {
     strategy_builds: u64,
     reach_scratch_writes: u64,
     values_zero: u64,
+    terminal_ns: u128,
+    strategy_ns: u128,
+    reach_ns: u128,
+    child_ns: u128,
+    combine_update_ns: u128,
 }
 
 impl RecursiveCfrProfile {
@@ -379,6 +394,11 @@ impl RecursiveCfrProfile {
         self.strategy_builds += other.strategy_builds;
         self.reach_scratch_writes += other.reach_scratch_writes;
         self.values_zero += other.values_zero;
+        self.terminal_ns += other.terminal_ns;
+        self.strategy_ns += other.strategy_ns;
+        self.reach_ns += other.reach_ns;
+        self.child_ns += other.child_ns;
+        self.combine_update_ns += other.combine_update_ns;
     }
 
     fn reset_counts(&mut self) {
@@ -391,6 +411,11 @@ impl RecursiveCfrProfile {
         self.strategy_builds = 0;
         self.reach_scratch_writes = 0;
         self.values_zero = 0;
+        self.terminal_ns = 0;
+        self.strategy_ns = 0;
+        self.reach_ns = 0;
+        self.child_ns = 0;
+        self.combine_update_ns = 0;
     }
 }
 
@@ -904,7 +929,7 @@ impl ArenaAlternatingCfrSolver {
             }
             if profile.enabled {
                 eprintln!(
-                    "arena_cfr_profile iteration={} terminal_calls={} fold_calls={} showdown_calls={} chance_calls={} chance_cards={} decision_calls={} strategy_builds={} reach_scratch_writes={} values_zero={}",
+                    "arena_cfr_profile iteration={} terminal_calls={} fold_calls={} showdown_calls={} chance_calls={} chance_cards={} decision_calls={} strategy_builds={} reach_scratch_writes={} values_zero={} terminal_ms={:.3} strategy_ms={:.3} reach_ms={:.3} child_ms={:.3} combine_update_ms={:.3}",
                     iteration,
                     profile.terminal_calls,
                     profile.fold_calls,
@@ -915,6 +940,11 @@ impl ArenaAlternatingCfrSolver {
                     profile.strategy_builds,
                     profile.reach_scratch_writes,
                     profile.values_zero,
+                    profile.terminal_ns as f64 / 1_000_000.0,
+                    profile.strategy_ns as f64 / 1_000_000.0,
+                    profile.reach_ns as f64 / 1_000_000.0,
+                    profile.child_ns as f64 / 1_000_000.0,
+                    profile.combine_update_ns as f64 / 1_000_000.0,
                 );
                 profile.reset_counts();
             }
@@ -1122,20 +1152,27 @@ fn arena_traverse_update_side_into(
 ) -> Result<usize, String> {
     let node_id = ctx.states[state_index].node_id;
     match &ctx.tree.nodes[node_id].kind {
-        PublicNodeKind::Terminal { reason } => arena_terminal_side_into(
-            ctx,
-            out,
-            state_index,
-            update_player,
-            ctx.tree.nodes[node_id].state.pot,
-            ctx.tree.nodes[node_id].state.player,
-            *reason,
-            oop_reach,
-            ip_reach,
-            terminal_scratch,
-            side_cache,
-            profile,
-        ),
+        PublicNodeKind::Terminal { reason } => {
+            let started = profile.enabled.then(Instant::now);
+            let result = arena_terminal_side_into(
+                ctx,
+                out,
+                state_index,
+                update_player,
+                ctx.tree.nodes[node_id].state.pot,
+                ctx.tree.nodes[node_id].state.player,
+                *reason,
+                oop_reach,
+                ip_reach,
+                terminal_scratch,
+                side_cache,
+                profile,
+            );
+            if let Some(started) = started {
+                profile.terminal_ns += started.elapsed().as_nanos();
+            }
+            result
+        }
         PublicNodeKind::Chance(_) => {
             if profile.enabled {
                 profile.chance_calls += 1;
@@ -1192,7 +1229,7 @@ fn arena_traverse_update_side_into(
                 return Ok(aggregate.terminal_evals);
             }
 
-            let mut child_values = terminal_scratch.take_vec(out.len());
+            let mut child_values = terminal_scratch.take_vec_dirty(out.len());
             let mut terminal_evals = 0usize;
             for (child_index, permutation_codes) in ctx.states[state_index]
                 .children
@@ -1277,24 +1314,29 @@ fn arena_traverse_update_side_into(
             if local_slot_end > regrets.len() || local_slot_end > strategy_sum.len() {
                 return Err("arena storage slice does not cover subtree infoset".to_string());
             }
-            let mut strategies = terminal_scratch.take_vec(infoset.slots_len);
+            let mut strategies = terminal_scratch.take_vec_dirty(infoset.slots_len);
+            let started = profile.enabled.then(Instant::now);
             current_strategies_into(
                 &regrets[local_slot_start..local_slot_end],
                 acting_combos,
                 actions_len,
                 &mut strategies,
             );
+            if let Some(started) = started {
+                profile.strategy_ns += started.elapsed().as_nanos();
+            }
             if profile.enabled {
                 profile.strategy_builds += 1;
                 profile.values_zero += 1;
             }
             let target_len = out.len();
-            let mut action_values = terminal_scratch.take_vec(actions_len * target_len);
+            let mut action_values = terminal_scratch.take_vec_dirty(actions_len * target_len);
             let mut terminal_evals = 0usize;
             match player {
                 Player::Oop => {
-                    let mut next_oop = terminal_scratch.take_vec(oop_reach.len());
+                    let mut next_oop = terminal_scratch.take_vec_dirty(oop_reach.len());
                     for action_index in 0..actions_len {
+                        let started = profile.enabled.then(Instant::now);
                         strategy_reach_into(
                             &mut next_oop,
                             oop_reach,
@@ -1302,9 +1344,13 @@ fn arena_traverse_update_side_into(
                             actions_len,
                             action_index,
                         );
+                        if let Some(started) = started {
+                            profile.reach_ns += started.elapsed().as_nanos();
+                        }
                         if profile.enabled {
                             profile.reach_scratch_writes += next_oop.len() as u64;
                         }
+                        let started = profile.enabled.then(Instant::now);
                         terminal_evals += arena_traverse_update_side_into(
                             ctx,
                             regrets,
@@ -1323,12 +1369,16 @@ fn arena_traverse_update_side_into(
                             side_cache,
                             profile,
                         )?;
+                        if let Some(started) = started {
+                            profile.child_ns += started.elapsed().as_nanos();
+                        }
                     }
                     terminal_scratch.release_vec(next_oop);
                 }
                 Player::Ip => {
-                    let mut next_ip = terminal_scratch.take_vec(ip_reach.len());
+                    let mut next_ip = terminal_scratch.take_vec_dirty(ip_reach.len());
                     for action_index in 0..actions_len {
+                        let started = profile.enabled.then(Instant::now);
                         strategy_reach_into(
                             &mut next_ip,
                             ip_reach,
@@ -1336,9 +1386,13 @@ fn arena_traverse_update_side_into(
                             actions_len,
                             action_index,
                         );
+                        if let Some(started) = started {
+                            profile.reach_ns += started.elapsed().as_nanos();
+                        }
                         if profile.enabled {
                             profile.reach_scratch_writes += next_ip.len() as u64;
                         }
+                        let started = profile.enabled.then(Instant::now);
                         terminal_evals += arena_traverse_update_side_into(
                             ctx,
                             regrets,
@@ -1357,10 +1411,14 @@ fn arena_traverse_update_side_into(
                             side_cache,
                             profile,
                         )?;
+                        if let Some(started) = started {
+                            profile.child_ns += started.elapsed().as_nanos();
+                        }
                     }
                     terminal_scratch.release_vec(next_ip);
                 }
             }
+            let started = profile.enabled.then(Instant::now);
             if player == update_player {
                 combine_acting_flat_values(out, &action_values, &strategies, actions_len);
                 let own_reach = match player {
@@ -1384,6 +1442,9 @@ fn arena_traverse_update_side_into(
                 }
             } else {
                 combine_nonacting_flat_values(out, &action_values, actions_len);
+            }
+            if let Some(started) = started {
+                profile.combine_update_ns += started.elapsed().as_nanos();
             }
             terminal_scratch.release_vec(strategies);
             terminal_scratch.release_vec(action_values);
@@ -1432,7 +1493,7 @@ fn arena_evaluate_side_into(
         PublicNodeKind::Chance(_) => {
             out.fill(0.0);
             let chance_weight = 1.0f32 / ctx.states[state_index].chance_concrete_events as f32;
-            let mut child_values = terminal_scratch.take_vec(out.len());
+            let mut child_values = terminal_scratch.take_vec_dirty(out.len());
             let mut terminal_evals = 0usize;
             for (child_index, permutation_codes) in ctx.states[state_index]
                 .children
@@ -1500,7 +1561,7 @@ fn arena_evaluate_side_into(
             if slot_end > strategy_sum.len() {
                 return Err("arena strategy sum slice does not cover infoset".to_string());
             }
-            let mut strategies = terminal_scratch.take_vec(infoset.slots_len);
+            let mut strategies = terminal_scratch.take_vec_dirty(infoset.slots_len);
             average_strategies_into(
                 &strategy_sum[slot_start..slot_end],
                 acting_combos,
@@ -1509,7 +1570,7 @@ fn arena_evaluate_side_into(
             );
 
             let target_len = out.len();
-            let mut action_values = terminal_scratch.take_vec(actions_len * target_len);
+            let mut action_values = terminal_scratch.take_vec_dirty(actions_len * target_len);
             let mut terminal_evals = 0usize;
             if player == value_player {
                 for action_index in 0..actions_len {
@@ -1537,7 +1598,7 @@ fn arena_evaluate_side_into(
                     }
                 }
             } else {
-                let mut next_opponent = terminal_scratch.take_vec(opponent_reach.len());
+                let mut next_opponent = terminal_scratch.take_vec_dirty(opponent_reach.len());
                 for action_index in 0..actions_len {
                     strategy_reach_into(
                         &mut next_opponent,
