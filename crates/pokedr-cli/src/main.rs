@@ -212,6 +212,12 @@ fn main() -> Result<(), String> {
                 stats.nodes, stats.decisions, stats.chances, stats.terminals, stats.max_depth
             );
             println!(
+                "tree_by_street flop_decisions={} turn_decisions={} river_decisions={}",
+                stats.decisions_by_street[0],
+                stats.decisions_by_street[1],
+                stats.decisions_by_street[2],
+            );
+            println!(
                 "estimate private_infosets={} action_slots={} private_pairs={} terminal_pair_visits={} memory_regret_strategy_f32_mb={:.1}",
                 estimate.private_infosets,
                 estimate.action_slots,
@@ -555,10 +561,29 @@ fn main() -> Result<(), String> {
                     report.max_parallel_fanout,
                 );
                 println!(
-                    "parallel_cfr_isomorphism concrete_chance_events={} representative_chance_events={} chance_permutation_members={}",
+                    "parallel_cfr_isomorphism concrete_chance_events={} representative_chance_events={} chance_permutation_members={} state_board_street_mismatches={}",
                     report.concrete_chance_events,
                     report.representative_chance_events,
                     report.chance_permutation_members,
+                    report.state_board_street_mismatches,
+                );
+                println!(
+                    "parallel_cfr_by_street flop_decisions={} turn_decisions={} river_decisions={} flop_action_slots={} turn_action_slots={} river_action_slots={}",
+                    report.decision_nodes_by_street[0],
+                    report.decision_nodes_by_street[1],
+                    report.decision_nodes_by_street[2],
+                    report.action_slots_by_street[0],
+                    report.action_slots_by_street[1],
+                    report.action_slots_by_street[2],
+                );
+                println!(
+                    "parallel_cfr_by_board_len flop_decisions={} turn_decisions={} river_decisions={} flop_action_slots={} turn_action_slots={} river_action_slots={}",
+                    report.decision_nodes_by_board_len[0],
+                    report.decision_nodes_by_board_len[1],
+                    report.decision_nodes_by_board_len[2],
+                    report.action_slots_by_board_len[0],
+                    report.action_slots_by_board_len[1],
+                    report.action_slots_by_board_len[2],
                 );
                 println!(
                     "parallel_cfr_storage_gib f32_strategy_regret={:.3} f32_reference_style={:.3}",

@@ -92,6 +92,7 @@ pub struct StreetTemplate {
 #[derive(Debug, Clone, PartialEq)]
 pub struct RaisePolicy {
     pub raise_multiplier: f32,
+    pub raise_sizes: Vec<RaiseSizeSpec>,
     pub max_raises_per_street: u8,
     pub shove_spr_threshold: f32,
     pub shove_commit_fraction: f32,
@@ -112,6 +113,14 @@ pub struct ActionAbstraction {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum BetSizeSpec {
     PotFraction(f32),
+    Geometric { streets: u8, max_pot_fraction: f32 },
+    AllIn,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum RaiseSizeSpec {
+    PotFraction(f32),
+    PreviousBetMultiplier(f32),
     Geometric { streets: u8, max_pot_fraction: f32 },
     AllIn,
 }
@@ -151,6 +160,7 @@ pub struct TreeStats {
     pub chances: usize,
     pub terminals: usize,
     pub max_depth: usize,
+    pub decisions_by_street: [usize; 3],
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -174,6 +184,14 @@ impl Player {
 }
 
 impl Street {
+    pub fn index(self) -> usize {
+        match self {
+            Self::Flop => 0,
+            Self::Turn => 1,
+            Self::River => 2,
+        }
+    }
+
     pub fn from_board_len(cards: usize) -> Option<Self> {
         match cards {
             3 => Some(Self::Flop),
@@ -219,6 +237,7 @@ impl ActionAbstraction {
             },
             raise: RaisePolicy {
                 raise_multiplier: 3.0,
+                raise_sizes: vec![RaiseSizeSpec::PreviousBetMultiplier(3.0)],
                 max_raises_per_street: 2,
                 shove_spr_threshold: 1.5,
                 shove_commit_fraction: 0.70,
@@ -254,6 +273,7 @@ impl ActionAbstraction {
             },
             raise: RaisePolicy {
                 raise_multiplier: 2.5,
+                raise_sizes: vec![RaiseSizeSpec::PreviousBetMultiplier(2.5)],
                 max_raises_per_street: u8::MAX,
                 shove_spr_threshold: 0.0,
                 shove_commit_fraction: 1.0,
@@ -280,6 +300,11 @@ impl TreeBuilder {
         if abstraction.min_bet == 0
             || abstraction.raise.raise_multiplier <= 1.0
             || !abstraction.raise.raise_multiplier.is_finite()
+            || abstraction
+                .raise
+                .raise_sizes
+                .iter()
+                .any(|size| !size.valid())
         {
             return Err(TreeBuildError::InvalidSizing);
         }
@@ -427,9 +452,17 @@ impl TreeBuilder {
             if state.raises_this_street
                 < self.template.action_abstraction.raise.max_raises_per_street
                 && stack > to_call
-                && let Some(raise) = self.raise_action(state)
             {
-                actions.push(raise);
+                for raise in self.raise_actions(state) {
+                    push_unique_action(&mut actions, raise);
+                }
+                let opponent_commit = commit_for(state, state.player.other());
+                actions = merge_bet_actions(
+                    sort_and_dedup_response_actions(actions),
+                    state.pot + to_call.min(stack),
+                    opponent_commit,
+                    self.template.action_abstraction.raise.merging_threshold,
+                );
             }
             return actions;
         }
@@ -485,7 +518,33 @@ impl TreeBuilder {
         self.force_all_in_if_close(state, bet_or_all_in(amount, stack))
     }
 
-    fn raise_action(&self, state: &PublicState) -> Option<ActionKind> {
+    fn raise_actions(&self, state: &PublicState) -> Vec<ActionKind> {
+        let sizes = &self.template.action_abstraction.raise.raise_sizes;
+        let mut actions = Vec::with_capacity(sizes.len().max(1));
+        if sizes.is_empty() {
+            if let Some(action) = self.raise_action_for_size(
+                state,
+                RaiseSizeSpec::PreviousBetMultiplier(
+                    self.template.action_abstraction.raise.raise_multiplier,
+                ),
+            ) {
+                actions.push(action);
+            }
+            return actions;
+        }
+        for size in sizes {
+            if let Some(action) = self.raise_action_for_size(state, *size) {
+                actions.push(action);
+            }
+        }
+        actions
+    }
+
+    fn raise_action_for_size(
+        &self,
+        state: &PublicState,
+        size: RaiseSizeSpec,
+    ) -> Option<ActionKind> {
         let actor_commit = commit_for(state, state.player);
         let opponent_commit = commit_for(state, state.player.other());
         let stack = stack_for(state, state.player);
@@ -494,16 +553,35 @@ impl TreeBuilder {
             + state
                 .last_raise_size
                 .max(self.template.action_abstraction.min_bet);
-        let geometric_to = ((opponent_commit as f32)
-            * self.template.action_abstraction.raise.raise_multiplier)
-            .round() as u32;
-        let target_to = min_raise_to.max(geometric_to);
         let max_to = actor_commit + stack;
+        let pot_after_call = state.pot + to_call.min(stack);
+        let target_to = match size {
+            RaiseSizeSpec::PotFraction(fraction) => {
+                opponent_commit + ((pot_after_call as f32) * fraction).round() as u32
+            }
+            RaiseSizeSpec::PreviousBetMultiplier(multiplier) => {
+                ((opponent_commit as f32) * multiplier).round() as u32
+            }
+            RaiseSizeSpec::Geometric {
+                streets,
+                max_pot_fraction,
+            } => {
+                let additional = geometric_bet_amount(
+                    pot_after_call,
+                    stack.saturating_sub(to_call),
+                    streets_for_raise_geometric(state.street, streets, state.raises_this_street),
+                    max_pot_fraction,
+                    self.template.action_abstraction.min_bet,
+                );
+                opponent_commit + additional
+            }
+            RaiseSizeSpec::AllIn => max_to,
+        }
+        .max(min_raise_to);
         if target_to >= max_to {
             return Some(ActionKind::AllIn { to: max_to });
         }
         let additional = target_to - actor_commit;
-        let pot_after_call = state.pot + to_call.min(stack);
         let remaining_after_raise = stack.saturating_sub(additional);
         let spr_after_raise = if pot_after_call == 0 {
             f32::INFINITY
@@ -534,14 +612,26 @@ impl TreeBuilder {
             return action;
         }
         let actor_commit = commit_for(state, state.player);
+        let opponent_commit = commit_for(state, state.player.other());
         let stack = stack_for(state, state.player);
-        let additional = match action {
-            ActionKind::Bet { amount } => amount,
-            ActionKind::Raise { to } => to.saturating_sub(actor_commit),
+        let (additional, pot_if_called) = match action {
+            ActionKind::Bet { amount } => {
+                (amount, state.pot.saturating_add(amount.saturating_mul(2)))
+            }
+            ActionKind::Raise { to } => {
+                let to_call = opponent_commit.saturating_sub(actor_commit).min(stack);
+                let raise_delta = to.saturating_sub(opponent_commit);
+                (
+                    to.saturating_sub(actor_commit),
+                    state
+                        .pot
+                        .saturating_add(to_call)
+                        .saturating_add(raise_delta.saturating_mul(2)),
+                )
+            }
             ActionKind::AllIn { .. } => return action,
             _ => return action,
         };
-        let pot_if_called = state.pot.saturating_add(additional.saturating_mul(2));
         let remaining = stack.saturating_sub(additional);
         let close_threshold = (pot_if_called as f32 * threshold).round() as u32;
         if remaining <= close_threshold {
@@ -635,11 +725,15 @@ impl PublicTree {
             chances: 0,
             terminals: 0,
             max_depth: 0,
+            decisions_by_street: [0; 3],
         };
         fn visit(tree: &PublicTree, node: usize, depth: usize, stats: &mut TreeStats) {
             stats.max_depth = stats.max_depth.max(depth);
             match tree.nodes[node].kind {
-                PublicNodeKind::Decision { .. } => stats.decisions += 1,
+                PublicNodeKind::Decision { .. } => {
+                    stats.decisions += 1;
+                    stats.decisions_by_street[tree.nodes[node].state.street.index()] += 1;
+                }
                 PublicNodeKind::Chance(_) => stats.chances += 1,
                 PublicNodeKind::Terminal { .. } => stats.terminals += 1,
             }
@@ -728,6 +822,29 @@ fn streets_for_geometric(street: Street, configured: u8) -> u8 {
     }
 }
 
+fn streets_for_raise_geometric(street: Street, configured: u8, raises_this_street: u8) -> u8 {
+    let base = if configured > 0 {
+        configured
+    } else {
+        streets_for_geometric(street, 0)
+    };
+    base.saturating_sub(raises_this_street).max(1)
+}
+
+impl RaiseSizeSpec {
+    fn valid(self) -> bool {
+        match self {
+            Self::PotFraction(value) | Self::PreviousBetMultiplier(value) => {
+                value.is_finite() && value > 0.0
+            }
+            Self::Geometric {
+                max_pot_fraction, ..
+            } => max_pot_fraction.is_finite() || max_pot_fraction.is_infinite(),
+            Self::AllIn => true,
+        }
+    }
+}
+
 fn bet_or_all_in(amount: u32, stack: u32) -> ActionKind {
     if amount >= stack {
         ActionKind::AllIn { to: stack }
@@ -740,6 +857,22 @@ fn push_unique_action(actions: &mut Vec<ActionKind>, action: ActionKind) {
     if !actions.contains(&action) {
         actions.push(action);
     }
+}
+
+fn sort_and_dedup_response_actions(mut actions: Vec<ActionKind>) -> Vec<ActionKind> {
+    fn key(action: &ActionKind) -> (u8, u32) {
+        match *action {
+            ActionKind::Fold => (0, 0),
+            ActionKind::Call { amount } => (1, amount),
+            ActionKind::Raise { to } => (2, to),
+            ActionKind::AllIn { to } => (2, to),
+            ActionKind::Check => (3, 0),
+            ActionKind::Bet { amount } => (4, amount),
+        }
+    }
+    actions.sort_by_key(key);
+    actions.dedup();
+    actions
 }
 
 fn sort_and_dedup_no_call_actions(mut actions: Vec<ActionKind>) -> Vec<ActionKind> {

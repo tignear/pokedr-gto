@@ -1,7 +1,7 @@
 use crate::cards::Board;
 use crate::isomorphism::next_card_isomorphism;
 use crate::range::{ComboWeight, RangeSpec};
-use crate::tree::{Player, PublicNodeKind, PublicTree};
+use crate::tree::{Player, PublicNodeKind, PublicTree, Street};
 use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -11,8 +11,12 @@ pub struct ParallelCfrStorageReport {
     pub chance_nodes: usize,
     pub terminal_nodes: usize,
     pub action_slots: usize,
+    pub action_slots_by_street: [usize; 3],
+    pub action_slots_by_board_len: [usize; 3],
     pub strategy_slots: usize,
     pub regret_slots: usize,
+    pub decision_nodes_by_street: [usize; 3],
+    pub decision_nodes_by_board_len: [usize; 3],
     pub ip_cfvalue_slots: usize,
     pub chance_cfvalue_slots: usize,
     pub scratch_value_slots: usize,
@@ -21,6 +25,7 @@ pub struct ParallelCfrStorageReport {
     pub concrete_chance_events: usize,
     pub representative_chance_events: usize,
     pub chance_permutation_members: usize,
+    pub state_board_street_mismatches: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -246,8 +251,12 @@ fn storage_report(
         chance_nodes: 0,
         terminal_nodes: 0,
         action_slots: 0,
+        action_slots_by_street: [0; 3],
+        action_slots_by_board_len: [0; 3],
         strategy_slots: 0,
         regret_slots: 0,
+        decision_nodes_by_street: [0; 3],
+        decision_nodes_by_board_len: [0; 3],
         ip_cfvalue_slots: 0,
         chance_cfvalue_slots: 0,
         scratch_value_slots: 0,
@@ -256,6 +265,7 @@ fn storage_report(
         concrete_chance_events: 0,
         representative_chance_events: 0,
         chance_permutation_members: 0,
+        state_board_street_mismatches: 0,
     };
     let mut strategy_offset = 0usize;
     let mut regret_offset = 0usize;
@@ -263,6 +273,9 @@ fn storage_report(
     let mut chance_cfvalue_offset = 0usize;
     for state in states {
         let node = &tree.nodes[state.node_id];
+        if state.board.cards().len() != street_board_len(node.state.street) {
+            report.state_board_street_mismatches += 1;
+        }
         report.max_parallel_fanout = report.max_parallel_fanout.max(state.children.len());
         if state.parallel_cut {
             report.parallel_cut_nodes += 1;
@@ -270,12 +283,20 @@ fn storage_report(
         match &node.kind {
             PublicNodeKind::Decision { player, actions } => {
                 report.decision_nodes += 1;
+                report.decision_nodes_by_street[street_index(node.state.street)] += 1;
+                if let Some(board_len_index) = board_len_index(state.board.cards().len()) {
+                    report.decision_nodes_by_board_len[board_len_index] += 1;
+                }
                 let combos = match player {
                     Player::Oop => oop_combos.len(),
                     Player::Ip => ip_combos.len(),
                 };
                 let slots = combos * actions.len();
                 report.action_slots += slots;
+                report.action_slots_by_street[street_index(node.state.street)] += slots;
+                if let Some(board_len_index) = board_len_index(state.board.cards().len()) {
+                    report.action_slots_by_board_len[board_len_index] += slots;
+                }
                 report.strategy_slots += slots;
                 report.regret_slots += slots;
                 strategy_offset += slots;
@@ -312,6 +333,31 @@ fn storage_report(
     debug_assert_eq!(report.ip_cfvalue_slots, ip_cfvalue_offset);
     debug_assert_eq!(report.chance_cfvalue_slots, chance_cfvalue_offset);
     report
+}
+
+fn street_board_len(street: Street) -> usize {
+    match street {
+        Street::Flop => 3,
+        Street::Turn => 4,
+        Street::River => 5,
+    }
+}
+
+fn board_len_index(cards: usize) -> Option<usize> {
+    match cards {
+        3 => Some(0),
+        4 => Some(1),
+        5 => Some(2),
+        _ => None,
+    }
+}
+
+fn street_index(street: Street) -> usize {
+    match street {
+        Street::Flop => 0,
+        Street::Turn => 1,
+        Street::River => 2,
+    }
 }
 
 fn board_key(board: &Board) -> u64 {
