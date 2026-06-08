@@ -57,6 +57,17 @@ pub struct NodeLocalCfrIterationSummary {
     pub ip_update_pass_value: f32,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct NodeLocalStrategyEv {
+    pub board: Board,
+    pub pot: u32,
+    pub oop_value: f32,
+    pub ip_value: f32,
+    pub oop_weight: f32,
+    pub ip_weight: f32,
+    pub terminal_evals: usize,
+}
+
 #[derive(Debug, Clone)]
 pub struct NodeLocalSolutionSnapshot {
     pub iterations: u32,
@@ -809,6 +820,47 @@ impl NodeLocalCfrSolver {
             nash_conv_chips,
             exploitability_chips,
             exploitability_bb_per_100: exploitability_chips,
+        })
+    }
+
+    pub fn strategy_ev_at_node(&self, node_index: usize) -> Result<NodeLocalStrategyEv, String> {
+        let node = self
+            .nodes
+            .get(node_index)
+            .ok_or_else(|| format!("unknown node {node_index}"))?
+            .get();
+        let oop_reach = live_reach_for_board(&self.oop_combos, &node.board);
+        let ip_reach = live_reach_for_board(&self.ip_combos, &node.board);
+        let oop_weight = oop_reach.iter().sum::<f32>();
+        let ip_weight = ip_reach.iter().sum::<f32>();
+        let mut scratch = NodeLocalScratch::new(self);
+        let mut profile_oop = vec![0.0; self.oop_combos.len()];
+        let mut profile_ip = vec![0.0; self.ip_combos.len()];
+        let oop_terminal_evals = self.evaluate_side_into(
+            node_index,
+            Player::Oop,
+            &ip_reach,
+            NodeLocalEvaluationMode::Profile,
+            &mut profile_oop,
+            &mut scratch,
+        )?;
+        scratch.side_cache.entries.clear();
+        let ip_terminal_evals = self.evaluate_side_into(
+            node_index,
+            Player::Ip,
+            &oop_reach,
+            NodeLocalEvaluationMode::Profile,
+            &mut profile_ip,
+            &mut scratch,
+        )?;
+        Ok(NodeLocalStrategyEv {
+            board: node.board.clone(),
+            pot: node.pot,
+            oop_value: weighted_average(&profile_oop, &self.oop_combos, oop_weight, ip_weight),
+            ip_value: weighted_average(&profile_ip, &self.ip_combos, ip_weight, oop_weight),
+            oop_weight,
+            ip_weight,
+            terminal_evals: oop_terminal_evals + ip_terminal_evals,
         })
     }
 
@@ -2828,6 +2880,19 @@ fn weighted_average(
         .map(|(value, combo)| *value * combo.weight)
         .sum::<f32>()
         / (own_total_weight * opponent_total_weight)
+}
+
+fn live_reach_for_board(combos: &[ComboWeight], board: &Board) -> Vec<f32> {
+    combos
+        .iter()
+        .map(|combo| {
+            if board.contains(combo.first) || board.contains(combo.second) {
+                0.0
+            } else {
+                combo.weight
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]

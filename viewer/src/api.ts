@@ -60,6 +60,28 @@ export type ViewerCombos = {
   ip: ViewerCombo[];
 };
 
+export type ViewerEquity = {
+  board: string;
+  pot_bb: number;
+  terminal_boards: number;
+  pair_weight: number;
+  oop_equity: number;
+  ip_equity: number;
+  oop_win_weight: number;
+  ip_win_weight: number;
+  tie_weight: number;
+};
+
+export type ViewerStrategyEv = {
+  board: string;
+  pot_bb: number;
+  oop_ev_bb: number;
+  ip_ev_bb: number;
+  oop_weight: number;
+  ip_weight: number;
+  terminal_evals: number;
+};
+
 export async function fetchSummary(): Promise<ViewerSummary> {
   return fetchJson("/api/summary");
 }
@@ -70,6 +92,14 @@ export async function fetchNode(id: number): Promise<ViewerNode> {
 
 export async function fetchCombos(): Promise<ViewerCombos> {
   return fetchJson("/api/combos");
+}
+
+export async function fetchEquity(id: number): Promise<ViewerEquity> {
+  return fetchJson(`/api/equity/${id}`);
+}
+
+export async function fetchStrategyEv(id: number): Promise<ViewerStrategyEv> {
+  return fetchJson(`/api/strategy-ev/${id}`);
 }
 
 async function fetchJson<T>(url: string): Promise<T> {

@@ -86,6 +86,11 @@ p {
   overflow: hidden;
 }
 
+.nodes {
+  display: flex;
+  flex-direction: column;
+}
+
 .detail {
   border-right: 0;
   border-left: 1px solid #29313a;
@@ -134,18 +139,71 @@ p {
   margin-top: 18px;
 }
 
+.chanceAnalysis {
+  margin-top: 10px;
+  padding: 10px;
+  border: 1px solid #2f3944;
+  border-radius: 6px;
+  background: #1b2026;
+}
+
+.chanceSummary,
+.bucketRow {
+  display: grid;
+  grid-template-columns: 64px minmax(0, 1fr);
+  gap: 8px;
+  align-items: start;
+}
+
+.chanceSummary {
+  margin-bottom: 8px;
+}
+
+.chanceSummary span,
+.bucketRow > span {
+  color: #9aa7b5;
+  font-size: 12px;
+}
+
+.chanceSummary strong {
+  color: #e6edf3;
+}
+
+.bucketRow {
+  margin-top: 7px;
+}
+
+.bucketRow div {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.bucketRow small {
+  padding: 2px 5px;
+  border: 1px solid #35404b;
+  border-radius: 4px;
+  background: #20262d;
+  color: #cbd5df;
+  white-space: nowrap;
+}
+
+.bucketRow strong {
+  color: #e6edf3;
+}
+
 .branchList {
   margin-top: 12px;
-  max-height: calc(66vh - 180px);
+  min-height: 0;
   overflow: auto;
   display: grid;
   gap: 6px;
 }
 
 .branchList button {
-  display: flex;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto 48px;
   align-items: center;
-  justify-content: space-between;
   gap: 8px;
   width: 100%;
   padding: 8px;
@@ -155,6 +213,32 @@ p {
   background: #1b2026;
   text-align: left;
   cursor: pointer;
+}
+
+.branchList button > span:first-child {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.branchEquity {
+  display: grid;
+  gap: 2px;
+  color: #e6edf3;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+.branchEquity span {
+  display: inline-flex;
+  justify-content: flex-end;
+  gap: 5px;
+}
+
+.branchEquity em {
+  color: #9aa7b5;
+  font-style: normal;
+  font-size: 12px;
 }
 
 .branchList button:hover,
@@ -309,6 +393,84 @@ p {
 
 .detail h2:not(:first-child) {
   margin-top: 22px;
+}
+
+.equityPanel {
+  padding: 10px;
+  border: 1px solid #2f3944;
+  border-radius: 6px;
+  background: #1b2026;
+}
+
+.equityBars {
+  display: grid;
+  gap: 8px;
+}
+
+.equityBars div {
+  display: grid;
+  grid-template-columns: 42px 54px minmax(0, 1fr);
+  gap: 8px;
+  align-items: center;
+}
+
+.equityBars span {
+  color: #9aa7b5;
+}
+
+.equityBars strong {
+  color: #e6edf3;
+  text-align: right;
+}
+
+.equityBars i {
+  height: 8px;
+  border-radius: 999px;
+  background:
+    linear-gradient(
+      to right,
+      #69d2a0 0%,
+      #69d2a0 calc(var(--equity) * 100%),
+      #29313a calc(var(--equity) * 100%),
+      #29313a 100%
+    );
+}
+
+.equityMeta {
+  margin-top: 9px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.equityMeta span {
+  padding: 3px 6px;
+  border: 1px solid #35404b;
+  border-radius: 4px;
+  color: #cbd5df;
+  background: #20262d;
+  font-size: 12px;
+}
+
+.strategyEv {
+  margin-top: 10px;
+  display: grid;
+  grid-template-columns: 1fr auto auto;
+  gap: 8px;
+  align-items: center;
+  padding-top: 9px;
+  border-top: 1px solid #2f3944;
+}
+
+.strategyEv span,
+.strategyEv em {
+  color: #9aa7b5;
+  font-style: normal;
+}
+
+.strategyEv strong {
+  color: #e6edf3;
+  font-variant-numeric: tabular-nums;
 }
 
 .actionLabel,

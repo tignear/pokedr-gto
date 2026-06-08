@@ -7,6 +7,7 @@ use axum::{
 };
 use clap::{Parser, Subcommand};
 use pokedr_agent::{FlopTreeRequest, build_flop_tree};
+use pokedr_core::terminal_cfv::PreparedTerminalBoard;
 use pokedr_core::{
     ActionAbstraction, ActionKind, Board, CfrStorageConfig, ChanceExpansion, ComboWeight,
     NodeLocalCfrSolver, NodeLocalSolutionNodeKind, NodeLocalSolutionSnapshot, Player,
@@ -15,9 +16,10 @@ use pokedr_core::{
     full_deck_future_board_isomorphism_survey, plan_cfr_work,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tower_http::services::{ServeDir, ServeFile};
 use tracing::info;
@@ -346,8 +348,8 @@ fn main() -> Result<(), String> {
             log_solver_config(&solver_options);
             let tree = build_tree(request.clone(), tree_options.enumerate_chance)?;
             log_tree_summary(&tree, &request);
-            let solution = solve_for_viewer(tree, request, &solver_options)?;
-            serve_viewer(solution, host, port, assets)?;
+            let viewer = solve_for_viewer(tree, request, &solver_options)?;
+            serve_viewer(viewer, host, port, assets)?;
         }
         Command::BoardIsomorphism {
             flop,
@@ -994,7 +996,7 @@ fn solve_for_viewer(
     tree: PublicTree,
     request: FlopTreeRequest,
     options: &SolverOptions,
-) -> Result<ViewerSolution, String> {
+) -> Result<ViewerBundle, String> {
     info!(
         flop = %tree.spot.board,
         variant = %format_cfr_variant(options.variant),
@@ -1073,13 +1075,14 @@ fn solve_for_viewer(
         total_elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
         "viewer_solve_finish"
     );
-    Ok(viewer_solution_from_snapshot(
+    let solution = viewer_solution_from_snapshot(
         snapshot,
         request,
         summary,
         exploitability.map(|value| value.exploitability_bb_per_100),
         started.elapsed().as_secs_f64() * 1000.0,
-    ))
+    );
+    Ok(ViewerBundle { solution, solver })
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1088,6 +1091,15 @@ struct ViewerSolution {
     oop_combos: Vec<ViewerCombo>,
     ip_combos: Vec<ViewerCombo>,
     nodes: Vec<ViewerNode>,
+    #[serde(skip)]
+    oop_weights: Vec<ComboWeight>,
+    #[serde(skip)]
+    ip_weights: Vec<ComboWeight>,
+}
+
+struct ViewerBundle {
+    solution: ViewerSolution,
+    solver: NodeLocalCfrSolver,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1155,6 +1167,30 @@ struct ViewerStrategy {
 struct ViewerCombos {
     oop: Vec<ViewerCombo>,
     ip: Vec<ViewerCombo>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ViewerEquity {
+    board: String,
+    pot_bb: f32,
+    terminal_boards: usize,
+    pair_weight: f64,
+    oop_equity: f32,
+    ip_equity: f32,
+    oop_win_weight: f64,
+    ip_win_weight: f64,
+    tie_weight: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ViewerStrategyEv {
+    board: String,
+    pot_bb: f32,
+    oop_ev_bb: f32,
+    ip_ev_bb: f32,
+    oop_weight: f32,
+    ip_weight: f32,
+    terminal_evals: usize,
 }
 
 fn viewer_solution_from_snapshot(
@@ -1251,6 +1287,8 @@ fn viewer_solution_from_snapshot(
         },
         oop_combos,
         ip_combos,
+        oop_weights: snapshot.oop_combos,
+        ip_weights: snapshot.ip_combos,
         nodes,
     }
 }
@@ -1288,19 +1326,27 @@ fn combo_class(combo: &ComboWeight) -> String {
 #[derive(Clone)]
 struct ViewerState {
     solution: Arc<ViewerSolution>,
+    solver: Arc<Mutex<NodeLocalCfrSolver>>,
+    equity_cache: Arc<Mutex<HashMap<usize, ViewerEquity>>>,
+    strategy_ev_cache: Arc<Mutex<HashMap<usize, ViewerStrategyEv>>>,
 }
 
 fn serve_viewer(
-    solution: ViewerSolution,
+    viewer: ViewerBundle,
     host: String,
     port: u16,
     assets: PathBuf,
 ) -> Result<(), String> {
     let state = ViewerState {
-        solution: Arc::new(solution),
+        solution: Arc::new(viewer.solution),
+        solver: Arc::new(Mutex::new(viewer.solver)),
+        equity_cache: Arc::new(Mutex::new(HashMap::new())),
+        strategy_ev_cache: Arc::new(Mutex::new(HashMap::new())),
     };
     let api = Router::new()
         .route("/combos", get(api_combos))
+        .route("/equity/{id}", get(api_equity))
+        .route("/strategy-ev/{id}", get(api_strategy_ev))
         .route("/summary", get(api_summary))
         .route("/node/{id}", get(api_node))
         .with_state(state);
@@ -1334,6 +1380,97 @@ async fn api_combos(State(state): State<ViewerState>) -> Json<ViewerCombos> {
     })
 }
 
+async fn api_equity(Path(id): Path<usize>, State(state): State<ViewerState>) -> impl IntoResponse {
+    if let Some(cached) = state
+        .equity_cache
+        .lock()
+        .expect("equity cache poisoned")
+        .get(&id)
+    {
+        return Json(cached.clone()).into_response();
+    }
+    let Some(node) = state.solution.nodes.get(id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": format!("unknown node {id}") })),
+        )
+            .into_response();
+    };
+    let board = match Board::from_str(&node.board) {
+        Ok(board) => board,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": error })),
+            )
+                .into_response();
+        }
+    };
+    match raw_range_equity(
+        &board,
+        node.pot_bb,
+        &state.solution.oop_weights,
+        &state.solution.ip_weights,
+    ) {
+        Ok(equity) => {
+            state
+                .equity_cache
+                .lock()
+                .expect("equity cache poisoned")
+                .insert(id, equity.clone());
+            Json(equity).into_response()
+        }
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": error })),
+        )
+            .into_response(),
+    }
+}
+
+async fn api_strategy_ev(
+    Path(id): Path<usize>,
+    State(state): State<ViewerState>,
+) -> impl IntoResponse {
+    if let Some(cached) = state
+        .strategy_ev_cache
+        .lock()
+        .expect("strategy EV cache poisoned")
+        .get(&id)
+    {
+        return Json(cached.clone()).into_response();
+    }
+    match state
+        .solver
+        .lock()
+        .expect("viewer solver poisoned")
+        .strategy_ev_at_node(id)
+    {
+        Ok(ev) => {
+            let value = ViewerStrategyEv {
+                board: ev.board.to_string(),
+                pot_bb: ev.pot as f32 / 100.0,
+                oop_ev_bb: ev.oop_value / 100.0,
+                ip_ev_bb: ev.ip_value / 100.0,
+                oop_weight: ev.oop_weight,
+                ip_weight: ev.ip_weight,
+                terminal_evals: ev.terminal_evals,
+            };
+            state
+                .strategy_ev_cache
+                .lock()
+                .expect("strategy EV cache poisoned")
+                .insert(id, value.clone());
+            Json(value).into_response()
+        }
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": error })),
+        )
+            .into_response(),
+    }
+}
+
 async fn api_node(Path(id): Path<usize>, State(state): State<ViewerState>) -> impl IntoResponse {
     if let Some(node) = state.solution.nodes.get(id) {
         Json(node.clone()).into_response()
@@ -1344,6 +1481,98 @@ async fn api_node(Path(id): Path<usize>, State(state): State<ViewerState>) -> im
         )
             .into_response()
     }
+}
+
+fn raw_range_equity(
+    board: &Board,
+    pot_bb: f32,
+    oop_combos: &[ComboWeight],
+    ip_combos: &[ComboWeight],
+) -> Result<ViewerEquity, String> {
+    let terminal_boards = viewer_terminal_boards(board)?;
+    let mut oop_win_weight = 0.0f64;
+    let mut ip_win_weight = 0.0f64;
+    let mut tie_weight = 0.0f64;
+
+    for terminal_board in &terminal_boards {
+        let prepared = PreparedTerminalBoard::new(terminal_board)?;
+        for oop in oop_combos {
+            let Some(oop_index) = prepared.combo_index(oop.first, oop.second) else {
+                continue;
+            };
+            for ip in ip_combos {
+                if combos_collide(oop, ip) {
+                    continue;
+                }
+                let Some(ip_index) = prepared.combo_index(ip.first, ip.second) else {
+                    continue;
+                };
+                let weight = (oop.weight as f64) * (ip.weight as f64);
+                if weight == 0.0 {
+                    continue;
+                }
+                let oop_strength = prepared.strength(oop_index);
+                let ip_strength = prepared.strength(ip_index);
+                if oop_strength > ip_strength {
+                    oop_win_weight += weight;
+                } else if oop_strength < ip_strength {
+                    ip_win_weight += weight;
+                } else {
+                    tie_weight += weight;
+                }
+            }
+        }
+    }
+
+    let pair_weight = oop_win_weight + ip_win_weight + tie_weight;
+    let oop_equity = if pair_weight > 0.0 {
+        ((oop_win_weight + tie_weight * 0.5) / pair_weight) as f32
+    } else {
+        0.0
+    };
+    Ok(ViewerEquity {
+        board: board.to_string(),
+        pot_bb,
+        terminal_boards: terminal_boards.len(),
+        pair_weight,
+        oop_equity,
+        ip_equity: 1.0 - oop_equity,
+        oop_win_weight,
+        ip_win_weight,
+        tie_weight,
+    })
+}
+
+fn viewer_terminal_boards(board: &Board) -> Result<Vec<Board>, String> {
+    match board.cards().len() {
+        5 => Ok(vec![board.clone()]),
+        4 => {
+            let deck = board.remaining_deck();
+            let mut boards = Vec::with_capacity(deck.len());
+            for river in deck {
+                boards.push(board.push(river)?);
+            }
+            Ok(boards)
+        }
+        3 => {
+            let deck = board.remaining_deck();
+            let mut boards = Vec::with_capacity(deck.len() * (deck.len() - 1) / 2);
+            for turn in 0..deck.len() {
+                for river in turn + 1..deck.len() {
+                    boards.push(board.push(deck[turn])?.push(deck[river])?);
+                }
+            }
+            Ok(boards)
+        }
+        other => Err(format!("equity board has invalid card count {other}")),
+    }
+}
+
+fn combos_collide(left: &ComboWeight, right: &ComboWeight) -> bool {
+    left.first == right.first
+        || left.first == right.second
+        || left.second == right.first
+        || left.second == right.second
 }
 
 fn build_tree(request: FlopTreeRequest, enumerate_chance: bool) -> Result<PublicTree, String> {

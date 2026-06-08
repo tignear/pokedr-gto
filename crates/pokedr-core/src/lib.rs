@@ -21,7 +21,7 @@ pub use legacy::real_cfr::{
 };
 pub use node_cfr::{
     NodeLocalCfrSolver, NodeLocalCfrSummary, NodeLocalSolutionNode, NodeLocalSolutionNodeKind,
-    NodeLocalSolutionSnapshot, NodeLocalStrategySnapshot,
+    NodeLocalSolutionSnapshot, NodeLocalStrategyEv, NodeLocalStrategySnapshot,
 };
 pub use plan::{CfrStorageConfig, CfrWorkPlan, StreetWorkPlan, TerminalWorkPlan, plan_cfr_work};
 pub use range::{ComboWeight, RangeSpec};
