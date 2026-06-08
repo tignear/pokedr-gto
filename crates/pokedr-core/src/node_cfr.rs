@@ -1288,6 +1288,80 @@ impl NodeLocalCfrSolver {
             NodeLocalKind::Chance => {
                 out.fill(0.0);
                 let chance_weight = 1.0 / node.chance_concrete_events as f32;
+                let target_len = out.len();
+                if should_parallel_node(node, target_len) {
+                    let result = node
+                        .children
+                        .par_iter()
+                        .copied()
+                        .enumerate()
+                        .fold(
+                            || NodeLocalChanceAccumulator::new(self, target_len),
+                            |mut accumulator, (action_index, child)| {
+                                if accumulator.error.is_some() {
+                                    return accumulator;
+                                }
+                                accumulator.child_values.resize(target_len, 0.0);
+                                let Some(local_scratch) = accumulator.scratch.as_mut() else {
+                                    accumulator.error =
+                                        Some("chance accumulator scratch is missing".to_string());
+                                    return accumulator;
+                                };
+                                match self.evaluate_side_into(
+                                    child,
+                                    value_player,
+                                    opponent_reach,
+                                    mode,
+                                    &mut accumulator.child_values,
+                                    local_scratch,
+                                ) {
+                                    Ok(terminal_evals) => {
+                                        accumulator.terminal_evals += terminal_evals;
+                                    }
+                                    Err(error) => {
+                                        accumulator.error = Some(error);
+                                        return accumulator;
+                                    }
+                                }
+                                for code in &node.chance_permutation_codes[action_index] {
+                                    let Some(maps) = self.combo_permutations.get(code) else {
+                                        accumulator.error = Some(
+                                            "chance isomorphism permutation is missing combo maps"
+                                                .to_string(),
+                                        );
+                                        return accumulator;
+                                    };
+                                    let source_to_target = match value_player {
+                                        Player::Oop => &maps.oop_source_to_target,
+                                        Player::Ip => &maps.ip_source_to_target,
+                                    };
+                                    add_permuted_scaled_slice(
+                                        &mut accumulator.out,
+                                        &accumulator.child_values,
+                                        source_to_target,
+                                        chance_weight,
+                                    );
+                                }
+                                accumulator
+                            },
+                        )
+                        .reduce(
+                            || NodeLocalChanceAccumulator::new_empty(target_len),
+                            |mut left, right| {
+                                if left.error.is_none() {
+                                    left.error = right.error;
+                                }
+                                left.terminal_evals += right.terminal_evals;
+                                add_slice(&mut left.out, &right.out);
+                                left
+                            },
+                        );
+                    if let Some(error) = result.error {
+                        return Err(error);
+                    }
+                    out.copy_from_slice(&result.out);
+                    return Ok(result.terminal_evals);
+                }
                 let mut child_values = std::mem::take(&mut scratch.child_values);
                 child_values.resize(out.len(), 0.0);
                 let mut terminal_evals = 0usize;
@@ -1347,18 +1421,41 @@ impl NodeLocalCfrSolver {
                 let target_len = out.len();
                 let mut action_values = std::mem::take(&mut scratch.action_values);
                 action_values.resize(actions * target_len, 0.0);
-                let mut terminal_evals = 0usize;
                 if player == value_player {
-                    for action in 0..actions {
-                        terminal_evals += self.evaluate_side_into(
-                            node.children[action],
-                            value_player,
-                            opponent_reach,
-                            mode,
-                            &mut action_values[action * target_len..(action + 1) * target_len],
-                            scratch,
-                        )?;
-                    }
+                    let terminal_evals = if should_parallel_node(node, target_len) {
+                        action_values
+                            .par_chunks_mut(target_len)
+                            .enumerate()
+                            .map_init(
+                                || PooledNodeLocalScratch::new(self),
+                                |local_scratch, (action, action_out)| {
+                                    self.evaluate_side_into(
+                                        node.children[action],
+                                        value_player,
+                                        opponent_reach,
+                                        mode,
+                                        action_out,
+                                        local_scratch,
+                                    )
+                                },
+                            )
+                            .collect::<Result<Vec<_>, _>>()?
+                            .into_iter()
+                            .sum()
+                    } else {
+                        let mut terminal_evals = 0usize;
+                        for action in 0..actions {
+                            terminal_evals += self.evaluate_side_into(
+                                node.children[action],
+                                value_player,
+                                opponent_reach,
+                                mode,
+                                &mut action_values[action * target_len..(action + 1) * target_len],
+                                scratch,
+                            )?;
+                        }
+                        terminal_evals
+                    };
                     match mode {
                         NodeLocalEvaluationMode::Profile => combine_acting_action_major_values(
                             out,
@@ -1370,12 +1467,54 @@ impl NodeLocalCfrSolver {
                             combine_best_response_action_major_values(out, &action_values, actions)
                         }
                     }
+                    scratch.action_values = action_values;
+                    scratch.strategies = strategies;
+                    scratch.denominators = denominators;
+                    return Ok(terminal_evals);
+                }
+
+                let terminal_evals = if should_parallel_node(node, target_len) {
+                    let results = (0..actions)
+                        .into_par_iter()
+                        .map_init(
+                            || PooledNodeLocalScratch::new(self),
+                            |local_scratch, action| {
+                                let mut child_values = vec![0.0; target_len];
+                                let mut next_opponent = vec![0.0; opponent_reach.len()];
+                                strategy_reach_action_major_into(
+                                    &mut next_opponent,
+                                    opponent_reach,
+                                    &strategies,
+                                    acting_combos,
+                                    actions,
+                                    action,
+                                );
+                                let terminal_evals = self.evaluate_side_into(
+                                    node.children[action],
+                                    value_player,
+                                    &next_opponent,
+                                    mode,
+                                    &mut child_values,
+                                    local_scratch,
+                                )?;
+                                Ok::<_, String>((action, child_values, terminal_evals))
+                            },
+                        )
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let mut terminal_evals = 0usize;
+                    for (action, child_values, child_terminal_evals) in results {
+                        terminal_evals += child_terminal_evals;
+                        action_values[action * target_len..(action + 1) * target_len]
+                            .copy_from_slice(&child_values);
+                    }
+                    terminal_evals
                 } else {
                     let mut next_opponent = match player {
                         Player::Oop => std::mem::take(&mut scratch.next_oop),
                         Player::Ip => std::mem::take(&mut scratch.next_ip),
                     };
                     next_opponent.resize(opponent_reach.len(), 0.0);
+                    let mut terminal_evals = 0usize;
                     for action in 0..actions {
                         strategy_reach_action_major_into(
                             &mut next_opponent,
@@ -1394,12 +1533,13 @@ impl NodeLocalCfrSolver {
                             scratch,
                         )?;
                     }
-                    combine_nonacting_action_major_values(out, &action_values, actions);
                     match player {
                         Player::Oop => scratch.next_oop = next_opponent,
                         Player::Ip => scratch.next_ip = next_opponent,
                     }
-                }
+                    terminal_evals
+                };
+                combine_nonacting_action_major_values(out, &action_values, actions);
                 scratch.action_values = action_values;
                 scratch.strategies = strategies;
                 scratch.denominators = denominators;

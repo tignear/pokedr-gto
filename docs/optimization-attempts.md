@@ -1281,3 +1281,27 @@ retrying similar ideas, so attempts stay in chronological order.
   time including exact BR checks. Exploitability evaluation is currently serial
   in the node-local path, so it is now part of the measurement overhead if the
   interval is small.
+
+## 2026-06-08: Parallel node-local exploitability evaluation
+
+- Parallelized the node-local profile/BR evaluation traversal at the same
+  chance/action cut points used by the update traversal. This does not change
+  CFR updates or terminal values; it only reduces the cost of exact
+  exploitability checks.
+- Correctness smoke: `cargo check -p pokedr-core -p pokedr-cli` and
+  `cargo test -p pokedr-core node_local_exploitability_runs_on_small_ranges`
+  pass.
+- Result on the same reference-comparison setup (`Td9d6h`, postflop-basic,
+  pot `200`, effective `900`, expanded UTG-vs-BU ranges, `dcfr-plus`):
+  - previous 16-iteration exploitability interval run:
+    `total_elapsed_ms=8115.863`;
+  - after parallel evaluation, 16-iteration interval:
+    `total_elapsed_ms=4845.278`, target reached at iteration 48 with
+    `exploitability_bb_per_100=0.947746`;
+  - 32-iteration interval reached target at iteration 64 and was worse:
+    `total_elapsed_ms=6244.566`;
+  - 24-iteration interval reached target at iteration 48 but was not better:
+    `total_elapsed_ms=4869.019`.
+- Takeaway: exact BR checks are no longer the dominant cost for the current
+  1BB/100 timing. The next speed work has to target the 48 CFR iterations
+  themselves or solver construction.
