@@ -34,6 +34,12 @@ CLI configuration:
   concern.
 - `[solver].threads = 0` means auto-detect available CPU parallelism. If
   `threads` is omitted, the CLI also uses auto-detect.
+- `[tree].preset` selects the base action abstraction, and detailed `[tree]`
+  fields can override it. Configurable fields include `min_bet`,
+  street-specific `*_first_bets` / `*_donk_bets`, `raise_sizes`,
+  `max_raises_per_street`, and the all-in/merge thresholds. Sizing tokens are
+  strings such as `"60%"`, `"0.6p"`, `"geo"`, `"allin"`, and `"2.5x"` for
+  raise multipliers. Later config files replace whole sizing arrays.
 
 Range input:
 

@@ -22,6 +22,8 @@ use std::time::Instant;
 use tower_http::services::{ServeDir, ServeFile};
 use tracing::info;
 
+use pokedr_core::tree::{BetSizeSpec, RaiseSizeSpec};
+
 #[derive(Debug, Parser)]
 #[command(name = "pokedr-cli")]
 #[command(about = "Pokedr postflop solver tooling")]
@@ -200,8 +202,8 @@ fn main() -> Result<(), String> {
                     first_player,
                 },
             )?;
-            let tree_options = resolve_tree_options(&config, tree_preset, enumerate_chance);
-            let request = flop_tree_request(&spot, &tree_options.tree_preset)?;
+            let tree_options = resolve_tree_options(&config, tree_preset, enumerate_chance)?;
+            let request = flop_tree_request(&spot, tree_options.action_abstraction.clone())?;
             log_config(config.source.as_deref(), &spot, &tree_options);
             let tree = build_tree(request.clone(), tree_options.enumerate_chance)?;
             print_tree_report(
@@ -249,7 +251,7 @@ fn main() -> Result<(), String> {
                     first_player,
                 },
             )?;
-            let tree_options = resolve_tree_options(&config, tree_preset, enumerate_chance);
+            let tree_options = resolve_tree_options(&config, tree_preset, enumerate_chance)?;
             let solver_options = resolve_solver_options(
                 &config,
                 SolverCliOverrides {
@@ -265,7 +267,7 @@ fn main() -> Result<(), String> {
                     dcfr_gamma,
                 },
             )?;
-            let request = flop_tree_request(&spot, &tree_options.tree_preset)?;
+            let request = flop_tree_request(&spot, tree_options.action_abstraction.clone())?;
             log_config(config.source.as_deref(), &spot, &tree_options);
             log_solver_config(&solver_options);
             let tree = build_tree(request.clone(), tree_options.enumerate_chance)?;
@@ -323,7 +325,7 @@ fn main() -> Result<(), String> {
                     first_player,
                 },
             )?;
-            let tree_options = resolve_tree_options(&config, tree_preset, enumerate_chance);
+            let tree_options = resolve_tree_options(&config, tree_preset, enumerate_chance)?;
             let solver_options = resolve_solver_options(
                 &config,
                 SolverCliOverrides {
@@ -339,7 +341,7 @@ fn main() -> Result<(), String> {
                     dcfr_gamma,
                 },
             )?;
-            let request = flop_tree_request(&spot, &tree_options.tree_preset)?;
+            let request = flop_tree_request(&spot, tree_options.action_abstraction.clone())?;
             log_config(config.source.as_deref(), &spot, &tree_options);
             log_solver_config(&solver_options);
             let tree = build_tree(request.clone(), tree_options.enumerate_chance)?;
@@ -470,6 +472,21 @@ struct TreeConfig {
     preset: Option<String>,
     tree_preset: Option<String>,
     enumerate_chance: Option<bool>,
+    min_bet: Option<u32>,
+    flop_first_bets: Option<Vec<String>>,
+    flop_donk_bets: Option<Vec<String>>,
+    turn_first_bets: Option<Vec<String>>,
+    turn_donk_bets: Option<Vec<String>>,
+    river_first_bets: Option<Vec<String>>,
+    river_donk_bets: Option<Vec<String>>,
+    raise_multiplier: Option<f32>,
+    raise_sizes: Option<Vec<String>>,
+    max_raises_per_street: Option<u8>,
+    shove_spr_threshold: Option<f32>,
+    shove_commit_fraction: Option<f32>,
+    add_all_in_threshold: Option<f32>,
+    force_all_in_threshold: Option<f32>,
+    merging_threshold: Option<f32>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -524,6 +541,24 @@ impl TreeConfig {
         merge_option(&mut self.preset, other.preset);
         merge_option(&mut self.tree_preset, other.tree_preset);
         merge_option(&mut self.enumerate_chance, other.enumerate_chance);
+        merge_option(&mut self.min_bet, other.min_bet);
+        merge_option(&mut self.flop_first_bets, other.flop_first_bets);
+        merge_option(&mut self.flop_donk_bets, other.flop_donk_bets);
+        merge_option(&mut self.turn_first_bets, other.turn_first_bets);
+        merge_option(&mut self.turn_donk_bets, other.turn_donk_bets);
+        merge_option(&mut self.river_first_bets, other.river_first_bets);
+        merge_option(&mut self.river_donk_bets, other.river_donk_bets);
+        merge_option(&mut self.raise_multiplier, other.raise_multiplier);
+        merge_option(&mut self.raise_sizes, other.raise_sizes);
+        merge_option(&mut self.max_raises_per_street, other.max_raises_per_street);
+        merge_option(&mut self.shove_spr_threshold, other.shove_spr_threshold);
+        merge_option(&mut self.shove_commit_fraction, other.shove_commit_fraction);
+        merge_option(&mut self.add_all_in_threshold, other.add_all_in_threshold);
+        merge_option(
+            &mut self.force_all_in_threshold,
+            other.force_all_in_threshold,
+        );
+        merge_option(&mut self.merging_threshold, other.merging_threshold);
     }
 }
 
@@ -620,6 +655,7 @@ struct SpotOptions {
 struct TreeOptions {
     tree_preset: String,
     enumerate_chance: bool,
+    action_abstraction: ActionAbstraction,
 }
 
 #[derive(Debug)]
@@ -709,16 +745,22 @@ fn resolve_tree_options(
     config: &CliConfig,
     cli_tree_preset: Option<String>,
     cli_enumerate_chance: bool,
-) -> TreeOptions {
+) -> Result<TreeOptions, String> {
     let tree = config.tree.as_ref();
-    TreeOptions {
-        tree_preset: cli_tree_preset
-            .or_else(|| tree.and_then(|tree| tree.tree_preset.clone()))
-            .or_else(|| tree.and_then(|tree| tree.preset.clone()))
-            .unwrap_or_else(|| "conservative".to_string()),
+    let tree_preset = cli_tree_preset
+        .or_else(|| tree.and_then(|tree| tree.tree_preset.clone()))
+        .or_else(|| tree.and_then(|tree| tree.preset.clone()))
+        .unwrap_or_else(|| "conservative".to_string());
+    let mut action_abstraction = parse_tree_preset(&tree_preset)?;
+    if let Some(tree) = tree {
+        apply_tree_config_overrides(&mut action_abstraction, tree)?;
+    }
+    Ok(TreeOptions {
+        tree_preset,
         enumerate_chance: cli_enumerate_chance
             || tree.and_then(|tree| tree.enumerate_chance).unwrap_or(false),
-    }
+        action_abstraction,
+    })
 }
 
 fn resolve_solver_options(
@@ -802,6 +844,8 @@ fn log_config(source: Option<&str>, spot: &SpotOptions, tree: &TreeOptions) {
         ip_range = %spot.ip_range,
         tree_preset = %tree.tree_preset,
         enumerate_chance = tree.enumerate_chance,
+        min_bet_bb = tree.action_abstraction.min_bet as f32 / 100.0,
+        max_raises_per_street = tree.action_abstraction.raise.max_raises_per_street,
         "solver_input"
     );
 }
@@ -1405,7 +1449,10 @@ fn print_tree_report(
     }
 }
 
-fn flop_tree_request(spot: &SpotOptions, tree_preset: &str) -> Result<FlopTreeRequest, String> {
+fn flop_tree_request(
+    spot: &SpotOptions,
+    action_abstraction: ActionAbstraction,
+) -> Result<FlopTreeRequest, String> {
     Ok(FlopTreeRequest {
         board: Board::from_str(&spot.flop)?,
         pot: spot.pot,
@@ -1413,7 +1460,7 @@ fn flop_tree_request(spot: &SpotOptions, tree_preset: &str) -> Result<FlopTreeRe
         oop_range: RangeSpec::from_str(&spot.oop_range)?,
         ip_range: RangeSpec::from_str(&spot.ip_range)?,
         first_player: parse_player(&spot.first_player)?,
-        action_abstraction: parse_tree_preset(tree_preset)?,
+        action_abstraction,
     })
 }
 
@@ -1426,6 +1473,155 @@ fn parse_tree_preset(value: &str) -> Result<ActionAbstraction, String> {
         other => Err(format!(
             "unknown tree preset {other:?}; expected conservative or postflop-basic"
         )),
+    }
+}
+
+fn apply_tree_config_overrides(
+    action: &mut ActionAbstraction,
+    config: &TreeConfig,
+) -> Result<(), String> {
+    if let Some(min_bet) = config.min_bet {
+        if min_bet == 0 {
+            return Err("tree.min_bet must be greater than zero".to_string());
+        }
+        action.min_bet = min_bet;
+    }
+    if let Some(values) = &config.flop_first_bets {
+        action.flop.first_bet_sizes = parse_bet_size_list("tree.flop_first_bets", values)?;
+    }
+    if let Some(values) = &config.flop_donk_bets {
+        action.flop.donk_bet_sizes = parse_bet_size_list("tree.flop_donk_bets", values)?;
+    }
+    if let Some(values) = &config.turn_first_bets {
+        action.turn.first_bet_sizes = parse_bet_size_list("tree.turn_first_bets", values)?;
+    }
+    if let Some(values) = &config.turn_donk_bets {
+        action.turn.donk_bet_sizes = parse_bet_size_list("tree.turn_donk_bets", values)?;
+    }
+    if let Some(values) = &config.river_first_bets {
+        action.river.first_bet_sizes = parse_bet_size_list("tree.river_first_bets", values)?;
+    }
+    if let Some(values) = &config.river_donk_bets {
+        action.river.donk_bet_sizes = parse_bet_size_list("tree.river_donk_bets", values)?;
+    }
+    if let Some(raise_multiplier) = config.raise_multiplier {
+        if !raise_multiplier.is_finite() || raise_multiplier <= 1.0 {
+            return Err("tree.raise_multiplier must be finite and greater than 1.0".to_string());
+        }
+        action.raise.raise_multiplier = raise_multiplier;
+    }
+    if let Some(values) = &config.raise_sizes {
+        action.raise.raise_sizes = parse_raise_size_list("tree.raise_sizes", values)?;
+    }
+    if let Some(value) = config.max_raises_per_street {
+        action.raise.max_raises_per_street = value;
+    }
+    if let Some(value) = config.shove_spr_threshold {
+        action.raise.shove_spr_threshold =
+            validate_non_negative_finite("tree.shove_spr_threshold", value)?;
+    }
+    if let Some(value) = config.shove_commit_fraction {
+        action.raise.shove_commit_fraction =
+            validate_non_negative_finite("tree.shove_commit_fraction", value)?;
+    }
+    if let Some(value) = config.add_all_in_threshold {
+        action.raise.add_all_in_threshold =
+            validate_non_negative_finite("tree.add_all_in_threshold", value)?;
+    }
+    if let Some(value) = config.force_all_in_threshold {
+        action.raise.force_all_in_threshold =
+            validate_non_negative_finite("tree.force_all_in_threshold", value)?;
+    }
+    if let Some(value) = config.merging_threshold {
+        action.raise.merging_threshold =
+            validate_non_negative_finite("tree.merging_threshold", value)?;
+    }
+    Ok(())
+}
+
+fn parse_bet_size_list(field: &str, values: &[String]) -> Result<Vec<BetSizeSpec>, String> {
+    values
+        .iter()
+        .map(|value| parse_bet_size(field, value))
+        .collect()
+}
+
+fn parse_raise_size_list(field: &str, values: &[String]) -> Result<Vec<RaiseSizeSpec>, String> {
+    values
+        .iter()
+        .map(|value| parse_raise_size(field, value))
+        .collect()
+}
+
+fn parse_bet_size(field: &str, value: &str) -> Result<BetSizeSpec, String> {
+    let normalized = value.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "allin" | "all-in" | "jam" | "shove" => Ok(BetSizeSpec::AllIn),
+        "geo" | "geometric" => Ok(BetSizeSpec::Geometric {
+            streets: 0,
+            max_pot_fraction: f32::INFINITY,
+        }),
+        _ => parse_pot_fraction(field, value).map(BetSizeSpec::PotFraction),
+    }
+}
+
+fn parse_raise_size(field: &str, value: &str) -> Result<RaiseSizeSpec, String> {
+    let normalized = value.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "allin" | "all-in" | "jam" | "shove" => Ok(RaiseSizeSpec::AllIn),
+        "geo" | "geometric" => Ok(RaiseSizeSpec::Geometric {
+            streets: 0,
+            max_pot_fraction: f32::INFINITY,
+        }),
+        _ if normalized.ends_with('x') => {
+            let multiplier = parse_positive_f32(field, normalized.trim_end_matches('x'))?;
+            if multiplier <= 1.0 {
+                return Err(format!(
+                    "{field} multiplier {value:?} must be greater than 1.0"
+                ));
+            }
+            Ok(RaiseSizeSpec::PreviousBetMultiplier(multiplier))
+        }
+        _ => parse_pot_fraction(field, value).map(RaiseSizeSpec::PotFraction),
+    }
+}
+
+fn parse_pot_fraction(field: &str, value: &str) -> Result<f32, String> {
+    let normalized = value.trim().to_ascii_lowercase();
+    let (number, divisor) = if let Some(percent) = normalized.strip_suffix('%') {
+        (percent, 100.0)
+    } else if let Some(pot) = normalized.strip_suffix('p') {
+        (pot, 1.0)
+    } else {
+        (normalized.as_str(), 1.0)
+    };
+    let fraction = parse_positive_f32(field, number)? / divisor;
+    if fraction <= 0.0 {
+        return Err(format!(
+            "{field} pot fraction {value:?} must be greater than zero"
+        ));
+    }
+    Ok(fraction)
+}
+
+fn parse_positive_f32(field: &str, value: &str) -> Result<f32, String> {
+    let parsed = value
+        .trim()
+        .parse::<f32>()
+        .map_err(|_| format!("{field} value {value:?} is not a number"))?;
+    if !parsed.is_finite() || parsed <= 0.0 {
+        return Err(format!(
+            "{field} value {value:?} must be finite and positive"
+        ));
+    }
+    Ok(parsed)
+}
+
+fn validate_non_negative_finite(field: &str, value: f32) -> Result<f32, String> {
+    if !value.is_finite() || value < 0.0 {
+        Err(format!("{field} must be finite and non-negative"))
+    } else {
+        Ok(value)
     }
 }
 

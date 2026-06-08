@@ -11,6 +11,19 @@ ip_range = "TT+,A2s+,KTs+,QJs,ATo+"
 [tree]
 preset = "postflop-basic"
 enumerate_chance = false
+min_bet = 100
+flop_first_bets = ["60%", "allin"]
+flop_donk_bets = []
+turn_first_bets = ["60%", "allin"]
+turn_donk_bets = []
+river_first_bets = ["60%", "allin"]
+river_donk_bets = ["50%"]
+raise_multiplier = 2.5
+raise_sizes = ["2.5x"]
+max_raises_per_street = 2
+add_all_in_threshold = 1.5
+force_all_in_threshold = 0.15
+merging_threshold = 0.1
 
 [solver]
 iterations = 1

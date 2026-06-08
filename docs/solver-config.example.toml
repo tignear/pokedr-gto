@@ -22,12 +22,31 @@ ip_range = "66+,A2s+,KTs+,QTs+,JTs,T9s,98s,AJo+,KQo,ATo:0.5,KJo:0.5,QJo:0.5"
 [tree]
 preset = "postflop-basic"
 enumerate_chance = false
+min_bet = 100
+
+# Bet sizes are pot fractions unless suffixed with x for raises.
+# Supported tokens: "60%", "0.6", "0.6p", "2.5x", "geo", "allin".
+flop_first_bets = ["60%", "geo", "allin"]
+flop_donk_bets = []
+turn_first_bets = ["60%", "geo", "allin"]
+turn_donk_bets = []
+river_first_bets = ["60%", "geo", "allin"]
+river_donk_bets = ["50%"]
+
+raise_multiplier = 2.5
+raise_sizes = ["2.5x"]
+max_raises_per_street = 2
+shove_spr_threshold = 0.0
+shove_commit_fraction = 1.0
+add_all_in_threshold = 1.5
+force_all_in_threshold = 0.15
+merging_threshold = 0.1
 
 [solver]
 iterations = 256
 threads = 0 # auto: use available CPU parallelism
 log_interval = 16
-exploitability_interval = 64
+exploitability_interval = 16
 target_exploitability_bb100 = 1.0
 variant = "dcfr-plus"
 average_strategy = "reach-weighted"
