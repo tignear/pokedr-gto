@@ -13,6 +13,7 @@ import {
 import "./styles.css";
 
 const ranks = ["A", "K", "Q", "J", "T", "9", "8", "7", "6", "5", "4", "3", "2"];
+const actionHues = [204, 142, 36, 0, 278, 318];
 
 type SelectedCell = {
   className: string;
@@ -51,8 +52,12 @@ function App() {
   }, [selectedNodeId]);
 
   const solutionCombos = useSolutionCombos();
-  const actingCombos =
+  const allActingCombos =
     selectedNode?.strategy?.player === "oop" ? solutionCombos.oop : solutionCombos.ip;
+  const actingCombos = useMemo(
+    () => liveCombosForBoard(allActingCombos, selectedNode?.board ?? ""),
+    [allActingCombos, selectedNode?.board]
+  );
   const actionBreakdown = useMemo(
     () => actionFrequencies(selectedNode, actingCombos),
     [actingCombos, selectedNode]
@@ -114,7 +119,8 @@ function App() {
                   className={candidate.index === selectedAction ? "active" : ""}
                   style={
                     {
-                      "--action-freq": actionBreakdown[candidate.index] ?? 0
+                      "--action-freq": actionBreakdown[candidate.index] ?? 0,
+                      "--action-hue": actionHue(candidate.index)
                     } as React.CSSProperties
                   }
                   onClick={() => {
@@ -135,6 +141,7 @@ function App() {
                 node={selectedNode}
                 combos={actingCombos}
                 actionIndex={selectedAction}
+                actionHue={actionHue(selectedAction)}
                 onSelect={setSelectedCell}
               />
             </div>
@@ -165,7 +172,7 @@ function App() {
               <div className="comboList">
                 {selectedCell.combos.map(({ combo, frequency }) => (
                   <div key={combo.index} className="comboRow">
-                    <span>{combo.label}</span>
+                    <CardPair label={combo.label} />
                     <span>{(frequency * 100).toFixed(1)}%</span>
                   </div>
                 ))}
@@ -225,6 +232,18 @@ function actionFrequencies(node: ViewerNode | null, combos: ViewerCombo[]) {
     }
     return weighted / totalWeight;
   });
+}
+
+function actionHue(index: number) {
+  return actionHues[index % actionHues.length];
+}
+
+function liveCombosForBoard(combos: ViewerCombo[], board: string) {
+  const dead = new Set(splitCards(board));
+  if (dead.size === 0) {
+    return combos;
+  }
+  return combos.filter((combo) => splitCards(combo.label).every((card) => !dead.has(card)));
 }
 
 function TreePanel({
@@ -291,11 +310,13 @@ function HandMatrix({
   node,
   combos,
   actionIndex,
+  actionHue,
   onSelect
 }: {
   node: ViewerNode;
   combos: ViewerCombo[];
   actionIndex: number;
+  actionHue: number;
   onSelect: (cell: SelectedCell) => void;
 }) {
   const cells = useMemo(() => {
@@ -319,19 +340,31 @@ function HandMatrix({
         ranks.map((col, colIndex) => {
           const className = handClass(row, col, rowIndex, colIndex);
           const entries = cells.get(className) ?? [];
+          const totalWeight = entries.reduce((sum, entry) => sum + entry.combo.weight, 0);
           const average =
-            entries.length === 0
+            totalWeight === 0
               ? 0
-              : entries.reduce((sum, entry) => sum + entry.frequency, 0) / entries.length;
+              : entries.reduce((sum, entry) => sum + entry.frequency * entry.combo.weight, 0) /
+                totalWeight;
           return (
             <button
               key={className}
-              className="cell"
-              style={{ "--freq": average } as React.CSSProperties}
-              onClick={() => onSelect({ className, combos: entries })}
+              className={entries.length === 0 ? "cell empty" : "cell"}
+              disabled={entries.length === 0}
+              style={
+                {
+                  "--freq": average,
+                  "--action-hue": actionHue
+                } as React.CSSProperties
+              }
+              onClick={() => {
+                if (entries.length > 0) {
+                  onSelect({ className, combos: entries });
+                }
+              }}
             >
               <span>{className}</span>
-              <strong>{(average * 100).toFixed(0)}%</strong>
+              <strong>{entries.length === 0 ? "dead" : `${(average * 100).toFixed(0)}%`}</strong>
             </button>
           );
         })
@@ -348,6 +381,53 @@ function handClass(row: string, col: string, rowIndex: number, colIndex: number)
     return `${row}${col}s`;
   }
   return `${col}${row}o`;
+}
+
+function CardPair({ label }: { label: string }) {
+  const cards = splitCards(label).sort((left, right) => cardSortValue(right) - cardSortValue(left));
+  return (
+    <span className="cardPair" aria-label={label}>
+      {cards.map((card) => (
+        <span key={card} className={`playingCard ${cardSuit(card)}`}>
+          <span>{card[0]}</span>
+          <small>{suitSymbol(card)}</small>
+        </span>
+      ))}
+    </span>
+  );
+}
+
+function splitCards(label: string) {
+  const cards: string[] = [];
+  for (let index = 0; index + 1 < label.length; index += 2) {
+    cards.push(label.slice(index, index + 2));
+  }
+  return cards;
+}
+
+function cardSortValue(card: string) {
+  const rankIndex = ranks.indexOf(card[0]);
+  return rankIndex < 0 ? 0 : 14 - rankIndex;
+}
+
+function cardSuit(card: string) {
+  const suit = card[1]?.toLowerCase();
+  return suit === "h" || suit === "d" ? "red" : "black";
+}
+
+function suitSymbol(card: string) {
+  switch (card[1]?.toLowerCase()) {
+    case "c":
+      return "♣";
+    case "d":
+      return "♦";
+    case "h":
+      return "♥";
+    case "s":
+      return "♠";
+    default:
+      return card[1] ?? "";
+  }
 }
 
 createRoot(document.getElementById("root")!).render(<App />);

@@ -221,7 +221,7 @@ p {
   position: absolute;
   inset: 0 auto 0 0;
   width: calc(var(--action-freq) * 100%);
-  background: rgba(105, 210, 160, 0.22);
+  background: hsl(var(--action-hue) 72% 55% / 0.24);
   pointer-events: none;
 }
 
@@ -239,8 +239,8 @@ p {
 
 .actionTabs button.active,
 .follow:hover {
-  border-color: #69d2a0;
-  background: #1f3a32;
+  border-color: hsl(var(--action-hue) 84% 64%);
+  background: hsl(var(--action-hue) 42% 22% / 0.72);
 }
 
 .matrixShell {
@@ -271,12 +271,21 @@ p {
   background:
     linear-gradient(
       to top,
-      rgba(105, 210, 160, calc(var(--freq) * 0.85)) 0%,
-      rgba(105, 210, 160, calc(var(--freq) * 0.85)) calc(var(--freq) * 100%),
+      hsl(var(--action-hue) 82% 54% / calc(0.16 + var(--freq) * 0.82)) 0%,
+      hsl(var(--action-hue) 82% 54% / calc(0.16 + var(--freq) * 0.82))
+        calc(var(--freq) * 100%),
       #1b2026 calc(var(--freq) * 100%),
       #1b2026 100%
     );
   cursor: pointer;
+}
+
+.cell.empty {
+  color: #697586;
+  background: #14181d;
+  border-color: #252d36;
+  cursor: not-allowed;
+  opacity: 0.72;
 }
 
 .cell span,
@@ -321,11 +330,43 @@ p {
 
 .comboRow {
   display: flex;
+  align-items: center;
   justify-content: space-between;
-  padding: 6px 8px;
-  border: 1px solid #2f3944;
-  border-radius: 5px;
-  background: #1b2026;
+  gap: 10px;
+  padding: 5px 0;
+  border-bottom: 1px solid #252d36;
+}
+
+.cardPair {
+  display: inline-flex;
+  gap: 4px;
+}
+
+.playingCard {
+  width: 28px;
+  height: 38px;
+  display: grid;
+  place-items: center;
+  border: 1px solid #d7dee8;
+  border-radius: 4px;
+  background: #f5f7fa;
+  color: #14181d;
+  box-shadow: 0 1px 3px rgb(0 0 0 / 0.24);
+  font-weight: 800;
+  line-height: 1;
+}
+
+.playingCard small {
+  margin-top: -3px;
+  font-size: 13px;
+}
+
+.playingCard.red {
+  color: #c92f43;
+}
+
+.playingCard.black {
+  color: #171b20;
 }
 
 .loading,
