@@ -489,17 +489,51 @@ fn main() -> Result<(), String> {
             }
             if run_node_cfr {
                 let started = Instant::now();
-                let solver = NodeLocalCfrSolver::new(
+                let mut solver = NodeLocalCfrSolver::new(
                     tree.clone(),
                     RangeSpec::from_str(&oop_range)?,
                     RangeSpec::from_str(&ip_range)?,
                 )?;
-                let summary = solver.summary();
+                let summary = if iterations > 0 {
+                    solver.run_with_progress(
+                        RealCfrConfig {
+                            iterations,
+                            variant: real_cfr_variant,
+                            average_strategy: real_cfr_average_strategy,
+                        },
+                        |progress| {
+                            if real_cfr_log_interval > 0
+                                && (progress.iteration == 1
+                                    || progress.iteration == iterations
+                                    || progress.iteration % real_cfr_log_interval == 0)
+                            {
+                                println!(
+                                    "node_cfr_progress iteration={} terminal_evals={} iteration_ms={:.3} oop_pass_value={:.6} ip_pass_value={:.6}",
+                                    progress.iteration,
+                                    progress.terminal_evals,
+                                    progress.elapsed_ms,
+                                    progress.oop_update_pass_value,
+                                    progress.ip_update_pass_value,
+                                );
+                            }
+                        },
+                    )?
+                } else {
+                    solver.summary()
+                };
                 println!(
-                    "node_cfr_state_allocated=true states={} decision_states={} action_slots={} storage_gib={:.3} build_ms={:.3}",
+                    "node_cfr iterations={} states={} decision_states={} action_slots={} terminal_evals={} elapsed_ms={:.3} oop_pass_value={:.6} ip_pass_value={:.6}",
+                    summary.iterations,
                     summary.states,
                     summary.decision_states,
                     summary.action_slots,
+                    summary.terminal_evals,
+                    summary.elapsed_ms,
+                    summary.oop_update_pass_value,
+                    summary.ip_update_pass_value,
+                );
+                println!(
+                    "node_cfr_state_allocated=true storage_gib={:.3} total_elapsed_ms={:.3}",
                     summary.storage_gib,
                     started.elapsed().as_secs_f64() * 1000.0,
                 );

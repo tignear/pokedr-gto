@@ -1,16 +1,37 @@
-use crate::cards::Board;
-use crate::isomorphism::next_card_isomorphism;
+use crate::cards::{Board, Card};
+use crate::isomorphism::{
+    all_suit_permutations, next_card_isomorphism, private_combo_permutation_indices,
+};
 use crate::range::{ComboWeight, RangeSpec};
-use crate::tree::{Player, PublicNodeKind, PublicTree};
+use crate::real_cfr::{RealCfrAverageStrategy, RealCfrConfig, RealCfrVariant};
+use crate::terminal_cfv::{
+    PreparedTerminalBoard, terminal_side_values_prefix_blocker_sorted_board_targets_into,
+};
+use crate::tree::{Player, PublicNodeKind, PublicTree, TerminalReason};
 use std::cell::UnsafeCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::time::Instant;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct NodeLocalCfrSummary {
+    pub iterations: u32,
     pub states: usize,
     pub decision_states: usize,
     pub action_slots: usize,
+    pub terminal_evals: usize,
+    pub elapsed_ms: f64,
+    pub oop_update_pass_value: f32,
+    pub ip_update_pass_value: f32,
     pub storage_gib: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct NodeLocalCfrIterationSummary {
+    pub iteration: u32,
+    pub terminal_evals: usize,
+    pub elapsed_ms: f64,
+    pub oop_update_pass_value: f32,
+    pub ip_update_pass_value: f32,
 }
 
 #[derive(Debug)]
@@ -22,6 +43,12 @@ pub struct NodeLocalCfrSolver {
     ip_combos: Vec<ComboWeight>,
     nodes: Vec<NodeLocalNodeCell>,
     node_by_key: BTreeMap<(usize, u64), usize>,
+    terminal_cache_index_by_key: BTreeMap<u64, usize>,
+    terminal_cache: Vec<NodeLocalTerminalCache>,
+    combo_permutations: BTreeMap<u8, ComboPermutationMaps>,
+    oop_same_ip_combo_indices: Vec<Option<usize>>,
+    ip_same_oop_combo_indices: Vec<Option<usize>>,
+    completed_iterations: u32,
     action_slots: usize,
     decision_states: usize,
 }
@@ -51,19 +78,86 @@ impl NodeLocalNodeCell {
 struct NodeLocalNode {
     public_node: usize,
     board: Board,
+    pot: u32,
     kind: NodeLocalKind,
     children: Vec<usize>,
     chance_concrete_events: usize,
     chance_permutation_codes: Vec<Vec<u8>>,
+    terminal_cache_indices: Vec<usize>,
     regrets: Vec<f32>,
     strategy_sum: Vec<f32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NodeLocalKind {
-    Terminal,
+    Terminal {
+        reason: TerminalReason,
+        folding_player: Player,
+    },
     Chance,
-    Decision { player: Player, actions: usize },
+    Decision {
+        player: Player,
+        actions: usize,
+    },
+}
+
+#[derive(Debug, Clone)]
+struct ComboPermutationMaps {
+    oop_source_to_target: Vec<usize>,
+    ip_source_to_target: Vec<usize>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PreparedComboTarget {
+    range_index: usize,
+    board_index: u16,
+}
+
+struct NodeLocalScratch {
+    strategies: Vec<f32>,
+    denominators: Vec<f32>,
+    child_values: Vec<f32>,
+    action_values: Vec<f32>,
+    next_oop: Vec<f32>,
+    next_ip: Vec<f32>,
+    terminal_oop_live: Vec<f32>,
+    terminal_ip_live: Vec<f32>,
+    terminal_values: Vec<f32>,
+    terminal_counts: Vec<f32>,
+    side_cache: NodeLocalTerminalSideCache,
+}
+
+#[derive(Debug, Clone)]
+struct NodeLocalTerminalCache {
+    prepared: PreparedTerminalBoard,
+    oop_targets: Vec<PreparedComboTarget>,
+    ip_targets: Vec<PreparedComboTarget>,
+    oop_board_targets_sorted: Vec<u16>,
+    ip_board_targets_sorted: Vec<u16>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum NodeLocalTerminalSide {
+    Oop,
+    Ip,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct NodeLocalTerminalSideCacheKey {
+    cache_index: usize,
+    side: NodeLocalTerminalSide,
+    reach_hash: u64,
+}
+
+#[derive(Debug, Clone)]
+struct NodeLocalTerminalSideCacheEntry {
+    signature: Vec<(u16, u32)>,
+    values: Vec<f32>,
+}
+
+#[derive(Debug, Default)]
+struct NodeLocalTerminalSideCache {
+    entries: HashMap<NodeLocalTerminalSideCacheKey, Vec<NodeLocalTerminalSideCacheEntry>>,
 }
 
 impl NodeLocalCfrSolver {
@@ -74,6 +168,44 @@ impl NodeLocalCfrSolver {
     ) -> Result<Self, String> {
         let oop_combos = oop_range.combos().to_vec();
         let ip_combos = ip_range.combos().to_vec();
+        let combo_permutations = all_suit_permutations()
+            .into_iter()
+            .filter_map(|permutation| {
+                let oop_source_to_target =
+                    private_combo_permutation_indices(&oop_combos, permutation)?;
+                let ip_source_to_target =
+                    private_combo_permutation_indices(&ip_combos, permutation)?;
+                Some((
+                    permutation.code(),
+                    ComboPermutationMaps {
+                        oop_source_to_target,
+                        ip_source_to_target,
+                    },
+                ))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let oop_same_ip_combo_indices = same_combo_indices(&oop_combos, &ip_combos);
+        let ip_same_oop_combo_indices = same_combo_indices(&ip_combos, &oop_combos);
+        let terminal_boards = unordered_river_boards_from_flop(&tree.spot.board)?;
+        let mut terminal_cache_index_by_key = BTreeMap::new();
+        let mut terminal_cache = Vec::with_capacity(terminal_boards.len());
+        for board in &terminal_boards {
+            let prepared = PreparedTerminalBoard::new(board)?;
+            let oop_targets = prepared_combo_targets(&prepared, &oop_combos);
+            let ip_targets = prepared_combo_targets(&prepared, &ip_combos);
+            let mut oop_board_targets_sorted = prepared_board_targets(&oop_targets);
+            let mut ip_board_targets_sorted = prepared_board_targets(&ip_targets);
+            prepared.sort_indices_by_strength(&mut oop_board_targets_sorted);
+            prepared.sort_indices_by_strength(&mut ip_board_targets_sorted);
+            terminal_cache_index_by_key.insert(unordered_board_key(board), terminal_cache.len());
+            terminal_cache.push(NodeLocalTerminalCache {
+                prepared,
+                oop_targets,
+                ip_targets,
+                oop_board_targets_sorted,
+                ip_board_targets_sorted,
+            });
+        }
         let mut solver = Self {
             tree,
             oop_range,
@@ -82,6 +214,12 @@ impl NodeLocalCfrSolver {
             ip_combos,
             nodes: Vec::new(),
             node_by_key: BTreeMap::new(),
+            terminal_cache_index_by_key,
+            terminal_cache,
+            combo_permutations,
+            oop_same_ip_combo_indices,
+            ip_same_oop_combo_indices,
+            completed_iterations: 0,
             action_slots: 0,
             decision_states: 0,
         };
@@ -100,9 +238,14 @@ impl NodeLocalCfrSolver {
         }
         std::hint::black_box((board_cards, public_nodes));
         NodeLocalCfrSummary {
+            iterations: self.completed_iterations,
             states: self.nodes.len(),
             decision_states: self.decision_states,
             action_slots: self.action_slots,
+            terminal_evals: 0,
+            elapsed_ms: 0.0,
+            oop_update_pass_value: 0.0,
+            ip_update_pass_value: 0.0,
             storage_gib: self.storage_gib(),
         }
     }
@@ -110,6 +253,364 @@ impl NodeLocalCfrSolver {
     pub fn storage_gib(&self) -> f64 {
         self.action_slots as f64 * 2.0 * std::mem::size_of::<f32>() as f64
             / (1024.0 * 1024.0 * 1024.0)
+    }
+
+    pub fn run_with_progress(
+        &mut self,
+        config: RealCfrConfig,
+        mut progress: impl FnMut(NodeLocalCfrIterationSummary),
+    ) -> Result<NodeLocalCfrSummary, String> {
+        let started_all = Instant::now();
+        let oop_weight = self
+            .oop_combos
+            .iter()
+            .map(|combo| combo.weight)
+            .sum::<f32>();
+        let ip_weight = self.ip_combos.iter().map(|combo| combo.weight).sum::<f32>();
+        let oop_root_reach = self
+            .oop_combos
+            .iter()
+            .map(|combo| combo.weight)
+            .collect::<Vec<_>>();
+        let ip_root_reach = self
+            .ip_combos
+            .iter()
+            .map(|combo| combo.weight)
+            .collect::<Vec<_>>();
+        let mut root_oop = vec![0.0; self.oop_combos.len()];
+        let mut root_ip = vec![0.0; self.ip_combos.len()];
+        let mut terminal_evals = 0usize;
+        for iteration in 1..=config.iterations {
+            let started = Instant::now();
+            self.completed_iterations += 1;
+            terminal_evals = 0;
+            let average_weight = self.completed_iterations as f32;
+            terminal_evals += self.traverse_update_side_into(
+                0,
+                Player::Oop,
+                &oop_root_reach,
+                &ip_root_reach,
+                average_weight,
+                config,
+                &mut root_oop,
+                &mut NodeLocalScratch::new(self)?,
+            )?;
+            terminal_evals += self.traverse_update_side_into(
+                0,
+                Player::Ip,
+                &oop_root_reach,
+                &ip_root_reach,
+                average_weight,
+                config,
+                &mut root_ip,
+                &mut NodeLocalScratch::new(self)?,
+            )?;
+            progress(NodeLocalCfrIterationSummary {
+                iteration,
+                terminal_evals,
+                elapsed_ms: started.elapsed().as_secs_f64() * 1000.0,
+                oop_update_pass_value: weighted_average(
+                    &root_oop,
+                    &self.oop_combos,
+                    oop_weight,
+                    ip_weight,
+                ),
+                ip_update_pass_value: weighted_average(
+                    &root_ip,
+                    &self.ip_combos,
+                    ip_weight,
+                    oop_weight,
+                ),
+            });
+        }
+        Ok(NodeLocalCfrSummary {
+            iterations: self.completed_iterations,
+            states: self.nodes.len(),
+            decision_states: self.decision_states,
+            action_slots: self.action_slots,
+            terminal_evals,
+            elapsed_ms: started_all.elapsed().as_secs_f64() * 1000.0,
+            oop_update_pass_value: weighted_average(
+                &root_oop,
+                &self.oop_combos,
+                oop_weight,
+                ip_weight,
+            ),
+            ip_update_pass_value: weighted_average(
+                &root_ip,
+                &self.ip_combos,
+                ip_weight,
+                oop_weight,
+            ),
+            storage_gib: self.storage_gib(),
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn traverse_update_side_into(
+        &self,
+        node_index: usize,
+        update_player: Player,
+        oop_reach: &[f32],
+        ip_reach: &[f32],
+        average_weight: f32,
+        config: RealCfrConfig,
+        out: &mut [f32],
+        scratch: &mut NodeLocalScratch,
+    ) -> Result<usize, String> {
+        let node = self.nodes[node_index].get();
+        match node.kind {
+            NodeLocalKind::Terminal {
+                reason,
+                folding_player,
+            } => self.terminal_side_into(
+                node_index,
+                update_player,
+                reason,
+                folding_player,
+                oop_reach,
+                ip_reach,
+                out,
+                scratch,
+            ),
+            NodeLocalKind::Chance => {
+                out.fill(0.0);
+                let chance_weight = 1.0 / node.chance_concrete_events as f32;
+                let target_len = out.len();
+                scratch.child_values.resize(target_len, 0.0);
+                let mut terminal_evals = 0usize;
+                for (action_index, child) in node.children.iter().copied().enumerate() {
+                    let mut child_values = std::mem::take(&mut scratch.child_values);
+                    terminal_evals += self.traverse_update_side_into(
+                        child,
+                        update_player,
+                        oop_reach,
+                        ip_reach,
+                        average_weight,
+                        config,
+                        &mut child_values,
+                        scratch,
+                    )?;
+                    for code in &node.chance_permutation_codes[action_index] {
+                        let maps = self.combo_permutations.get(code).ok_or_else(|| {
+                            "chance isomorphism permutation is missing combo maps".to_string()
+                        })?;
+                        let source_to_target = match update_player {
+                            Player::Oop => &maps.oop_source_to_target,
+                            Player::Ip => &maps.ip_source_to_target,
+                        };
+                        add_permuted_scaled_slice(
+                            out,
+                            &child_values,
+                            source_to_target,
+                            chance_weight,
+                        );
+                    }
+                    scratch.child_values = child_values;
+                }
+                Ok(terminal_evals)
+            }
+            NodeLocalKind::Decision { player, actions } => {
+                if actions == 1 {
+                    return self.traverse_update_side_into(
+                        node.children[0],
+                        update_player,
+                        oop_reach,
+                        ip_reach,
+                        average_weight,
+                        config,
+                        out,
+                        scratch,
+                    );
+                }
+                let acting_combos = match player {
+                    Player::Oop => self.oop_combos.len(),
+                    Player::Ip => self.ip_combos.len(),
+                };
+                let target_len = out.len();
+                let mut strategies = std::mem::take(&mut scratch.strategies);
+                let mut denominators = std::mem::take(&mut scratch.denominators);
+                let node_ref = self.nodes[node_index].get();
+                current_strategies_action_major_into(
+                    &node_ref.regrets,
+                    acting_combos,
+                    actions,
+                    &mut strategies,
+                    &mut denominators,
+                );
+                if player != update_player {
+                    out.fill(0.0);
+                    let mut terminal_evals = 0usize;
+                    let mut child_values = std::mem::take(&mut scratch.child_values);
+                    child_values.resize(target_len, 0.0);
+                    match player {
+                        Player::Oop => {
+                            let mut next_oop = std::mem::take(&mut scratch.next_oop);
+                            next_oop.resize(oop_reach.len(), 0.0);
+                            for action in 0..actions {
+                                let child = self.nodes[node_index].get().children[action];
+                                strategy_reach_action_major_into(
+                                    &mut next_oop,
+                                    oop_reach,
+                                    &strategies,
+                                    acting_combos,
+                                    actions,
+                                    action,
+                                );
+                                terminal_evals += self.traverse_update_side_into(
+                                    child,
+                                    update_player,
+                                    &next_oop,
+                                    ip_reach,
+                                    average_weight,
+                                    config,
+                                    &mut child_values,
+                                    scratch,
+                                )?;
+                                add_slice(out, &child_values);
+                            }
+                            scratch.next_oop = next_oop;
+                        }
+                        Player::Ip => {
+                            let mut next_ip = std::mem::take(&mut scratch.next_ip);
+                            next_ip.resize(ip_reach.len(), 0.0);
+                            for action in 0..actions {
+                                let child = self.nodes[node_index].get().children[action];
+                                strategy_reach_action_major_into(
+                                    &mut next_ip,
+                                    ip_reach,
+                                    &strategies,
+                                    acting_combos,
+                                    actions,
+                                    action,
+                                );
+                                terminal_evals += self.traverse_update_side_into(
+                                    child,
+                                    update_player,
+                                    oop_reach,
+                                    &next_ip,
+                                    average_weight,
+                                    config,
+                                    &mut child_values,
+                                    scratch,
+                                )?;
+                                add_slice(out, &child_values);
+                            }
+                            scratch.next_ip = next_ip;
+                        }
+                    }
+                    scratch.child_values = child_values;
+                    scratch.strategies = strategies;
+                    scratch.denominators = denominators;
+                    return Ok(terminal_evals);
+                }
+
+                let mut action_values = std::mem::take(&mut scratch.action_values);
+                action_values.resize(actions * target_len, 0.0);
+                let mut terminal_evals = 0usize;
+                match player {
+                    Player::Oop => {
+                        let mut next_oop = std::mem::take(&mut scratch.next_oop);
+                        next_oop.resize(oop_reach.len(), 0.0);
+                        for action in 0..actions {
+                            let child = self.nodes[node_index].get().children[action];
+                            let child_oop = if config.average_strategy
+                                == RealCfrAverageStrategy::ReachWeighted
+                            {
+                                strategy_reach_action_major_into(
+                                    &mut next_oop,
+                                    oop_reach,
+                                    &strategies,
+                                    acting_combos,
+                                    actions,
+                                    action,
+                                );
+                                &next_oop
+                            } else {
+                                oop_reach
+                            };
+                            terminal_evals += self.traverse_update_side_into(
+                                child,
+                                update_player,
+                                child_oop,
+                                ip_reach,
+                                average_weight,
+                                config,
+                                &mut action_values[action * target_len..(action + 1) * target_len],
+                                scratch,
+                            )?;
+                        }
+                        scratch.next_oop = next_oop;
+                    }
+                    Player::Ip => {
+                        let mut next_ip = std::mem::take(&mut scratch.next_ip);
+                        next_ip.resize(ip_reach.len(), 0.0);
+                        for action in 0..actions {
+                            let child = self.nodes[node_index].get().children[action];
+                            let child_ip = if config.average_strategy
+                                == RealCfrAverageStrategy::ReachWeighted
+                            {
+                                strategy_reach_action_major_into(
+                                    &mut next_ip,
+                                    ip_reach,
+                                    &strategies,
+                                    acting_combos,
+                                    actions,
+                                    action,
+                                );
+                                &next_ip
+                            } else {
+                                ip_reach
+                            };
+                            terminal_evals += self.traverse_update_side_into(
+                                child,
+                                update_player,
+                                oop_reach,
+                                child_ip,
+                                average_weight,
+                                config,
+                                &mut action_values[action * target_len..(action + 1) * target_len],
+                                scratch,
+                            )?;
+                        }
+                        scratch.next_ip = next_ip;
+                    }
+                }
+                combine_acting_action_major_values(out, &action_values, &strategies, actions);
+                let own_reach = match player {
+                    Player::Oop => oop_reach,
+                    Player::Ip => ip_reach,
+                };
+                let factors = NodeLocalUpdateFactors::new(
+                    config.variant,
+                    average_weight,
+                    config.average_strategy,
+                );
+                let node_mut = self.nodes[node_index].get_mut();
+                for combo in 0..acting_combos {
+                    let node_value = out[combo];
+                    for action in 0..actions {
+                        let local_slot = action * acting_combos + combo;
+                        let action_value = action_values[action * target_len + combo];
+                        apply_node_local_update(
+                            &mut node_mut.regrets[local_slot],
+                            &mut node_mut.strategy_sum[local_slot],
+                            action_value - node_value,
+                            average_strategy_delta(
+                                config.average_strategy,
+                                own_reach[combo],
+                                strategies[local_slot],
+                            ),
+                            &factors,
+                        );
+                    }
+                }
+                scratch.action_values = action_values;
+                scratch.strategies = strategies;
+                scratch.denominators = denominators;
+                Ok(terminal_evals)
+            }
+        }
     }
 
     fn collect_node(&mut self, public_node: usize, board: &Board) -> Result<usize, String> {
@@ -123,10 +624,15 @@ impl NodeLocalCfrSolver {
         self.nodes.push(NodeLocalNodeCell::new(NodeLocalNode {
             public_node,
             board: board.clone(),
-            kind: NodeLocalKind::Terminal,
+            pot: 0,
+            kind: NodeLocalKind::Terminal {
+                reason: TerminalReason::Showdown,
+                folding_player: Player::Oop,
+            },
             children: Vec::new(),
             chance_concrete_events: 0,
             chance_permutation_codes: Vec::new(),
+            terminal_cache_indices: Vec::new(),
             regrets: Vec::new(),
             strategy_sum: Vec::new(),
         }));
@@ -138,15 +644,29 @@ impl NodeLocalCfrSolver {
             .ok_or_else(|| "public node index is out of bounds".to_string())?
             .clone();
 
-        let mut kind = NodeLocalKind::Terminal;
+        let kind;
         let mut children = Vec::new();
         let mut chance_concrete_events = 0usize;
         let mut chance_permutation_codes = Vec::new();
+        let mut terminal_cache_indices = Vec::new();
         let mut regrets = Vec::new();
         let mut strategy_sum = Vec::new();
 
         match public.kind {
-            PublicNodeKind::Terminal { .. } => {}
+            PublicNodeKind::Terminal { reason } => {
+                kind = NodeLocalKind::Terminal {
+                    reason,
+                    folding_player: public.state.player,
+                };
+                for terminal_board in terminal_boards(board)? {
+                    let index = self
+                        .terminal_cache_index_by_key
+                        .get(&unordered_board_key(&terminal_board))
+                        .copied()
+                        .ok_or_else(|| "terminal board is outside cache".to_string())?;
+                    terminal_cache_indices.push(index);
+                }
+            }
             PublicNodeKind::Chance(_) => {
                 kind = NodeLocalKind::Chance;
                 let Some(child) = public.children.first().copied() else {
@@ -192,13 +712,168 @@ impl NodeLocalCfrSolver {
         }
 
         let node = self.nodes[index].get_mut();
+        node.pot = public.state.pot;
         node.kind = kind;
         node.children = children;
         node.chance_concrete_events = chance_concrete_events;
         node.chance_permutation_codes = chance_permutation_codes;
+        node.terminal_cache_indices = terminal_cache_indices;
         node.regrets = regrets;
         node.strategy_sum = strategy_sum;
         Ok(index)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn terminal_side_into(
+        &self,
+        node_index: usize,
+        update_player: Player,
+        reason: TerminalReason,
+        folding_player: Player,
+        oop_reach: &[f32],
+        ip_reach: &[f32],
+        out: &mut [f32],
+        scratch: &mut NodeLocalScratch,
+    ) -> Result<usize, String> {
+        let node = self.nodes[node_index].get();
+        match reason {
+            TerminalReason::Fold => {
+                self.fold_side_into(
+                    &node.board,
+                    node.pot,
+                    update_player,
+                    folding_player,
+                    oop_reach,
+                    ip_reach,
+                    out,
+                );
+                Ok(0)
+            }
+            TerminalReason::Showdown | TerminalReason::AllIn => self.showdown_side_into(
+                node_index,
+                node.pot,
+                update_player,
+                oop_reach,
+                ip_reach,
+                out,
+                scratch,
+            ),
+        }
+    }
+
+    fn fold_side_into(
+        &self,
+        board: &Board,
+        pot: u32,
+        update_player: Player,
+        folding_player: Player,
+        oop_reach: &[f32],
+        ip_reach: &[f32],
+        out: &mut [f32],
+    ) {
+        let pot = pot as f32;
+        match update_player {
+            Player::Oop => opponent_weights_for_fast_into(
+                &self.oop_combos,
+                &self.ip_combos,
+                ip_reach,
+                &self.oop_same_ip_combo_indices,
+                board,
+                out,
+            ),
+            Player::Ip => opponent_weights_for_fast_into(
+                &self.ip_combos,
+                &self.oop_combos,
+                oop_reach,
+                &self.ip_same_oop_combo_indices,
+                board,
+                out,
+            ),
+        }
+        let sign = if folding_player == update_player {
+            -pot
+        } else {
+            pot
+        };
+        for value in out {
+            *value *= sign;
+        }
+    }
+
+    fn showdown_side_into(
+        &self,
+        node_index: usize,
+        pot: u32,
+        update_player: Player,
+        oop_reach: &[f32],
+        ip_reach: &[f32],
+        out: &mut [f32],
+        scratch: &mut NodeLocalScratch,
+    ) -> Result<usize, String> {
+        out.fill(0.0);
+        scratch.terminal_counts.resize(out.len(), 0.0);
+        scratch.terminal_counts.fill(0.0);
+        let cache_indices = &self.nodes[node_index].get().terminal_cache_indices;
+        let pot = pot as f32;
+        for cache_index in cache_indices {
+            let cache = &self.terminal_cache[*cache_index];
+            let prepared = &cache.prepared;
+            let (opponent_reach, own_targets, board_targets) = match update_player {
+                Player::Oop => {
+                    scratch
+                        .terminal_ip_live
+                        .resize(prepared.combos().len(), 0.0);
+                    reach_on_targets_into(
+                        &cache.ip_targets,
+                        ip_reach,
+                        &mut scratch.terminal_ip_live,
+                    );
+                    (
+                        &scratch.terminal_ip_live,
+                        &cache.oop_targets,
+                        &cache.oop_board_targets_sorted,
+                    )
+                }
+                Player::Ip => {
+                    scratch
+                        .terminal_oop_live
+                        .resize(prepared.combos().len(), 0.0);
+                    reach_on_targets_into(
+                        &cache.oop_targets,
+                        oop_reach,
+                        &mut scratch.terminal_oop_live,
+                    );
+                    (
+                        &scratch.terminal_oop_live,
+                        &cache.ip_targets,
+                        &cache.ip_board_targets_sorted,
+                    )
+                }
+            };
+            terminal_side_cached_values(
+                &mut scratch.side_cache,
+                *cache_index,
+                match update_player {
+                    Player::Oop => NodeLocalTerminalSide::Oop,
+                    Player::Ip => NodeLocalTerminalSide::Ip,
+                },
+                prepared,
+                opponent_reach,
+                board_targets,
+                &mut scratch.terminal_values,
+            )?;
+            for target in own_targets {
+                out[target.range_index] +=
+                    scratch.terminal_values[target.board_index as usize] * pot;
+                scratch.terminal_counts[target.range_index] += 1.0;
+            }
+        }
+        for (value, count) in out.iter_mut().zip(&scratch.terminal_counts) {
+            if *count > 0.0 {
+                *value /= *count;
+            }
+        }
+        Ok(cache_indices.len())
     }
 }
 
@@ -207,4 +882,509 @@ fn ordered_board_key(board: &Board) -> u64 {
         .cards()
         .iter()
         .fold(0u64, |key, card| (key << 6) | card.index() as u64)
+}
+
+impl NodeLocalScratch {
+    fn new(solver: &NodeLocalCfrSolver) -> Result<Self, String> {
+        let prepared = &solver
+            .terminal_cache
+            .first()
+            .ok_or_else(|| "terminal cache is empty".to_string())?
+            .prepared;
+        Ok(Self {
+            strategies: Vec::new(),
+            denominators: Vec::new(),
+            child_values: Vec::new(),
+            action_values: Vec::new(),
+            next_oop: Vec::new(),
+            next_ip: Vec::new(),
+            terminal_oop_live: vec![0.0; prepared.combos().len()],
+            terminal_ip_live: vec![0.0; prepared.combos().len()],
+            terminal_values: vec![0.0; prepared.combos().len()],
+            terminal_counts: Vec::new(),
+            side_cache: NodeLocalTerminalSideCache::default(),
+        })
+    }
+}
+
+fn current_strategies_action_major_into(
+    regrets: &[f32],
+    combos: usize,
+    actions: usize,
+    strategies: &mut Vec<f32>,
+    denominators: &mut Vec<f32>,
+) {
+    strategies.resize(regrets.len(), 0.0);
+    denominators.resize(combos, 0.0);
+    denominators.fill(0.0);
+    for (strategy, regret) in strategies.iter_mut().zip(regrets) {
+        *strategy = regret.max(0.0);
+    }
+    for action in 0..actions {
+        for (denominator, strategy) in denominators
+            .iter_mut()
+            .zip(&strategies[action * combos..(action + 1) * combos])
+        {
+            *denominator += *strategy;
+        }
+    }
+    let uniform = 1.0 / actions as f32;
+    for action in 0..actions {
+        for (strategy, denominator) in strategies[action * combos..(action + 1) * combos]
+            .iter_mut()
+            .zip(denominators.iter().copied())
+        {
+            *strategy = if denominator > 0.0 {
+                *strategy / denominator
+            } else {
+                uniform
+            };
+        }
+    }
+}
+
+fn strategy_reach_action_major_into(
+    out: &mut [f32],
+    reach: &[f32],
+    strategies: &[f32],
+    combos: usize,
+    _actions: usize,
+    action: usize,
+) {
+    let row = &strategies[action * combos..(action + 1) * combos];
+    for ((out, reach), strategy) in out.iter_mut().zip(reach).zip(row) {
+        *out = *reach * *strategy;
+    }
+}
+
+fn combine_acting_action_major_values(
+    out: &mut [f32],
+    action_values: &[f32],
+    strategies: &[f32],
+    actions: usize,
+) {
+    out.fill(0.0);
+    let combos = out.len();
+    for action in 0..actions {
+        let value_row = &action_values[action * combos..(action + 1) * combos];
+        let strategy_row = &strategies[action * combos..(action + 1) * combos];
+        for ((out, value), strategy) in out.iter_mut().zip(value_row).zip(strategy_row) {
+            *out += *value * *strategy;
+        }
+    }
+}
+
+fn add_slice(out: &mut [f32], input: &[f32]) {
+    for (out, input) in out.iter_mut().zip(input) {
+        *out += *input;
+    }
+}
+
+fn add_permuted_scaled_slice(
+    out: &mut [f32],
+    input: &[f32],
+    source_to_target: &[usize],
+    scale: f32,
+) {
+    for (source, target) in source_to_target.iter().copied().enumerate() {
+        out[source] += input[target] * scale;
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct NodeLocalUpdateFactors {
+    variant: RealCfrVariant,
+    positive_regret_discount: f32,
+    negative_regret_discount: f32,
+    strategy_discount: f32,
+    iteration_weight: f32,
+}
+
+impl NodeLocalUpdateFactors {
+    fn new(
+        variant: RealCfrVariant,
+        iteration_weight: f32,
+        _average_strategy: RealCfrAverageStrategy,
+    ) -> Self {
+        let (positive_regret_discount, negative_regret_discount, strategy_discount) = match variant
+        {
+            RealCfrVariant::CfrPlus => (1.0, 1.0, 1.0),
+            RealCfrVariant::Dcfr { alpha, beta, gamma } => (
+                dcfr_discount_for_exponent(iteration_weight, alpha),
+                dcfr_discount_for_exponent(iteration_weight, beta),
+                dcfr_strategy_discount(iteration_weight, gamma),
+            ),
+            RealCfrVariant::DcfrPlus { alpha, gamma } => (
+                dcfr_discount_for_exponent(iteration_weight, alpha),
+                dcfr_discount_for_exponent(iteration_weight, 0.0),
+                dcfr_strategy_discount(iteration_weight, gamma),
+            ),
+        };
+        Self {
+            variant,
+            positive_regret_discount,
+            negative_regret_discount,
+            strategy_discount,
+            iteration_weight,
+        }
+    }
+}
+
+fn apply_node_local_update(
+    regret: &mut f32,
+    strategy_sum: &mut f32,
+    regret_delta: f32,
+    average_delta: f32,
+    factors: &NodeLocalUpdateFactors,
+) {
+    match factors.variant {
+        RealCfrVariant::CfrPlus => {
+            *regret = (*regret + regret_delta).max(0.0);
+            *strategy_sum += factors.iteration_weight * average_delta;
+        }
+        RealCfrVariant::Dcfr { .. } => {
+            let regret_discount = if *regret >= 0.0 {
+                factors.positive_regret_discount
+            } else {
+                factors.negative_regret_discount
+            };
+            *regret = *regret * regret_discount + regret_delta;
+            *strategy_sum = *strategy_sum * factors.strategy_discount + average_delta;
+        }
+        RealCfrVariant::DcfrPlus { .. } => {
+            *regret = (*regret * factors.positive_regret_discount + regret_delta).max(0.0);
+            *strategy_sum = *strategy_sum * factors.strategy_discount + average_delta;
+        }
+    }
+}
+
+fn average_strategy_delta(
+    mode: RealCfrAverageStrategy,
+    own_reach: f32,
+    strategy_probability: f32,
+) -> f32 {
+    match mode {
+        RealCfrAverageStrategy::ReachWeighted => own_reach * strategy_probability,
+        RealCfrAverageStrategy::Local => strategy_probability,
+    }
+}
+
+fn dcfr_discount_for_exponent(iteration: f32, exponent: f32) -> f32 {
+    let powered = iteration.powf(exponent.max(0.0));
+    powered / (powered + 1.0)
+}
+
+fn dcfr_strategy_discount(iteration: f32, gamma: f32) -> f32 {
+    (iteration / (iteration + 1.0)).powf(gamma.max(0.0))
+}
+
+fn opponent_weights_for_fast_into(
+    own_combos: &[ComboWeight],
+    opponent_combos: &[ComboWeight],
+    opponent_reach: &[f32],
+    same_combo_indices: &[Option<usize>],
+    board: &Board,
+    out: &mut [f32],
+) {
+    let mut total = 0.0f32;
+    let mut card_totals = [0.0f32; 52];
+    for (combo, reach) in opponent_combos.iter().zip(opponent_reach) {
+        if *reach == 0.0 || board.contains(combo.first) || board.contains(combo.second) {
+            continue;
+        }
+        total += *reach;
+        card_totals[combo.first.index()] += *reach;
+        card_totals[combo.second.index()] += *reach;
+    }
+    for ((own, same_index), out) in own_combos
+        .iter()
+        .zip(same_combo_indices)
+        .zip(out.iter_mut())
+    {
+        if board.contains(own.first) || board.contains(own.second) {
+            *out = 0.0;
+            continue;
+        }
+        let same_reach = same_index
+            .and_then(|index| {
+                let opponent = &opponent_combos[index];
+                (!board.contains(opponent.first) && !board.contains(opponent.second))
+                    .then_some(opponent_reach[index])
+            })
+            .unwrap_or(0.0);
+        *out =
+            total - card_totals[own.first.index()] - card_totals[own.second.index()] + same_reach;
+    }
+}
+
+fn same_combo_indices(
+    own_combos: &[ComboWeight],
+    opponent_combos: &[ComboWeight],
+) -> Vec<Option<usize>> {
+    let opponent_by_key = opponent_combos
+        .iter()
+        .enumerate()
+        .map(|(index, combo)| (combo_key(combo.first, combo.second), index))
+        .collect::<BTreeMap<_, _>>();
+    own_combos
+        .iter()
+        .map(|combo| {
+            opponent_by_key
+                .get(&combo_key(combo.first, combo.second))
+                .copied()
+        })
+        .collect()
+}
+
+fn combo_key(first: Card, second: Card) -> u64 {
+    (1u64 << first.index()) | (1u64 << second.index())
+}
+
+fn prepared_combo_targets(
+    prepared: &PreparedTerminalBoard,
+    combos: &[ComboWeight],
+) -> Vec<PreparedComboTarget> {
+    combos
+        .iter()
+        .enumerate()
+        .filter_map(|(range_index, combo)| {
+            prepared
+                .combo_index(combo.first, combo.second)
+                .map(|board_index| PreparedComboTarget {
+                    range_index,
+                    board_index: board_index as u16,
+                })
+        })
+        .collect()
+}
+
+fn prepared_board_targets(targets: &[PreparedComboTarget]) -> Vec<u16> {
+    targets.iter().map(|target| target.board_index).collect()
+}
+
+fn reach_on_targets_into(targets: &[PreparedComboTarget], reach: &[f32], out: &mut [f32]) {
+    out.fill(0.0);
+    for target in targets {
+        out[target.board_index as usize] = reach[target.range_index];
+    }
+}
+
+fn terminal_side_cached_values(
+    cache: &mut NodeLocalTerminalSideCache,
+    cache_index: usize,
+    side: NodeLocalTerminalSide,
+    prepared: &PreparedTerminalBoard,
+    opponent_reach: &[f32],
+    targets_sorted_by_strength: &[u16],
+    scratch_values: &mut Vec<f32>,
+) -> Result<(), String> {
+    let signature = reach_signature(opponent_reach);
+    let reach_hash = signature
+        .iter()
+        .fold(0xcbf29ce484222325u64, |hash, (index, value)| {
+            mix_hash(mix_hash(hash, *index as u64), *value as u64)
+        });
+    let key = NodeLocalTerminalSideCacheKey {
+        cache_index,
+        side,
+        reach_hash,
+    };
+    if let Some(entries) = cache.entries.get(&key) {
+        for entry in entries {
+            if entry.signature == signature {
+                scratch_values.clone_from(&entry.values);
+                return Ok(());
+            }
+        }
+    }
+    scratch_values.resize(prepared.combos().len(), 0.0);
+    terminal_side_values_prefix_blocker_sorted_board_targets_into(
+        prepared,
+        opponent_reach,
+        targets_sorted_by_strength,
+        scratch_values,
+    )?;
+    let entries = cache.entries.entry(key).or_default();
+    entries.push(NodeLocalTerminalSideCacheEntry {
+        signature,
+        values: scratch_values.clone(),
+    });
+    Ok(())
+}
+
+fn reach_signature(reach: &[f32]) -> Vec<(u16, u32)> {
+    reach
+        .iter()
+        .enumerate()
+        .filter_map(|(index, value)| (*value != 0.0).then_some((index as u16, value.to_bits())))
+        .collect()
+}
+
+fn mix_hash(hash: u64, value: u64) -> u64 {
+    hash.wrapping_mul(0x100000001b3).wrapping_add(value)
+}
+
+fn terminal_boards(board: &Board) -> Result<Vec<Board>, String> {
+    match board.cards().len() {
+        5 => Ok(vec![board.clone()]),
+        4 => {
+            let deck = board.remaining_deck();
+            let mut boards = Vec::with_capacity(deck.len());
+            for river in deck {
+                boards.push(board.push(river)?);
+            }
+            Ok(boards)
+        }
+        3 => {
+            let deck = board.remaining_deck();
+            let mut boards = Vec::with_capacity(deck.len() * (deck.len() - 1) / 2);
+            for turn in 0..deck.len() {
+                for river in turn + 1..deck.len() {
+                    boards.push(board.push(deck[turn])?.push(deck[river])?);
+                }
+            }
+            Ok(boards)
+        }
+        other => Err(format!("terminal board has invalid length {other}")),
+    }
+}
+
+fn unordered_river_boards_from_flop(flop: &Board) -> Result<Vec<Board>, String> {
+    if flop.cards().len() != 3 {
+        return Err("node-local CFR solver must start from a flop board".to_string());
+    }
+    let deck = flop.remaining_deck();
+    let mut boards = Vec::with_capacity(deck.len() * (deck.len() - 1) / 2);
+    for turn in 0..deck.len() {
+        for river in turn + 1..deck.len() {
+            boards.push(flop.push(deck[turn])?.push(deck[river])?);
+        }
+    }
+    Ok(boards)
+}
+
+fn unordered_board_key(board: &Board) -> u64 {
+    board
+        .cards()
+        .iter()
+        .fold(0u64, |key, card| key | (1u64 << card.index()))
+}
+
+fn weighted_average(
+    values: &[f32],
+    combos: &[ComboWeight],
+    own_total_weight: f32,
+    opponent_total_weight: f32,
+) -> f32 {
+    if own_total_weight <= 0.0 || opponent_total_weight <= 0.0 {
+        return 0.0;
+    }
+    values
+        .iter()
+        .zip(combos)
+        .map(|(value, combo)| *value * combo.weight)
+        .sum::<f32>()
+        / (own_total_weight * opponent_total_weight)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::real_cfr::{ArenaAlternatingCfrSolver, RealCfrAverageStrategy};
+    use crate::tree::{
+        ActionAbstraction, ChanceExpansion, RaisePolicy, Spot, StreetTemplate, TreeBuilder,
+        TreeTemplate,
+    };
+    use std::str::FromStr;
+
+    #[test]
+    fn node_local_cfr_allocates_same_slots_as_arena_on_small_ranges() {
+        let board = Board::from_str("As7h2c").unwrap();
+        let oop_range = RangeSpec::from_str("AcAd,KcKd").unwrap();
+        let ip_range = RangeSpec::from_str("QcQd,JcJd").unwrap();
+        let tree = TreeBuilder::new(TreeTemplate {
+            action_abstraction: tiny_checkdown_abstraction(),
+            chance_expansion: ChanceExpansion::Enumerate,
+        })
+        .unwrap()
+        .build(Spot {
+            board,
+            pot: 200,
+            effective_stack: 900,
+            oop_range: oop_range.clone(),
+            ip_range: ip_range.clone(),
+            first_player: Player::Oop,
+        })
+        .unwrap();
+        let arena =
+            ArenaAlternatingCfrSolver::new(tree.clone(), oop_range.clone(), ip_range.clone())
+                .unwrap();
+        let node = NodeLocalCfrSolver::new(tree, oop_range, ip_range).unwrap();
+        assert_eq!(node.summary().states, arena.state_count());
+        assert_eq!(node.summary().action_slots, arena.regret_len());
+    }
+
+    #[test]
+    fn node_local_cfr_runs_one_iteration_on_small_ranges() {
+        let board = Board::from_str("As7h2c").unwrap();
+        let oop_range = RangeSpec::from_str("AcAd,KcKd").unwrap();
+        let ip_range = RangeSpec::from_str("QcQd,JcJd").unwrap();
+        let tree = TreeBuilder::new(TreeTemplate {
+            action_abstraction: tiny_checkdown_abstraction(),
+            chance_expansion: ChanceExpansion::Enumerate,
+        })
+        .unwrap()
+        .build(Spot {
+            board,
+            pot: 200,
+            effective_stack: 900,
+            oop_range: oop_range.clone(),
+            ip_range: ip_range.clone(),
+            first_player: Player::Oop,
+        })
+        .unwrap();
+        let mut solver = NodeLocalCfrSolver::new(tree, oop_range, ip_range).unwrap();
+        let summary = solver
+            .run_with_progress(
+                RealCfrConfig {
+                    iterations: 1,
+                    variant: RealCfrVariant::CfrPlus,
+                    average_strategy: RealCfrAverageStrategy::ReachWeighted,
+                },
+                |_| {},
+            )
+            .unwrap();
+        assert_eq!(summary.iterations, 1);
+        assert!(summary.terminal_evals > 0);
+        assert!(summary.oop_update_pass_value.is_finite());
+        assert!(summary.ip_update_pass_value.is_finite());
+    }
+
+    fn tiny_checkdown_abstraction() -> ActionAbstraction {
+        ActionAbstraction {
+            min_bet: 2,
+            flop: StreetTemplate {
+                first_bet_sizes: Vec::new(),
+                donk_bet_sizes: Vec::new(),
+            },
+            turn: StreetTemplate {
+                first_bet_sizes: Vec::new(),
+                donk_bet_sizes: Vec::new(),
+            },
+            river: StreetTemplate {
+                first_bet_sizes: Vec::new(),
+                donk_bet_sizes: Vec::new(),
+            },
+            raise: RaisePolicy {
+                raise_multiplier: 2.0,
+                raise_sizes: Vec::new(),
+                max_raises_per_street: 0,
+                shove_spr_threshold: 0.0,
+                shove_commit_fraction: 1.0,
+                add_all_in_threshold: 0.0,
+                force_all_in_threshold: 1.0,
+                merging_threshold: 0.0,
+            },
+        }
+    }
 }

@@ -953,3 +953,21 @@ retrying similar ideas, so attempts stay in chronological order.
   comparison. Storage is `0.611GiB` for f32 regret+strategy rows.
 - Takeaway: this is the correct base for pursuing reference-style recursion.
   Do not add more action-parallel overlays to `ArenaAlternatingCfrSolver`.
+
+## 2026-06-08: Node-local CFR first executable path
+
+- Added: sequential alternating CFR recursion to `NodeLocalCfrSolver`, including
+  exact chance-isomorphism accumulation, fold values, showdown/all-in terminal
+  values, and DCFR+/CFR+ regret/strategy updates.
+- Correctness smoke: node-local small tests pass, and the full `Td9d6h` UTG vs
+  BU first iteration matches arena pass values:
+  `oop_pass_value=201.607941`, `ip_pass_value=-525.215759`.
+- Performance progression on `Td9d6h`, UTG vs BU, pot `200`, effective `900`,
+  `postflop-basic`, `1` release iteration:
+  - naive terminal prepare per call: `17630ms/iter`;
+  - precomputed terminal board cache: `1969ms/iter`;
+  - terminal side-value cache plus no hot-path strategy/children clones:
+    `1197ms/iter`.
+- Takeaway: this path is now executable but not competitive. The next necessary
+  step is reference-style pre-river child parallelism in the node-local solver,
+  not more arena changes.
