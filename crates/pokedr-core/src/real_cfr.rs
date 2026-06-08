@@ -4774,7 +4774,7 @@ mod tests {
             .filter_map(Option::as_ref)
             .map(|infoset| infoset.slots_len)
             .sum::<usize>();
-        assert!(action_slots < 4_606_558);
+        assert_eq!(action_slots, 7_929_144);
         assert_eq!(solver.terminal_cache.len(), 49 * 48 / 2);
         assert_eq!(solver.terminal_cache_index_by_key.len(), 49 * 48 / 2);
     }

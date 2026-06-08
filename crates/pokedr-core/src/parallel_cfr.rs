@@ -364,7 +364,7 @@ fn board_key(board: &Board) -> u64 {
     board
         .cards()
         .iter()
-        .fold(0u64, |key, card| key | (1u64 << card.index()))
+        .fold(0u64, |key, card| (key << 6) | card.index() as u64)
 }
 
 #[cfg(test)]

@@ -473,7 +473,7 @@ impl TreeBuilder {
             Street::Turn => &self.template.action_abstraction.turn,
             Street::River => &self.template.action_abstraction.river,
         };
-        let sizes = if state.can_donk {
+        let sizes = if state.can_donk && !street_template.donk_bet_sizes.is_empty() {
             &street_template.donk_bet_sizes
         } else {
             &street_template.first_bet_sizes
@@ -481,8 +481,7 @@ impl TreeBuilder {
         for size in sizes {
             push_unique_action(&mut actions, self.bet_action(state, *size));
         }
-        let allows_threshold_all_in = !state.can_donk || !street_template.donk_bet_sizes.is_empty();
-        if allows_threshold_all_in && self.add_threshold_all_in_allowed(state) {
+        if self.add_threshold_all_in_allowed(state) {
             push_unique_action(&mut actions, ActionKind::AllIn { to: stack });
         }
         actions = sort_and_dedup_no_call_actions(actions);
@@ -685,7 +684,9 @@ impl TreeBuilder {
                 let mut next = state.clone();
                 let current = commit_for(&next, state.player);
                 commit_chips(&mut next, state.player, to.saturating_sub(current));
-                if to_call(&next) == 0 {
+                let opponent_commit = commit_for(&next, state.player.other());
+                let actor_commit = commit_for(&next, state.player);
+                if opponent_commit == actor_commit {
                     Transition::Terminal(TerminalReason::AllIn)
                 } else {
                     next.raises_this_street += 1;
@@ -987,7 +988,7 @@ mod tests {
     }
 
     #[test]
-    fn postflop_basic_forbids_empty_turn_donk_branch() {
+    fn postflop_basic_empty_turn_donk_uses_regular_bet_sizes() {
         let builder = TreeBuilder::new(TreeTemplate {
             action_abstraction: ActionAbstraction::postflop_solver_basic(),
             chance_expansion: ChanceExpansion::TemplateOnly,
@@ -1042,6 +1043,60 @@ mod tests {
         let PublicNodeKind::Decision { actions, .. } = &turn.kind else {
             panic!("turn child must be decision");
         };
-        assert_eq!(actions, &[ActionKind::Check]);
+        assert!(
+            actions
+                .iter()
+                .any(|action| matches!(action, ActionKind::Check))
+        );
+        assert!(
+            actions
+                .iter()
+                .any(|action| matches!(action, ActionKind::Bet { .. })),
+            "{actions:?}"
+        );
+    }
+
+    #[test]
+    fn all_in_open_keeps_opponent_response() {
+        let builder = TreeBuilder::new(TreeTemplate {
+            action_abstraction: ActionAbstraction::postflop_solver_basic(),
+            chance_expansion: ChanceExpansion::TemplateOnly,
+        })
+        .unwrap();
+        let tree = builder
+            .build(Spot {
+                board: Board::from_str("Td9d6h").unwrap(),
+                pot: 200,
+                effective_stack: 900,
+                oop_range: RangeSpec::full_deck_uniform(),
+                ip_range: RangeSpec::full_deck_uniform(),
+                first_player: Player::Oop,
+            })
+            .unwrap();
+        let root = &tree.nodes[0];
+        let PublicNodeKind::Decision { actions, .. } = &root.kind else {
+            panic!("root must be decision");
+        };
+        let all_in_child = actions
+            .iter()
+            .position(|action| matches!(action, ActionKind::AllIn { to: 900 }))
+            .and_then(|index| root.children.get(index))
+            .copied()
+            .expect("root should include all-in");
+        let response = &tree.nodes[all_in_child];
+        let PublicNodeKind::Decision { player, actions } = &response.kind else {
+            panic!("all-in open must give the opponent a response");
+        };
+        assert_eq!(*player, Player::Ip);
+        assert!(
+            actions
+                .iter()
+                .any(|action| matches!(action, ActionKind::Fold))
+        );
+        assert!(
+            actions
+                .iter()
+                .any(|action| matches!(action, ActionKind::Call { amount: 900 }))
+        );
     }
 }
