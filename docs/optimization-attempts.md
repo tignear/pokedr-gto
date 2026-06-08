@@ -733,3 +733,36 @@ retrying similar ideas, so attempts stay in chronological order.
   structural, not a single terminal-CFV micro-optimization. The main suspects
   are still action-tree shape/state materialization, reach/backup dataflow, and
   missing node-local compact traversal patterns used by the reference solver.
+
+## 2026-06-08: Parallel-first CFR rewrite plan
+
+- Tried: stop extending the three-phase solver and add a separate
+  `parallel_cfr` module that compiles a `(public node, concrete public board)`
+  state plan for a future node-local solver. The plan is explicit about
+  parallel cut points, action storage, and chance fanout.
+- Correction: the first draft incorrectly counted the existing public tree
+  shape directly and therefore did not include exact chance isomorphism. That
+  was not acceptable because the older `RealCfrSolver` already had exact
+  representative chance boards. The kept version uses `next_card_isomorphism`
+  during compile planning, stores representative chance children, and records
+  concrete member permutation codes for later value backup.
+- Rejected experiment: a quick recursive chance-parallel test used multiple
+  mutable references to one `RealCfrSolver` through a raw pointer. That is not a
+  valid Rust aliasing model and was reverted before commit. It did show that
+  child-level chance parallelism can reduce one recursive iteration from about
+  `6.9s` to about `2.2s`, but the implementation shape is not reusable.
+- Result: kept as a planning foundation, not a solver yet. On `Td9d6h` UTG vs
+  BU with enumerated chance and exact representative chance planning, the new
+  plan reported `nodes=2,452,240`, `decisions=272,738`, `chances=2,279`,
+  `terminals=562,336`, `action_slots=173,821,975`,
+  `ip_cfvalue_slots=105,470`, `chance_cfvalue_slots=603,935`, f32
+  regret+strategy storage `1.295GiB`, and f32 reference-style storage
+  `1.298GiB`. It also reported `concrete_chance_events=109,403`,
+  `representative_chance_events=90,423`, and
+  `chance_permutation_members=109,403`.
+- Takeaway: this is still about `1.9x` the reference implementation's
+  `0.671631GiB` f32 storage on the same comparison, but it is far closer than
+  the old phase layout and it keeps exact chance isomorphism. The remaining
+  storage gap is action-state count, not terminal CFV. The next step is to
+  align the action tree and node-local storage semantics with the reference
+  solver before implementing traversal.

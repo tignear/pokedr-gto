@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand};
 use pokedr_agent::{FlopTreeRequest, build_flop_tree};
 use pokedr_core::{
-    ActionKind, Board, CfrPlusState, CfrStorageConfig, ChanceExpansion, Player,
+    ActionKind, Board, CfrPlusState, CfrStorageConfig, ChanceExpansion, ParallelCfrSolver, Player,
     PreparedTerminalCfvSmoke, PublicNodeKind, RangeSpec, RealCfrConfig, RealCfrSolver,
     RealCfrVariant, Street, TreeTemplate, analyze_cfr_storage_scenarios,
     analyze_public_state_duplicates, build_action_slot_layout, dry_run_cfr_plus_iteration,
@@ -92,6 +92,8 @@ enum Command {
         terminal_cfv_tree_pass: bool,
         #[arg(long)]
         run_real_cfr: bool,
+        #[arg(long)]
+        parallel_cfr_plan: bool,
         #[arg(long)]
         run_real_cfr_three_phase: bool,
         #[arg(long, default_value_t = 1)]
@@ -340,6 +342,7 @@ fn main() -> Result<(), String> {
             terminal_cfv_batch_width,
             terminal_cfv_tree_pass,
             run_real_cfr,
+            parallel_cfr_plan,
             run_real_cfr_three_phase,
             real_cfr_log_interval,
             real_cfr_exploitability_interval,
@@ -523,6 +526,51 @@ fn main() -> Result<(), String> {
                     solver.regret_len(),
                     solver.strategy_sum_len(),
                     solver.storage_gib(),
+                );
+                return Ok(());
+            }
+            if parallel_cfr_plan {
+                let solver = ParallelCfrSolver::new(
+                    tree.clone(),
+                    RangeSpec::from_str(&oop_range)?,
+                    RangeSpec::from_str(&ip_range)?,
+                )?;
+                let report = solver.storage_report();
+                let (oop_combos, ip_combos) = solver.combo_counts();
+                println!(
+                    "parallel_cfr_plan nodes={} oop_combos={} ip_combos={} decisions={} chances={} terminals={} action_slots={} strategy_slots={} regret_slots={} ip_cfvalue_slots={} chance_cfvalue_slots={} scratch_value_slots={} parallel_cut_nodes={} max_parallel_fanout={}",
+                    report.nodes,
+                    oop_combos,
+                    ip_combos,
+                    report.decision_nodes,
+                    report.chance_nodes,
+                    report.terminal_nodes,
+                    report.action_slots,
+                    report.strategy_slots,
+                    report.regret_slots,
+                    report.ip_cfvalue_slots,
+                    report.chance_cfvalue_slots,
+                    report.scratch_value_slots,
+                    report.parallel_cut_nodes,
+                    report.max_parallel_fanout,
+                );
+                println!(
+                    "parallel_cfr_isomorphism concrete_chance_events={} representative_chance_events={} chance_permutation_members={}",
+                    report.concrete_chance_events,
+                    report.representative_chance_events,
+                    report.chance_permutation_members,
+                );
+                println!(
+                    "parallel_cfr_storage_gib f32_strategy_regret={:.3} f32_reference_style={:.3}",
+                    (report.strategy_slots + report.regret_slots) as f64
+                        * std::mem::size_of::<f32>() as f64
+                        / (1024.0 * 1024.0 * 1024.0),
+                    (report.strategy_slots
+                        + report.regret_slots
+                        + report.ip_cfvalue_slots
+                        + report.chance_cfvalue_slots) as f64
+                        * std::mem::size_of::<f32>() as f64
+                        / (1024.0 * 1024.0 * 1024.0),
                 );
                 return Ok(());
             }
