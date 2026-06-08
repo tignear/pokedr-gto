@@ -292,6 +292,7 @@ struct TerminalWorkerProfile {
     fold_states: usize,
     sparse_tasks: usize,
     prefix_tasks: usize,
+    zero_reach_tasks: usize,
     side_cache_hits: usize,
     side_cache_misses: usize,
     oop_nonzero_sum: usize,
@@ -1818,6 +1819,8 @@ impl RealCfrSolver {
         let mut ip_live = vec![0.0f32; combos];
         let mut oop_nonzero = Vec::new();
         let mut ip_nonzero = Vec::new();
+        let zero_oop_values = vec![0.0f32; self.oop_combos.len()];
+        let zero_ip_values = vec![0.0f32; self.ip_combos.len()];
         let sparse_nonzero_limit = terminal_sparse_nonzero_limit();
         let mut side_cache = TerminalSideValueCache::default();
         let mut accumulator =
@@ -1876,10 +1879,69 @@ impl RealCfrSolver {
                         profile.ip_nonzero_sum += ip_nonzero.len();
                         profile.oop_nonzero_max = profile.oop_nonzero_max.max(oop_nonzero.len());
                         profile.ip_nonzero_max = profile.ip_nonzero_max.max(ip_nonzero.len());
+                        if oop_nonzero.is_empty() && ip_nonzero.is_empty() {
+                            profile.zero_reach_tasks += 1;
+                            let accumulator_started = profile_terminal.then(Instant::now);
+                            self.add_terminal_ref_zero_values(
+                                &mut accumulator,
+                                terminal_ref,
+                                cache,
+                            )?;
+                            if let Some(started) = accumulator_started {
+                                profile.accumulator_ms += started.elapsed().as_secs_f64() * 1000.0;
+                            }
+                            continue;
+                        }
                         let cfv_started = profile_terminal.then(Instant::now);
                         let use_sparse = oop_nonzero.len() <= sparse_nonzero_limit
                             && ip_nonzero.len() <= sparse_nonzero_limit;
-                        if use_side_cache {
+                        if use_side_cache && oop_nonzero.is_empty() {
+                            profile.zero_reach_tasks += 1;
+                            let hero_values = terminal_side_cached_values(
+                                &mut side_cache,
+                                cache,
+                                terminal_ref.cache_index,
+                                TerminalSideValue::OopValue,
+                                &ip_live,
+                                &ip_nonzero,
+                                &cache.oop_targets,
+                                &cache.oop_board_targets,
+                                self.oop_combos.len(),
+                                use_sparse,
+                                &mut scratch,
+                            )?;
+                            self.add_terminal_ref_compact_values(
+                                &mut accumulator,
+                                terminal_ref,
+                                cache,
+                                node.state.pot,
+                                &hero_values,
+                                &zero_ip_values,
+                            )?;
+                        } else if use_side_cache && ip_nonzero.is_empty() {
+                            profile.zero_reach_tasks += 1;
+                            let villain_values = terminal_side_cached_values(
+                                &mut side_cache,
+                                cache,
+                                terminal_ref.cache_index,
+                                TerminalSideValue::IpValue,
+                                &oop_live,
+                                &oop_nonzero,
+                                &cache.ip_targets,
+                                &cache.ip_board_targets,
+                                self.ip_combos.len(),
+                                use_sparse,
+                                &mut scratch,
+                            )?;
+                            self.add_terminal_ref_compact_values(
+                                &mut accumulator,
+                                terminal_ref,
+                                cache,
+                                node.state.pot,
+                                &zero_oop_values,
+                                &villain_values,
+                            )?;
+                        } else if use_side_cache {
                             let hero_values = terminal_side_cached_values(
                                 &mut side_cache,
                                 cache,
@@ -1996,6 +2058,33 @@ impl RealCfrSolver {
                 pot,
                 hero_values,
                 villain_values,
+                &maps.oop_source_to_target,
+                &maps.ip_source_to_target,
+            );
+        }
+        Ok(())
+    }
+
+    fn add_terminal_ref_zero_values(
+        &self,
+        accumulator: &mut TerminalAccumulator,
+        terminal_ref: &TerminalCacheRef,
+        cache: &TerminalEvalCache,
+    ) -> Result<(), String> {
+        let identity_code = crate::isomorphism::SuitPermutation::identity().code();
+        for permutation_code in &terminal_ref.member_permutation_codes {
+            if *permutation_code == identity_code {
+                accumulator.add_zero_board_values(cache);
+                continue;
+            }
+            let maps = self
+                .combo_permutations
+                .get(permutation_code)
+                .ok_or_else(|| {
+                    "terminal isomorphism permutation is missing combo maps".to_string()
+                })?;
+            accumulator.add_zero_board_values_permuted(
+                cache,
                 &maps.oop_source_to_target,
                 &maps.ip_source_to_target,
             );
@@ -2931,6 +3020,16 @@ impl TerminalAccumulator {
         self.values.terminal_evals += 1;
     }
 
+    fn add_zero_board_values(&mut self, cache: &TerminalEvalCache) {
+        for target in &cache.oop_targets {
+            self.oop_counts[target.range_index] += 1.0;
+        }
+        for target in &cache.ip_targets {
+            self.ip_counts[target.range_index] += 1.0;
+        }
+        self.values.terminal_evals += 1;
+    }
+
     fn add_compact_board_values(
         &mut self,
         cache: &TerminalEvalCache,
@@ -2969,6 +3068,25 @@ impl TerminalAccumulator {
         for (source_index, target_index) in ip_source_to_target.iter().enumerate() {
             if let Some(board_index) = cache.ip_combo_indices[*target_index] {
                 self.values.ip[source_index] += villain_values[board_index] * pot;
+                self.ip_counts[source_index] += 1.0;
+            }
+        }
+        self.values.terminal_evals += 1;
+    }
+
+    fn add_zero_board_values_permuted(
+        &mut self,
+        cache: &TerminalEvalCache,
+        oop_source_to_target: &[usize],
+        ip_source_to_target: &[usize],
+    ) {
+        for (source_index, target_index) in oop_source_to_target.iter().enumerate() {
+            if cache.oop_combo_indices[*target_index].is_some() {
+                self.oop_counts[source_index] += 1.0;
+            }
+        }
+        for (source_index, target_index) in ip_source_to_target.iter().enumerate() {
+            if cache.ip_combo_indices[*target_index].is_some() {
                 self.ip_counts[source_index] += 1.0;
             }
         }
@@ -4302,6 +4420,10 @@ fn print_terminal_worker_profiles(
         .iter()
         .map(|profile| profile.prefix_tasks)
         .sum::<usize>();
+    let zero_reach_tasks = profiles
+        .iter()
+        .map(|profile| profile.zero_reach_tasks)
+        .sum::<usize>();
     let side_cache_hits = profiles
         .iter()
         .map(|profile| profile.side_cache_hits)
@@ -4359,12 +4481,13 @@ fn print_terminal_worker_profiles(
         0.0
     };
     eprintln!(
-        "real_cfr_terminal_profile tasks={} accounted_tasks={} threads={} sparse_tasks={} prefix_tasks={} side_cache_hits={} side_cache_misses={} avg_oop_nonzero={:.2} avg_ip_nonzero={:.2} min_worker_ms={:.3} max_worker_ms={:.3}",
+        "real_cfr_terminal_profile tasks={} accounted_tasks={} threads={} sparse_tasks={} prefix_tasks={} zero_reach_tasks={} side_cache_hits={} side_cache_misses={} avg_oop_nonzero={:.2} avg_ip_nonzero={:.2} min_worker_ms={:.3} max_worker_ms={:.3}",
         total_tasks,
         tasks,
         threads,
         sparse_tasks,
         prefix_tasks,
+        zero_reach_tasks,
         side_cache_hits,
         side_cache_misses,
         avg_oop_nonzero,
@@ -4394,13 +4517,14 @@ fn print_terminal_worker_profiles(
             0.0
         };
         eprintln!(
-            "real_cfr_terminal_worker worker={} terminal_states={} fold_states={} tasks={} sparse={} prefix={} side_cache_hits={} side_cache_misses={} avg_oop_nonzero={:.2} avg_ip_nonzero={:.2} max_oop_nonzero={} max_ip_nonzero={} output_states={} board_expand_ms={:.3} fold_ms={:.3} reach_map_ms={:.3} cfv_ms={:.3} accumulator_ms={:.3} elapsed_ms={:.3}",
+            "real_cfr_terminal_worker worker={} terminal_states={} fold_states={} tasks={} sparse={} prefix={} zero_reach={} side_cache_hits={} side_cache_misses={} avg_oop_nonzero={:.2} avg_ip_nonzero={:.2} max_oop_nonzero={} max_ip_nonzero={} output_states={} board_expand_ms={:.3} fold_ms={:.3} reach_map_ms={:.3} cfv_ms={:.3} accumulator_ms={:.3} elapsed_ms={:.3}",
             profile.worker_index,
             profile.terminal_states,
             profile.fold_states,
             profile.tasks,
             profile.sparse_tasks,
             profile.prefix_tasks,
+            profile.zero_reach_tasks,
             profile.side_cache_hits,
             profile.side_cache_misses,
             avg_oop,

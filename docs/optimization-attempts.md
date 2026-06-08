@@ -685,3 +685,27 @@ retrying similar ideas, so attempts stay in chronological order.
   probability only during chance backup.
 - Decision: keep. The next tree-side cleanup is planner/reporting consistency,
   then more structural reduction in the action tree itself.
+
+## 2026-06-08: One-sided terminal CFV fast path
+
+- Tried: avoid full terminal CFV work when one side has zero reach on a
+  terminal board. This is exact only if the other side's counterfactual values
+  are still computed: OOP values depend on IP reach, and IP values depend on OOP
+  reach. The first attempt skipped the whole task when either side was empty;
+  the recursive-vs-three-phase equality test caught the bug because later CFR
+  updates changed. The kept version skips both sides only when both reaches are
+  empty, and otherwise computes only the side whose opponent reach is nonzero.
+  Board counts are still accumulated so terminal-board averaging is unchanged.
+- Expected: reduce terminal side-value cache misses and CFV work in later
+  iterations, where many terminal states have one side with no private reach.
+- Result: kept. On `Td9d6h` UTG vs BU with `--run-real-cfr-three-phase`,
+  `4` release iterations moved terminal phase time from about `4485ms` to
+  about `2429ms`; total elapsed moved from about `15.96s` to `10.91s`.
+  Iteration 4 preserved the previous root values
+  `root_oop_value=-67.446320`, `root_ip_value=67.440964`.
+- Validation: `cargo check --workspace` and the ignored
+  recursive-vs-three-phase one-iteration equality test passed before the
+  benchmark.
+- Decision: keep. This is a real terminal-CFV reduction, not a layout-only
+  tweak. The broader next target is still batching/grouping terminal side-value
+  work to reduce repeated reach mapping and cache misses.
