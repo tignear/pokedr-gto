@@ -84,15 +84,26 @@ p {
   border-left: 1px solid #29313a;
 }
 
-.nodeScroll {
+.rootButton {
   margin-top: 12px;
-  max-height: calc(100vh - 130px);
+  width: 100%;
+  padding: 8px;
+  color: #d8dee9;
+  border: 1px solid #3a4552;
+  border-radius: 6px;
+  background: #20262d;
+  cursor: pointer;
+}
+
+.pathStack {
+  margin-top: 12px;
+  max-height: 34vh;
   overflow: auto;
   display: grid;
   gap: 5px;
 }
 
-.nodeScroll button {
+.pathStack button {
   display: grid;
   grid-template-columns: 54px 1fr 74px;
   gap: 6px;
@@ -106,9 +117,47 @@ p {
   cursor: pointer;
 }
 
-.nodeScroll button.selected {
+.pathStack button.selected {
   border-color: #6ca1ff;
   background: #223047;
+}
+
+.branchTitle {
+  margin-top: 18px;
+}
+
+.branchList {
+  margin-top: 12px;
+  max-height: calc(66vh - 180px);
+  overflow: auto;
+  display: grid;
+  gap: 6px;
+}
+
+.branchList button {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  width: 100%;
+  padding: 8px;
+  color: #e6edf3;
+  border: 1px solid #2f3944;
+  border-radius: 6px;
+  background: #1b2026;
+  text-align: left;
+  cursor: pointer;
+}
+
+.branchList button:hover,
+.rootButton:hover {
+  border-color: #69d2a0;
+  background: #1f3a32;
+}
+
+.branchList small,
+.emptyBranches {
+  color: #9aa7b5;
 }
 
 .matrixPanel {

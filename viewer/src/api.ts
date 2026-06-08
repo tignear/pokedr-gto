@@ -27,6 +27,11 @@ export type ViewerAction = {
   child: number | null;
 };
 
+export type ViewerBranch = {
+  label: string;
+  child: number;
+};
+
 export type ViewerStrategy = {
   player: "oop" | "ip";
   combos: number;
@@ -44,6 +49,7 @@ export type ViewerNode = {
   kind: string;
   children: number[];
   actions: ViewerAction[];
+  choices: ViewerBranch[];
   strategy: ViewerStrategy | null;
 };
 

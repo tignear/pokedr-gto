@@ -4,6 +4,7 @@ import {
   fetchNode,
   fetchSummary,
   fetchCombos,
+  type ViewerBranch,
   type ViewerCombo,
   type ViewerNodeListItem,
   type ViewerNode,
@@ -25,7 +26,7 @@ type ComboAggregate = {
 
 function App() {
   const [summary, setSummary] = useState<ViewerSummary | null>(null);
-  const [nodesById, setNodesById] = useState<Map<number, ViewerNodeListItem>>(() => new Map());
+  const [path, setPath] = useState<ViewerNodeListItem[]>([]);
   const [selectedNodeId, setSelectedNodeId] = useState(0);
   const [selectedNode, setSelectedNode] = useState<ViewerNode | null>(null);
   const [selectedAction, setSelectedAction] = useState(0);
@@ -42,11 +43,7 @@ function App() {
     fetchNode(selectedNodeId)
       .then((node) => {
         setSelectedNode(node);
-        setNodesById((previous) => {
-          const next = new Map(previous);
-          next.set(node.id, nodeListItem(node));
-          return next;
-        });
+        setPath((previous) => updatePath(previous, nodeListItem(node)));
         setSelectedAction(0);
         setSelectedCell(null);
       })
@@ -56,10 +53,6 @@ function App() {
   const solutionCombos = useSolutionCombos();
   const actingCombos =
     selectedNode?.strategy?.player === "oop" ? solutionCombos.oop : solutionCombos.ip;
-  const nodes = useMemo(
-    () => Array.from(nodesById.values()).sort((left, right) => left.id - right.id),
-    [nodesById]
-  );
 
   if (error) {
     return <div className="fatal">viewer error: {error}</div>;
@@ -91,7 +84,13 @@ function App() {
       </header>
 
       <section className="layout">
-        <NodeList nodes={nodes} selected={selectedNodeId} onSelect={setSelectedNodeId} />
+        <TreePanel
+          path={path}
+          node={selectedNode}
+          selected={selectedNodeId}
+          onSelect={setSelectedNodeId}
+          onReset={() => setSelectedNodeId(0)}
+        />
 
         <section className="matrixPanel">
           <div className="panelHeader">
@@ -174,6 +173,14 @@ function nodeListItem(node: ViewerNode): ViewerNodeListItem {
   return item;
 }
 
+function updatePath(path: ViewerNodeListItem[], node: ViewerNodeListItem) {
+  const existing = path.findIndex((entry) => entry.id === node.id);
+  if (existing >= 0) {
+    return [...path.slice(0, existing), node];
+  }
+  return [...path, node];
+}
+
 function useSolutionCombos() {
   const [combos, setCombos] = useState<{ oop: ViewerCombo[]; ip: ViewerCombo[] }>({
     oop: [],
@@ -189,20 +196,27 @@ function useSolutionCombos() {
   return combos;
 }
 
-function NodeList({
-  nodes,
+function TreePanel({
+  path,
+  node,
   selected,
-  onSelect
+  onSelect,
+  onReset
 }: {
-  nodes: ViewerNodeListItem[];
+  path: ViewerNodeListItem[];
+  node: ViewerNode;
   selected: number;
   onSelect: (id: number) => void;
+  onReset: () => void;
 }) {
   return (
     <aside className="nodes">
       <h2>Tree</h2>
-      <div className="nodeScroll">
-        {nodes.map((node) => (
+      <button className="rootButton" onClick={onReset}>
+        root
+      </button>
+      <div className="pathStack">
+        {path.map((node) => (
           <button
             key={node.id}
             className={node.id === selected ? "selected" : ""}
@@ -214,7 +228,31 @@ function NodeList({
           </button>
         ))}
       </div>
+      <h2 className="branchTitle">Branches</h2>
+      <BranchList choices={node.choices} onSelect={onSelect} />
     </aside>
+  );
+}
+
+function BranchList({
+  choices,
+  onSelect
+}: {
+  choices: ViewerBranch[];
+  onSelect: (id: number) => void;
+}) {
+  if (choices.length === 0) {
+    return <p className="emptyBranches">terminal node</p>;
+  }
+  return (
+    <div className="branchList">
+      {choices.map((choice) => (
+        <button key={choice.child} onClick={() => onSelect(choice.child)}>
+          <span>{choice.label}</span>
+          <small>#{choice.child}</small>
+        </button>
+      ))}
+    </div>
   );
 }
 

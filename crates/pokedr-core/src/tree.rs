@@ -258,7 +258,7 @@ impl ActionAbstraction {
             BetSizeSpec::AllIn,
         ];
         Self {
-            min_bet: 1,
+            min_bet: 100,
             flop: StreetTemplate {
                 first_bet_sizes: first_bets.clone(),
                 donk_bet_sizes: Vec::new(),

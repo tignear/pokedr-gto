@@ -1126,6 +1126,7 @@ struct ViewerNode {
     kind: String,
     children: Vec<usize>,
     actions: Vec<ViewerAction>,
+    choices: Vec<ViewerBranch>,
     strategy: Option<ViewerStrategy>,
 }
 
@@ -1134,6 +1135,12 @@ struct ViewerAction {
     index: usize,
     label: String,
     child: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ViewerBranch {
+    label: String,
+    child: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1159,7 +1166,7 @@ fn viewer_solution_from_snapshot(
 ) -> ViewerSolution {
     let oop_combos = viewer_combos(&snapshot.oop_combos);
     let ip_combos = viewer_combos(&snapshot.ip_combos);
-    let nodes = snapshot
+    let mut nodes = snapshot
         .nodes
         .into_iter()
         .map(|node| {
@@ -1190,6 +1197,7 @@ fn viewer_solution_from_snapshot(
                 kind,
                 children: node.children,
                 actions,
+                choices: Vec::new(),
                 strategy: node.strategy.map(|strategy| ViewerStrategy {
                     player: format_player(strategy.player),
                     combos: strategy.combos,
@@ -1199,6 +1207,32 @@ fn viewer_solution_from_snapshot(
             }
         })
         .collect::<Vec<_>>();
+    for index in 0..nodes.len() {
+        let choices = if nodes[index].kind == "chance" {
+            nodes[index]
+                .children
+                .iter()
+                .filter_map(|child| {
+                    nodes.get(*child).map(|node| ViewerBranch {
+                        label: node.board.clone(),
+                        child: *child,
+                    })
+                })
+                .collect::<Vec<_>>()
+        } else {
+            nodes[index]
+                .actions
+                .iter()
+                .filter_map(|action| {
+                    action.child.map(|child| ViewerBranch {
+                        label: action.label.clone(),
+                        child,
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+        nodes[index].choices = choices;
+    }
     ViewerSolution {
         summary: ViewerSummary {
             board: request.board.to_string(),
