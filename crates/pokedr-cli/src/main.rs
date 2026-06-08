@@ -426,19 +426,18 @@ fn main() -> Result<(), String> {
                                 || progress.iteration % real_cfr_log_interval == 0)
                         {
                             println!(
-                                "arena_cfr_progress iteration={} terminal_evals={} iteration_ms={:.3} root_oop_value={:.6} root_ip_value={:.6} zero_sum_delta={:.6}",
+                                "arena_cfr_progress iteration={} terminal_evals={} iteration_ms={:.3} oop_pass_value={:.6} ip_pass_value={:.6}",
                                 progress.iteration,
                                 progress.terminal_evals,
                                 progress.elapsed_ms,
-                                progress.root_oop_value,
-                                progress.root_ip_value,
-                                progress.root_oop_value + progress.root_ip_value,
+                                progress.oop_update_pass_value,
+                                progress.ip_update_pass_value,
                             );
                         }
                     },
                 )?;
                 println!(
-                    "arena_cfr iterations={} threads={} states={} decision_states={} action_slots={} terminal_evals={} elapsed_ms={:.3} root_oop_value={:.6} root_ip_value={:.6} zero_sum_delta={:.6}",
+                    "arena_cfr iterations={} threads={} states={} decision_states={} action_slots={} terminal_evals={} elapsed_ms={:.3} oop_pass_value={:.6} ip_pass_value={:.6}",
                     summary.iterations,
                     state_threads,
                     summary.states,
@@ -446,9 +445,8 @@ fn main() -> Result<(), String> {
                     summary.action_slots,
                     summary.terminal_evals,
                     started.elapsed().as_secs_f64() * 1000.0,
-                    summary.root_oop_value,
-                    summary.root_ip_value,
-                    summary.root_oop_value + summary.root_ip_value,
+                    summary.oop_update_pass_value,
+                    summary.ip_update_pass_value,
                 );
                 println!(
                     "arena_cfr_state_allocated=true states={} regret_len={} strategy_sum_len={} storage_gib={:.3}",

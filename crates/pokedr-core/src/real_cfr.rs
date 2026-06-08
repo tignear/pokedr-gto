@@ -186,8 +186,8 @@ pub struct ArenaAlternatingCfrSummary {
     pub decision_states: usize,
     pub action_slots: usize,
     pub terminal_evals: usize,
-    pub root_oop_value: f32,
-    pub root_ip_value: f32,
+    pub oop_update_pass_value: f32,
+    pub ip_update_pass_value: f32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -195,8 +195,8 @@ pub struct ArenaAlternatingCfrIterationSummary {
     pub iteration: u32,
     pub terminal_evals: usize,
     pub elapsed_ms: f64,
-    pub root_oop_value: f32,
-    pub root_ip_value: f32,
+    pub oop_update_pass_value: f32,
+    pub ip_update_pass_value: f32,
 }
 
 #[derive(Debug, Clone)]
@@ -259,11 +259,15 @@ struct ArenaChanceChildTask {
     slot_end: usize,
 }
 
-struct ArenaChanceChildResult {
+struct ArenaChanceSideAggregate {
+    terminal_evals: usize,
+    profile: RecursiveCfrProfile,
+}
+
+struct ArenaChanceSideTaskResult {
     original_index: usize,
     terminal_evals: usize,
-    oop: Vec<f32>,
-    ip: Vec<f32>,
+    values: Vec<f32>,
     profile: RecursiveCfrProfile,
 }
 
@@ -743,13 +747,16 @@ impl ArenaAlternatingCfrSolver {
                     oop_same_ip_combo_indices: &self.oop_same_ip_combo_indices,
                     ip_same_oop_combo_indices: &self.ip_same_oop_combo_indices,
                 };
-                root_terminal_evals += arena_traverse_update_into(
+                let root_values = match update_player {
+                    Player::Oop => &mut root_oop,
+                    Player::Ip => &mut root_ip,
+                };
+                root_terminal_evals += arena_traverse_update_side_into(
                     &ctx,
                     &mut self.regrets,
                     &mut self.strategy_sum,
                     0,
-                    &mut root_oop,
-                    &mut root_ip,
+                    root_values,
                     0,
                     update_player,
                     &oop_reach,
@@ -782,13 +789,18 @@ impl ArenaAlternatingCfrSolver {
                 iteration,
                 terminal_evals: root_terminal_evals,
                 elapsed_ms: started.elapsed().as_secs_f64() * 1000.0,
-                root_oop_value: weighted_average(
+                oop_update_pass_value: weighted_average(
                     &root_oop,
                     &self.oop_combos,
                     oop_weight,
                     ip_weight,
                 ),
-                root_ip_value: weighted_average(&root_ip, &self.ip_combos, ip_weight, oop_weight),
+                ip_update_pass_value: weighted_average(
+                    &root_ip,
+                    &self.ip_combos,
+                    ip_weight,
+                    oop_weight,
+                ),
             });
         }
         Ok(ArenaAlternatingCfrSummary {
@@ -801,8 +813,18 @@ impl ArenaAlternatingCfrSolver {
                 .count(),
             action_slots: self.regrets.len(),
             terminal_evals: root_terminal_evals,
-            root_oop_value: weighted_average(&root_oop, &self.oop_combos, oop_weight, ip_weight),
-            root_ip_value: weighted_average(&root_ip, &self.ip_combos, ip_weight, oop_weight),
+            oop_update_pass_value: weighted_average(
+                &root_oop,
+                &self.oop_combos,
+                oop_weight,
+                ip_weight,
+            ),
+            ip_update_pass_value: weighted_average(
+                &root_ip,
+                &self.ip_combos,
+                ip_weight,
+                oop_weight,
+            ),
         })
     }
 
@@ -948,13 +970,12 @@ impl ArenaAlternatingCfrSolver {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn arena_traverse_update_into(
+fn arena_traverse_update_side_into(
     ctx: &ArenaCfrContext<'_>,
     regrets: &mut [f32],
     strategy_sum: &mut [f32],
     slot_base: usize,
-    out_oop: &mut [f32],
-    out_ip: &mut [f32],
+    out: &mut [f32],
     state_index: usize,
     update_player: Player,
     oop_reach: &[f32],
@@ -968,11 +989,11 @@ fn arena_traverse_update_into(
 ) -> Result<usize, String> {
     let node_id = ctx.states[state_index].node_id;
     match &ctx.tree.nodes[node_id].kind {
-        PublicNodeKind::Terminal { reason } => arena_terminal_slices_into(
+        PublicNodeKind::Terminal { reason } => arena_terminal_side_into(
             ctx,
-            out_oop,
-            out_ip,
+            out,
             state_index,
+            update_player,
             ctx.tree.nodes[node_id].state.pot,
             ctx.tree.nodes[node_id].state.player,
             *reason,
@@ -988,8 +1009,7 @@ fn arena_traverse_update_into(
                 profile.values_zero += 1;
                 profile.chance_cards += ctx.states[state_index].chance_concrete_events as u64;
             }
-            out_oop.fill(0.0);
-            out_ip.fill(0.0);
+            out.fill(0.0);
             let chance_weight = 1.0f32 / ctx.states[state_index].chance_concrete_events as f32;
             if parallel_budget > 1 && ctx.states[state_index].children.len() >= 8 {
                 let mut tasks = Vec::with_capacity(ctx.states[state_index].children.len());
@@ -1018,13 +1038,16 @@ fn arena_traverse_update_into(
                 tasks.sort_unstable_by_key(|task| {
                     (task.slot_start, task.slot_end, task.original_index)
                 });
-                let results = arena_run_chance_tasks_parallel(
+                let aggregate = arena_run_chance_side_tasks_parallel_into(
                     ctx,
                     regrets,
                     strategy_sum,
                     slot_base,
+                    out,
                     &tasks,
+                    state_index,
                     update_player,
+                    chance_weight,
                     oop_reach,
                     ip_reach,
                     average_weight,
@@ -1032,38 +1055,11 @@ fn arena_traverse_update_into(
                     profile.enabled,
                     parallel_budget,
                 )?;
-                let mut terminal_evals = 0usize;
-                for result in results {
-                    terminal_evals += result.terminal_evals;
-                    profile.add_counts(&result.profile);
-                    for permutation_code in &ctx.states[state_index].chance_member_permutation_codes
-                        [result.original_index]
-                    {
-                        let maps =
-                            ctx.combo_permutations
-                                .get(permutation_code)
-                                .ok_or_else(|| {
-                                    "chance isomorphism permutation is missing combo maps"
-                                        .to_string()
-                                })?;
-                        add_permuted_scaled_slice(
-                            out_oop,
-                            &result.oop,
-                            &maps.oop_source_to_target,
-                            chance_weight,
-                        );
-                        add_permuted_scaled_slice(
-                            out_ip,
-                            &result.ip,
-                            &maps.ip_source_to_target,
-                            chance_weight,
-                        );
-                    }
-                }
-                return Ok(terminal_evals);
+                profile.add_counts(&aggregate.profile);
+                return Ok(aggregate.terminal_evals);
             }
-            let mut child_oop = terminal_scratch.take_vec(out_oop.len());
-            let mut child_ip = terminal_scratch.take_vec(out_ip.len());
+
+            let mut child_values = terminal_scratch.take_vec(out.len());
             let mut terminal_evals = 0usize;
             for (child_index, permutation_codes) in ctx.states[state_index]
                 .children
@@ -1071,13 +1067,12 @@ fn arena_traverse_update_into(
                 .copied()
                 .zip(&ctx.states[state_index].chance_member_permutation_codes)
             {
-                terminal_evals += arena_traverse_update_into(
+                terminal_evals += arena_traverse_update_side_into(
                     ctx,
                     regrets,
                     strategy_sum,
                     slot_base,
-                    &mut child_oop,
-                    &mut child_ip,
+                    &mut child_values,
                     child_index,
                     update_player,
                     oop_reach,
@@ -1096,22 +1091,14 @@ fn arena_traverse_update_into(
                         .ok_or_else(|| {
                             "chance isomorphism permutation is missing combo maps".to_string()
                         })?;
-                    add_permuted_scaled_slice(
-                        out_oop,
-                        &child_oop,
-                        &maps.oop_source_to_target,
-                        chance_weight,
-                    );
-                    add_permuted_scaled_slice(
-                        out_ip,
-                        &child_ip,
-                        &maps.ip_source_to_target,
-                        chance_weight,
-                    );
+                    let source_to_target = match update_player {
+                        Player::Oop => &maps.oop_source_to_target,
+                        Player::Ip => &maps.ip_source_to_target,
+                    };
+                    add_permuted_scaled_slice(out, &child_values, source_to_target, chance_weight);
                 }
             }
-            terminal_scratch.release_vec(child_oop);
-            terminal_scratch.release_vec(child_ip);
+            terminal_scratch.release_vec(child_values);
             Ok(terminal_evals)
         }
         PublicNodeKind::Decision { player, actions } => {
@@ -1121,13 +1108,12 @@ fn arena_traverse_update_into(
                 profile.decision_calls += 1;
             }
             if actions_len == 1 {
-                return arena_traverse_update_into(
+                return arena_traverse_update_side_into(
                     ctx,
                     regrets,
                     strategy_sum,
                     slot_base,
-                    out_oop,
-                    out_ip,
+                    out,
                     ctx.states[state_index].children[0],
                     update_player,
                     oop_reach,
@@ -1169,10 +1155,8 @@ fn arena_traverse_update_into(
                 profile.strategy_builds += 1;
                 profile.values_zero += 1;
             }
-            let oop_len = out_oop.len();
-            let ip_len = out_ip.len();
-            let mut action_oop = terminal_scratch.take_vec(actions_len * oop_len);
-            let mut action_ip = terminal_scratch.take_vec(actions_len * ip_len);
+            let target_len = out.len();
+            let mut action_values = terminal_scratch.take_vec(actions_len * target_len);
             let mut terminal_evals = 0usize;
             match player {
                 Player::Oop => {
@@ -1188,13 +1172,13 @@ fn arena_traverse_update_into(
                         if profile.enabled {
                             profile.reach_scratch_writes += next_oop.len() as u64;
                         }
-                        terminal_evals += arena_traverse_update_into(
+                        terminal_evals += arena_traverse_update_side_into(
                             ctx,
                             regrets,
                             strategy_sum,
                             slot_base,
-                            &mut action_oop[action_index * oop_len..(action_index + 1) * oop_len],
-                            &mut action_ip[action_index * ip_len..(action_index + 1) * ip_len],
+                            &mut action_values
+                                [action_index * target_len..(action_index + 1) * target_len],
                             ctx.states[state_index].children[action_index],
                             update_player,
                             &next_oop,
@@ -1222,13 +1206,13 @@ fn arena_traverse_update_into(
                         if profile.enabled {
                             profile.reach_scratch_writes += next_ip.len() as u64;
                         }
-                        terminal_evals += arena_traverse_update_into(
+                        terminal_evals += arena_traverse_update_side_into(
                             ctx,
                             regrets,
                             strategy_sum,
                             slot_base,
-                            &mut action_oop[action_index * oop_len..(action_index + 1) * oop_len],
-                            &mut action_ip[action_index * ip_len..(action_index + 1) * ip_len],
+                            &mut action_values
+                                [action_index * target_len..(action_index + 1) * target_len],
                             ctx.states[state_index].children[action_index],
                             update_player,
                             oop_reach,
@@ -1244,32 +1228,17 @@ fn arena_traverse_update_into(
                     terminal_scratch.release_vec(next_ip);
                 }
             }
-            match player {
-                Player::Oop => {
-                    combine_acting_flat_values(out_oop, &action_oop, &strategies, actions_len);
-                    combine_nonacting_flat_values(out_ip, &action_ip, actions_len);
-                }
-                Player::Ip => {
-                    combine_acting_flat_values(out_ip, &action_ip, &strategies, actions_len);
-                    combine_nonacting_flat_values(out_oop, &action_oop, actions_len);
-                }
-            }
             if player == update_player {
+                combine_acting_flat_values(out, &action_values, &strategies, actions_len);
                 let own_reach = match player {
                     Player::Oop => oop_reach,
                     Player::Ip => ip_reach,
                 };
                 let update_factors = RealCfrUpdateFactors::new(variant, average_weight);
                 for combo in 0..acting_combos {
-                    let node_value = match player {
-                        Player::Oop => out_oop[combo],
-                        Player::Ip => out_ip[combo],
-                    };
+                    let node_value = out[combo];
                     for action_index in 0..actions_len {
-                        let action_value = match player {
-                            Player::Oop => action_oop[action_index * oop_len + combo],
-                            Player::Ip => action_ip[action_index * ip_len + combo],
-                        };
+                        let action_value = action_values[action_index * target_len + combo];
                         let local_slot = local_slot_start + combo * actions_len + action_index;
                         apply_real_cfr_update_with_factors(
                             &mut regrets[local_slot],
@@ -1280,37 +1249,47 @@ fn arena_traverse_update_into(
                         );
                     }
                 }
+            } else {
+                combine_nonacting_flat_values(out, &action_values, actions_len);
             }
             terminal_scratch.release_vec(strategies);
-            terminal_scratch.release_vec(action_oop);
-            terminal_scratch.release_vec(action_ip);
+            terminal_scratch.release_vec(action_values);
             Ok(terminal_evals)
         }
     }
 }
 
 #[allow(clippy::too_many_arguments)]
-fn arena_run_chance_tasks_parallel(
+fn arena_run_chance_side_tasks_parallel_into(
     ctx: &ArenaCfrContext<'_>,
     regrets: &mut [f32],
     strategy_sum: &mut [f32],
     slot_base: usize,
+    out: &mut [f32],
     tasks: &[ArenaChanceChildTask],
+    parent_state_index: usize,
     update_player: Player,
+    chance_weight: f32,
     oop_reach: &[f32],
     ip_reach: &[f32],
     average_weight: f32,
     variant: RealCfrVariant,
     profile_enabled: bool,
     parallel_budget: usize,
-) -> Result<Vec<ArenaChanceChildResult>, String> {
+) -> Result<ArenaChanceSideAggregate, String> {
     if tasks.is_empty() {
-        return Ok(Vec::new());
+        return Ok(ArenaChanceSideAggregate {
+            terminal_evals: 0,
+            profile: RecursiveCfrProfile::default(),
+        });
     }
     if tasks.len() == 1 || parallel_budget <= 1 {
-        let mut results = Vec::with_capacity(tasks.len());
+        let mut aggregate = ArenaChanceSideAggregate {
+            terminal_evals: 0,
+            profile: RecursiveCfrProfile::default(),
+        };
         for task in tasks {
-            results.push(arena_run_chance_task(
+            let result = arena_run_chance_side_task(
                 ctx,
                 regrets,
                 strategy_sum,
@@ -1322,9 +1301,20 @@ fn arena_run_chance_tasks_parallel(
                 average_weight,
                 variant,
                 profile_enabled,
-            )?);
+            )?;
+            aggregate.terminal_evals += result.terminal_evals;
+            aggregate.profile.add_counts(&result.profile);
+            arena_add_chance_side_result(
+                ctx,
+                out,
+                parent_state_index,
+                update_player,
+                chance_weight,
+                result.original_index,
+                &result.values,
+            )?;
         }
-        return Ok(results);
+        return Ok(aggregate);
     }
 
     let split_index = tasks.len() / 2;
@@ -1341,15 +1331,19 @@ fn arena_run_chance_tasks_parallel(
     let (left_strategy_sum, right_strategy_sum) = strategy_sum.split_at_mut(split_offset);
     let left_budget = parallel_budget / 2;
     let right_budget = parallel_budget - left_budget;
+    let mut right_values = vec![0.0; out.len()];
     let (left, right) = rayon::join(
         || {
-            arena_run_chance_tasks_parallel(
+            arena_run_chance_side_tasks_parallel_into(
                 ctx,
                 left_regrets,
                 left_strategy_sum,
                 slot_base,
+                out,
                 left_tasks,
+                parent_state_index,
                 update_player,
+                chance_weight,
                 oop_reach,
                 ip_reach,
                 average_weight,
@@ -1359,13 +1353,16 @@ fn arena_run_chance_tasks_parallel(
             )
         },
         || {
-            arena_run_chance_tasks_parallel(
+            arena_run_chance_side_tasks_parallel_into(
                 ctx,
                 right_regrets,
                 right_strategy_sum,
                 split_slot,
+                &mut right_values,
                 right_tasks,
+                parent_state_index,
                 update_player,
+                chance_weight,
                 oop_reach,
                 ip_reach,
                 average_weight,
@@ -1376,12 +1373,15 @@ fn arena_run_chance_tasks_parallel(
         },
     );
     let mut left = left?;
-    left.extend(right?);
+    let right = right?;
+    add_slice(out, &right_values);
+    left.terminal_evals += right.terminal_evals;
+    left.profile.add_counts(&right.profile);
     Ok(left)
 }
 
 #[allow(clippy::too_many_arguments)]
-fn arena_run_chance_task(
+fn arena_run_chance_side_task(
     ctx: &ArenaCfrContext<'_>,
     regrets: &mut [f32],
     strategy_sum: &mut [f32],
@@ -1393,7 +1393,7 @@ fn arena_run_chance_task(
     average_weight: f32,
     variant: RealCfrVariant,
     profile_enabled: bool,
-) -> Result<ArenaChanceChildResult, String> {
+) -> Result<ArenaChanceSideTaskResult, String> {
     let local_start = task
         .slot_start
         .checked_sub(slot_base)
@@ -1411,15 +1411,19 @@ fn arena_run_chance_task(
         enabled: profile_enabled,
         ..RecursiveCfrProfile::default()
     };
-    let mut oop = vec![0.0; ctx.oop_combos.len()];
-    let mut ip = vec![0.0; ctx.ip_combos.len()];
-    let terminal_evals = arena_traverse_update_into(
+    let mut values = vec![
+        0.0;
+        match update_player {
+            Player::Oop => ctx.oop_combos.len(),
+            Player::Ip => ctx.ip_combos.len(),
+        }
+    ];
+    let terminal_evals = arena_traverse_update_side_into(
         ctx,
         &mut regrets[local_start..local_end],
         &mut strategy_sum[local_start..local_end],
         task.slot_start,
-        &mut oop,
-        &mut ip,
+        &mut values,
         task.child_index,
         update_player,
         oop_reach,
@@ -1431,38 +1435,45 @@ fn arena_run_chance_task(
         &mut side_cache,
         &mut profile,
     )?;
-    Ok(ArenaChanceChildResult {
+    Ok(ArenaChanceSideTaskResult {
         original_index: task.original_index,
         terminal_evals,
-        oop,
-        ip,
+        values,
         profile,
     })
 }
 
-fn arena_terminal_scratch(ctx: &ArenaCfrContext<'_>) -> Result<RecursiveTerminalScratch, String> {
-    let scratch_source = ctx
-        .terminal_cache
-        .first()
-        .ok_or_else(|| "terminal board cache is empty".to_string())?;
-    let terminal_combos = scratch_source.prepared.combos().len();
-    Ok(RecursiveTerminalScratch {
-        cfv: TerminalCfvScratch::new(&scratch_source.prepared),
-        oop_live: vec![0.0; terminal_combos],
-        ip_live: vec![0.0; terminal_combos],
-        oop_nonzero: Vec::new(),
-        ip_nonzero: Vec::new(),
-        accumulator: TerminalAccumulator::zero(ctx.oop_combos.len(), ctx.ip_combos.len()),
-        vectors: Vec::new(),
-    })
+fn arena_add_chance_side_result(
+    ctx: &ArenaCfrContext<'_>,
+    out: &mut [f32],
+    parent_state_index: usize,
+    update_player: Player,
+    chance_weight: f32,
+    original_index: usize,
+    child_values: &[f32],
+) -> Result<(), String> {
+    for permutation_code in
+        &ctx.states[parent_state_index].chance_member_permutation_codes[original_index]
+    {
+        let maps = ctx
+            .combo_permutations
+            .get(permutation_code)
+            .ok_or_else(|| "chance isomorphism permutation is missing combo maps".to_string())?;
+        let source_to_target = match update_player {
+            Player::Oop => &maps.oop_source_to_target,
+            Player::Ip => &maps.ip_source_to_target,
+        };
+        add_permuted_scaled_slice(out, child_values, source_to_target, chance_weight);
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
-fn arena_terminal_slices_into(
+fn arena_terminal_side_into(
     ctx: &ArenaCfrContext<'_>,
-    out_oop: &mut [f32],
-    out_ip: &mut [f32],
+    out: &mut [f32],
     state_index: usize,
+    update_player: Player,
     pot: u32,
     folding_player: Player,
     reason: TerminalReason,
@@ -1480,13 +1491,13 @@ fn arena_terminal_slices_into(
             if profile.enabled {
                 profile.fold_calls += 1;
             }
-            arena_fold_slices_into(
+            arena_fold_side_into(
                 ctx,
-                out_oop,
-                out_ip,
+                out,
                 &ctx.states[state_index].board,
                 pot,
                 folding_player,
+                update_player,
                 oop_reach,
                 ip_reach,
             );
@@ -1496,25 +1507,92 @@ fn arena_terminal_slices_into(
             if profile.enabled {
                 profile.showdown_calls += 1;
             }
-            let sparse_nonzero_limit = terminal_sparse_nonzero_limit();
-            terminal_scratch.accumulator.reset();
-            for terminal_ref in &ctx.states[state_index].terminal_cache_refs {
-                let cache = &ctx.terminal_cache[terminal_ref.cache_index];
-                reach_on_prepared_board_targets_sparse_into(
-                    &cache.oop_targets,
-                    oop_reach,
-                    &mut terminal_scratch.oop_live,
-                    &mut terminal_scratch.oop_nonzero,
-                );
+            arena_showdown_side_into(
+                ctx,
+                out,
+                state_index,
+                update_player,
+                pot,
+                oop_reach,
+                ip_reach,
+                terminal_scratch,
+                side_cache,
+            )
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn arena_fold_side_into(
+    ctx: &ArenaCfrContext<'_>,
+    out: &mut [f32],
+    board: &Board,
+    pot: u32,
+    folding_player: Player,
+    update_player: Player,
+    oop_reach: &[f32],
+    ip_reach: &[f32],
+) {
+    let pot = pot as f32;
+    match update_player {
+        Player::Oop => {
+            opponent_weights_for_fast_into(
+                ctx.oop_combos,
+                ctx.ip_combos,
+                ip_reach,
+                ctx.oop_same_ip_combo_indices,
+                board,
+                out,
+            );
+        }
+        Player::Ip => {
+            opponent_weights_for_fast_into(
+                ctx.ip_combos,
+                ctx.oop_combos,
+                oop_reach,
+                ctx.ip_same_oop_combo_indices,
+                board,
+                out,
+            );
+        }
+    }
+    let sign = if folding_player == update_player {
+        -pot
+    } else {
+        pot
+    };
+    for value in out.iter_mut() {
+        *value *= sign;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn arena_showdown_side_into(
+    ctx: &ArenaCfrContext<'_>,
+    out: &mut [f32],
+    state_index: usize,
+    update_player: Player,
+    pot: u32,
+    oop_reach: &[f32],
+    ip_reach: &[f32],
+    terminal_scratch: &mut RecursiveTerminalScratch,
+    side_cache: &mut TerminalSideValueCache,
+) -> Result<usize, String> {
+    out.fill(0.0);
+    let mut counts = terminal_scratch.take_vec(out.len());
+    let sparse_nonzero_limit = terminal_sparse_nonzero_limit();
+    let mut terminal_evals = 0usize;
+    for terminal_ref in &ctx.states[state_index].terminal_cache_refs {
+        let cache = &ctx.terminal_cache[terminal_ref.cache_index];
+        let values = match update_player {
+            Player::Oop => {
                 reach_on_prepared_board_targets_sparse_into(
                     &cache.ip_targets,
                     ip_reach,
                     &mut terminal_scratch.ip_live,
                     &mut terminal_scratch.ip_nonzero,
                 );
-                let use_sparse = terminal_scratch.oop_nonzero.len() <= sparse_nonzero_limit
-                    && terminal_scratch.ip_nonzero.len() <= sparse_nonzero_limit;
-                let hero_values = terminal_side_cached_values(
+                terminal_side_cached_values(
                     side_cache,
                     cache,
                     terminal_ref.cache_index,
@@ -1524,10 +1602,18 @@ fn arena_terminal_slices_into(
                     &cache.oop_targets,
                     &cache.oop_board_targets,
                     ctx.oop_combos.len(),
-                    use_sparse,
+                    terminal_scratch.ip_nonzero.len() <= sparse_nonzero_limit,
                     &mut terminal_scratch.cfv,
-                )?;
-                let villain_values = terminal_side_cached_values(
+                )?
+            }
+            Player::Ip => {
+                reach_on_prepared_board_targets_sparse_into(
+                    &cache.oop_targets,
+                    oop_reach,
+                    &mut terminal_scratch.oop_live,
+                    &mut terminal_scratch.oop_nonzero,
+                );
+                terminal_side_cached_values(
                     side_cache,
                     cache,
                     terminal_ref.cache_index,
@@ -1537,100 +1623,142 @@ fn arena_terminal_slices_into(
                     &cache.ip_targets,
                     &cache.ip_board_targets,
                     ctx.ip_combos.len(),
-                    use_sparse,
+                    terminal_scratch.oop_nonzero.len() <= sparse_nonzero_limit,
                     &mut terminal_scratch.cfv,
-                )?;
-                arena_add_terminal_ref_compact_values(
-                    ctx,
-                    &mut terminal_scratch.accumulator,
-                    terminal_ref,
-                    cache,
-                    pot,
-                    &hero_values,
-                    &villain_values,
-                )?;
+                )?
             }
-            terminal_scratch.accumulator.finish();
-            out_oop.copy_from_slice(&terminal_scratch.accumulator.values.oop);
-            out_ip.copy_from_slice(&terminal_scratch.accumulator.values.ip);
-            Ok(terminal_scratch.accumulator.values.terminal_evals)
+        };
+        terminal_evals += arena_add_terminal_ref_side_values(
+            ctx,
+            out,
+            &mut counts,
+            terminal_ref,
+            cache,
+            update_player,
+            pot,
+            &values,
+        )?;
+    }
+    for (value, count) in out.iter_mut().zip(&counts) {
+        if *count > 0.0 {
+            *value /= *count;
         }
     }
+    terminal_scratch.release_vec(counts);
+    Ok(terminal_evals)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn arena_fold_slices_into(
+fn arena_add_terminal_ref_side_values(
     ctx: &ArenaCfrContext<'_>,
-    out_oop: &mut [f32],
-    out_ip: &mut [f32],
-    board: &Board,
-    pot: u32,
-    folding_player: Player,
-    oop_reach: &[f32],
-    ip_reach: &[f32],
-) {
-    let pot = pot as f32;
-    opponent_weights_for_fast_into(
-        ctx.oop_combos,
-        ctx.ip_combos,
-        ip_reach,
-        ctx.oop_same_ip_combo_indices,
-        board,
-        out_oop,
-    );
-    opponent_weights_for_fast_into(
-        ctx.ip_combos,
-        ctx.oop_combos,
-        oop_reach,
-        ctx.ip_same_oop_combo_indices,
-        board,
-        out_ip,
-    );
-    for value in out_oop.iter_mut() {
-        *value = if folding_player == Player::Oop {
-            -pot
-        } else {
-            pot
-        } * *value;
-    }
-    for value in out_ip.iter_mut() {
-        *value = if folding_player == Player::Ip {
-            -pot
-        } else {
-            pot
-        } * *value;
-    }
-}
-
-fn arena_add_terminal_ref_compact_values(
-    ctx: &ArenaCfrContext<'_>,
-    accumulator: &mut TerminalAccumulator,
+    out: &mut [f32],
+    counts: &mut [f32],
     terminal_ref: &TerminalCacheRef,
     cache: &TerminalEvalCache,
+    update_player: Player,
     pot: u32,
-    hero_values: &[f32],
-    villain_values: &[f32],
-) -> Result<(), String> {
+    values: &[f32],
+) -> Result<usize, String> {
     let identity_code = crate::isomorphism::SuitPermutation::identity().code();
+    let mut terminal_evals = 0usize;
     for permutation_code in &terminal_ref.member_permutation_codes {
         if *permutation_code == identity_code {
-            accumulator.add_compact_board_values(cache, pot, hero_values, villain_values);
-            continue;
+            arena_add_compact_side_values(out, counts, cache, update_player, pot, values);
+        } else {
+            let maps = ctx
+                .combo_permutations
+                .get(permutation_code)
+                .ok_or_else(|| {
+                    "terminal isomorphism permutation is missing combo maps".to_string()
+                })?;
+            let source_to_target = match update_player {
+                Player::Oop => &maps.oop_source_to_target,
+                Player::Ip => &maps.ip_source_to_target,
+            };
+            arena_add_compact_side_values_permuted(
+                out,
+                counts,
+                cache,
+                update_player,
+                pot,
+                values,
+                source_to_target,
+            );
         }
-        let maps = ctx
-            .combo_permutations
-            .get(permutation_code)
-            .ok_or_else(|| "terminal isomorphism permutation is missing combo maps".to_string())?;
-        accumulator.add_compact_board_values_permuted(
-            cache,
-            pot,
-            hero_values,
-            villain_values,
-            &maps.oop_source_to_target,
-            &maps.ip_source_to_target,
-        );
+        terminal_evals += 1;
     }
-    Ok(())
+    Ok(terminal_evals)
+}
+
+fn arena_add_compact_side_values(
+    out: &mut [f32],
+    counts: &mut [f32],
+    cache: &TerminalEvalCache,
+    update_player: Player,
+    pot: u32,
+    values: &[f32],
+) {
+    let pot = pot as f32;
+    let targets = match update_player {
+        Player::Oop => &cache.oop_targets,
+        Player::Ip => &cache.ip_targets,
+    };
+    for target in targets {
+        out[target.range_index] += values[target.range_index] * pot;
+        counts[target.range_index] += 1.0;
+    }
+}
+
+fn arena_add_compact_side_values_permuted(
+    out: &mut [f32],
+    counts: &mut [f32],
+    cache: &TerminalEvalCache,
+    update_player: Player,
+    pot: u32,
+    values: &[f32],
+    source_to_target: &[usize],
+) {
+    let pot = pot as f32;
+    match update_player {
+        Player::Oop => {
+            for (source_index, target_index) in source_to_target.iter().copied().enumerate() {
+                if cache.oop_combo_indices[target_index].is_some() {
+                    out[source_index] += values[target_index] * pot;
+                    counts[source_index] += 1.0;
+                }
+            }
+        }
+        Player::Ip => {
+            for (source_index, target_index) in source_to_target.iter().copied().enumerate() {
+                if cache.ip_combo_indices[target_index].is_some() {
+                    out[source_index] += values[target_index] * pot;
+                    counts[source_index] += 1.0;
+                }
+            }
+        }
+    }
+}
+
+fn add_slice(out: &mut [f32], input: &[f32]) {
+    for (out, input) in out.iter_mut().zip(input) {
+        *out += *input;
+    }
+}
+
+fn arena_terminal_scratch(ctx: &ArenaCfrContext<'_>) -> Result<RecursiveTerminalScratch, String> {
+    let scratch_source = ctx
+        .terminal_cache
+        .first()
+        .ok_or_else(|| "terminal board cache is empty".to_string())?;
+    let terminal_combos = scratch_source.prepared.combos().len();
+    Ok(RecursiveTerminalScratch {
+        cfv: TerminalCfvScratch::new(&scratch_source.prepared),
+        oop_live: vec![0.0; terminal_combos],
+        ip_live: vec![0.0; terminal_combos],
+        oop_nonzero: Vec::new(),
+        ip_nonzero: Vec::new(),
+        accumulator: TerminalAccumulator::zero(ctx.oop_combos.len(), ctx.ip_combos.len()),
+        vectors: Vec::new(),
+    })
 }
 
 impl RealCfrSolver {
@@ -6087,11 +6215,13 @@ mod tests {
             parallel_summary.terminal_evals
         );
         assert!(
-            (single_summary.root_oop_value - parallel_summary.root_oop_value).abs() < 0.001,
+            (single_summary.oop_update_pass_value - parallel_summary.oop_update_pass_value).abs()
+                < 0.001,
             "{single_summary:?} != {parallel_summary:?}"
         );
         assert!(
-            (single_summary.root_ip_value - parallel_summary.root_ip_value).abs() < 0.001,
+            (single_summary.ip_update_pass_value - parallel_summary.ip_update_pass_value).abs()
+                < 0.001,
             "{single_summary:?} != {parallel_summary:?}"
         );
         assert_eq!(single.regrets.len(), parallel.regrets.len());
@@ -6102,6 +6232,74 @@ mod tests {
         for (left, right) in single.strategy_sum.iter().zip(&parallel.strategy_sum) {
             assert!((*left - *right).abs() < 0.001);
         }
+    }
+
+    #[test]
+    fn arena_cfr_oop_pass_matches_recursive_on_small_ranges() {
+        let board = Board::from_str("Td9d6h").unwrap();
+        let action_abstraction = ActionAbstraction {
+            min_bet: 1,
+            flop: StreetTemplate {
+                first_bet_sizes: vec![BetSizeSpec::PotFraction(0.50)],
+                donk_bet_sizes: Vec::new(),
+            },
+            turn: StreetTemplate {
+                first_bet_sizes: vec![BetSizeSpec::PotFraction(0.50)],
+                donk_bet_sizes: Vec::new(),
+            },
+            river: StreetTemplate {
+                first_bet_sizes: vec![BetSizeSpec::PotFraction(0.50)],
+                donk_bet_sizes: Vec::new(),
+            },
+            raise: RaisePolicy {
+                raise_multiplier: 2.5,
+                raise_sizes: Vec::new(),
+                max_raises_per_street: 0,
+                shove_spr_threshold: 0.0,
+                shove_commit_fraction: 1.0,
+                add_all_in_threshold: 0.0,
+                force_all_in_threshold: 0.0,
+                merging_threshold: 0.1,
+            },
+        };
+        let tree = TreeBuilder::new(TreeTemplate {
+            action_abstraction,
+            chance_expansion: ChanceExpansion::TemplateOnly,
+        })
+        .unwrap()
+        .build(Spot {
+            board,
+            pot: 200,
+            effective_stack: 900,
+            oop_range: RangeSpec::from_str("AsAh,KsKh").unwrap(),
+            ip_range: RangeSpec::from_str("QsQh,JsJh").unwrap(),
+            first_player: Player::Oop,
+        })
+        .unwrap();
+        let config = RealCfrConfig {
+            iterations: 1,
+            variant: RealCfrVariant::CfrPlus,
+        };
+        let mut recursive = RealCfrSolver::new(
+            tree.clone(),
+            RangeSpec::from_str("AsAh,KsKh").unwrap(),
+            RangeSpec::from_str("QsQh,JsJh").unwrap(),
+        )
+        .unwrap();
+        let mut arena = ArenaAlternatingCfrSolver::new(
+            tree,
+            RangeSpec::from_str("AsAh,KsKh").unwrap(),
+            RangeSpec::from_str("QsQh,JsJh").unwrap(),
+        )
+        .unwrap();
+
+        let recursive_summary = recursive.run(config).unwrap();
+        let arena_summary = arena.run_with_progress_threads(config, 1, |_| {}).unwrap();
+
+        assert!(
+            (recursive_summary.root_oop_value - arena_summary.oop_update_pass_value).abs() < 0.001,
+            "{recursive_summary:?} != {arena_summary:?}"
+        );
     }
 
     #[test]
