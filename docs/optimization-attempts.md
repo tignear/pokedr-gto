@@ -709,3 +709,27 @@ retrying similar ideas, so attempts stay in chronological order.
 - Decision: keep. This is a real terminal-CFV reduction, not a layout-only
   tweak. The broader next target is still batching/grouping terminal side-value
   work to reduce repeated reach mapping and cache misses.
+
+## 2026-06-08: postflop-solver reference comparison
+
+- Tried: rerun the local `postflop-solver` reference benchmark created during
+  the solver comparison work. The previous stdout had not been saved, so the
+  reproducible example is `/tmp/postflop-solver/examples/bench_flop_16.rs`.
+  It uses `Td9d6h`, the UTG-vs-BU ranges from
+  `/tmp/postflop_flop_ranges.txt`, `pot=200`, `effective_stack=900`,
+  bet sizes `60%, e, a`, raise size `2.5x`, no turn donk, river donk `50%`,
+  all-in thresholds `1.5/0.15`, and merge threshold `0.1`.
+- Result: `postflop-solver` reported `oop_private_hands=180`,
+  `ip_private_hands=265`, `memory_f32_gib=0.671631`, and `16` iterations in
+  `1258.678ms` (`78.667ms/iter`).
+- Current local comparison: the current phase CFR path on the same board and
+  concrete ranges, `--run-real-cfr-three-phase --iterations 16
+  --state-threads 16`, reported `states=1,491,293`,
+  `action_slots=309,523,075`, `storage_gib=2.31`, and `16` iterations in
+  `32651.698ms` (`2040.731ms/iter`). The summed phase times were
+  `reach_ms=8883.189`, `terminal_ms=13824.711`, and `backup_ms=5158.402`.
+- Takeaway: this implementation is still about `25.9x` slower per iteration
+  and about `3.4x` larger in f32 state storage on this comparison. The gap is
+  structural, not a single terminal-CFV micro-optimization. The main suspects
+  are still action-tree shape/state materialization, reach/backup dataflow, and
+  missing node-local compact traversal patterns used by the reference solver.
