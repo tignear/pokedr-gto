@@ -766,3 +766,27 @@ retrying similar ideas, so attempts stay in chronological order.
   storage gap is action-state count, not terminal CFV. The next step is to
   align the action tree and node-local storage semantics with the reference
   solver before implementing traversal.
+
+## 2026-06-08: Arena terminal direct side-value bypass
+
+- Tried: bypass the arena `TerminalSideValueCache` and call the existing
+  terminal side-value evaluator directly into reusable scratch buffers. This
+  was a check against `postflop-solver`'s terminal evaluator, which uses
+  opponent reach sum plus per-card blocker subtraction rather than a nested
+  hero-villain combo loop.
+- Finding: our terminal side-value core already uses the same algebraic shape
+  in `terminal_cfv.rs`: strength-order scan, opponent reach sums, and per-card
+  blocker correction. The suspected missing terminal formula was not actually
+  missing.
+- Validation: the direct path passed
+  `arena_cfr_oop_pass_matches_recursive_on_small_ranges`,
+  `arena_cfr_exploitability_profile_is_zero_sum_on_small_ranges`, and
+  `arena_cfr_parallel_matches_single_thread_on_small_ranges`.
+- Result: reverted. On `Td9d6h` UTG vs BU, `4` release arena iterations with
+  `16` threads, the direct bypass did not beat the existing cached side-value
+  path. A noisy run put the bypass around `2.31s` for `4` iterations, while the
+  clean cached baseline remains around `1.45s` for the same run shape.
+- Takeaway: do not replace the arena terminal cache with a direct side-value
+  bypass. Cache lookup/hash/`Arc` overhead is not the current reference gap.
+  The remaining gap is more likely action tree/state shape and node-local
+  traversal overhead than the terminal blocker-subtraction math itself.
