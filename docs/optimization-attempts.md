@@ -850,3 +850,28 @@ retrying similar ideas, so attempts stay in chronological order.
   the reference gap. The larger cost remains current-player decision work:
   strategy generation, own-reach propagation for strategy averaging, and
   action-value storage/update layout.
+
+## 2026-06-08: Local average strategy experiment
+
+- Tried: add an explicit `--real-cfr-average-strategy local` mode. This changes
+  average-strategy accumulation from standard reach-weighted
+  `strategy_sum += own_reach * strategy_probability` to local unweighted
+  `strategy_sum += strategy_probability`. This is a practical/reference-style
+  experiment, not the standard average-strategy definition.
+- Important limitation: this implementation only changes the contribution
+  written to `strategy_sum`. It still propagates update-player own reach through
+  the traversal because the same code path supports the standard mode. That
+  means it does not remove the expensive reach bookkeeping that would be the
+  real speed cheat.
+- Result on `Td9d6h`, UTG vs BU ranges, pot `200`, effective stack `900`,
+  `postflop-basic`, DCFR+, `16` release arena iterations with `16` threads:
+  reach-weighted runs were about `6328-6543ms`; local runs were about
+  `6294-6571ms`. The difference is noise-level.
+- Exploitability check at `16` iterations was also essentially tied:
+  reach-weighted `6.694 bb/100`, local `6.593 bb/100`.
+- Takeaway: keep the mode for controlled comparison, but do not count it as a
+  speed optimization in the current arena traversal. A real reference-style
+  speed experiment needs a separate local-average traversal that never
+  propagates own reach for the updating player. That is a structural change and
+  must be validated against zero-sum profile values and exploitability before
+  becoming default.

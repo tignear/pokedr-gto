@@ -27,8 +27,9 @@ pub use plan::{CfrStorageConfig, CfrWorkPlan, StreetWorkPlan, TerminalWorkPlan, 
 pub use range::{ComboWeight, RangeSpec};
 pub use real_cfr::{
     ArenaAlternatingCfrIterationSummary, ArenaAlternatingCfrSolver, ArenaAlternatingCfrSummary,
-    RealCfrConfig, RealCfrSolver, RealCfrSummary, RealCfrVariant, TerminalBoardPhaseSummary,
-    TerminalBoardReuseReport, TerminalBoardReuseRow, TerminalEvalBreakdown,
+    RealCfrAverageStrategy, RealCfrConfig, RealCfrSolver, RealCfrSummary, RealCfrVariant,
+    TerminalBoardPhaseSummary, TerminalBoardReuseReport, TerminalBoardReuseRow,
+    TerminalEvalBreakdown,
 };
 pub use terminal_cfv::{
     PreparedTerminalCfvSmoke, TerminalCfvBatchSmoke, TerminalCfvParallelSmoke, TerminalCfvTreePass,

@@ -20,6 +20,7 @@ use std::time::Instant;
 pub struct RealCfrConfig {
     pub iterations: u32,
     pub variant: RealCfrVariant,
+    pub average_strategy: RealCfrAverageStrategy,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -32,6 +33,18 @@ pub enum RealCfrVariant {
 impl Default for RealCfrVariant {
     fn default() -> Self {
         Self::CfrPlus
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RealCfrAverageStrategy {
+    ReachWeighted,
+    Local,
+}
+
+impl Default for RealCfrAverageStrategy {
+    fn default() -> Self {
+        Self::ReachWeighted
     }
 }
 
@@ -921,6 +934,7 @@ impl ArenaAlternatingCfrSolver {
                     &ip_root_reach,
                     average_weight,
                     config.variant,
+                    config.average_strategy,
                     threads,
                     &mut terminal_scratch,
                     &mut side_cache,
@@ -1145,6 +1159,7 @@ fn arena_traverse_update_side_into(
     ip_reach: &[f32],
     average_weight: f32,
     variant: RealCfrVariant,
+    average_strategy: RealCfrAverageStrategy,
     parallel_budget: usize,
     terminal_scratch: &mut RecursiveTerminalScratch,
     side_cache: &mut TerminalSideValueCache,
@@ -1222,6 +1237,7 @@ fn arena_traverse_update_side_into(
                     ip_reach,
                     average_weight,
                     variant,
+                    average_strategy,
                     profile.enabled,
                     parallel_budget,
                 )?;
@@ -1249,6 +1265,7 @@ fn arena_traverse_update_side_into(
                     ip_reach,
                     average_weight,
                     variant,
+                    average_strategy,
                     parallel_budget,
                     terminal_scratch,
                     side_cache,
@@ -1290,6 +1307,7 @@ fn arena_traverse_update_side_into(
                     ip_reach,
                     average_weight,
                     variant,
+                    average_strategy,
                     parallel_budget,
                     terminal_scratch,
                     side_cache,
@@ -1365,6 +1383,7 @@ fn arena_traverse_update_side_into(
                                 ip_reach,
                                 average_weight,
                                 variant,
+                                average_strategy,
                                 parallel_budget,
                                 terminal_scratch,
                                 side_cache,
@@ -1407,6 +1426,7 @@ fn arena_traverse_update_side_into(
                                 &next_ip,
                                 average_weight,
                                 variant,
+                                average_strategy,
                                 parallel_budget,
                                 terminal_scratch,
                                 side_cache,
@@ -1458,6 +1478,7 @@ fn arena_traverse_update_side_into(
                             ip_reach,
                             average_weight,
                             variant,
+                            average_strategy,
                             parallel_budget,
                             terminal_scratch,
                             side_cache,
@@ -1500,6 +1521,7 @@ fn arena_traverse_update_side_into(
                             &next_ip,
                             average_weight,
                             variant,
+                            average_strategy,
                             parallel_budget,
                             terminal_scratch,
                             side_cache,
@@ -1518,7 +1540,8 @@ fn arena_traverse_update_side_into(
                 Player::Oop => oop_reach,
                 Player::Ip => ip_reach,
             };
-            let update_factors = RealCfrUpdateFactors::new(variant, average_weight);
+            let update_factors =
+                RealCfrUpdateFactors::new(variant, average_weight, average_strategy);
             for combo in 0..acting_combos {
                 let node_value = out[combo];
                 for action_index in 0..actions_len {
@@ -1528,7 +1551,11 @@ fn arena_traverse_update_side_into(
                         &mut regrets[local_slot],
                         &mut strategy_sum[local_slot],
                         action_value - node_value,
-                        own_reach[combo] * strategies[combo * actions_len + action_index],
+                        average_strategy_delta(
+                            average_strategy,
+                            own_reach[combo],
+                            strategies[combo * actions_len + action_index],
+                        ),
                         &update_factors,
                     );
                 }
@@ -1737,6 +1764,7 @@ fn arena_run_chance_side_tasks_parallel_into(
     ip_reach: &[f32],
     average_weight: f32,
     variant: RealCfrVariant,
+    average_strategy: RealCfrAverageStrategy,
     profile_enabled: bool,
     parallel_budget: usize,
 ) -> Result<ArenaChanceSideAggregate, String> {
@@ -1763,6 +1791,7 @@ fn arena_run_chance_side_tasks_parallel_into(
                 ip_reach,
                 average_weight,
                 variant,
+                average_strategy,
                 profile_enabled,
             )?;
             aggregate.terminal_evals += result.terminal_evals;
@@ -1811,6 +1840,7 @@ fn arena_run_chance_side_tasks_parallel_into(
                 ip_reach,
                 average_weight,
                 variant,
+                average_strategy,
                 profile_enabled,
                 left_budget,
             )
@@ -1830,6 +1860,7 @@ fn arena_run_chance_side_tasks_parallel_into(
                 ip_reach,
                 average_weight,
                 variant,
+                average_strategy,
                 profile_enabled,
                 right_budget,
             )
@@ -1855,6 +1886,7 @@ fn arena_run_chance_side_task(
     ip_reach: &[f32],
     average_weight: f32,
     variant: RealCfrVariant,
+    average_strategy: RealCfrAverageStrategy,
     profile_enabled: bool,
 ) -> Result<ArenaChanceSideTaskResult, String> {
     let local_start = task
@@ -1893,6 +1925,7 @@ fn arena_run_chance_side_task(
         ip_reach,
         average_weight,
         variant,
+        average_strategy,
         1,
         &mut terminal_scratch,
         &mut side_cache,
@@ -2413,6 +2446,7 @@ impl RealCfrSolver {
                 &ip_reach,
                 average_weight,
                 config.variant,
+                config.average_strategy,
                 &mut terminal_scratch,
                 &mut terminal_ref_cache,
                 &mut side_cache,
@@ -2563,6 +2597,7 @@ impl RealCfrSolver {
                 threads,
                 average_weight,
                 config.variant,
+                config.average_strategy,
             )?;
             let backup_ms = backup_started.elapsed().as_secs_f64() * 1000.0;
 
@@ -3920,8 +3955,9 @@ impl RealCfrSolver {
         threads: usize,
         average_weight: f32,
         variant: RealCfrVariant,
+        average_strategy: RealCfrAverageStrategy,
     ) -> Result<usize, String> {
-        let update_factors = RealCfrUpdateFactors::new(variant, average_weight);
+        let update_factors = RealCfrUpdateFactors::new(variant, average_weight, average_strategy);
         let worker_count = effective_worker_count(threads);
         for level in backup_plan.levels.iter().skip(1) {
             for run in level {
@@ -4271,6 +4307,7 @@ impl RealCfrSolver {
         ip_reach: &[f32],
         average_weight: f32,
         variant: RealCfrVariant,
+        average_strategy: RealCfrAverageStrategy,
         terminal_scratch: &mut RecursiveTerminalScratch,
         terminal_ref_cache: &mut BTreeMap<u64, Vec<TerminalCacheRef>>,
         side_cache: &mut TerminalSideValueCache,
@@ -4325,6 +4362,7 @@ impl RealCfrSolver {
                         ip_reach,
                         average_weight,
                         variant,
+                        average_strategy,
                         terminal_scratch,
                         terminal_ref_cache,
                         side_cache,
@@ -4373,6 +4411,7 @@ impl RealCfrSolver {
                         ip_reach,
                         average_weight,
                         variant,
+                        average_strategy,
                         terminal_scratch,
                         terminal_ref_cache,
                         side_cache,
@@ -4437,6 +4476,7 @@ impl RealCfrSolver {
                                 ip_reach,
                                 average_weight,
                                 variant,
+                                average_strategy,
                                 terminal_scratch,
                                 terminal_ref_cache,
                                 side_cache,
@@ -4471,6 +4511,7 @@ impl RealCfrSolver {
                                 &next_ip,
                                 average_weight,
                                 variant,
+                                average_strategy,
                                 terminal_scratch,
                                 terminal_ref_cache,
                                 side_cache,
@@ -4512,7 +4553,11 @@ impl RealCfrSolver {
                             &mut self.regrets[slot],
                             &mut self.strategy_sum[slot],
                             action_value - node_value,
-                            own_reach[combo] * strategies[local_slot],
+                            average_strategy_delta(
+                                average_strategy,
+                                own_reach[combo],
+                                strategies[local_slot],
+                            ),
                             average_weight,
                             variant,
                         );
@@ -4972,9 +5017,21 @@ fn apply_real_cfr_update(
     }
 }
 
+fn average_strategy_delta(
+    mode: RealCfrAverageStrategy,
+    own_reach: f32,
+    strategy_probability: f32,
+) -> f32 {
+    match mode {
+        RealCfrAverageStrategy::ReachWeighted => own_reach * strategy_probability,
+        RealCfrAverageStrategy::Local => strategy_probability,
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct RealCfrUpdateFactors {
     variant: RealCfrVariant,
+    average_strategy: RealCfrAverageStrategy,
     positive_regret_discount: f32,
     negative_regret_discount: f32,
     strategy_discount: f32,
@@ -4982,7 +5039,11 @@ struct RealCfrUpdateFactors {
 }
 
 impl RealCfrUpdateFactors {
-    fn new(variant: RealCfrVariant, iteration_weight: f32) -> Self {
+    fn new(
+        variant: RealCfrVariant,
+        iteration_weight: f32,
+        average_strategy: RealCfrAverageStrategy,
+    ) -> Self {
         let (positive_regret_discount, negative_regret_discount, strategy_discount) = match variant
         {
             RealCfrVariant::CfrPlus => (1.0, 1.0, 1.0),
@@ -4999,6 +5060,7 @@ impl RealCfrUpdateFactors {
         };
         Self {
             variant,
+            average_strategy,
             positive_regret_discount,
             negative_regret_discount,
             strategy_discount,
@@ -5563,7 +5625,11 @@ fn backup_decision_chunk(
                     &mut regrets[local_slot],
                     &mut strategy_sum[local_slot],
                     action_value - node_value,
-                    own_reach[combo] * strategy_probs[action_index],
+                    average_strategy_delta(
+                        update_factors.average_strategy,
+                        own_reach[combo],
+                        strategy_probs[action_index],
+                    ),
                     update_factors,
                 );
             }
@@ -6597,6 +6663,7 @@ mod tests {
             .run(RealCfrConfig {
                 iterations: 1,
                 variant: RealCfrVariant::CfrPlus,
+                average_strategy: RealCfrAverageStrategy::ReachWeighted,
             })
             .unwrap();
         assert_eq!(summary.iterations, 1);
@@ -6654,6 +6721,7 @@ mod tests {
         let config = RealCfrConfig {
             iterations: 2,
             variant: RealCfrVariant::CfrPlus,
+            average_strategy: RealCfrAverageStrategy::ReachWeighted,
         };
         let mut single = ArenaAlternatingCfrSolver::new(
             tree.clone(),
@@ -6744,6 +6812,7 @@ mod tests {
         let config = RealCfrConfig {
             iterations: 1,
             variant: RealCfrVariant::CfrPlus,
+            average_strategy: RealCfrAverageStrategy::ReachWeighted,
         };
         let mut recursive = RealCfrSolver::new(
             tree.clone(),
@@ -6820,6 +6889,7 @@ mod tests {
                 RealCfrConfig {
                     iterations: 1,
                     variant: RealCfrVariant::CfrPlus,
+                    average_strategy: RealCfrAverageStrategy::ReachWeighted,
                 },
                 1,
                 |_| {},
@@ -6871,6 +6941,7 @@ mod tests {
             .run(RealCfrConfig {
                 iterations: 1,
                 variant: RealCfrVariant::CfrPlus,
+                average_strategy: RealCfrAverageStrategy::ReachWeighted,
             })
             .unwrap();
         let phased = phased
@@ -6878,6 +6949,7 @@ mod tests {
                 RealCfrConfig {
                     iterations: 1,
                     variant: RealCfrVariant::CfrPlus,
+                    average_strategy: RealCfrAverageStrategy::ReachWeighted,
                 },
                 4,
                 |_| {},
@@ -6921,6 +6993,7 @@ mod tests {
         let config = RealCfrConfig {
             iterations: 1,
             variant: RealCfrVariant::CfrPlus,
+            average_strategy: RealCfrAverageStrategy::ReachWeighted,
         };
         let cached = cached
             .run_three_phase_with_terminal_side_cache(config, 4, true, |_| {})

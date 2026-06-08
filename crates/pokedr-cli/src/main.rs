@@ -2,10 +2,10 @@ use clap::{Parser, Subcommand};
 use pokedr_agent::{FlopTreeRequest, build_flop_tree};
 use pokedr_core::{
     ActionKind, ArenaAlternatingCfrSolver, Board, CfrPlusState, CfrStorageConfig, ChanceExpansion,
-    ParallelCfrSolver, Player, PreparedTerminalCfvSmoke, PublicNodeKind, RangeSpec, RealCfrConfig,
-    RealCfrSolver, RealCfrVariant, Street, TreeTemplate, analyze_cfr_storage_scenarios,
-    analyze_public_state_duplicates, build_action_slot_layout, dry_run_cfr_plus_iteration,
-    plan_cfr_work, terminal_cfv_parallel_smoke,
+    ParallelCfrSolver, Player, PreparedTerminalCfvSmoke, PublicNodeKind, RangeSpec,
+    RealCfrAverageStrategy, RealCfrConfig, RealCfrSolver, RealCfrVariant, Street, TreeTemplate,
+    analyze_cfr_storage_scenarios, analyze_public_state_duplicates, build_action_slot_layout,
+    dry_run_cfr_plus_iteration, plan_cfr_work, terminal_cfv_parallel_smoke,
 };
 use std::str::FromStr;
 use std::time::Instant;
@@ -106,6 +106,8 @@ enum Command {
         real_cfr_target_exploitability_bb100: Option<f32>,
         #[arg(long, default_value = "dcfr-plus")]
         real_cfr_variant: String,
+        #[arg(long, default_value = "reach-weighted")]
+        real_cfr_average_strategy: String,
         #[arg(long, default_value_t = 1.5)]
         dcfr_alpha: f32,
         #[arg(long, default_value_t = 0.0)]
@@ -357,6 +359,7 @@ fn main() -> Result<(), String> {
             real_cfr_exploitability_interval,
             real_cfr_target_exploitability_bb100,
             real_cfr_variant,
+            real_cfr_average_strategy,
             dcfr_alpha,
             dcfr_beta,
             dcfr_gamma,
@@ -401,11 +404,14 @@ fn main() -> Result<(), String> {
             };
             let real_cfr_variant =
                 parse_real_cfr_variant(&real_cfr_variant, dcfr_alpha, dcfr_beta, dcfr_gamma)?;
+            let real_cfr_average_strategy =
+                parse_real_cfr_average_strategy(&real_cfr_average_strategy)?;
             if run_arena_cfr {
                 println!(
-                    "solving flop={} variant={} iterations={iterations} threads={state_threads}",
+                    "solving flop={} variant={} average_strategy={} iterations={iterations} threads={state_threads}",
                     tree.spot.board,
                     format_real_cfr_variant(real_cfr_variant),
+                    format_real_cfr_average_strategy(real_cfr_average_strategy),
                 );
                 let started = Instant::now();
                 let mut solver = ArenaAlternatingCfrSolver::new(
@@ -417,6 +423,7 @@ fn main() -> Result<(), String> {
                     RealCfrConfig {
                         iterations,
                         variant: real_cfr_variant,
+                        average_strategy: real_cfr_average_strategy,
                     },
                     state_threads,
                     |progress| {
@@ -483,9 +490,10 @@ fn main() -> Result<(), String> {
             let plan = plan_cfr_work(&tree, config);
             let layout = build_action_slot_layout(&tree, config);
             println!(
-                "solving flop={} variant={} iterations={iterations}",
+                "solving flop={} variant={} average_strategy={} iterations={iterations}",
                 tree.spot.board,
                 format_real_cfr_variant(real_cfr_variant),
+                format_real_cfr_average_strategy(real_cfr_average_strategy),
             );
             println!(
                 "layout records={} action_slots={} storage_gib={:.2} flop_slots={} turn_slots={} river_slots={}",
@@ -575,6 +583,7 @@ fn main() -> Result<(), String> {
                     RealCfrConfig {
                         iterations,
                         variant: real_cfr_variant,
+                        average_strategy: real_cfr_average_strategy,
                     },
                     |progress| {
                         if real_cfr_log_interval > 0
@@ -701,6 +710,7 @@ fn main() -> Result<(), String> {
                         RealCfrConfig {
                             iterations: chunk,
                             variant: real_cfr_variant,
+                            average_strategy: real_cfr_average_strategy,
                         },
                         state_threads,
                         |progress| {
@@ -843,6 +853,7 @@ fn main() -> Result<(), String> {
                         RealCfrConfig {
                             iterations,
                             variant: real_cfr_variant,
+                            average_strategy: real_cfr_average_strategy,
                         },
                         state_threads,
                         |progress| {
@@ -1294,6 +1305,23 @@ fn format_real_cfr_variant(variant: RealCfrVariant) -> String {
         RealCfrVariant::DcfrPlus { alpha, gamma } => {
             format!("dcfr-plus(alpha={alpha},gamma={gamma})")
         }
+    }
+}
+
+fn parse_real_cfr_average_strategy(value: &str) -> Result<RealCfrAverageStrategy, String> {
+    match value.to_ascii_lowercase().as_str() {
+        "reach-weighted" | "reach" | "standard" => Ok(RealCfrAverageStrategy::ReachWeighted),
+        "local" | "local-unweighted" | "reference" => Ok(RealCfrAverageStrategy::Local),
+        _ => Err(format!(
+            "invalid real CFR average strategy {value:?}; expected reach-weighted or local"
+        )),
+    }
+}
+
+fn format_real_cfr_average_strategy(value: RealCfrAverageStrategy) -> &'static str {
+    match value {
+        RealCfrAverageStrategy::ReachWeighted => "reach-weighted",
+        RealCfrAverageStrategy::Local => "local",
     }
 }
 
