@@ -1,6 +1,7 @@
 use crate::cards::{Board, Card};
 use crate::isomorphism::{
-    all_suit_permutations, private_combo_permutation_indices, terminal_board_isomorphism,
+    all_suit_permutations, fixed_flop_future_board_isomorphism, next_card_isomorphism,
+    private_combo_permutation_indices, terminal_board_isomorphism,
 };
 use crate::range::{ComboWeight, RangeSpec};
 use crate::terminal_cfv::{
@@ -462,8 +463,8 @@ impl RealCfrSolver {
         let oop_same_ip_combo_indices = same_combo_indices(&oop_combos, &ip_combos);
         let ip_same_oop_combo_indices = same_combo_indices(&ip_combos, &oop_combos);
         let flop_board = tree.spot.board.clone();
-        let turn_boards = turn_boards_from_flop(&flop_board)?;
-        let river_boards = ordered_river_boards_from_flop(&flop_board)?;
+        let (turn_boards, river_boards) =
+            representative_ordered_future_boards(&flop_board, &oop_range, &ip_range)?;
         let turn_index_by_key = turn_boards
             .iter()
             .enumerate()
@@ -512,7 +513,12 @@ impl RealCfrSolver {
                 Player::Oop => oop_combos.len(),
                 Player::Ip => ip_combos.len(),
             };
-            let board_count = board_count_for_len(node.state.board.cards().len())?;
+            let board_count = match node.state.board.cards().len() {
+                3 => 1,
+                4 => turn_index_by_key.len(),
+                5 => river_index_by_key.len(),
+                other => return Err(format!("invalid public board length {other}")),
+            };
             let slots_len = board_count * combos * actions.len();
             infosets[node.id] = Some(RealInfoset {
                 player: *player,
@@ -2402,17 +2408,21 @@ impl RealCfrSolver {
                 let Some(child) = node.children.first().copied() else {
                     return Ok(0);
                 };
-                let next_cards = board.remaining_deck();
-                let chance_weight = 1.0f32 / next_cards.len() as f32;
+                let chance_classes = next_card_isomorphism(board, &self.oop_range, &self.ip_range);
+                let chance_weight = 1.0f32 / chance_classes.concrete_events as f32;
                 if profile.enabled {
-                    profile.chance_cards += next_cards.len() as u64;
+                    profile.chance_cards += chance_classes.concrete_events as u64;
                 }
                 let mut child_oop = terminal_scratch.take_vec(out_oop.len());
                 let mut child_ip = terminal_scratch.take_vec(out_ip.len());
                 let mut terminal_evals = 0usize;
-                for card in next_cards {
+                for chance_class in chance_classes.classes {
+                    let card = *chance_class
+                        .representative
+                        .first()
+                        .ok_or_else(|| "chance class has no representative card".to_string())?;
                     let next_board = board.push(card)?;
-                    terminal_evals += self.traverse_slices_into(
+                    let child_terminal_evals = self.traverse_slices_into(
                         &mut child_oop,
                         &mut child_ip,
                         child,
@@ -2426,8 +2436,29 @@ impl RealCfrSolver {
                         side_cache,
                         profile,
                     )?;
-                    add_scaled_slice(out_oop, &child_oop, chance_weight);
-                    add_scaled_slice(out_ip, &child_ip, chance_weight);
+                    terminal_evals += child_terminal_evals * chance_class.multiplicity;
+                    for member in chance_class.members {
+                        let permutation_code = member.permutation_to_representative.code();
+                        let maps =
+                            self.combo_permutations
+                                .get(&permutation_code)
+                                .ok_or_else(|| {
+                                    "chance isomorphism permutation is missing combo maps"
+                                        .to_string()
+                                })?;
+                        add_permuted_scaled_slice(
+                            out_oop,
+                            &child_oop,
+                            &maps.oop_source_to_target,
+                            chance_weight,
+                        );
+                        add_permuted_scaled_slice(
+                            out_ip,
+                            &child_ip,
+                            &maps.ip_source_to_target,
+                            chance_weight,
+                        );
+                    }
                 }
                 terminal_scratch.release_vec(child_oop);
                 terminal_scratch.release_vec(child_ip);
@@ -3149,9 +3180,14 @@ fn strategy_reach_into(
     }
 }
 
-fn add_scaled_slice(out: &mut [f32], input: &[f32], scale: f32) {
-    for (out, input) in out.iter_mut().zip(input) {
-        *out += *input * scale;
+fn add_permuted_scaled_slice(
+    out: &mut [f32],
+    input: &[f32],
+    source_to_target: &[usize],
+    scale: f32,
+) {
+    for (source_index, target_index) in source_to_target.iter().copied().enumerate() {
+        out[source_index] += input[target_index] * scale;
     }
 }
 
@@ -4462,42 +4498,38 @@ fn terminal_boards(board: &Board) -> Result<Vec<Board>, String> {
     }
 }
 
-fn board_count_for_len(cards: usize) -> Result<usize, String> {
-    match cards {
-        3 => Ok(1),
-        4 => Ok(49),
-        5 => Ok(49 * 48),
-        other => Err(format!("invalid public board length {other}")),
-    }
-}
-
-fn turn_boards_from_flop(flop: &Board) -> Result<Vec<Board>, String> {
+fn representative_ordered_future_boards(
+    flop: &Board,
+    oop_range: &RangeSpec,
+    ip_range: &RangeSpec,
+) -> Result<(Vec<Board>, Vec<Board>), String> {
     if flop.cards().len() != 3 {
         return Err("real CFR solver must start from a flop board".to_string());
     }
-    let deck = flop.remaining_deck();
-    let mut boards = Vec::with_capacity(deck.len());
-    for card in deck {
-        boards.push(flop.push(card)?);
-    }
-    Ok(boards)
-}
-
-fn ordered_river_boards_from_flop(flop: &Board) -> Result<Vec<Board>, String> {
-    if flop.cards().len() != 3 {
-        return Err("real CFR solver must start from a flop board".to_string());
-    }
-    let deck = flop.remaining_deck();
-    let mut boards = Vec::with_capacity(deck.len() * (deck.len() - 1));
-    for turn in 0..deck.len() {
-        for river in 0..deck.len() {
-            if turn == river {
-                continue;
-            }
-            boards.push(flop.push(deck[turn])?.push(deck[river])?);
+    let report = fixed_flop_future_board_isomorphism(flop, oop_range, ip_range)?;
+    let mut turn_boards = Vec::with_capacity(report.turn.classes.len());
+    let mut river_boards = Vec::with_capacity(report.ordered_turn_river_representative_events);
+    for (turn_class, river_classes) in report
+        .turn
+        .classes
+        .iter()
+        .zip(&report.representative_turn_river_classes)
+    {
+        let turn_card = *turn_class
+            .representative
+            .first()
+            .ok_or_else(|| "turn class has no representative card".to_string())?;
+        let turn_board = flop.push(turn_card)?;
+        turn_boards.push(turn_board.clone());
+        for river_class in &river_classes.classes {
+            let river_card = *river_class
+                .representative
+                .first()
+                .ok_or_else(|| "river class has no representative card".to_string())?;
+            river_boards.push(turn_board.push(river_card)?);
         }
     }
-    Ok(boards)
+    Ok((turn_boards, river_boards))
 }
 
 fn unordered_river_boards_from_flop(flop: &Board) -> Result<Vec<Board>, String> {
@@ -4537,7 +4569,7 @@ mod tests {
     use std::str::FromStr;
 
     #[test]
-    fn real_cfr_allocates_exact_board_indexed_state_on_small_ranges() {
+    fn real_cfr_allocates_isomorphic_board_indexed_state_on_small_ranges() {
         let board = Board::from_str("As7h2c").unwrap();
         let tree = TreeBuilder::new(TreeTemplate {
             action_abstraction: ActionAbstraction::conservative_default(),
@@ -4559,15 +4591,24 @@ mod tests {
             RangeSpec::from_str("QsQh,JsJh").unwrap(),
         )
         .unwrap();
+        let iso = fixed_flop_future_board_isomorphism(
+            &solver.flop_board,
+            &RangeSpec::from_str("AsAh,KsKh").unwrap(),
+            &RangeSpec::from_str("QsQh,JsJh").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(solver.turn_index_by_key.len(), iso.turn.classes.len());
+        assert_eq!(
+            solver.river_index_by_key.len(),
+            iso.ordered_turn_river_representative_events
+        );
         let action_slots = solver
             .infosets
             .iter()
             .filter_map(Option::as_ref)
             .map(|infoset| infoset.slots_len)
             .sum::<usize>();
-        assert_eq!(action_slots, 4_606_558);
-        assert_eq!(solver.turn_index_by_key.len(), 49);
-        assert_eq!(solver.river_index_by_key.len(), 49 * 48);
+        assert!(action_slots < 4_606_558);
         assert_eq!(solver.terminal_cache.len(), 49 * 48 / 2);
         assert_eq!(solver.terminal_cache_index_by_key.len(), 49 * 48 / 2);
     }

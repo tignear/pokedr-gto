@@ -639,3 +639,24 @@ retrying similar ideas, so attempts stay in chronological order.
 - Rule: do not use one-iteration terminal side-cache profiles to justify
   cache-layout changes. Measure at a later iteration with
   `POKEDR_REAL_CFR_PROFILE_START_ITER` or use a repeated benchmark harness.
+
+## 2026-06-07: Real CFR chance isomorphism and representative board state
+
+- Tried: make the recursive real-CFR path traverse only exact
+  suit-isomorphic representative turn/river cards. Skipped concrete chance
+  values are added back by permuting private combo values from the representative
+  child. Regret/strategy storage for the recursive path was also changed from
+  all ordered turn/river boards to representative ordered boards only.
+- Expected: remove duplicated chance subtrees and stop allocating state for
+  board slots that the isomorphic traversal never visits.
+- Result: kept. On `Td9d6h` UTG vs BU, exact future-board isomorphism reports
+  ordered turn-river events `2352 -> 2053`, so the direct chance-work reduction
+  is only about `12.7%` for this suit-asymmetric range. The memory/state
+  reduction is larger in the real recursive path: `action_slots` moved from
+  about `72.5M` to `44.2M`, `storage_gib` from `0.54` to `0.33`, and a
+  `4`-iteration release run moved from about `4.81s` to `3.38s`.
+- Validation: real-CFR zero-sum smoke and isomorphism unit tests passed.
+- Decision: keep. This confirms that the tree/state representation was a real
+  bottleneck. The current CLI planner still prints the older full-expansion
+  layout estimate, so the next cleanup should make planner output report the
+  same representative-board storage used by real CFR.
