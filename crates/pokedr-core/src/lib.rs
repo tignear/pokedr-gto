@@ -26,6 +26,7 @@ pub use parallel_cfr::{ParallelCfrSolver, ParallelCfrStorageReport};
 pub use plan::{CfrStorageConfig, CfrWorkPlan, StreetWorkPlan, TerminalWorkPlan, plan_cfr_work};
 pub use range::{ComboWeight, RangeSpec};
 pub use real_cfr::{
+    ArenaAlternatingCfrIterationSummary, ArenaAlternatingCfrSolver, ArenaAlternatingCfrSummary,
     RealCfrConfig, RealCfrSolver, RealCfrSummary, RealCfrVariant, TerminalBoardPhaseSummary,
     TerminalBoardReuseReport, TerminalBoardReuseRow, TerminalEvalBreakdown,
 };

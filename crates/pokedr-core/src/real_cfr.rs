@@ -179,6 +179,94 @@ pub struct RealCfrSolver {
     ip_same_oop_combo_indices: Vec<Option<usize>>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ArenaAlternatingCfrSummary {
+    pub iterations: u32,
+    pub states: usize,
+    pub decision_states: usize,
+    pub action_slots: usize,
+    pub terminal_evals: usize,
+    pub root_oop_value: f32,
+    pub root_ip_value: f32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ArenaAlternatingCfrIterationSummary {
+    pub iteration: u32,
+    pub terminal_evals: usize,
+    pub elapsed_ms: f64,
+    pub root_oop_value: f32,
+    pub root_ip_value: f32,
+}
+
+#[derive(Debug, Clone)]
+pub struct ArenaAlternatingCfrSolver {
+    tree: PublicTree,
+    oop_range: RangeSpec,
+    ip_range: RangeSpec,
+    oop_combos: Vec<ComboWeight>,
+    ip_combos: Vec<ComboWeight>,
+    states: Vec<ArenaState>,
+    state_by_key: BTreeMap<(usize, u64), usize>,
+    regrets: Vec<f32>,
+    strategy_sum: Vec<f32>,
+    completed_iterations: u32,
+    flop_board: Board,
+    terminal_cache_index_by_key: BTreeMap<u64, usize>,
+    terminal_cache: Vec<TerminalEvalCache>,
+    combo_permutations: BTreeMap<u8, ComboPermutationMaps>,
+    oop_same_ip_combo_indices: Vec<Option<usize>>,
+    ip_same_oop_combo_indices: Vec<Option<usize>>,
+}
+
+#[derive(Debug, Clone)]
+struct ArenaState {
+    node_id: usize,
+    board: Board,
+    children: Vec<usize>,
+    chance_member_permutation_codes: Vec<Vec<u8>>,
+    chance_concrete_events: usize,
+    terminal_cache_refs: Vec<TerminalCacheRef>,
+    infoset: Option<ArenaInfoset>,
+    subtree_slot_start: usize,
+    subtree_slot_end: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ArenaInfoset {
+    player: Player,
+    actions: usize,
+    slots_start: usize,
+    slots_len: usize,
+}
+
+struct ArenaCfrContext<'a> {
+    tree: &'a PublicTree,
+    oop_combos: &'a [ComboWeight],
+    ip_combos: &'a [ComboWeight],
+    states: &'a [ArenaState],
+    terminal_cache: &'a [TerminalEvalCache],
+    combo_permutations: &'a BTreeMap<u8, ComboPermutationMaps>,
+    oop_same_ip_combo_indices: &'a [Option<usize>],
+    ip_same_oop_combo_indices: &'a [Option<usize>],
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ArenaChanceChildTask {
+    original_index: usize,
+    child_index: usize,
+    slot_start: usize,
+    slot_end: usize,
+}
+
+struct ArenaChanceChildResult {
+    original_index: usize,
+    terminal_evals: usize,
+    oop: Vec<f32>,
+    ip: Vec<f32>,
+    profile: RecursiveCfrProfile,
+}
+
 #[derive(Debug, Clone)]
 struct RealInfoset {
     player: Player,
@@ -271,6 +359,18 @@ struct RecursiveCfrProfile {
 }
 
 impl RecursiveCfrProfile {
+    fn add_counts(&mut self, other: &Self) {
+        self.terminal_calls += other.terminal_calls;
+        self.fold_calls += other.fold_calls;
+        self.showdown_calls += other.showdown_calls;
+        self.chance_calls += other.chance_calls;
+        self.chance_cards += other.chance_cards;
+        self.decision_calls += other.decision_calls;
+        self.strategy_builds += other.strategy_builds;
+        self.reach_scratch_writes += other.reach_scratch_writes;
+        self.values_zero += other.values_zero;
+    }
+
     fn reset_counts(&mut self) {
         self.terminal_calls = 0;
         self.fold_calls = 0;
@@ -437,6 +537,1100 @@ enum EvaluationMode {
 enum StrategySource {
     Current,
     Average,
+}
+
+impl ArenaAlternatingCfrSolver {
+    pub fn new(
+        tree: PublicTree,
+        oop_range: RangeSpec,
+        ip_range: RangeSpec,
+    ) -> Result<Self, String> {
+        let oop_combos = oop_range.combos().to_vec();
+        let ip_combos = ip_range.combos().to_vec();
+        let combo_permutations = all_suit_permutations()
+            .into_iter()
+            .filter_map(|permutation| {
+                let oop_source_to_target =
+                    private_combo_permutation_indices(&oop_combos, permutation)?;
+                let ip_source_to_target =
+                    private_combo_permutation_indices(&ip_combos, permutation)?;
+                Some((
+                    permutation.code(),
+                    ComboPermutationMaps {
+                        oop_source_to_target,
+                        ip_source_to_target,
+                    },
+                ))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let oop_same_ip_combo_indices = same_combo_indices(&oop_combos, &ip_combos);
+        let ip_same_oop_combo_indices = same_combo_indices(&ip_combos, &oop_combos);
+        let flop_board = tree.spot.board.clone();
+        let terminal_boards = unordered_river_boards_from_flop(&flop_board)?;
+        let mut terminal_cache_index_by_key = BTreeMap::new();
+        let mut terminal_cache = Vec::with_capacity(terminal_boards.len());
+        for board in &terminal_boards {
+            let prepared = PreparedTerminalBoard::new(board)?;
+            let oop_combo_indices = prepared_combo_indices(&prepared, &oop_combos);
+            let ip_combo_indices = prepared_combo_indices(&prepared, &ip_combos);
+            let oop_targets = prepared_combo_targets(&oop_combo_indices);
+            let ip_targets = prepared_combo_targets(&ip_combo_indices);
+            let mut oop_board_targets = prepared_board_targets(&oop_targets);
+            let mut ip_board_targets = prepared_board_targets(&ip_targets);
+            prepared.sort_indices_by_strength(&mut oop_board_targets);
+            prepared.sort_indices_by_strength(&mut ip_board_targets);
+            terminal_cache_index_by_key.insert(unordered_board_key(board), terminal_cache.len());
+            terminal_cache.push(TerminalEvalCache {
+                board: board.clone(),
+                prepared,
+                oop_combo_indices,
+                ip_combo_indices,
+                oop_targets,
+                ip_targets,
+                oop_board_targets,
+                ip_board_targets,
+            });
+        }
+
+        let mut solver = Self {
+            tree,
+            oop_range,
+            ip_range,
+            oop_combos,
+            ip_combos,
+            states: Vec::new(),
+            state_by_key: BTreeMap::new(),
+            regrets: Vec::new(),
+            strategy_sum: Vec::new(),
+            completed_iterations: 0,
+            flop_board,
+            terminal_cache_index_by_key,
+            terminal_cache,
+            combo_permutations,
+            oop_same_ip_combo_indices,
+            ip_same_oop_combo_indices,
+        };
+        let flop = solver.flop_board.clone();
+        solver.collect_state_from(0, &flop)?;
+        let mut total_action_slots = 0usize;
+        for state in &mut solver.states {
+            let node = &solver.tree.nodes[state.node_id];
+            let PublicNodeKind::Decision { player, actions } = &node.kind else {
+                continue;
+            };
+            if actions.len() <= 1 {
+                continue;
+            }
+            let combos = match player {
+                Player::Oop => solver.oop_combos.len(),
+                Player::Ip => solver.ip_combos.len(),
+            };
+            let slots_len = combos * actions.len();
+            state.infoset = Some(ArenaInfoset {
+                player: *player,
+                actions: actions.len(),
+                slots_start: total_action_slots,
+                slots_len,
+            });
+            total_action_slots += slots_len;
+        }
+        solver.regrets = vec![0.0; total_action_slots];
+        solver.strategy_sum = vec![0.0; total_action_slots];
+        solver.compute_subtree_slot_ranges(0)?;
+        Ok(solver)
+    }
+
+    pub fn regret_len(&self) -> usize {
+        self.regrets.len()
+    }
+
+    pub fn strategy_sum_len(&self) -> usize {
+        self.strategy_sum.len()
+    }
+
+    pub fn storage_gib(&self) -> f64 {
+        (self.regrets.len() + self.strategy_sum.len()) as f64 * std::mem::size_of::<f32>() as f64
+            / (1024.0 * 1024.0 * 1024.0)
+    }
+
+    pub fn state_count(&self) -> usize {
+        self.states.len()
+    }
+
+    pub fn run_with_progress(
+        &mut self,
+        config: RealCfrConfig,
+        mut progress: impl FnMut(ArenaAlternatingCfrIterationSummary) + Send,
+    ) -> Result<ArenaAlternatingCfrSummary, String> {
+        self.run_with_progress_threads(config, 1, &mut progress)
+    }
+
+    pub fn run_with_progress_threads(
+        &mut self,
+        config: RealCfrConfig,
+        threads: usize,
+        progress: impl FnMut(ArenaAlternatingCfrIterationSummary) + Send,
+    ) -> Result<ArenaAlternatingCfrSummary, String> {
+        let threads = threads.max(1);
+        if threads > 1 {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .map_err(|error| format!("failed to build arena CFR thread pool: {error}"))?;
+            return pool
+                .install(|| self.run_with_progress_threads_inner(config, threads, progress));
+        }
+        self.run_with_progress_threads_inner(config, threads, progress)
+    }
+
+    fn run_with_progress_threads_inner(
+        &mut self,
+        config: RealCfrConfig,
+        threads: usize,
+        mut progress: impl FnMut(ArenaAlternatingCfrIterationSummary) + Send,
+    ) -> Result<ArenaAlternatingCfrSummary, String> {
+        let scratch_source = self
+            .terminal_cache
+            .first()
+            .ok_or_else(|| "terminal board cache is empty".to_string())?;
+        let terminal_combos = scratch_source.prepared.combos().len();
+        let mut terminal_scratch = RecursiveTerminalScratch {
+            cfv: TerminalCfvScratch::new(&scratch_source.prepared),
+            oop_live: vec![0.0; terminal_combos],
+            ip_live: vec![0.0; terminal_combos],
+            oop_nonzero: Vec::new(),
+            ip_nonzero: Vec::new(),
+            accumulator: TerminalAccumulator::zero(self.oop_combos.len(), self.ip_combos.len()),
+            vectors: Vec::new(),
+        };
+        let mut side_cache = TerminalSideValueCache::default();
+        let mut profile = RecursiveCfrProfile {
+            enabled: std::env::var_os("POKEDR_ARENA_CFR_PROFILE").is_some(),
+            ..RecursiveCfrProfile::default()
+        };
+        let oop_weight = self
+            .oop_combos
+            .iter()
+            .map(|combo| combo.weight)
+            .sum::<f32>();
+        let ip_weight = self.ip_combos.iter().map(|combo| combo.weight).sum::<f32>();
+        let mut root_oop = vec![0.0; self.oop_combos.len()];
+        let mut root_ip = vec![0.0; self.ip_combos.len()];
+        let mut root_terminal_evals = 0usize;
+        for iteration in 1..=config.iterations {
+            let started = Instant::now();
+            self.completed_iterations += 1;
+            let average_weight = self.completed_iterations as f32;
+            let oop_reach = self
+                .oop_combos
+                .iter()
+                .map(|combo| combo.weight)
+                .collect::<Vec<_>>();
+            let ip_reach = self
+                .ip_combos
+                .iter()
+                .map(|combo| combo.weight)
+                .collect::<Vec<_>>();
+            root_terminal_evals = 0;
+            for update_player in [Player::Oop, Player::Ip] {
+                let ctx = ArenaCfrContext {
+                    tree: &self.tree,
+                    oop_combos: &self.oop_combos,
+                    ip_combos: &self.ip_combos,
+                    states: &self.states,
+                    terminal_cache: &self.terminal_cache,
+                    combo_permutations: &self.combo_permutations,
+                    oop_same_ip_combo_indices: &self.oop_same_ip_combo_indices,
+                    ip_same_oop_combo_indices: &self.ip_same_oop_combo_indices,
+                };
+                root_terminal_evals += arena_traverse_update_into(
+                    &ctx,
+                    &mut self.regrets,
+                    &mut self.strategy_sum,
+                    0,
+                    &mut root_oop,
+                    &mut root_ip,
+                    0,
+                    update_player,
+                    &oop_reach,
+                    &ip_reach,
+                    average_weight,
+                    config.variant,
+                    threads,
+                    &mut terminal_scratch,
+                    &mut side_cache,
+                    &mut profile,
+                )?;
+            }
+            if profile.enabled {
+                eprintln!(
+                    "arena_cfr_profile iteration={} terminal_calls={} fold_calls={} showdown_calls={} chance_calls={} chance_cards={} decision_calls={} strategy_builds={} reach_scratch_writes={} values_zero={}",
+                    iteration,
+                    profile.terminal_calls,
+                    profile.fold_calls,
+                    profile.showdown_calls,
+                    profile.chance_calls,
+                    profile.chance_cards,
+                    profile.decision_calls,
+                    profile.strategy_builds,
+                    profile.reach_scratch_writes,
+                    profile.values_zero,
+                );
+                profile.reset_counts();
+            }
+            progress(ArenaAlternatingCfrIterationSummary {
+                iteration,
+                terminal_evals: root_terminal_evals,
+                elapsed_ms: started.elapsed().as_secs_f64() * 1000.0,
+                root_oop_value: weighted_average(
+                    &root_oop,
+                    &self.oop_combos,
+                    oop_weight,
+                    ip_weight,
+                ),
+                root_ip_value: weighted_average(&root_ip, &self.ip_combos, ip_weight, oop_weight),
+            });
+        }
+        Ok(ArenaAlternatingCfrSummary {
+            iterations: config.iterations,
+            states: self.states.len(),
+            decision_states: self
+                .states
+                .iter()
+                .filter(|state| state.infoset.is_some())
+                .count(),
+            action_slots: self.regrets.len(),
+            terminal_evals: root_terminal_evals,
+            root_oop_value: weighted_average(&root_oop, &self.oop_combos, oop_weight, ip_weight),
+            root_ip_value: weighted_average(&root_ip, &self.ip_combos, ip_weight, oop_weight),
+        })
+    }
+
+    fn collect_state_from(&mut self, node_id: usize, board: &Board) -> Result<usize, String> {
+        let key = (node_id, ordered_board_key(board));
+        if let Some(state_index) = self.state_by_key.get(&key) {
+            return Ok(*state_index);
+        }
+        let state_index = self.states.len();
+        self.state_by_key.insert(key, state_index);
+        self.states.push(ArenaState {
+            node_id,
+            board: board.clone(),
+            children: Vec::new(),
+            chance_member_permutation_codes: Vec::new(),
+            chance_concrete_events: 0,
+            terminal_cache_refs: Vec::new(),
+            infoset: None,
+            subtree_slot_start: usize::MAX,
+            subtree_slot_end: 0,
+        });
+        let node = self.tree.nodes[node_id].clone();
+        let mut children = Vec::new();
+        let mut chance_member_permutation_codes = Vec::new();
+        let mut chance_concrete_events = 0usize;
+        let mut terminal_cache_refs = Vec::new();
+        match node.kind {
+            PublicNodeKind::Terminal { .. } => {
+                terminal_cache_refs = self.terminal_cache_refs_for_board(board)?;
+            }
+            PublicNodeKind::Chance(_) => {
+                let Some(child) = node.children.first().copied() else {
+                    return Ok(state_index);
+                };
+                let chance = next_card_isomorphism(board, &self.oop_range, &self.ip_range);
+                chance_concrete_events = chance.concrete_events;
+                for class in chance.classes {
+                    let card = *class
+                        .representative
+                        .first()
+                        .ok_or_else(|| "chance class has no representative card".to_string())?;
+                    children.push(self.collect_state_from(child, &board.push(card)?)?);
+                    chance_member_permutation_codes.push(
+                        class
+                            .members
+                            .iter()
+                            .map(|member| member.permutation_to_representative.code())
+                            .collect(),
+                    );
+                }
+            }
+            PublicNodeKind::Decision { .. } => {
+                for child in node.children {
+                    children.push(self.collect_state_from(child, board)?);
+                }
+            }
+        }
+        let state = &mut self.states[state_index];
+        state.children = children;
+        state.chance_member_permutation_codes = chance_member_permutation_codes;
+        state.chance_concrete_events = chance_concrete_events;
+        state.terminal_cache_refs = terminal_cache_refs;
+        Ok(state_index)
+    }
+
+    fn compute_subtree_slot_ranges(
+        &mut self,
+        state_index: usize,
+    ) -> Result<(usize, usize), String> {
+        let mut start = self.states[state_index]
+            .infoset
+            .map(|infoset| infoset.slots_start)
+            .unwrap_or(usize::MAX);
+        let mut end = self.states[state_index]
+            .infoset
+            .map(|infoset| infoset.slots_start + infoset.slots_len)
+            .unwrap_or(0);
+        let children = self.states[state_index].children.clone();
+        let mut child_ranges = Vec::with_capacity(children.len());
+        for child in children {
+            let (child_start, child_end) = self.compute_subtree_slot_ranges(child)?;
+            if child_start < child_end {
+                start = start.min(child_start);
+                end = end.max(child_end);
+                child_ranges.push((child_start, child_end));
+            }
+        }
+        child_ranges.sort_unstable();
+        for pair in child_ranges.windows(2) {
+            if pair[0].1 > pair[1].0 {
+                return Err(format!(
+                    "arena child subtree slot ranges overlap at state {state_index}: {:?} and {:?}",
+                    pair[0], pair[1]
+                ));
+            }
+        }
+        if start == usize::MAX {
+            start = 0;
+        }
+        self.states[state_index].subtree_slot_start = start;
+        self.states[state_index].subtree_slot_end = end;
+        Ok((start, end))
+    }
+
+    fn terminal_cache_refs_for_board(
+        &self,
+        board: &Board,
+    ) -> Result<Vec<TerminalCacheRef>, String> {
+        if board.cards().len() == 5 {
+            let cache_index = self
+                .terminal_cache_index_by_key
+                .get(&unordered_board_key(board))
+                .copied()
+                .ok_or_else(|| "terminal board is outside the solver board cache".to_string())?;
+            return Ok(vec![TerminalCacheRef {
+                cache_index,
+                member_permutation_codes: vec![
+                    crate::isomorphism::SuitPermutation::identity().code(),
+                ],
+            }]);
+        }
+        terminal_board_isomorphism(board, &self.oop_range, &self.ip_range)?
+            .into_iter()
+            .map(|class| {
+                let cache_index = self
+                    .terminal_cache_index_by_key
+                    .get(&unordered_board_key(&class.representative_board))
+                    .copied()
+                    .ok_or_else(|| {
+                        "terminal board is outside the solver board cache".to_string()
+                    })?;
+                Ok(TerminalCacheRef {
+                    cache_index,
+                    member_permutation_codes: class
+                        .members
+                        .iter()
+                        .map(|member| member.permutation_to_representative.code())
+                        .collect(),
+                })
+            })
+            .collect()
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn arena_traverse_update_into(
+    ctx: &ArenaCfrContext<'_>,
+    regrets: &mut [f32],
+    strategy_sum: &mut [f32],
+    slot_base: usize,
+    out_oop: &mut [f32],
+    out_ip: &mut [f32],
+    state_index: usize,
+    update_player: Player,
+    oop_reach: &[f32],
+    ip_reach: &[f32],
+    average_weight: f32,
+    variant: RealCfrVariant,
+    parallel_budget: usize,
+    terminal_scratch: &mut RecursiveTerminalScratch,
+    side_cache: &mut TerminalSideValueCache,
+    profile: &mut RecursiveCfrProfile,
+) -> Result<usize, String> {
+    let node_id = ctx.states[state_index].node_id;
+    match &ctx.tree.nodes[node_id].kind {
+        PublicNodeKind::Terminal { reason } => arena_terminal_slices_into(
+            ctx,
+            out_oop,
+            out_ip,
+            state_index,
+            ctx.tree.nodes[node_id].state.pot,
+            ctx.tree.nodes[node_id].state.player,
+            *reason,
+            oop_reach,
+            ip_reach,
+            terminal_scratch,
+            side_cache,
+            profile,
+        ),
+        PublicNodeKind::Chance(_) => {
+            if profile.enabled {
+                profile.chance_calls += 1;
+                profile.values_zero += 1;
+                profile.chance_cards += ctx.states[state_index].chance_concrete_events as u64;
+            }
+            out_oop.fill(0.0);
+            out_ip.fill(0.0);
+            let chance_weight = 1.0f32 / ctx.states[state_index].chance_concrete_events as f32;
+            if parallel_budget > 1 && ctx.states[state_index].children.len() >= 8 {
+                let mut tasks = Vec::with_capacity(ctx.states[state_index].children.len());
+                for (original_index, child_index) in
+                    ctx.states[state_index].children.iter().copied().enumerate()
+                {
+                    let child_state = &ctx.states[child_index];
+                    let (slot_start, slot_end) =
+                        if child_state.subtree_slot_start < child_state.subtree_slot_end {
+                            (child_state.subtree_slot_start, child_state.subtree_slot_end)
+                        } else {
+                            (slot_base, slot_base)
+                        };
+                    if slot_start < slot_base || slot_end > slot_base + regrets.len() {
+                        return Err(
+                            "arena chance child subtree is outside storage slice".to_string()
+                        );
+                    }
+                    tasks.push(ArenaChanceChildTask {
+                        original_index,
+                        child_index,
+                        slot_start,
+                        slot_end,
+                    });
+                }
+                tasks.sort_unstable_by_key(|task| {
+                    (task.slot_start, task.slot_end, task.original_index)
+                });
+                let results = arena_run_chance_tasks_parallel(
+                    ctx,
+                    regrets,
+                    strategy_sum,
+                    slot_base,
+                    &tasks,
+                    update_player,
+                    oop_reach,
+                    ip_reach,
+                    average_weight,
+                    variant,
+                    profile.enabled,
+                    parallel_budget,
+                )?;
+                let mut terminal_evals = 0usize;
+                for result in results {
+                    terminal_evals += result.terminal_evals;
+                    profile.add_counts(&result.profile);
+                    for permutation_code in &ctx.states[state_index].chance_member_permutation_codes
+                        [result.original_index]
+                    {
+                        let maps =
+                            ctx.combo_permutations
+                                .get(permutation_code)
+                                .ok_or_else(|| {
+                                    "chance isomorphism permutation is missing combo maps"
+                                        .to_string()
+                                })?;
+                        add_permuted_scaled_slice(
+                            out_oop,
+                            &result.oop,
+                            &maps.oop_source_to_target,
+                            chance_weight,
+                        );
+                        add_permuted_scaled_slice(
+                            out_ip,
+                            &result.ip,
+                            &maps.ip_source_to_target,
+                            chance_weight,
+                        );
+                    }
+                }
+                return Ok(terminal_evals);
+            }
+            let mut child_oop = terminal_scratch.take_vec(out_oop.len());
+            let mut child_ip = terminal_scratch.take_vec(out_ip.len());
+            let mut terminal_evals = 0usize;
+            for (child_index, permutation_codes) in ctx.states[state_index]
+                .children
+                .iter()
+                .copied()
+                .zip(&ctx.states[state_index].chance_member_permutation_codes)
+            {
+                terminal_evals += arena_traverse_update_into(
+                    ctx,
+                    regrets,
+                    strategy_sum,
+                    slot_base,
+                    &mut child_oop,
+                    &mut child_ip,
+                    child_index,
+                    update_player,
+                    oop_reach,
+                    ip_reach,
+                    average_weight,
+                    variant,
+                    parallel_budget,
+                    terminal_scratch,
+                    side_cache,
+                    profile,
+                )?;
+                for permutation_code in permutation_codes {
+                    let maps = ctx
+                        .combo_permutations
+                        .get(permutation_code)
+                        .ok_or_else(|| {
+                            "chance isomorphism permutation is missing combo maps".to_string()
+                        })?;
+                    add_permuted_scaled_slice(
+                        out_oop,
+                        &child_oop,
+                        &maps.oop_source_to_target,
+                        chance_weight,
+                    );
+                    add_permuted_scaled_slice(
+                        out_ip,
+                        &child_ip,
+                        &maps.ip_source_to_target,
+                        chance_weight,
+                    );
+                }
+            }
+            terminal_scratch.release_vec(child_oop);
+            terminal_scratch.release_vec(child_ip);
+            Ok(terminal_evals)
+        }
+        PublicNodeKind::Decision { player, actions } => {
+            let player = *player;
+            let actions_len = actions.len();
+            if profile.enabled {
+                profile.decision_calls += 1;
+            }
+            if actions_len == 1 {
+                return arena_traverse_update_into(
+                    ctx,
+                    regrets,
+                    strategy_sum,
+                    slot_base,
+                    out_oop,
+                    out_ip,
+                    ctx.states[state_index].children[0],
+                    update_player,
+                    oop_reach,
+                    ip_reach,
+                    average_weight,
+                    variant,
+                    parallel_budget,
+                    terminal_scratch,
+                    side_cache,
+                    profile,
+                );
+            }
+            let acting_combos = match player {
+                Player::Oop => ctx.oop_combos.len(),
+                Player::Ip => ctx.ip_combos.len(),
+            };
+            let infoset = ctx.states[state_index]
+                .infoset
+                .expect("decision state must have infoset");
+            debug_assert_eq!(infoset.player, player);
+            debug_assert_eq!(infoset.actions, actions_len);
+            debug_assert_eq!(infoset.slots_len, acting_combos * actions_len);
+            let local_slot_start = infoset
+                .slots_start
+                .checked_sub(slot_base)
+                .ok_or_else(|| "arena storage slot base is outside subtree".to_string())?;
+            let local_slot_end = local_slot_start + infoset.slots_len;
+            if local_slot_end > regrets.len() || local_slot_end > strategy_sum.len() {
+                return Err("arena storage slice does not cover subtree infoset".to_string());
+            }
+            let mut strategies = terminal_scratch.take_vec(infoset.slots_len);
+            current_strategies_into(
+                &regrets[local_slot_start..local_slot_end],
+                acting_combos,
+                actions_len,
+                &mut strategies,
+            );
+            if profile.enabled {
+                profile.strategy_builds += 1;
+                profile.values_zero += 1;
+            }
+            let oop_len = out_oop.len();
+            let ip_len = out_ip.len();
+            let mut action_oop = terminal_scratch.take_vec(actions_len * oop_len);
+            let mut action_ip = terminal_scratch.take_vec(actions_len * ip_len);
+            let mut terminal_evals = 0usize;
+            match player {
+                Player::Oop => {
+                    let mut next_oop = terminal_scratch.take_vec(oop_reach.len());
+                    for action_index in 0..actions_len {
+                        strategy_reach_into(
+                            &mut next_oop,
+                            oop_reach,
+                            &strategies,
+                            actions_len,
+                            action_index,
+                        );
+                        if profile.enabled {
+                            profile.reach_scratch_writes += next_oop.len() as u64;
+                        }
+                        terminal_evals += arena_traverse_update_into(
+                            ctx,
+                            regrets,
+                            strategy_sum,
+                            slot_base,
+                            &mut action_oop[action_index * oop_len..(action_index + 1) * oop_len],
+                            &mut action_ip[action_index * ip_len..(action_index + 1) * ip_len],
+                            ctx.states[state_index].children[action_index],
+                            update_player,
+                            &next_oop,
+                            ip_reach,
+                            average_weight,
+                            variant,
+                            parallel_budget,
+                            terminal_scratch,
+                            side_cache,
+                            profile,
+                        )?;
+                    }
+                    terminal_scratch.release_vec(next_oop);
+                }
+                Player::Ip => {
+                    let mut next_ip = terminal_scratch.take_vec(ip_reach.len());
+                    for action_index in 0..actions_len {
+                        strategy_reach_into(
+                            &mut next_ip,
+                            ip_reach,
+                            &strategies,
+                            actions_len,
+                            action_index,
+                        );
+                        if profile.enabled {
+                            profile.reach_scratch_writes += next_ip.len() as u64;
+                        }
+                        terminal_evals += arena_traverse_update_into(
+                            ctx,
+                            regrets,
+                            strategy_sum,
+                            slot_base,
+                            &mut action_oop[action_index * oop_len..(action_index + 1) * oop_len],
+                            &mut action_ip[action_index * ip_len..(action_index + 1) * ip_len],
+                            ctx.states[state_index].children[action_index],
+                            update_player,
+                            oop_reach,
+                            &next_ip,
+                            average_weight,
+                            variant,
+                            parallel_budget,
+                            terminal_scratch,
+                            side_cache,
+                            profile,
+                        )?;
+                    }
+                    terminal_scratch.release_vec(next_ip);
+                }
+            }
+            match player {
+                Player::Oop => {
+                    combine_acting_flat_values(out_oop, &action_oop, &strategies, actions_len);
+                    combine_nonacting_flat_values(out_ip, &action_ip, actions_len);
+                }
+                Player::Ip => {
+                    combine_acting_flat_values(out_ip, &action_ip, &strategies, actions_len);
+                    combine_nonacting_flat_values(out_oop, &action_oop, actions_len);
+                }
+            }
+            if player == update_player {
+                let own_reach = match player {
+                    Player::Oop => oop_reach,
+                    Player::Ip => ip_reach,
+                };
+                let update_factors = RealCfrUpdateFactors::new(variant, average_weight);
+                for combo in 0..acting_combos {
+                    let node_value = match player {
+                        Player::Oop => out_oop[combo],
+                        Player::Ip => out_ip[combo],
+                    };
+                    for action_index in 0..actions_len {
+                        let action_value = match player {
+                            Player::Oop => action_oop[action_index * oop_len + combo],
+                            Player::Ip => action_ip[action_index * ip_len + combo],
+                        };
+                        let local_slot = local_slot_start + combo * actions_len + action_index;
+                        apply_real_cfr_update_with_factors(
+                            &mut regrets[local_slot],
+                            &mut strategy_sum[local_slot],
+                            action_value - node_value,
+                            own_reach[combo] * strategies[combo * actions_len + action_index],
+                            &update_factors,
+                        );
+                    }
+                }
+            }
+            terminal_scratch.release_vec(strategies);
+            terminal_scratch.release_vec(action_oop);
+            terminal_scratch.release_vec(action_ip);
+            Ok(terminal_evals)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn arena_run_chance_tasks_parallel(
+    ctx: &ArenaCfrContext<'_>,
+    regrets: &mut [f32],
+    strategy_sum: &mut [f32],
+    slot_base: usize,
+    tasks: &[ArenaChanceChildTask],
+    update_player: Player,
+    oop_reach: &[f32],
+    ip_reach: &[f32],
+    average_weight: f32,
+    variant: RealCfrVariant,
+    profile_enabled: bool,
+    parallel_budget: usize,
+) -> Result<Vec<ArenaChanceChildResult>, String> {
+    if tasks.is_empty() {
+        return Ok(Vec::new());
+    }
+    if tasks.len() == 1 || parallel_budget <= 1 {
+        let mut results = Vec::with_capacity(tasks.len());
+        for task in tasks {
+            results.push(arena_run_chance_task(
+                ctx,
+                regrets,
+                strategy_sum,
+                slot_base,
+                *task,
+                update_player,
+                oop_reach,
+                ip_reach,
+                average_weight,
+                variant,
+                profile_enabled,
+            )?);
+        }
+        return Ok(results);
+    }
+
+    let split_index = tasks.len() / 2;
+    let (left_tasks, right_tasks) = tasks.split_at(split_index);
+    let split_slot = right_tasks
+        .first()
+        .map(|task| task.slot_start)
+        .unwrap_or(slot_base + regrets.len());
+    if split_slot < slot_base || split_slot > slot_base + regrets.len() {
+        return Err("arena chance split slot is outside storage slice".to_string());
+    }
+    let split_offset = split_slot - slot_base;
+    let (left_regrets, right_regrets) = regrets.split_at_mut(split_offset);
+    let (left_strategy_sum, right_strategy_sum) = strategy_sum.split_at_mut(split_offset);
+    let left_budget = parallel_budget / 2;
+    let right_budget = parallel_budget - left_budget;
+    let (left, right) = rayon::join(
+        || {
+            arena_run_chance_tasks_parallel(
+                ctx,
+                left_regrets,
+                left_strategy_sum,
+                slot_base,
+                left_tasks,
+                update_player,
+                oop_reach,
+                ip_reach,
+                average_weight,
+                variant,
+                profile_enabled,
+                left_budget,
+            )
+        },
+        || {
+            arena_run_chance_tasks_parallel(
+                ctx,
+                right_regrets,
+                right_strategy_sum,
+                split_slot,
+                right_tasks,
+                update_player,
+                oop_reach,
+                ip_reach,
+                average_weight,
+                variant,
+                profile_enabled,
+                right_budget,
+            )
+        },
+    );
+    let mut left = left?;
+    left.extend(right?);
+    Ok(left)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn arena_run_chance_task(
+    ctx: &ArenaCfrContext<'_>,
+    regrets: &mut [f32],
+    strategy_sum: &mut [f32],
+    slot_base: usize,
+    task: ArenaChanceChildTask,
+    update_player: Player,
+    oop_reach: &[f32],
+    ip_reach: &[f32],
+    average_weight: f32,
+    variant: RealCfrVariant,
+    profile_enabled: bool,
+) -> Result<ArenaChanceChildResult, String> {
+    let local_start = task
+        .slot_start
+        .checked_sub(slot_base)
+        .ok_or_else(|| "arena chance task starts before storage slice".to_string())?;
+    let local_end = task
+        .slot_end
+        .checked_sub(slot_base)
+        .ok_or_else(|| "arena chance task ends before storage slice".to_string())?;
+    if local_start > local_end || local_end > regrets.len() || local_end > strategy_sum.len() {
+        return Err("arena chance task storage range is outside storage slice".to_string());
+    }
+    let mut terminal_scratch = arena_terminal_scratch(ctx)?;
+    let mut side_cache = TerminalSideValueCache::default();
+    let mut profile = RecursiveCfrProfile {
+        enabled: profile_enabled,
+        ..RecursiveCfrProfile::default()
+    };
+    let mut oop = vec![0.0; ctx.oop_combos.len()];
+    let mut ip = vec![0.0; ctx.ip_combos.len()];
+    let terminal_evals = arena_traverse_update_into(
+        ctx,
+        &mut regrets[local_start..local_end],
+        &mut strategy_sum[local_start..local_end],
+        task.slot_start,
+        &mut oop,
+        &mut ip,
+        task.child_index,
+        update_player,
+        oop_reach,
+        ip_reach,
+        average_weight,
+        variant,
+        1,
+        &mut terminal_scratch,
+        &mut side_cache,
+        &mut profile,
+    )?;
+    Ok(ArenaChanceChildResult {
+        original_index: task.original_index,
+        terminal_evals,
+        oop,
+        ip,
+        profile,
+    })
+}
+
+fn arena_terminal_scratch(ctx: &ArenaCfrContext<'_>) -> Result<RecursiveTerminalScratch, String> {
+    let scratch_source = ctx
+        .terminal_cache
+        .first()
+        .ok_or_else(|| "terminal board cache is empty".to_string())?;
+    let terminal_combos = scratch_source.prepared.combos().len();
+    Ok(RecursiveTerminalScratch {
+        cfv: TerminalCfvScratch::new(&scratch_source.prepared),
+        oop_live: vec![0.0; terminal_combos],
+        ip_live: vec![0.0; terminal_combos],
+        oop_nonzero: Vec::new(),
+        ip_nonzero: Vec::new(),
+        accumulator: TerminalAccumulator::zero(ctx.oop_combos.len(), ctx.ip_combos.len()),
+        vectors: Vec::new(),
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn arena_terminal_slices_into(
+    ctx: &ArenaCfrContext<'_>,
+    out_oop: &mut [f32],
+    out_ip: &mut [f32],
+    state_index: usize,
+    pot: u32,
+    folding_player: Player,
+    reason: TerminalReason,
+    oop_reach: &[f32],
+    ip_reach: &[f32],
+    terminal_scratch: &mut RecursiveTerminalScratch,
+    side_cache: &mut TerminalSideValueCache,
+    profile: &mut RecursiveCfrProfile,
+) -> Result<usize, String> {
+    if profile.enabled {
+        profile.terminal_calls += 1;
+    }
+    match reason {
+        TerminalReason::Fold => {
+            if profile.enabled {
+                profile.fold_calls += 1;
+            }
+            arena_fold_slices_into(
+                ctx,
+                out_oop,
+                out_ip,
+                &ctx.states[state_index].board,
+                pot,
+                folding_player,
+                oop_reach,
+                ip_reach,
+            );
+            Ok(0)
+        }
+        TerminalReason::Showdown | TerminalReason::AllIn => {
+            if profile.enabled {
+                profile.showdown_calls += 1;
+            }
+            let sparse_nonzero_limit = terminal_sparse_nonzero_limit();
+            terminal_scratch.accumulator.reset();
+            for terminal_ref in &ctx.states[state_index].terminal_cache_refs {
+                let cache = &ctx.terminal_cache[terminal_ref.cache_index];
+                reach_on_prepared_board_targets_sparse_into(
+                    &cache.oop_targets,
+                    oop_reach,
+                    &mut terminal_scratch.oop_live,
+                    &mut terminal_scratch.oop_nonzero,
+                );
+                reach_on_prepared_board_targets_sparse_into(
+                    &cache.ip_targets,
+                    ip_reach,
+                    &mut terminal_scratch.ip_live,
+                    &mut terminal_scratch.ip_nonzero,
+                );
+                let use_sparse = terminal_scratch.oop_nonzero.len() <= sparse_nonzero_limit
+                    && terminal_scratch.ip_nonzero.len() <= sparse_nonzero_limit;
+                let hero_values = terminal_side_cached_values(
+                    side_cache,
+                    cache,
+                    terminal_ref.cache_index,
+                    TerminalSideValue::OopValue,
+                    &terminal_scratch.ip_live,
+                    &terminal_scratch.ip_nonzero,
+                    &cache.oop_targets,
+                    &cache.oop_board_targets,
+                    ctx.oop_combos.len(),
+                    use_sparse,
+                    &mut terminal_scratch.cfv,
+                )?;
+                let villain_values = terminal_side_cached_values(
+                    side_cache,
+                    cache,
+                    terminal_ref.cache_index,
+                    TerminalSideValue::IpValue,
+                    &terminal_scratch.oop_live,
+                    &terminal_scratch.oop_nonzero,
+                    &cache.ip_targets,
+                    &cache.ip_board_targets,
+                    ctx.ip_combos.len(),
+                    use_sparse,
+                    &mut terminal_scratch.cfv,
+                )?;
+                arena_add_terminal_ref_compact_values(
+                    ctx,
+                    &mut terminal_scratch.accumulator,
+                    terminal_ref,
+                    cache,
+                    pot,
+                    &hero_values,
+                    &villain_values,
+                )?;
+            }
+            terminal_scratch.accumulator.finish();
+            out_oop.copy_from_slice(&terminal_scratch.accumulator.values.oop);
+            out_ip.copy_from_slice(&terminal_scratch.accumulator.values.ip);
+            Ok(terminal_scratch.accumulator.values.terminal_evals)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn arena_fold_slices_into(
+    ctx: &ArenaCfrContext<'_>,
+    out_oop: &mut [f32],
+    out_ip: &mut [f32],
+    board: &Board,
+    pot: u32,
+    folding_player: Player,
+    oop_reach: &[f32],
+    ip_reach: &[f32],
+) {
+    let pot = pot as f32;
+    opponent_weights_for_fast_into(
+        ctx.oop_combos,
+        ctx.ip_combos,
+        ip_reach,
+        ctx.oop_same_ip_combo_indices,
+        board,
+        out_oop,
+    );
+    opponent_weights_for_fast_into(
+        ctx.ip_combos,
+        ctx.oop_combos,
+        oop_reach,
+        ctx.ip_same_oop_combo_indices,
+        board,
+        out_ip,
+    );
+    for value in out_oop.iter_mut() {
+        *value = if folding_player == Player::Oop {
+            -pot
+        } else {
+            pot
+        } * *value;
+    }
+    for value in out_ip.iter_mut() {
+        *value = if folding_player == Player::Ip {
+            -pot
+        } else {
+            pot
+        } * *value;
+    }
+}
+
+fn arena_add_terminal_ref_compact_values(
+    ctx: &ArenaCfrContext<'_>,
+    accumulator: &mut TerminalAccumulator,
+    terminal_ref: &TerminalCacheRef,
+    cache: &TerminalEvalCache,
+    pot: u32,
+    hero_values: &[f32],
+    villain_values: &[f32],
+) -> Result<(), String> {
+    let identity_code = crate::isomorphism::SuitPermutation::identity().code();
+    for permutation_code in &terminal_ref.member_permutation_codes {
+        if *permutation_code == identity_code {
+            accumulator.add_compact_board_values(cache, pot, hero_values, villain_values);
+            continue;
+        }
+        let maps = ctx
+            .combo_permutations
+            .get(permutation_code)
+            .ok_or_else(|| "terminal isomorphism permutation is missing combo maps".to_string())?;
+        accumulator.add_compact_board_values_permuted(
+            cache,
+            pot,
+            hero_values,
+            villain_values,
+            &maps.oop_source_to_target,
+            &maps.ip_source_to_target,
+        );
+    }
+    Ok(())
 }
 
 impl RealCfrSolver {
@@ -4731,7 +5925,10 @@ fn ordered_board_key(board: &Board) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tree::{ActionAbstraction, ChanceExpansion, Spot, TreeBuilder, TreeTemplate};
+    use crate::tree::{
+        ActionAbstraction, BetSizeSpec, ChanceExpansion, RaisePolicy, Spot, StreetTemplate,
+        TreeBuilder, TreeTemplate,
+    };
     use std::str::FromStr;
 
     #[test]
@@ -4817,6 +6014,94 @@ mod tests {
             (summary.root_oop_value + summary.root_ip_value).abs() < 0.05,
             "{summary:?}"
         );
+    }
+
+    #[test]
+    fn arena_cfr_parallel_matches_single_thread_on_small_ranges() {
+        let board = Board::from_str("Td9d6h").unwrap();
+        let action_abstraction = ActionAbstraction {
+            min_bet: 1,
+            flop: StreetTemplate {
+                first_bet_sizes: vec![BetSizeSpec::PotFraction(0.50)],
+                donk_bet_sizes: Vec::new(),
+            },
+            turn: StreetTemplate {
+                first_bet_sizes: vec![BetSizeSpec::PotFraction(0.50)],
+                donk_bet_sizes: Vec::new(),
+            },
+            river: StreetTemplate {
+                first_bet_sizes: vec![BetSizeSpec::PotFraction(0.50)],
+                donk_bet_sizes: Vec::new(),
+            },
+            raise: RaisePolicy {
+                raise_multiplier: 2.5,
+                raise_sizes: Vec::new(),
+                max_raises_per_street: 0,
+                shove_spr_threshold: 0.0,
+                shove_commit_fraction: 1.0,
+                add_all_in_threshold: 0.0,
+                force_all_in_threshold: 0.0,
+                merging_threshold: 0.1,
+            },
+        };
+        let tree = TreeBuilder::new(TreeTemplate {
+            action_abstraction,
+            chance_expansion: ChanceExpansion::TemplateOnly,
+        })
+        .unwrap()
+        .build(Spot {
+            board,
+            pot: 200,
+            effective_stack: 900,
+            oop_range: RangeSpec::from_str("AsAh,KsKh").unwrap(),
+            ip_range: RangeSpec::from_str("QsQh,JsJh").unwrap(),
+            first_player: Player::Oop,
+        })
+        .unwrap();
+        let config = RealCfrConfig {
+            iterations: 2,
+            variant: RealCfrVariant::CfrPlus,
+        };
+        let mut single = ArenaAlternatingCfrSolver::new(
+            tree.clone(),
+            RangeSpec::from_str("AsAh,KsKh").unwrap(),
+            RangeSpec::from_str("QsQh,JsJh").unwrap(),
+        )
+        .unwrap();
+        let mut parallel = ArenaAlternatingCfrSolver::new(
+            tree,
+            RangeSpec::from_str("AsAh,KsKh").unwrap(),
+            RangeSpec::from_str("QsQh,JsJh").unwrap(),
+        )
+        .unwrap();
+
+        let single_summary = single.run_with_progress_threads(config, 1, |_| {}).unwrap();
+        let parallel_summary = parallel
+            .run_with_progress_threads(config, 4, |_| {})
+            .unwrap();
+
+        assert_eq!(single_summary.states, parallel_summary.states);
+        assert_eq!(single_summary.action_slots, parallel_summary.action_slots);
+        assert_eq!(
+            single_summary.terminal_evals,
+            parallel_summary.terminal_evals
+        );
+        assert!(
+            (single_summary.root_oop_value - parallel_summary.root_oop_value).abs() < 0.001,
+            "{single_summary:?} != {parallel_summary:?}"
+        );
+        assert!(
+            (single_summary.root_ip_value - parallel_summary.root_ip_value).abs() < 0.001,
+            "{single_summary:?} != {parallel_summary:?}"
+        );
+        assert_eq!(single.regrets.len(), parallel.regrets.len());
+        assert_eq!(single.strategy_sum.len(), parallel.strategy_sum.len());
+        for (left, right) in single.regrets.iter().zip(&parallel.regrets) {
+            assert!((*left - *right).abs() < 0.001);
+        }
+        for (left, right) in single.strategy_sum.iter().zip(&parallel.strategy_sum) {
+            assert!((*left - *right).abs() < 0.001);
+        }
     }
 
     #[test]

@@ -1,9 +1,9 @@
 use clap::{Parser, Subcommand};
 use pokedr_agent::{FlopTreeRequest, build_flop_tree};
 use pokedr_core::{
-    ActionKind, Board, CfrPlusState, CfrStorageConfig, ChanceExpansion, ParallelCfrSolver, Player,
-    PreparedTerminalCfvSmoke, PublicNodeKind, RangeSpec, RealCfrConfig, RealCfrSolver,
-    RealCfrVariant, Street, TreeTemplate, analyze_cfr_storage_scenarios,
+    ActionKind, ArenaAlternatingCfrSolver, Board, CfrPlusState, CfrStorageConfig, ChanceExpansion,
+    ParallelCfrSolver, Player, PreparedTerminalCfvSmoke, PublicNodeKind, RangeSpec, RealCfrConfig,
+    RealCfrSolver, RealCfrVariant, Street, TreeTemplate, analyze_cfr_storage_scenarios,
     analyze_public_state_duplicates, build_action_slot_layout, dry_run_cfr_plus_iteration,
     plan_cfr_work, terminal_cfv_parallel_smoke,
 };
@@ -92,6 +92,8 @@ enum Command {
         terminal_cfv_tree_pass: bool,
         #[arg(long)]
         run_real_cfr: bool,
+        #[arg(long)]
+        run_arena_cfr: bool,
         #[arg(long)]
         parallel_cfr_plan: bool,
         #[arg(long)]
@@ -348,6 +350,7 @@ fn main() -> Result<(), String> {
             terminal_cfv_batch_width,
             terminal_cfv_tree_pass,
             run_real_cfr,
+            run_arena_cfr,
             parallel_cfr_plan,
             run_real_cfr_three_phase,
             real_cfr_log_interval,
@@ -396,12 +399,70 @@ fn main() -> Result<(), String> {
             } else {
                 build_flop_tree(request).map_err(|error| format!("{error:?}"))?
             };
+            let real_cfr_variant =
+                parse_real_cfr_variant(&real_cfr_variant, dcfr_alpha, dcfr_beta, dcfr_gamma)?;
+            if run_arena_cfr {
+                println!(
+                    "solving flop={} variant={} iterations={iterations} threads={state_threads}",
+                    tree.spot.board,
+                    format_real_cfr_variant(real_cfr_variant),
+                );
+                let started = Instant::now();
+                let mut solver = ArenaAlternatingCfrSolver::new(
+                    tree.clone(),
+                    RangeSpec::from_str(&oop_range)?,
+                    RangeSpec::from_str(&ip_range)?,
+                )?;
+                let summary = solver.run_with_progress_threads(
+                    RealCfrConfig {
+                        iterations,
+                        variant: real_cfr_variant,
+                    },
+                    state_threads,
+                    |progress| {
+                        if real_cfr_log_interval > 0
+                            && (progress.iteration == 1
+                                || progress.iteration == iterations
+                                || progress.iteration % real_cfr_log_interval == 0)
+                        {
+                            println!(
+                                "arena_cfr_progress iteration={} terminal_evals={} iteration_ms={:.3} root_oop_value={:.6} root_ip_value={:.6} zero_sum_delta={:.6}",
+                                progress.iteration,
+                                progress.terminal_evals,
+                                progress.elapsed_ms,
+                                progress.root_oop_value,
+                                progress.root_ip_value,
+                                progress.root_oop_value + progress.root_ip_value,
+                            );
+                        }
+                    },
+                )?;
+                println!(
+                    "arena_cfr iterations={} threads={} states={} decision_states={} action_slots={} terminal_evals={} elapsed_ms={:.3} root_oop_value={:.6} root_ip_value={:.6} zero_sum_delta={:.6}",
+                    summary.iterations,
+                    state_threads,
+                    summary.states,
+                    summary.decision_states,
+                    summary.action_slots,
+                    summary.terminal_evals,
+                    started.elapsed().as_secs_f64() * 1000.0,
+                    summary.root_oop_value,
+                    summary.root_ip_value,
+                    summary.root_oop_value + summary.root_ip_value,
+                );
+                println!(
+                    "arena_cfr_state_allocated=true states={} regret_len={} strategy_sum_len={} storage_gib={:.3}",
+                    solver.state_count(),
+                    solver.regret_len(),
+                    solver.strategy_sum_len(),
+                    solver.storage_gib(),
+                );
+                return Ok(());
+            }
             let config = CfrStorageConfig {
                 chunk_target_bytes: chunk_mib as u128 * 1024 * 1024,
                 ..CfrStorageConfig::default()
             };
-            let real_cfr_variant =
-                parse_real_cfr_variant(&real_cfr_variant, dcfr_alpha, dcfr_beta, dcfr_gamma)?;
             let plan = plan_cfr_work(&tree, config);
             let layout = build_action_slot_layout(&tree, config);
             println!(
