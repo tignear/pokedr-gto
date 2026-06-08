@@ -11,6 +11,7 @@ use crate::tree::{Player, PublicNodeKind, PublicTree, TerminalReason};
 use rayon::prelude::*;
 use std::cell::UnsafeCell;
 use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -24,6 +25,9 @@ pub struct NodeLocalCfrSummary {
     pub oop_update_pass_value: f32,
     pub ip_update_pass_value: f32,
     pub storage_gib: f64,
+    pub scratch_allocations: usize,
+    pub terminal_cache_hits: usize,
+    pub terminal_cache_misses: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -52,6 +56,23 @@ pub struct NodeLocalCfrSolver {
     completed_iterations: u32,
     action_slots: usize,
     decision_states: usize,
+    profile_enabled: bool,
+    profile: NodeLocalProfile,
+}
+
+#[derive(Debug, Default)]
+struct NodeLocalProfile {
+    scratch_allocations: AtomicUsize,
+    terminal_cache_hits: AtomicUsize,
+    terminal_cache_misses: AtomicUsize,
+}
+
+impl NodeLocalProfile {
+    fn reset(&self) {
+        self.scratch_allocations.store(0, Ordering::Relaxed);
+        self.terminal_cache_hits.store(0, Ordering::Relaxed);
+        self.terminal_cache_misses.store(0, Ordering::Relaxed);
+    }
 }
 
 #[derive(Debug)]
@@ -161,6 +182,48 @@ struct NodeLocalTerminalSideCache {
     entries: HashMap<NodeLocalTerminalSideCacheKey, Vec<NodeLocalTerminalSideCacheEntry>>,
 }
 
+struct NodeLocalChanceAccumulator {
+    out: Vec<f32>,
+    child_values: Vec<f32>,
+    scratch: NodeLocalScratch,
+    terminal_evals: usize,
+    error: Option<String>,
+}
+
+impl NodeLocalChanceAccumulator {
+    fn new(solver: &NodeLocalCfrSolver, value_len: usize) -> Self {
+        Self {
+            out: vec![0.0; value_len],
+            child_values: vec![0.0; value_len],
+            scratch: NodeLocalScratch::new(solver),
+            terminal_evals: 0,
+            error: None,
+        }
+    }
+
+    fn new_empty(value_len: usize) -> Self {
+        Self {
+            out: vec![0.0; value_len],
+            child_values: Vec::new(),
+            scratch: NodeLocalScratch {
+                strategies: Vec::new(),
+                denominators: Vec::new(),
+                child_values: Vec::new(),
+                action_values: Vec::new(),
+                next_oop: Vec::new(),
+                next_ip: Vec::new(),
+                terminal_oop_live: Vec::new(),
+                terminal_ip_live: Vec::new(),
+                terminal_values: Vec::new(),
+                terminal_counts: Vec::new(),
+                side_cache: NodeLocalTerminalSideCache::default(),
+            },
+            terminal_evals: 0,
+            error: None,
+        }
+    }
+}
+
 impl NodeLocalCfrSolver {
     pub fn new(
         tree: PublicTree,
@@ -223,6 +286,8 @@ impl NodeLocalCfrSolver {
             completed_iterations: 0,
             action_slots: 0,
             decision_states: 0,
+            profile_enabled: std::env::var_os("POKEDR_NODE_CFR_PROFILE").is_some(),
+            profile: NodeLocalProfile::default(),
         };
         let board = solver.tree.spot.board.clone();
         solver.collect_node(0, &board)?;
@@ -248,6 +313,9 @@ impl NodeLocalCfrSolver {
             oop_update_pass_value: 0.0,
             ip_update_pass_value: 0.0,
             storage_gib: self.storage_gib(),
+            scratch_allocations: self.profile.scratch_allocations.load(Ordering::Relaxed),
+            terminal_cache_hits: self.profile.terminal_cache_hits.load(Ordering::Relaxed),
+            terminal_cache_misses: self.profile.terminal_cache_misses.load(Ordering::Relaxed),
         }
     }
 
@@ -261,6 +329,9 @@ impl NodeLocalCfrSolver {
         config: RealCfrConfig,
         mut progress: impl FnMut(NodeLocalCfrIterationSummary),
     ) -> Result<NodeLocalCfrSummary, String> {
+        if self.profile_enabled {
+            self.profile.reset();
+        }
         let started_all = Instant::now();
         let oop_weight = self
             .oop_combos
@@ -294,7 +365,7 @@ impl NodeLocalCfrSolver {
                 average_weight,
                 config,
                 &mut root_oop,
-                &mut NodeLocalScratch::new(self)?,
+                &mut NodeLocalScratch::new(self),
             )?;
             terminal_evals += self.traverse_update_side_into(
                 0,
@@ -304,7 +375,7 @@ impl NodeLocalCfrSolver {
                 average_weight,
                 config,
                 &mut root_ip,
-                &mut NodeLocalScratch::new(self)?,
+                &mut NodeLocalScratch::new(self),
             )?;
             progress(NodeLocalCfrIterationSummary {
                 iteration,
@@ -344,6 +415,9 @@ impl NodeLocalCfrSolver {
                 oop_weight,
             ),
             storage_gib: self.storage_gib(),
+            scratch_allocations: self.profile.scratch_allocations.load(Ordering::Relaxed),
+            terminal_cache_hits: self.profile.terminal_cache_hits.load(Ordering::Relaxed),
+            terminal_cache_misses: self.profile.terminal_cache_misses.load(Ordering::Relaxed),
         })
     }
 
@@ -379,47 +453,74 @@ impl NodeLocalCfrSolver {
                 let chance_weight = 1.0 / node.chance_concrete_events as f32;
                 let target_len = out.len();
                 if should_parallel_node(node, target_len) {
-                    let results = node
+                    let result = node
                         .children
                         .par_iter()
                         .copied()
                         .enumerate()
-                        .map(|(action_index, child)| {
-                            let mut local_scratch = NodeLocalScratch::new(self)?;
-                            let mut child_values = vec![0.0; target_len];
-                            let terminal_evals = self.traverse_update_side_into(
-                                child,
-                                update_player,
-                                oop_reach,
-                                ip_reach,
-                                average_weight,
-                                config,
-                                &mut child_values,
-                                &mut local_scratch,
-                            )?;
-                            Ok::<_, String>((action_index, child_values, terminal_evals))
-                        })
-                        .collect::<Result<Vec<_>, _>>()?;
-                    let mut terminal_evals = 0usize;
-                    for (action_index, child_values, child_terminal_evals) in results {
-                        terminal_evals += child_terminal_evals;
-                        for code in &node.chance_permutation_codes[action_index] {
-                            let maps = self.combo_permutations.get(code).ok_or_else(|| {
-                                "chance isomorphism permutation is missing combo maps".to_string()
-                            })?;
-                            let source_to_target = match update_player {
-                                Player::Oop => &maps.oop_source_to_target,
-                                Player::Ip => &maps.ip_source_to_target,
-                            };
-                            add_permuted_scaled_slice(
-                                out,
-                                &child_values,
-                                source_to_target,
-                                chance_weight,
-                            );
-                        }
+                        .fold(
+                            || NodeLocalChanceAccumulator::new(self, target_len),
+                            |mut accumulator, (action_index, child)| {
+                                if accumulator.error.is_some() {
+                                    return accumulator;
+                                }
+                                accumulator.child_values.resize(target_len, 0.0);
+                                match self.traverse_update_side_into(
+                                    child,
+                                    update_player,
+                                    oop_reach,
+                                    ip_reach,
+                                    average_weight,
+                                    config,
+                                    &mut accumulator.child_values,
+                                    &mut accumulator.scratch,
+                                ) {
+                                    Ok(terminal_evals) => {
+                                        accumulator.terminal_evals += terminal_evals;
+                                    }
+                                    Err(error) => {
+                                        accumulator.error = Some(error);
+                                        return accumulator;
+                                    }
+                                }
+                                for code in &node.chance_permutation_codes[action_index] {
+                                    let Some(maps) = self.combo_permutations.get(code) else {
+                                        accumulator.error = Some(
+                                            "chance isomorphism permutation is missing combo maps"
+                                                .to_string(),
+                                        );
+                                        return accumulator;
+                                    };
+                                    let source_to_target = match update_player {
+                                        Player::Oop => &maps.oop_source_to_target,
+                                        Player::Ip => &maps.ip_source_to_target,
+                                    };
+                                    add_permuted_scaled_slice(
+                                        &mut accumulator.out,
+                                        &accumulator.child_values,
+                                        source_to_target,
+                                        chance_weight,
+                                    );
+                                }
+                                accumulator
+                            },
+                        )
+                        .reduce(
+                            || NodeLocalChanceAccumulator::new_empty(target_len),
+                            |mut left, right| {
+                                if left.error.is_none() {
+                                    left.error = right.error;
+                                }
+                                left.terminal_evals += right.terminal_evals;
+                                add_slice(&mut left.out, &right.out);
+                                left
+                            },
+                        );
+                    if let Some(error) = result.error {
+                        return Err(error);
                     }
-                    return Ok(terminal_evals);
+                    out.copy_from_slice(&result.out);
+                    return Ok(result.terminal_evals);
                 }
                 scratch.child_values.resize(target_len, 0.0);
                 let mut terminal_evals = 0usize;
@@ -484,64 +585,68 @@ impl NodeLocalCfrSolver {
                 );
                 if player != update_player {
                     out.fill(0.0);
-                    let mut terminal_evals = 0usize;
                     if should_parallel_node(node, target_len) {
                         let results = match player {
                             Player::Oop => (0..actions)
                                 .into_par_iter()
-                                .map(|action| {
-                                    let mut local_scratch = NodeLocalScratch::new(self)?;
-                                    let mut child_values = vec![0.0; target_len];
-                                    let mut next_oop = vec![0.0; oop_reach.len()];
-                                    strategy_reach_action_major_into(
-                                        &mut next_oop,
-                                        oop_reach,
-                                        &strategies,
-                                        acting_combos,
-                                        actions,
-                                        action,
-                                    );
-                                    let terminal_evals = self.traverse_update_side_into(
-                                        node.children[action],
-                                        update_player,
-                                        &next_oop,
-                                        ip_reach,
-                                        average_weight,
-                                        config,
-                                        &mut child_values,
-                                        &mut local_scratch,
-                                    )?;
-                                    Ok::<_, String>((child_values, terminal_evals))
-                                })
-                                .collect::<Result<Vec<_>, _>>()?,
+                                .map_init(
+                                    || NodeLocalScratch::new(self),
+                                    |local_scratch, action| {
+                                        let mut child_values = vec![0.0; target_len];
+                                        let mut next_oop = vec![0.0; oop_reach.len()];
+                                        strategy_reach_action_major_into(
+                                            &mut next_oop,
+                                            oop_reach,
+                                            &strategies,
+                                            acting_combos,
+                                            actions,
+                                            action,
+                                        );
+                                        let terminal_evals = self.traverse_update_side_into(
+                                            node.children[action],
+                                            update_player,
+                                            &next_oop,
+                                            ip_reach,
+                                            average_weight,
+                                            config,
+                                            &mut child_values,
+                                            local_scratch,
+                                        )?;
+                                        Ok::<_, String>((child_values, terminal_evals))
+                                    },
+                                )
+                                .collect::<Result<Vec<_>, _>>(),
                             Player::Ip => (0..actions)
                                 .into_par_iter()
-                                .map(|action| {
-                                    let mut local_scratch = NodeLocalScratch::new(self)?;
-                                    let mut child_values = vec![0.0; target_len];
-                                    let mut next_ip = vec![0.0; ip_reach.len()];
-                                    strategy_reach_action_major_into(
-                                        &mut next_ip,
-                                        ip_reach,
-                                        &strategies,
-                                        acting_combos,
-                                        actions,
-                                        action,
-                                    );
-                                    let terminal_evals = self.traverse_update_side_into(
-                                        node.children[action],
-                                        update_player,
-                                        oop_reach,
-                                        &next_ip,
-                                        average_weight,
-                                        config,
-                                        &mut child_values,
-                                        &mut local_scratch,
-                                    )?;
-                                    Ok::<_, String>((child_values, terminal_evals))
-                                })
-                                .collect::<Result<Vec<_>, _>>()?,
-                        };
+                                .map_init(
+                                    || NodeLocalScratch::new(self),
+                                    |local_scratch, action| {
+                                        let mut child_values = vec![0.0; target_len];
+                                        let mut next_ip = vec![0.0; ip_reach.len()];
+                                        strategy_reach_action_major_into(
+                                            &mut next_ip,
+                                            ip_reach,
+                                            &strategies,
+                                            acting_combos,
+                                            actions,
+                                            action,
+                                        );
+                                        let terminal_evals = self.traverse_update_side_into(
+                                            node.children[action],
+                                            update_player,
+                                            oop_reach,
+                                            &next_ip,
+                                            average_weight,
+                                            config,
+                                            &mut child_values,
+                                            local_scratch,
+                                        )?;
+                                        Ok::<_, String>((child_values, terminal_evals))
+                                    },
+                                )
+                                .collect::<Result<Vec<_>, _>>(),
+                        }?;
+                        let mut terminal_evals = 0usize;
                         for (child_values, child_terminal_evals) in results {
                             terminal_evals += child_terminal_evals;
                             add_slice(out, &child_values);
@@ -550,6 +655,7 @@ impl NodeLocalCfrSolver {
                         scratch.denominators = denominators;
                         return Ok(terminal_evals);
                     }
+                    let mut terminal_evals = 0usize;
                     let mut child_values = std::mem::take(&mut scratch.child_values);
                     child_values.resize(target_len, 0.0);
                     match player {
@@ -621,84 +727,88 @@ impl NodeLocalCfrSolver {
                         Player::Oop => action_values
                             .par_chunks_mut(target_len)
                             .enumerate()
-                            .map(|(action, action_out)| {
-                                let mut local_scratch = NodeLocalScratch::new(self)?;
-                                let next_oop = if config.average_strategy
-                                    == RealCfrAverageStrategy::ReachWeighted
-                                {
-                                    let mut next_oop = vec![0.0; oop_reach.len()];
-                                    strategy_reach_action_major_into(
-                                        &mut next_oop,
-                                        oop_reach,
-                                        &strategies,
-                                        acting_combos,
-                                        actions,
-                                        action,
-                                    );
-                                    next_oop
-                                } else {
-                                    Vec::new()
-                                };
-                                let child_oop = if config.average_strategy
-                                    == RealCfrAverageStrategy::ReachWeighted
-                                {
-                                    &next_oop
-                                } else {
-                                    oop_reach
-                                };
-                                self.traverse_update_side_into(
-                                    node.children[action],
-                                    update_player,
-                                    child_oop,
-                                    ip_reach,
-                                    average_weight,
-                                    config,
-                                    action_out,
-                                    &mut local_scratch,
-                                )
-                            })
+                            .map_init(
+                                || NodeLocalScratch::new(self),
+                                |local_scratch, (action, action_out)| {
+                                    let next_oop = if config.average_strategy
+                                        == RealCfrAverageStrategy::ReachWeighted
+                                    {
+                                        let mut next_oop = vec![0.0; oop_reach.len()];
+                                        strategy_reach_action_major_into(
+                                            &mut next_oop,
+                                            oop_reach,
+                                            &strategies,
+                                            acting_combos,
+                                            actions,
+                                            action,
+                                        );
+                                        next_oop
+                                    } else {
+                                        Vec::new()
+                                    };
+                                    let child_oop = if config.average_strategy
+                                        == RealCfrAverageStrategy::ReachWeighted
+                                    {
+                                        &next_oop
+                                    } else {
+                                        oop_reach
+                                    };
+                                    self.traverse_update_side_into(
+                                        node.children[action],
+                                        update_player,
+                                        child_oop,
+                                        ip_reach,
+                                        average_weight,
+                                        config,
+                                        action_out,
+                                        local_scratch,
+                                    )
+                                },
+                            )
                             .collect::<Result<Vec<_>, _>>()?
                             .into_iter()
                             .sum(),
                         Player::Ip => action_values
                             .par_chunks_mut(target_len)
                             .enumerate()
-                            .map(|(action, action_out)| {
-                                let mut local_scratch = NodeLocalScratch::new(self)?;
-                                let next_ip = if config.average_strategy
-                                    == RealCfrAverageStrategy::ReachWeighted
-                                {
-                                    let mut next_ip = vec![0.0; ip_reach.len()];
-                                    strategy_reach_action_major_into(
-                                        &mut next_ip,
-                                        ip_reach,
-                                        &strategies,
-                                        acting_combos,
-                                        actions,
-                                        action,
-                                    );
-                                    next_ip
-                                } else {
-                                    Vec::new()
-                                };
-                                let child_ip = if config.average_strategy
-                                    == RealCfrAverageStrategy::ReachWeighted
-                                {
-                                    &next_ip
-                                } else {
-                                    ip_reach
-                                };
-                                self.traverse_update_side_into(
-                                    node.children[action],
-                                    update_player,
-                                    oop_reach,
-                                    child_ip,
-                                    average_weight,
-                                    config,
-                                    action_out,
-                                    &mut local_scratch,
-                                )
-                            })
+                            .map_init(
+                                || NodeLocalScratch::new(self),
+                                |local_scratch, (action, action_out)| {
+                                    let next_ip = if config.average_strategy
+                                        == RealCfrAverageStrategy::ReachWeighted
+                                    {
+                                        let mut next_ip = vec![0.0; ip_reach.len()];
+                                        strategy_reach_action_major_into(
+                                            &mut next_ip,
+                                            ip_reach,
+                                            &strategies,
+                                            acting_combos,
+                                            actions,
+                                            action,
+                                        );
+                                        next_ip
+                                    } else {
+                                        Vec::new()
+                                    };
+                                    let child_ip = if config.average_strategy
+                                        == RealCfrAverageStrategy::ReachWeighted
+                                    {
+                                        &next_ip
+                                    } else {
+                                        ip_reach
+                                    };
+                                    self.traverse_update_side_into(
+                                        node.children[action],
+                                        update_player,
+                                        oop_reach,
+                                        child_ip,
+                                        average_weight,
+                                        config,
+                                        action_out,
+                                        local_scratch,
+                                    )
+                                },
+                            )
                             .collect::<Result<Vec<_>, _>>()?
                             .into_iter()
                             .sum(),
@@ -1062,6 +1172,7 @@ impl NodeLocalCfrSolver {
                 opponent_reach,
                 board_targets,
                 &mut scratch.terminal_values,
+                self.profile_enabled.then_some(&self.profile),
             )?;
             for target in own_targets {
                 out[target.range_index] +=
@@ -1090,13 +1201,15 @@ fn should_parallel_node(node: &NodeLocalNode, value_len: usize) -> bool {
 }
 
 impl NodeLocalScratch {
-    fn new(solver: &NodeLocalCfrSolver) -> Result<Self, String> {
-        let prepared = &solver
-            .terminal_cache
-            .first()
-            .ok_or_else(|| "terminal cache is empty".to_string())?
-            .prepared;
-        Ok(Self {
+    fn new(solver: &NodeLocalCfrSolver) -> Self {
+        if solver.profile_enabled {
+            solver
+                .profile
+                .scratch_allocations
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        let prepared = &solver.terminal_cache[0].prepared;
+        Self {
             strategies: Vec::new(),
             denominators: Vec::new(),
             child_values: Vec::new(),
@@ -1108,7 +1221,7 @@ impl NodeLocalScratch {
             terminal_values: vec![0.0; prepared.combos().len()],
             terminal_counts: Vec::new(),
             side_cache: NodeLocalTerminalSideCache::default(),
-        })
+        }
     }
 }
 
@@ -1382,6 +1495,7 @@ fn terminal_side_cached_values(
     opponent_reach: &[f32],
     targets_sorted_by_strength: &[u16],
     scratch_values: &mut Vec<f32>,
+    profile: Option<&NodeLocalProfile>,
 ) -> Result<(), String> {
     let signature = reach_signature(opponent_reach);
     let reach_hash = signature
@@ -1397,10 +1511,18 @@ fn terminal_side_cached_values(
     if let Some(entries) = cache.entries.get(&key) {
         for entry in entries {
             if entry.signature == signature {
+                if let Some(profile) = profile {
+                    profile.terminal_cache_hits.fetch_add(1, Ordering::Relaxed);
+                }
                 scratch_values.clone_from(&entry.values);
                 return Ok(());
             }
         }
+    }
+    if let Some(profile) = profile {
+        profile
+            .terminal_cache_misses
+            .fetch_add(1, Ordering::Relaxed);
     }
     scratch_values.resize(prepared.combos().len(), 0.0);
     terminal_side_values_prefix_blocker_sorted_board_targets_into(

@@ -537,6 +537,14 @@ fn main() -> Result<(), String> {
                     summary.storage_gib,
                     started.elapsed().as_secs_f64() * 1000.0,
                 );
+                if std::env::var_os("POKEDR_NODE_CFR_PROFILE").is_some() {
+                    println!(
+                        "node_cfr_profile scratch_allocations={} terminal_cache_hits={} terminal_cache_misses={}",
+                        summary.scratch_allocations,
+                        summary.terminal_cache_hits,
+                        summary.terminal_cache_misses,
+                    );
+                }
                 return Ok(());
             }
             let config = CfrStorageConfig {

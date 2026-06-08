@@ -1000,3 +1000,25 @@ retrying similar ideas, so attempts stay in chronological order.
   bit-mixed fingerprint key also slowed the same 16-iteration run to `6318ms`.
   The key construction is not the current 3x gap; keep the exact signature path
   until a broader cache layout change is made.
+- Follow-up: worker-local scratch reuse with Rayon `map_init` reduced the same
+  16-iteration run to about `4029ms`; changing chance-node parallel aggregation
+  to fold/reduce brought the best single run to about `3869ms`.
+- Profile: with `POKEDR_NODE_CFR_PROFILE=1`, 16 iterations still created about
+  `932k` scratch objects and saw about `1.36M` terminal side-cache hits versus
+  `4.33M` misses. This confirms that cache reuse is still fragmented by nested
+  parallel traversal.
+- Failed follow-up: writing opponent-decision child values directly into a
+  parent `action_values` buffer, matching the reference `cfv_actions` shape more
+  closely, slowed the 16-iteration run to about `4209ms`. In this implementation
+  the larger parent buffer traffic outweighed the avoided child vector returns.
+- Failed follow-up: suppressing nested Rayon parallelism around recursive
+  node-local parallel sections made the same 16-iteration run much slower
+  (`~19s`). Nested work stealing is expensive, but turning it off at this level
+  starves the traversal. Do not reintroduce a simple global "already in
+  parallel" guard.
+- Scaling check after worker-local scratch reuse/chance fold-reduce on
+  `Td9d6h`, UTG vs BU, `postflop-basic`, 16 release iterations:
+  `RAYON_NUM_THREADS=1` took `38331ms`, `4` took `11799ms`, `8` took `7962ms`,
+  and `16` took `6348ms`. This is real parallel speedup but only about 6x at
+  16 threads, so the next candidate is coarser, locality-aware scheduling or a
+  persistent worker scratch/cache layout, not more tiny Rayon overlays.
