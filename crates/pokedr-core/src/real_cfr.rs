@@ -1330,8 +1330,102 @@ fn arena_traverse_update_side_into(
                 profile.values_zero += 1;
             }
             let target_len = out.len();
-            let mut action_values = terminal_scratch.take_vec_dirty(actions_len * target_len);
             let mut terminal_evals = 0usize;
+            if player != update_player {
+                out.fill(0.0);
+                let mut child_values = terminal_scratch.take_vec_dirty(target_len);
+                match player {
+                    Player::Oop => {
+                        let mut next_oop = terminal_scratch.take_vec_dirty(oop_reach.len());
+                        for action_index in 0..actions_len {
+                            let started = profile.enabled.then(Instant::now);
+                            strategy_reach_into(
+                                &mut next_oop,
+                                oop_reach,
+                                &strategies,
+                                actions_len,
+                                action_index,
+                            );
+                            if let Some(started) = started {
+                                profile.reach_ns += started.elapsed().as_nanos();
+                            }
+                            if profile.enabled {
+                                profile.reach_scratch_writes += next_oop.len() as u64;
+                            }
+                            let started = profile.enabled.then(Instant::now);
+                            terminal_evals += arena_traverse_update_side_into(
+                                ctx,
+                                regrets,
+                                strategy_sum,
+                                slot_base,
+                                &mut child_values,
+                                ctx.states[state_index].children[action_index],
+                                update_player,
+                                &next_oop,
+                                ip_reach,
+                                average_weight,
+                                variant,
+                                parallel_budget,
+                                terminal_scratch,
+                                side_cache,
+                                profile,
+                            )?;
+                            if let Some(started) = started {
+                                profile.child_ns += started.elapsed().as_nanos();
+                            }
+                            add_slice(out, &child_values);
+                        }
+                        terminal_scratch.release_vec(next_oop);
+                    }
+                    Player::Ip => {
+                        let mut next_ip = terminal_scratch.take_vec_dirty(ip_reach.len());
+                        for action_index in 0..actions_len {
+                            let started = profile.enabled.then(Instant::now);
+                            strategy_reach_into(
+                                &mut next_ip,
+                                ip_reach,
+                                &strategies,
+                                actions_len,
+                                action_index,
+                            );
+                            if let Some(started) = started {
+                                profile.reach_ns += started.elapsed().as_nanos();
+                            }
+                            if profile.enabled {
+                                profile.reach_scratch_writes += next_ip.len() as u64;
+                            }
+                            let started = profile.enabled.then(Instant::now);
+                            terminal_evals += arena_traverse_update_side_into(
+                                ctx,
+                                regrets,
+                                strategy_sum,
+                                slot_base,
+                                &mut child_values,
+                                ctx.states[state_index].children[action_index],
+                                update_player,
+                                oop_reach,
+                                &next_ip,
+                                average_weight,
+                                variant,
+                                parallel_budget,
+                                terminal_scratch,
+                                side_cache,
+                                profile,
+                            )?;
+                            if let Some(started) = started {
+                                profile.child_ns += started.elapsed().as_nanos();
+                            }
+                            add_slice(out, &child_values);
+                        }
+                        terminal_scratch.release_vec(next_ip);
+                    }
+                }
+                terminal_scratch.release_vec(child_values);
+                terminal_scratch.release_vec(strategies);
+                return Ok(terminal_evals);
+            }
+
+            let mut action_values = terminal_scratch.take_vec_dirty(actions_len * target_len);
             match player {
                 Player::Oop => {
                     let mut next_oop = terminal_scratch.take_vec_dirty(oop_reach.len());
@@ -1419,29 +1513,25 @@ fn arena_traverse_update_side_into(
                 }
             }
             let started = profile.enabled.then(Instant::now);
-            if player == update_player {
-                combine_acting_flat_values(out, &action_values, &strategies, actions_len);
-                let own_reach = match player {
-                    Player::Oop => oop_reach,
-                    Player::Ip => ip_reach,
-                };
-                let update_factors = RealCfrUpdateFactors::new(variant, average_weight);
-                for combo in 0..acting_combos {
-                    let node_value = out[combo];
-                    for action_index in 0..actions_len {
-                        let action_value = action_values[action_index * target_len + combo];
-                        let local_slot = local_slot_start + combo * actions_len + action_index;
-                        apply_real_cfr_update_with_factors(
-                            &mut regrets[local_slot],
-                            &mut strategy_sum[local_slot],
-                            action_value - node_value,
-                            own_reach[combo] * strategies[combo * actions_len + action_index],
-                            &update_factors,
-                        );
-                    }
+            combine_acting_flat_values(out, &action_values, &strategies, actions_len);
+            let own_reach = match player {
+                Player::Oop => oop_reach,
+                Player::Ip => ip_reach,
+            };
+            let update_factors = RealCfrUpdateFactors::new(variant, average_weight);
+            for combo in 0..acting_combos {
+                let node_value = out[combo];
+                for action_index in 0..actions_len {
+                    let action_value = action_values[action_index * target_len + combo];
+                    let local_slot = local_slot_start + combo * actions_len + action_index;
+                    apply_real_cfr_update_with_factors(
+                        &mut regrets[local_slot],
+                        &mut strategy_sum[local_slot],
+                        action_value - node_value,
+                        own_reach[combo] * strategies[combo * actions_len + action_index],
+                        &update_factors,
+                    );
                 }
-            } else {
-                combine_nonacting_flat_values(out, &action_values, actions_len);
             }
             if let Some(started) = started {
                 profile.combine_update_ns += started.elapsed().as_nanos();

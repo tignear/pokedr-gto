@@ -834,3 +834,19 @@ retrying similar ideas, so attempts stay in chronological order.
   `326574` strategy builds and `164128480` reach scratch writes per iteration.
   The next structural target is reducing decision-local strategy/reach/action
   value materialization, not another terminal-cache variant.
+
+## 2026-06-08: Direct accumulation at non-updating arena decisions
+
+- Tried: at decision nodes where the acting player is not the CFR update
+  player, stop materializing the full `actions * hands` `action_values` table.
+  The parent value is just the sum of child values after opponent reach has
+  been multiplied into each child, so one reusable child buffer can be
+  traversed and added directly into `out`.
+- Correctness: `arena_cfr_parallel_matches_single_thread_on_small_ranges` and
+  `arena_cfr_oop_pass_matches_recursive_on_small_ranges` pass.
+- Result: small improvement only. On `Td9d6h` UTG vs BU, `16` release arena
+  iterations with `16` threads moved from about `6716ms` to about `6615ms`.
+- Takeaway: this removes exact redundant writes and should stay, but it is not
+  the reference gap. The larger cost remains current-player decision work:
+  strategy generation, own-reach propagation for strategy averaging, and
+  action-value storage/update layout.
