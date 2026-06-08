@@ -40,6 +40,12 @@ pub struct NodeLocalCfrSummary {
     pub showdown_only_ns: u64,
     pub allin_calls: usize,
     pub allin_ns: u64,
+    pub allin_flop_calls: usize,
+    pub allin_flop_ns: u64,
+    pub allin_turn_calls: usize,
+    pub allin_turn_ns: u64,
+    pub allin_river_calls: usize,
+    pub allin_river_ns: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -93,6 +99,12 @@ struct NodeLocalProfile {
     showdown_only_ns: AtomicU64,
     allin_calls: AtomicUsize,
     allin_ns: AtomicU64,
+    allin_flop_calls: AtomicUsize,
+    allin_flop_ns: AtomicU64,
+    allin_turn_calls: AtomicUsize,
+    allin_turn_ns: AtomicU64,
+    allin_river_calls: AtomicUsize,
+    allin_river_ns: AtomicU64,
 }
 
 impl NodeLocalProfile {
@@ -110,6 +122,12 @@ impl NodeLocalProfile {
         self.showdown_only_ns.store(0, Ordering::Relaxed);
         self.allin_calls.store(0, Ordering::Relaxed);
         self.allin_ns.store(0, Ordering::Relaxed);
+        self.allin_flop_calls.store(0, Ordering::Relaxed);
+        self.allin_flop_ns.store(0, Ordering::Relaxed);
+        self.allin_turn_calls.store(0, Ordering::Relaxed);
+        self.allin_turn_ns.store(0, Ordering::Relaxed);
+        self.allin_river_calls.store(0, Ordering::Relaxed);
+        self.allin_river_ns.store(0, Ordering::Relaxed);
     }
 }
 
@@ -428,6 +446,12 @@ impl NodeLocalCfrSolver {
             showdown_only_ns: self.profile.showdown_only_ns.load(Ordering::Relaxed),
             allin_calls: self.profile.allin_calls.load(Ordering::Relaxed),
             allin_ns: self.profile.allin_ns.load(Ordering::Relaxed),
+            allin_flop_calls: self.profile.allin_flop_calls.load(Ordering::Relaxed),
+            allin_flop_ns: self.profile.allin_flop_ns.load(Ordering::Relaxed),
+            allin_turn_calls: self.profile.allin_turn_calls.load(Ordering::Relaxed),
+            allin_turn_ns: self.profile.allin_turn_ns.load(Ordering::Relaxed),
+            allin_river_calls: self.profile.allin_river_calls.load(Ordering::Relaxed),
+            allin_river_ns: self.profile.allin_river_ns.load(Ordering::Relaxed),
         }
     }
 
@@ -584,6 +608,12 @@ impl NodeLocalCfrSolver {
             showdown_only_ns: self.profile.showdown_only_ns.load(Ordering::Relaxed),
             allin_calls: self.profile.allin_calls.load(Ordering::Relaxed),
             allin_ns: self.profile.allin_ns.load(Ordering::Relaxed),
+            allin_flop_calls: self.profile.allin_flop_calls.load(Ordering::Relaxed),
+            allin_flop_ns: self.profile.allin_flop_ns.load(Ordering::Relaxed),
+            allin_turn_calls: self.profile.allin_turn_calls.load(Ordering::Relaxed),
+            allin_turn_ns: self.profile.allin_turn_ns.load(Ordering::Relaxed),
+            allin_river_calls: self.profile.allin_river_calls.load(Ordering::Relaxed),
+            allin_river_ns: self.profile.allin_river_ns.load(Ordering::Relaxed),
         })
     }
 
@@ -1341,6 +1371,24 @@ impl NodeLocalCfrSolver {
                         }
                         TerminalReason::AllIn => {
                             self.profile.allin_calls.fetch_add(1, Ordering::Relaxed);
+                            match node.board.cards().len() {
+                                3 => {
+                                    self.profile
+                                        .allin_flop_calls
+                                        .fetch_add(1, Ordering::Relaxed);
+                                }
+                                4 => {
+                                    self.profile
+                                        .allin_turn_calls
+                                        .fetch_add(1, Ordering::Relaxed);
+                                }
+                                5 => {
+                                    self.profile
+                                        .allin_river_calls
+                                        .fetch_add(1, Ordering::Relaxed);
+                                }
+                                _ => {}
+                            }
                         }
                         TerminalReason::Fold => {}
                     }
@@ -1394,6 +1442,24 @@ impl NodeLocalCfrSolver {
                             self.profile
                                 .allin_ns
                                 .fetch_add(elapsed_ns, Ordering::Relaxed);
+                            match node.board.cards().len() {
+                                3 => {
+                                    self.profile
+                                        .allin_flop_ns
+                                        .fetch_add(elapsed_ns, Ordering::Relaxed);
+                                }
+                                4 => {
+                                    self.profile
+                                        .allin_turn_ns
+                                        .fetch_add(elapsed_ns, Ordering::Relaxed);
+                                }
+                                5 => {
+                                    self.profile
+                                        .allin_river_ns
+                                        .fetch_add(elapsed_ns, Ordering::Relaxed);
+                                }
+                                _ => {}
+                            }
                         }
                         TerminalReason::Fold => {}
                     }

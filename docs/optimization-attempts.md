@@ -1151,3 +1151,25 @@ retrying similar ideas, so attempts stay in chronological order.
   The code path is opt-in with `POKEDR_NODE_CFR_ALLIN_ORACLE_LIMIT_MIB`; the
   default is disabled. A useful all-in oracle would need a more structured or
   sparse/blocker-aware layout, not a dense payoff matrix.
+
+## 2026-06-08: All-in board-depth profile split
+
+- Added profile split for all-in terminal cost by public board depth:
+  `allin_flop_calls/allin_flop_ms`, `allin_turn_calls/allin_turn_ms`, and
+  `allin_river_calls/allin_river_ms`.
+- Result on the current `As7h2c` node-local CLI smoke, OOP/IP ranges from
+  `/tmp/oop_range.txt` and `/tmp/ip_range.txt`, 16 release iterations:
+  `allin_calls=19409152`, `allin_ms=31641.955`,
+  `allin_flop_calls=64`, `allin_flop_ms=162.051`,
+  `allin_turn_calls=65856`, `allin_turn_ms=4844.144`,
+  `allin_river_calls=19343232`, `allin_river_ms=26635.760`.
+- Takeaway: the earlier idea of optimizing only flop/turn all-in terminals
+  cannot move the benchmark much. River all-ins dominate the all-in cost, so a
+  useful all-in-specific optimization must also help one-board river evaluation.
+- Also tried precomputing strength and card indices into a fatter showdown
+  target struct to remove `PreparedTerminalBoard::combo/strength` lookups from
+  the hot loop. Profile aggregate terminal time improved
+  (`showdown_ms` about `69.0s -> 49.0s` on one run), but non-profile wall time
+  did not improve (`~10.6s/16iter` before, `~10.8-10.9s/16iter` after). The
+  added target footprint likely hurt cache locality enough to erase the
+  instruction-count win, so the change was not kept.
