@@ -1208,3 +1208,29 @@ retrying similar ideas, so attempts stay in chronological order.
 - Takeaway: this is a modest but real exact improvement. It confirms that part
   of the gap to the reference solver is still in update-loop layout and
   branch/function-call overhead, not only terminal CFV.
+
+## 2026-06-08: River terminal target fast path
+
+- Added a node-local river-only terminal path. River showdown/all-in terminals
+  have exactly one terminal board, so the evaluator now uses precomputed
+  compact river targets (`strength`, `range_index`, and two card indices)
+  instead of repeatedly calling through `PreparedTerminalBoard::combo/strength`
+  in the generic sorted target path.
+- Correctness: added `river_fast_path_matches_sorted_terminal_path`, which
+  checks the river fast path against the existing generic sorted terminal path
+  for both OOP and IP values with non-uniform reaches. Also ran
+  `cargo check -p pokedr-core -p pokedr-cli` and
+  `cargo test -p pokedr-core node_local_cfr -- --nocapture`.
+- Result on the reference-comparison setup (`Td9d6h`, postflop-basic,
+  pot `200`, effective `900`, expanded UTG-vs-BU ranges from
+  `/tmp/postflop_flop_ranges.txt`, 16 release iterations):
+  - before river fast path: `node_cfr elapsed_ms=1479.351`;
+  - river fast path with wider target struct: `node_cfr elapsed_ms=1364.927`;
+  - compact `u16/u8/u8` river targets: `node_cfr elapsed_ms=1346.084`,
+    then `1308.894` on a no-recompile rerun.
+- Reference `postflop-solver` on the same benchmark run:
+  `solve_ms=1210.231`, `per_iter_ms=75.639`, `memory_f32_gib=0.671631`.
+- Takeaway: the exact river fast path closes the reference gap from about
+  `1.22x` to roughly `1.08x` on this benchmark. Remaining differences are now
+  likely traversal/action-row storage overhead and non-river terminal work,
+  not a single large terminal-CFV bottleneck.
