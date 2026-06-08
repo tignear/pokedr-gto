@@ -17,6 +17,28 @@ experiments are kept under the crate-internal `legacy` namespace for tests and
 historical comparison only. They should not be wired back into user-facing CLI
 flags unless they are promoted as the single active solver.
 
+CLI configuration:
+
+- `build-tree`, `solve-flop`, and `board-isomorphism` accept one or more
+  `--config` TOML files.
+- Config files are merged field-by-field in command-line order, so later files
+  override earlier files without replacing entire sections.
+- Explicit CLI arguments override all config files.
+- The supported sections are `[spot]`, `[tree]`, `[solver]`, `[output]`, and
+  `[logging]`; see [solver-config.example.toml](solver-config.example.toml).
+- Solver logs use `tracing` and can be controlled with `--log-level` or
+  `[logging].level`.
+
+Range input:
+
+- `full` still means all 1326 private combos.
+- Exact combos such as `AhAd` and comma-separated combo lists are supported.
+- Traditional poker range tokens are supported: `TT+`, `99+:0.7`, `ATo+`,
+  `A2s+`, `KQs`, `AK`, etc.
+- A `:weight` suffix applies only to newly introduced combos. If tokens overlap,
+  the first token keeps ownership of that combo. For example `TT+,88+:0.7`
+  keeps TT+ at weight `1.0` and adds only 88-99 at weight `0.7`.
+
 The replacement target remains a layout that can later be made GPU-portable, but
 the current correctness and performance baseline is the node-local CPU solver,
 not the old dense phase solver:

@@ -6,13 +6,22 @@ use pokedr_core::{
     RealCfrVariant, Spot, Street, TreeBuilder, TreeTemplate, fixed_flop_future_board_isomorphism,
     full_deck_future_board_isomorphism_survey, plan_cfr_work,
 };
+use serde::Deserialize;
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::Instant;
+use tracing::info;
 
 #[derive(Debug, Parser)]
 #[command(name = "pokedr-cli")]
 #[command(about = "Pokedr postflop solver tooling")]
 struct Cli {
+    #[arg(
+        long,
+        global = true,
+        help = "Tracing level: error, warn, info, debug, trace"
+    )]
+    log_level: Option<String>,
     #[command(subcommand)]
     command: Command,
 }
@@ -21,73 +30,82 @@ struct Cli {
 enum Command {
     #[command(about = "Inspect a schematic flop public tree and its exact board-expanded size")]
     BuildTree {
-        flop: String,
-        #[arg(long, default_value_t = 650)]
-        pot: u32,
-        #[arg(long, default_value_t = 9700)]
-        effective_stack: u32,
-        #[arg(long, default_value = "full")]
-        oop_range: String,
-        #[arg(long, default_value = "full")]
-        ip_range: String,
-        #[arg(long, default_value = "oop")]
-        first_player: String,
-        #[arg(long, default_value = "conservative")]
-        tree_preset: String,
-        #[arg(long, default_value_t = 20)]
-        print_nodes: usize,
+        #[arg(required_unless_present = "config")]
+        flop: Option<String>,
+        #[arg(long)]
+        config: Vec<PathBuf>,
+        #[arg(long)]
+        pot: Option<u32>,
+        #[arg(long)]
+        effective_stack: Option<u32>,
+        #[arg(long)]
+        oop_range: Option<String>,
+        #[arg(long)]
+        ip_range: Option<String>,
+        #[arg(long)]
+        first_player: Option<String>,
+        #[arg(long)]
+        tree_preset: Option<String>,
+        #[arg(long)]
+        print_nodes: Option<usize>,
         #[arg(long)]
         enumerate_chance: bool,
-        #[arg(long, default_value_t = 256)]
-        chunk_mib: u32,
+        #[arg(long)]
+        chunk_mib: Option<u32>,
     },
     #[command(about = "Solve a fixed flop with the node-local full-range postflop CFR solver")]
     SolveFlop {
-        flop: String,
-        #[arg(long, default_value_t = 650)]
-        pot: u32,
-        #[arg(long, default_value_t = 9700)]
-        effective_stack: u32,
-        #[arg(long, default_value = "full")]
-        oop_range: String,
-        #[arg(long, default_value = "full")]
-        ip_range: String,
-        #[arg(long, default_value = "oop")]
-        first_player: String,
-        #[arg(long, default_value = "conservative")]
-        tree_preset: String,
+        #[arg(required_unless_present = "config")]
+        flop: Option<String>,
+        #[arg(long)]
+        config: Vec<PathBuf>,
+        #[arg(long)]
+        pot: Option<u32>,
+        #[arg(long)]
+        effective_stack: Option<u32>,
+        #[arg(long)]
+        oop_range: Option<String>,
+        #[arg(long)]
+        ip_range: Option<String>,
+        #[arg(long)]
+        first_player: Option<String>,
+        #[arg(long)]
+        tree_preset: Option<String>,
         #[arg(long)]
         enumerate_chance: bool,
-        #[arg(long, default_value_t = 1)]
-        iterations: u32,
-        #[arg(long, default_value_t = 1)]
-        threads: usize,
-        #[arg(long, default_value_t = 1)]
-        log_interval: u32,
-        #[arg(long, default_value_t = 0)]
-        exploitability_interval: u32,
+        #[arg(long)]
+        iterations: Option<u32>,
+        #[arg(long)]
+        threads: Option<usize>,
+        #[arg(long)]
+        log_interval: Option<u32>,
+        #[arg(long)]
+        exploitability_interval: Option<u32>,
         #[arg(long)]
         target_exploitability_bb100: Option<f32>,
-        #[arg(long, default_value = "dcfr-plus")]
-        variant: String,
-        #[arg(long, default_value = "reach-weighted")]
-        average_strategy: String,
-        #[arg(long, default_value_t = 1.5)]
-        dcfr_alpha: f32,
-        #[arg(long, default_value_t = 0.0)]
-        dcfr_beta: f32,
-        #[arg(long, default_value_t = 2.0)]
-        dcfr_gamma: f32,
+        #[arg(long)]
+        variant: Option<String>,
+        #[arg(long)]
+        average_strategy: Option<String>,
+        #[arg(long)]
+        dcfr_alpha: Option<f32>,
+        #[arg(long)]
+        dcfr_beta: Option<f32>,
+        #[arg(long)]
+        dcfr_gamma: Option<f32>,
     },
     #[command(about = "Inspect exact future-board suit isomorphism for a fixed flop and ranges")]
     BoardIsomorphism {
-        flop: String,
-        #[arg(long, default_value = "full")]
-        oop_range: String,
-        #[arg(long, default_value = "full")]
-        ip_range: String,
-        #[arg(long, default_value_t = 8)]
-        print_turns: usize,
+        #[arg(required_unless_present = "config")]
+        flop: Option<String>,
+        #[arg(long)]
+        config: Vec<PathBuf>,
+        #[arg(long)]
+        oop_range: Option<String>,
+        #[arg(long)]
+        ip_range: Option<String>,
+        #[arg(long)]
+        print_turns: Option<usize>,
         #[arg(
             long,
             help = "Survey every unordered flop instead of only the supplied flop"
@@ -97,10 +115,11 @@ enum Command {
 }
 
 fn main() -> Result<(), String> {
-    let cli = Cli::parse();
-    match cli.command {
+    let Cli { log_level, command } = Cli::parse();
+    match command {
         Command::BuildTree {
             flop,
+            config,
             pot,
             effective_stack,
             oop_range,
@@ -111,20 +130,37 @@ fn main() -> Result<(), String> {
             enumerate_chance,
             chunk_mib,
         } => {
-            let request = flop_tree_request(
-                &flop,
-                pot,
-                effective_stack,
-                &oop_range,
-                &ip_range,
-                &first_player,
-                &tree_preset,
+            let config = load_config(&config)?;
+            init_logging(log_level.as_deref(), &config)?;
+            let spot = resolve_spot_options(
+                &config,
+                SpotCliOverrides {
+                    flop,
+                    pot,
+                    effective_stack,
+                    oop_range,
+                    ip_range,
+                    first_player,
+                },
             )?;
-            let tree = build_tree(request.clone(), enumerate_chance)?;
-            print_tree_report(&tree, &request, chunk_mib, print_nodes);
+            let tree_options = resolve_tree_options(&config, tree_preset, enumerate_chance);
+            let request = flop_tree_request(&spot, &tree_options.tree_preset)?;
+            log_config(config.source.as_deref(), &spot, &tree_options);
+            let tree = build_tree(request.clone(), tree_options.enumerate_chance)?;
+            print_tree_report(
+                &tree,
+                &request,
+                chunk_mib
+                    .or(config.output.as_ref().and_then(|output| output.chunk_mib))
+                    .unwrap_or(256),
+                print_nodes
+                    .or(config.output.as_ref().and_then(|output| output.print_nodes))
+                    .unwrap_or(20),
+            );
         }
         Command::SolveFlop {
             flop,
+            config,
             pot,
             effective_stack,
             oop_range,
@@ -143,43 +179,79 @@ fn main() -> Result<(), String> {
             dcfr_beta,
             dcfr_gamma,
         } => {
-            let request = flop_tree_request(
-                &flop,
-                pot,
-                effective_stack,
-                &oop_range,
-                &ip_range,
-                &first_player,
-                &tree_preset,
+            let config = load_config(&config)?;
+            init_logging(log_level.as_deref(), &config)?;
+            let spot = resolve_spot_options(
+                &config,
+                SpotCliOverrides {
+                    flop,
+                    pot,
+                    effective_stack,
+                    oop_range,
+                    ip_range,
+                    first_player,
+                },
             )?;
-            let tree = build_tree(request.clone(), enumerate_chance)?;
-            let variant = parse_cfr_variant(&variant, dcfr_alpha, dcfr_beta, dcfr_gamma)?;
-            let average_strategy = parse_average_strategy(&average_strategy)?;
+            let tree_options = resolve_tree_options(&config, tree_preset, enumerate_chance);
+            let solver_options = resolve_solver_options(
+                &config,
+                SolverCliOverrides {
+                    iterations,
+                    threads,
+                    log_interval,
+                    exploitability_interval,
+                    target_exploitability_bb100,
+                    variant,
+                    average_strategy,
+                    dcfr_alpha,
+                    dcfr_beta,
+                    dcfr_gamma,
+                },
+            )?;
+            let request = flop_tree_request(&spot, &tree_options.tree_preset)?;
+            log_config(config.source.as_deref(), &spot, &tree_options);
+            log_solver_config(&solver_options);
+            let tree = build_tree(request.clone(), tree_options.enumerate_chance)?;
+            log_tree_summary(&tree, &request);
             solve_flop(
                 tree,
                 request.oop_range,
                 request.ip_range,
-                iterations,
-                threads,
-                log_interval,
-                exploitability_interval,
-                target_exploitability_bb100,
+                solver_options.iterations,
+                solver_options.threads,
+                solver_options.log_interval,
+                solver_options.exploitability_interval,
+                solver_options.target_exploitability_bb100,
                 RealCfrConfig {
-                    iterations,
-                    variant,
-                    average_strategy,
+                    iterations: solver_options.iterations,
+                    variant: solver_options.variant,
+                    average_strategy: solver_options.average_strategy,
                 },
             )?;
         }
         Command::BoardIsomorphism {
             flop,
+            config,
             oop_range,
             ip_range,
             print_turns,
             survey_all_flops,
         } => {
-            let oop_range = RangeSpec::from_str(&oop_range)?;
-            let ip_range = RangeSpec::from_str(&ip_range)?;
+            let config = load_config(&config)?;
+            init_logging(log_level.as_deref(), &config)?;
+            let spot = resolve_spot_options(
+                &config,
+                SpotCliOverrides {
+                    flop,
+                    pot: None,
+                    effective_stack: None,
+                    oop_range,
+                    ip_range,
+                    first_player: None,
+                },
+            )?;
+            let oop_range = RangeSpec::from_str(&spot.oop_range)?;
+            let ip_range = RangeSpec::from_str(&spot.ip_range)?;
             if survey_all_flops {
                 let survey = full_deck_future_board_isomorphism_survey(&oop_range, &ip_range)?;
                 println!("flops={}", survey.flops);
@@ -194,7 +266,7 @@ fn main() -> Result<(), String> {
                 );
                 return Ok(());
             }
-            let flop = Board::from_str(&flop)?;
+            let flop = Board::from_str(&spot.flop)?;
             let report = fixed_flop_future_board_isomorphism(&flop, &oop_range, &ip_range)?;
             println!("board={}", report.flop);
             println!(
@@ -224,6 +296,9 @@ fn main() -> Result<(), String> {
                     .ordered_turn_river_concrete_events
                     .saturating_sub(report.ordered_turn_river_representative_events)
             );
+            let print_turns = print_turns
+                .or(config.output.as_ref().and_then(|output| output.print_turns))
+                .unwrap_or(8);
             for (index, turn_class) in report.turn.classes.iter().take(print_turns).enumerate() {
                 let turn = turn_class
                     .representative
@@ -246,6 +321,392 @@ fn main() -> Result<(), String> {
     Ok(())
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct CliConfig {
+    #[serde(skip)]
+    source: Option<String>,
+    #[serde(default)]
+    spot: Option<SpotConfig>,
+    #[serde(default)]
+    tree: Option<TreeConfig>,
+    #[serde(default)]
+    solver: Option<SolverConfig>,
+    #[serde(default)]
+    output: Option<OutputConfig>,
+    #[serde(default)]
+    logging: Option<LoggingConfig>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct SpotConfig {
+    flop: Option<String>,
+    pot: Option<u32>,
+    effective_stack: Option<u32>,
+    oop_range: Option<String>,
+    ip_range: Option<String>,
+    first_player: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct TreeConfig {
+    preset: Option<String>,
+    tree_preset: Option<String>,
+    enumerate_chance: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct SolverConfig {
+    iterations: Option<u32>,
+    threads: Option<usize>,
+    log_interval: Option<u32>,
+    exploitability_interval: Option<u32>,
+    target_exploitability_bb100: Option<f32>,
+    variant: Option<String>,
+    average_strategy: Option<String>,
+    dcfr_alpha: Option<f32>,
+    dcfr_beta: Option<f32>,
+    dcfr_gamma: Option<f32>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct OutputConfig {
+    print_nodes: Option<usize>,
+    print_turns: Option<usize>,
+    chunk_mib: Option<u32>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct LoggingConfig {
+    level: Option<String>,
+}
+
+impl CliConfig {
+    fn merge(&mut self, other: CliConfig) {
+        merge_option_struct(&mut self.spot, other.spot, SpotConfig::merge);
+        merge_option_struct(&mut self.tree, other.tree, TreeConfig::merge);
+        merge_option_struct(&mut self.solver, other.solver, SolverConfig::merge);
+        merge_option_struct(&mut self.output, other.output, OutputConfig::merge);
+        merge_option_struct(&mut self.logging, other.logging, LoggingConfig::merge);
+    }
+}
+
+impl SpotConfig {
+    fn merge(&mut self, other: Self) {
+        merge_option(&mut self.flop, other.flop);
+        merge_option(&mut self.pot, other.pot);
+        merge_option(&mut self.effective_stack, other.effective_stack);
+        merge_option(&mut self.oop_range, other.oop_range);
+        merge_option(&mut self.ip_range, other.ip_range);
+        merge_option(&mut self.first_player, other.first_player);
+    }
+}
+
+impl TreeConfig {
+    fn merge(&mut self, other: Self) {
+        merge_option(&mut self.preset, other.preset);
+        merge_option(&mut self.tree_preset, other.tree_preset);
+        merge_option(&mut self.enumerate_chance, other.enumerate_chance);
+    }
+}
+
+impl SolverConfig {
+    fn merge(&mut self, other: Self) {
+        merge_option(&mut self.iterations, other.iterations);
+        merge_option(&mut self.threads, other.threads);
+        merge_option(&mut self.log_interval, other.log_interval);
+        merge_option(
+            &mut self.exploitability_interval,
+            other.exploitability_interval,
+        );
+        merge_option(
+            &mut self.target_exploitability_bb100,
+            other.target_exploitability_bb100,
+        );
+        merge_option(&mut self.variant, other.variant);
+        merge_option(&mut self.average_strategy, other.average_strategy);
+        merge_option(&mut self.dcfr_alpha, other.dcfr_alpha);
+        merge_option(&mut self.dcfr_beta, other.dcfr_beta);
+        merge_option(&mut self.dcfr_gamma, other.dcfr_gamma);
+    }
+}
+
+impl OutputConfig {
+    fn merge(&mut self, other: Self) {
+        merge_option(&mut self.print_nodes, other.print_nodes);
+        merge_option(&mut self.print_turns, other.print_turns);
+        merge_option(&mut self.chunk_mib, other.chunk_mib);
+    }
+}
+
+impl LoggingConfig {
+    fn merge(&mut self, other: Self) {
+        merge_option(&mut self.level, other.level);
+    }
+}
+
+fn merge_option<T>(base: &mut Option<T>, override_value: Option<T>) {
+    if override_value.is_some() {
+        *base = override_value;
+    }
+}
+
+fn merge_option_struct<T>(
+    base: &mut Option<T>,
+    override_value: Option<T>,
+    merge: impl FnOnce(&mut T, T),
+) {
+    if let Some(override_value) = override_value {
+        if let Some(base) = base {
+            merge(base, override_value);
+        } else {
+            *base = Some(override_value);
+        }
+    }
+}
+
+#[derive(Debug)]
+struct SpotCliOverrides {
+    flop: Option<String>,
+    pot: Option<u32>,
+    effective_stack: Option<u32>,
+    oop_range: Option<String>,
+    ip_range: Option<String>,
+    first_player: Option<String>,
+}
+
+#[derive(Debug)]
+struct SolverCliOverrides {
+    iterations: Option<u32>,
+    threads: Option<usize>,
+    log_interval: Option<u32>,
+    exploitability_interval: Option<u32>,
+    target_exploitability_bb100: Option<f32>,
+    variant: Option<String>,
+    average_strategy: Option<String>,
+    dcfr_alpha: Option<f32>,
+    dcfr_beta: Option<f32>,
+    dcfr_gamma: Option<f32>,
+}
+
+#[derive(Debug)]
+struct SpotOptions {
+    flop: String,
+    pot: u32,
+    effective_stack: u32,
+    oop_range: String,
+    ip_range: String,
+    first_player: String,
+}
+
+#[derive(Debug)]
+struct TreeOptions {
+    tree_preset: String,
+    enumerate_chance: bool,
+}
+
+#[derive(Debug)]
+struct SolverOptions {
+    iterations: u32,
+    threads: usize,
+    log_interval: u32,
+    exploitability_interval: u32,
+    target_exploitability_bb100: Option<f32>,
+    variant: RealCfrVariant,
+    average_strategy: RealCfrAverageStrategy,
+}
+
+fn load_config(paths: &[PathBuf]) -> Result<CliConfig, String> {
+    if paths.is_empty() {
+        return Ok(CliConfig::default());
+    }
+    let mut merged = CliConfig::default();
+    let mut sources = Vec::with_capacity(paths.len());
+    for path in paths {
+        let text = std::fs::read_to_string(path)
+            .map_err(|error| format!("failed to read config {}: {error}", path.display()))?;
+        let config: CliConfig = toml::from_str(&text)
+            .map_err(|error| format!("failed to parse config {}: {error}", path.display()))?;
+        sources.push(path.display().to_string());
+        merged.merge(config);
+    }
+    merged.source = Some(sources.join(","));
+    Ok(merged)
+}
+
+fn init_logging(cli_level: Option<&str>, config: &CliConfig) -> Result<(), String> {
+    let level = cli_level
+        .or_else(|| {
+            config
+                .logging
+                .as_ref()
+                .and_then(|logging| logging.level.as_deref())
+        })
+        .unwrap_or("info");
+    let level = tracing::Level::from_str(level).map_err(|_| {
+        format!("invalid log level {level:?}; expected error, warn, info, debug, or trace")
+    })?;
+    tracing_subscriber::fmt()
+        .with_max_level(level)
+        .with_target(false)
+        .without_time()
+        .compact()
+        .try_init()
+        .map_err(|error| format!("failed to initialize tracing subscriber: {error}"))
+}
+
+fn resolve_spot_options(config: &CliConfig, cli: SpotCliOverrides) -> Result<SpotOptions, String> {
+    let spot = config.spot.as_ref();
+    let flop = cli
+        .flop
+        .or_else(|| spot.and_then(|spot| spot.flop.clone()))
+        .ok_or_else(|| {
+            "missing flop; pass it as an argument or set spot.flop in config".to_string()
+        })?;
+    Ok(SpotOptions {
+        flop,
+        pot: cli
+            .pot
+            .or_else(|| spot.and_then(|spot| spot.pot))
+            .unwrap_or(650),
+        effective_stack: cli
+            .effective_stack
+            .or_else(|| spot.and_then(|spot| spot.effective_stack))
+            .unwrap_or(9700),
+        oop_range: cli
+            .oop_range
+            .or_else(|| spot.and_then(|spot| spot.oop_range.clone()))
+            .unwrap_or_else(|| "full".to_string()),
+        ip_range: cli
+            .ip_range
+            .or_else(|| spot.and_then(|spot| spot.ip_range.clone()))
+            .unwrap_or_else(|| "full".to_string()),
+        first_player: cli
+            .first_player
+            .or_else(|| spot.and_then(|spot| spot.first_player.clone()))
+            .unwrap_or_else(|| "oop".to_string()),
+    })
+}
+
+fn resolve_tree_options(
+    config: &CliConfig,
+    cli_tree_preset: Option<String>,
+    cli_enumerate_chance: bool,
+) -> TreeOptions {
+    let tree = config.tree.as_ref();
+    TreeOptions {
+        tree_preset: cli_tree_preset
+            .or_else(|| tree.and_then(|tree| tree.tree_preset.clone()))
+            .or_else(|| tree.and_then(|tree| tree.preset.clone()))
+            .unwrap_or_else(|| "conservative".to_string()),
+        enumerate_chance: cli_enumerate_chance
+            || tree.and_then(|tree| tree.enumerate_chance).unwrap_or(false),
+    }
+}
+
+fn resolve_solver_options(
+    config: &CliConfig,
+    cli: SolverCliOverrides,
+) -> Result<SolverOptions, String> {
+    let solver = config.solver.as_ref();
+    let iterations = cli
+        .iterations
+        .or_else(|| solver.and_then(|solver| solver.iterations))
+        .unwrap_or(1);
+    let threads = cli
+        .threads
+        .or_else(|| solver.and_then(|solver| solver.threads))
+        .unwrap_or(1);
+    let log_interval = cli
+        .log_interval
+        .or_else(|| solver.and_then(|solver| solver.log_interval))
+        .unwrap_or(1);
+    let exploitability_interval = cli
+        .exploitability_interval
+        .or_else(|| solver.and_then(|solver| solver.exploitability_interval))
+        .unwrap_or(0);
+    let target_exploitability_bb100 = cli
+        .target_exploitability_bb100
+        .or_else(|| solver.and_then(|solver| solver.target_exploitability_bb100));
+    let variant = cli
+        .variant
+        .or_else(|| solver.and_then(|solver| solver.variant.clone()))
+        .unwrap_or_else(|| "dcfr-plus".to_string());
+    let average_strategy = cli
+        .average_strategy
+        .or_else(|| solver.and_then(|solver| solver.average_strategy.clone()))
+        .unwrap_or_else(|| "reach-weighted".to_string());
+    let dcfr_alpha = cli
+        .dcfr_alpha
+        .or_else(|| solver.and_then(|solver| solver.dcfr_alpha))
+        .unwrap_or(1.5);
+    let dcfr_beta = cli
+        .dcfr_beta
+        .or_else(|| solver.and_then(|solver| solver.dcfr_beta))
+        .unwrap_or(0.0);
+    let dcfr_gamma = cli
+        .dcfr_gamma
+        .or_else(|| solver.and_then(|solver| solver.dcfr_gamma))
+        .unwrap_or(2.0);
+    Ok(SolverOptions {
+        iterations,
+        threads,
+        log_interval,
+        exploitability_interval,
+        target_exploitability_bb100,
+        variant: parse_cfr_variant(&variant, dcfr_alpha, dcfr_beta, dcfr_gamma)?,
+        average_strategy: parse_average_strategy(&average_strategy)?,
+    })
+}
+
+fn log_config(source: Option<&str>, spot: &SpotOptions, tree: &TreeOptions) {
+    info!(
+        config = source.unwrap_or("<cli-only>"),
+        flop = %spot.flop,
+        pot_bb = spot.pot as f32 / 100.0,
+        effective_stack_bb = spot.effective_stack as f32 / 100.0,
+        first_player = %spot.first_player,
+        oop_range = %spot.oop_range,
+        ip_range = %spot.ip_range,
+        tree_preset = %tree.tree_preset,
+        enumerate_chance = tree.enumerate_chance,
+        "solver_input"
+    );
+}
+
+fn log_solver_config(options: &SolverOptions) {
+    info!(
+        iterations = options.iterations,
+        threads = options.threads,
+        log_interval = options.log_interval,
+        exploitability_interval = options.exploitability_interval,
+        target_exploitability_bb100 = options.target_exploitability_bb100,
+        variant = %format_cfr_variant(options.variant),
+        average_strategy = format_average_strategy(options.average_strategy),
+        "solver_config"
+    );
+}
+
+fn log_tree_summary(tree: &PublicTree, request: &FlopTreeRequest) {
+    let stats = tree.stats();
+    let estimate = estimate_tree_work(
+        tree,
+        request.oop_range.combos().len(),
+        request.ip_range.combos().len(),
+    );
+    info!(
+        nodes = stats.nodes,
+        decisions = stats.decisions,
+        chances = stats.chances,
+        terminals = stats.terminals,
+        max_depth = stats.max_depth,
+        private_infosets = estimate.private_infosets,
+        action_slots = estimate.action_slots,
+        terminal_pair_visits = estimate.terminal_pair_visits,
+        memory_regret_strategy_f32_mb = estimate.memory_regret_strategy_f32_mb,
+        "tree_summary"
+    );
+}
+
 #[allow(clippy::too_many_arguments)]
 fn solve_flop(
     tree: PublicTree,
@@ -258,13 +719,13 @@ fn solve_flop(
     target_exploitability_bb100: Option<f32>,
     config: RealCfrConfig,
 ) -> Result<(), String> {
-    println!(
-        "solving flop={} variant={} average_strategy={} iterations={} threads={}",
-        tree.spot.board,
-        format_cfr_variant(config.variant),
-        format_average_strategy(config.average_strategy),
+    info!(
+        flop = %tree.spot.board,
+        variant = %format_cfr_variant(config.variant),
+        average_strategy = format_average_strategy(config.average_strategy),
         iterations,
         threads,
+        "node_cfr_start"
     );
     let started = Instant::now();
     let mut solver = NodeLocalCfrSolver::new(tree, oop_range, ip_range)?;
@@ -297,13 +758,13 @@ fn solve_flop(
                         || global_iteration == iterations
                         || global_iteration % log_interval == 0)
                 {
-                    println!(
-                        "node_cfr_progress iteration={} terminal_evals={} iteration_ms={:.3} oop_pass_value={:.6} ip_pass_value={:.6}",
-                        global_iteration,
-                        progress.terminal_evals,
-                        progress.elapsed_ms,
-                        progress.oop_update_pass_value,
-                        progress.ip_update_pass_value,
+                    info!(
+                        iteration = global_iteration,
+                        terminal_evals = progress.terminal_evals,
+                        iteration_ms = progress.elapsed_ms,
+                        oop_pass_value = progress.oop_update_pass_value,
+                        ip_pass_value = progress.ip_update_pass_value,
+                        "node_cfr_progress"
                     );
                 }
             },
@@ -311,19 +772,19 @@ fn solve_flop(
         completed = summary.iterations;
         if interval > 0 {
             let exploitability = solver.exploitability(threads)?;
-            println!(
-                "node_cfr_exploitability iteration={} profile_oop={:.6} profile_ip={:.6} zero_sum_delta={:.6} oop_br={:.6} ip_br={:.6} oop_gain={:.6} ip_gain={:.6} nash_conv_chips={:.6} exploitability_chips={:.6} exploitability_bb_per_100={:.6}",
-                completed,
-                exploitability.profile_oop_value,
-                exploitability.profile_ip_value,
-                exploitability.profile_oop_value + exploitability.profile_ip_value,
-                exploitability.oop_best_response_value,
-                exploitability.ip_best_response_value,
-                exploitability.oop_gain,
-                exploitability.ip_gain,
-                exploitability.nash_conv_chips,
-                exploitability.exploitability_chips,
-                exploitability.exploitability_bb_per_100,
+            info!(
+                iteration = completed,
+                profile_oop = exploitability.profile_oop_value,
+                profile_ip = exploitability.profile_ip_value,
+                zero_sum_delta = exploitability.profile_oop_value + exploitability.profile_ip_value,
+                oop_br = exploitability.oop_best_response_value,
+                ip_br = exploitability.ip_best_response_value,
+                oop_gain = exploitability.oop_gain,
+                ip_gain = exploitability.ip_gain,
+                nash_conv_chips = exploitability.nash_conv_chips,
+                exploitability_chips = exploitability.exploitability_chips,
+                exploitability_bb_per_100 = exploitability.exploitability_bb_per_100,
+                "node_cfr_exploitability"
             );
             if target_exploitability_bb100
                 .is_some_and(|target| exploitability.exploitability_bb_per_100 <= target)
@@ -332,21 +793,22 @@ fn solve_flop(
             }
         }
     }
-    println!(
-        "node_cfr iterations={} states={} decision_states={} action_slots={} terminal_evals={} elapsed_ms={:.3} oop_pass_value={:.6} ip_pass_value={:.6}",
-        summary.iterations,
-        summary.states,
-        summary.decision_states,
-        summary.action_slots,
-        summary.terminal_evals,
-        summary.elapsed_ms,
-        summary.oop_update_pass_value,
-        summary.ip_update_pass_value,
+    info!(
+        iterations = summary.iterations,
+        states = summary.states,
+        decision_states = summary.decision_states,
+        action_slots = summary.action_slots,
+        terminal_evals = summary.terminal_evals,
+        elapsed_ms = summary.elapsed_ms,
+        oop_pass_value = summary.oop_update_pass_value,
+        ip_pass_value = summary.ip_update_pass_value,
+        "node_cfr_summary"
     );
-    println!(
-        "node_cfr_state_allocated=true storage_gib={:.3} total_elapsed_ms={:.3}",
-        summary.storage_gib,
-        started.elapsed().as_secs_f64() * 1000.0,
+    info!(
+        state_allocated = true,
+        storage_gib = summary.storage_gib,
+        total_elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+        "node_cfr_finish"
     );
     Ok(())
 }
@@ -478,22 +940,14 @@ fn print_tree_report(
     }
 }
 
-fn flop_tree_request(
-    flop: &str,
-    pot: u32,
-    effective_stack: u32,
-    oop_range: &str,
-    ip_range: &str,
-    first_player: &str,
-    tree_preset: &str,
-) -> Result<FlopTreeRequest, String> {
+fn flop_tree_request(spot: &SpotOptions, tree_preset: &str) -> Result<FlopTreeRequest, String> {
     Ok(FlopTreeRequest {
-        board: Board::from_str(flop)?,
-        pot,
-        effective_stack,
-        oop_range: RangeSpec::from_str(oop_range)?,
-        ip_range: RangeSpec::from_str(ip_range)?,
-        first_player: parse_player(first_player)?,
+        board: Board::from_str(&spot.flop)?,
+        pot: spot.pot,
+        effective_stack: spot.effective_stack,
+        oop_range: RangeSpec::from_str(&spot.oop_range)?,
+        ip_range: RangeSpec::from_str(&spot.ip_range)?,
+        first_player: parse_player(&spot.first_player)?,
         action_abstraction: parse_tree_preset(tree_preset)?,
     })
 }
