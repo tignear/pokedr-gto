@@ -251,6 +251,12 @@ struct ArenaCfrContext<'a> {
     ip_same_oop_combo_indices: &'a [Option<usize>],
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArenaEvaluationMode {
+    Profile,
+    BestResponse,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct ArenaChanceChildTask {
     original_index: usize,
@@ -662,58 +668,130 @@ impl ArenaAlternatingCfrSolver {
     }
 
     pub fn exploitability(&self, threads: usize) -> Result<RealCfrExploitability, String> {
-        let mut evaluator = RealCfrSolver::new(
-            self.tree.clone(),
-            self.oop_range.clone(),
-            self.ip_range.clone(),
+        let ctx = ArenaCfrContext {
+            tree: &self.tree,
+            oop_combos: &self.oop_combos,
+            ip_combos: &self.ip_combos,
+            states: &self.states,
+            terminal_cache: &self.terminal_cache,
+            combo_permutations: &self.combo_permutations,
+            oop_same_ip_combo_indices: &self.oop_same_ip_combo_indices,
+            ip_same_oop_combo_indices: &self.ip_same_oop_combo_indices,
+        };
+        let scratch_source = self
+            .terminal_cache
+            .first()
+            .ok_or_else(|| "terminal board cache is empty".to_string())?;
+        let terminal_combos = scratch_source.prepared.combos().len();
+        let mut terminal_scratch = RecursiveTerminalScratch {
+            cfv: TerminalCfvScratch::new(&scratch_source.prepared),
+            oop_live: vec![0.0; terminal_combos],
+            ip_live: vec![0.0; terminal_combos],
+            oop_nonzero: Vec::new(),
+            ip_nonzero: Vec::new(),
+            accumulator: TerminalAccumulator::zero(self.oop_combos.len(), self.ip_combos.len()),
+            vectors: Vec::new(),
+        };
+        let mut side_cache = TerminalSideValueCache::default();
+        let mut profile = RecursiveCfrProfile::default();
+        let oop_root_reach = self
+            .oop_combos
+            .iter()
+            .map(|combo| combo.weight)
+            .collect::<Vec<_>>();
+        let ip_root_reach = self
+            .ip_combos
+            .iter()
+            .map(|combo| combo.weight)
+            .collect::<Vec<_>>();
+        let mut profile_oop = vec![0.0; self.oop_combos.len()];
+        let mut profile_ip = vec![0.0; self.ip_combos.len()];
+        let mut oop_br = vec![0.0; self.oop_combos.len()];
+        let mut ip_br = vec![0.0; self.ip_combos.len()];
+
+        let parallel_budget = threads.max(1);
+        arena_evaluate_side_into(
+            &ctx,
+            &self.strategy_sum,
+            &mut profile_oop,
+            0,
+            Player::Oop,
+            &ip_root_reach,
+            ArenaEvaluationMode::Profile,
+            parallel_budget,
+            &mut terminal_scratch,
+            &mut side_cache,
+            &mut profile,
         )?;
-        if evaluator.strategy_sum.len() != self.strategy_sum.len() {
-            return Err(format!(
-                "arena/evaluator strategy storage length mismatch: arena={} evaluator={}",
-                self.strategy_sum.len(),
-                evaluator.strategy_sum.len()
-            ));
-        }
-        for state in &self.states {
-            let Some(arena_infoset) = state.infoset else {
-                continue;
-            };
-            let evaluator_infoset = evaluator.infosets[state.node_id]
-                .as_ref()
-                .ok_or_else(|| "arena decision state is missing evaluator infoset".to_string())?;
-            if evaluator_infoset.player != arena_infoset.player
-                || evaluator_infoset.actions != arena_infoset.actions
-            {
-                return Err("arena/evaluator infoset shape mismatch".to_string());
-            }
-            let board_index = match state.board.cards().len() {
-                3 => 0,
-                4 => *evaluator
-                    .turn_index_by_key
-                    .get(&ordered_board_key(&state.board))
-                    .ok_or_else(|| "arena turn board is missing evaluator index".to_string())?,
-                5 => *evaluator
-                    .river_index_by_key
-                    .get(&ordered_board_key(&state.board))
-                    .ok_or_else(|| "arena river board is missing evaluator index".to_string())?,
-                other => return Err(format!("invalid arena board length {other}")),
-            };
-            if board_index >= evaluator_infoset.board_count {
-                return Err("arena board index is outside evaluator infoset".to_string());
-            }
-            let combos = match arena_infoset.player {
-                Player::Oop => self.oop_combos.len(),
-                Player::Ip => self.ip_combos.len(),
-            };
-            let board_slots = combos * arena_infoset.actions;
-            let source_start = arena_infoset.slots_start;
-            let source_end = source_start + board_slots;
-            let target_start = evaluator_infoset.slots_start + board_index * board_slots;
-            let target_end = target_start + board_slots;
-            evaluator.strategy_sum[target_start..target_end]
-                .copy_from_slice(&self.strategy_sum[source_start..source_end]);
-        }
-        evaluator.exploitability(threads)
+        arena_evaluate_side_into(
+            &ctx,
+            &self.strategy_sum,
+            &mut profile_ip,
+            0,
+            Player::Ip,
+            &oop_root_reach,
+            ArenaEvaluationMode::Profile,
+            parallel_budget,
+            &mut terminal_scratch,
+            &mut side_cache,
+            &mut profile,
+        )?;
+        arena_evaluate_side_into(
+            &ctx,
+            &self.strategy_sum,
+            &mut oop_br,
+            0,
+            Player::Oop,
+            &ip_root_reach,
+            ArenaEvaluationMode::BestResponse,
+            parallel_budget,
+            &mut terminal_scratch,
+            &mut side_cache,
+            &mut profile,
+        )?;
+        arena_evaluate_side_into(
+            &ctx,
+            &self.strategy_sum,
+            &mut ip_br,
+            0,
+            Player::Ip,
+            &oop_root_reach,
+            ArenaEvaluationMode::BestResponse,
+            parallel_budget,
+            &mut terminal_scratch,
+            &mut side_cache,
+            &mut profile,
+        )?;
+
+        let oop_weight = self
+            .oop_combos
+            .iter()
+            .map(|combo| combo.weight)
+            .sum::<f32>();
+        let ip_weight = self.ip_combos.iter().map(|combo| combo.weight).sum::<f32>();
+        let profile_oop_value =
+            weighted_average(&profile_oop, &self.oop_combos, oop_weight, ip_weight);
+        let profile_ip_value =
+            weighted_average(&profile_ip, &self.ip_combos, ip_weight, oop_weight);
+        let oop_best_response_value =
+            weighted_average(&oop_br, &self.oop_combos, oop_weight, ip_weight);
+        let ip_best_response_value =
+            weighted_average(&ip_br, &self.ip_combos, ip_weight, oop_weight);
+        let oop_gain = (oop_best_response_value - profile_oop_value).max(0.0);
+        let ip_gain = (ip_best_response_value - profile_ip_value).max(0.0);
+        let nash_conv_chips = oop_gain + ip_gain;
+        let exploitability_chips = nash_conv_chips * 0.5;
+        Ok(RealCfrExploitability {
+            profile_oop_value,
+            profile_ip_value,
+            oop_best_response_value,
+            ip_best_response_value,
+            oop_gain,
+            ip_gain,
+            nash_conv_chips,
+            exploitability_chips,
+            exploitability_bb_per_100: exploitability_chips,
+        })
     }
 
     pub fn run_with_progress(
@@ -773,6 +851,16 @@ impl ArenaAlternatingCfrSolver {
             .map(|combo| combo.weight)
             .sum::<f32>();
         let ip_weight = self.ip_combos.iter().map(|combo| combo.weight).sum::<f32>();
+        let oop_root_reach = self
+            .oop_combos
+            .iter()
+            .map(|combo| combo.weight)
+            .collect::<Vec<_>>();
+        let ip_root_reach = self
+            .ip_combos
+            .iter()
+            .map(|combo| combo.weight)
+            .collect::<Vec<_>>();
         let mut root_oop = vec![0.0; self.oop_combos.len()];
         let mut root_ip = vec![0.0; self.ip_combos.len()];
         let mut root_terminal_evals = 0usize;
@@ -780,16 +868,6 @@ impl ArenaAlternatingCfrSolver {
             let started = Instant::now();
             self.completed_iterations += 1;
             let average_weight = self.completed_iterations as f32;
-            let oop_reach = self
-                .oop_combos
-                .iter()
-                .map(|combo| combo.weight)
-                .collect::<Vec<_>>();
-            let ip_reach = self
-                .ip_combos
-                .iter()
-                .map(|combo| combo.weight)
-                .collect::<Vec<_>>();
             root_terminal_evals = 0;
             for update_player in [Player::Oop, Player::Ip] {
                 let ctx = ArenaCfrContext {
@@ -814,8 +892,8 @@ impl ArenaAlternatingCfrSolver {
                     root_values,
                     0,
                     update_player,
-                    &oop_reach,
-                    &ip_reach,
+                    &oop_root_reach,
+                    &ip_root_reach,
                     average_weight,
                     config.variant,
                     threads,
@@ -1306,6 +1384,185 @@ fn arena_traverse_update_side_into(
                 }
             } else {
                 combine_nonacting_flat_values(out, &action_values, actions_len);
+            }
+            terminal_scratch.release_vec(strategies);
+            terminal_scratch.release_vec(action_values);
+            Ok(terminal_evals)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn arena_evaluate_side_into(
+    ctx: &ArenaCfrContext<'_>,
+    strategy_sum: &[f32],
+    out: &mut [f32],
+    state_index: usize,
+    value_player: Player,
+    opponent_reach: &[f32],
+    mode: ArenaEvaluationMode,
+    parallel_budget: usize,
+    terminal_scratch: &mut RecursiveTerminalScratch,
+    side_cache: &mut TerminalSideValueCache,
+    profile: &mut RecursiveCfrProfile,
+) -> Result<usize, String> {
+    let node_id = ctx.states[state_index].node_id;
+    match &ctx.tree.nodes[node_id].kind {
+        PublicNodeKind::Terminal { reason } => {
+            let empty_own: &[f32] = &[];
+            let (oop_reach, ip_reach) = match value_player {
+                Player::Oop => (empty_own, opponent_reach),
+                Player::Ip => (opponent_reach, empty_own),
+            };
+            arena_terminal_side_into(
+                ctx,
+                out,
+                state_index,
+                value_player,
+                ctx.tree.nodes[node_id].state.pot,
+                ctx.tree.nodes[node_id].state.player,
+                *reason,
+                oop_reach,
+                ip_reach,
+                terminal_scratch,
+                side_cache,
+                profile,
+            )
+        }
+        PublicNodeKind::Chance(_) => {
+            out.fill(0.0);
+            let chance_weight = 1.0f32 / ctx.states[state_index].chance_concrete_events as f32;
+            let mut child_values = terminal_scratch.take_vec(out.len());
+            let mut terminal_evals = 0usize;
+            for (child_index, permutation_codes) in ctx.states[state_index]
+                .children
+                .iter()
+                .copied()
+                .zip(&ctx.states[state_index].chance_member_permutation_codes)
+            {
+                terminal_evals += arena_evaluate_side_into(
+                    ctx,
+                    strategy_sum,
+                    &mut child_values,
+                    child_index,
+                    value_player,
+                    opponent_reach,
+                    mode,
+                    parallel_budget,
+                    terminal_scratch,
+                    side_cache,
+                    profile,
+                )?;
+                for permutation_code in permutation_codes {
+                    let maps = ctx
+                        .combo_permutations
+                        .get(permutation_code)
+                        .ok_or_else(|| {
+                            "chance isomorphism permutation is missing combo maps".to_string()
+                        })?;
+                    let source_to_target = match value_player {
+                        Player::Oop => &maps.oop_source_to_target,
+                        Player::Ip => &maps.ip_source_to_target,
+                    };
+                    add_permuted_scaled_slice(out, &child_values, source_to_target, chance_weight);
+                }
+            }
+            terminal_scratch.release_vec(child_values);
+            Ok(terminal_evals)
+        }
+        PublicNodeKind::Decision { player, actions } => {
+            let player = *player;
+            let actions_len = actions.len();
+            if actions_len == 1 {
+                return arena_evaluate_side_into(
+                    ctx,
+                    strategy_sum,
+                    out,
+                    ctx.states[state_index].children[0],
+                    value_player,
+                    opponent_reach,
+                    mode,
+                    parallel_budget,
+                    terminal_scratch,
+                    side_cache,
+                    profile,
+                );
+            }
+            let acting_combos = match player {
+                Player::Oop => ctx.oop_combos.len(),
+                Player::Ip => ctx.ip_combos.len(),
+            };
+            let infoset = ctx.states[state_index]
+                .infoset
+                .expect("decision state must have infoset");
+            let slot_start = infoset.slots_start;
+            let slot_end = slot_start + infoset.slots_len;
+            if slot_end > strategy_sum.len() {
+                return Err("arena strategy sum slice does not cover infoset".to_string());
+            }
+            let mut strategies = terminal_scratch.take_vec(infoset.slots_len);
+            average_strategies_into(
+                &strategy_sum[slot_start..slot_end],
+                acting_combos,
+                actions_len,
+                &mut strategies,
+            );
+
+            let target_len = out.len();
+            let mut action_values = terminal_scratch.take_vec(actions_len * target_len);
+            let mut terminal_evals = 0usize;
+            if player == value_player {
+                for action_index in 0..actions_len {
+                    terminal_evals += arena_evaluate_side_into(
+                        ctx,
+                        strategy_sum,
+                        &mut action_values
+                            [action_index * target_len..(action_index + 1) * target_len],
+                        ctx.states[state_index].children[action_index],
+                        value_player,
+                        opponent_reach,
+                        mode,
+                        parallel_budget,
+                        terminal_scratch,
+                        side_cache,
+                        profile,
+                    )?;
+                }
+                match mode {
+                    ArenaEvaluationMode::Profile => {
+                        combine_acting_flat_values(out, &action_values, &strategies, actions_len);
+                    }
+                    ArenaEvaluationMode::BestResponse => {
+                        combine_best_response_flat_values(out, &action_values, actions_len);
+                    }
+                }
+            } else {
+                let mut next_opponent = terminal_scratch.take_vec(opponent_reach.len());
+                for action_index in 0..actions_len {
+                    strategy_reach_into(
+                        &mut next_opponent,
+                        opponent_reach,
+                        &strategies,
+                        actions_len,
+                        action_index,
+                    );
+                    terminal_evals += arena_evaluate_side_into(
+                        ctx,
+                        strategy_sum,
+                        &mut action_values
+                            [action_index * target_len..(action_index + 1) * target_len],
+                        ctx.states[state_index].children[action_index],
+                        value_player,
+                        &next_opponent,
+                        mode,
+                        parallel_budget,
+                        terminal_scratch,
+                        side_cache,
+                        profile,
+                    )?;
+                }
+                combine_nonacting_flat_values(out, &action_values, actions_len);
+                terminal_scratch.release_vec(next_opponent);
             }
             terminal_scratch.release_vec(strategies);
             terminal_scratch.release_vec(action_values);
@@ -4350,7 +4607,6 @@ impl Values {
         self.ip.copy_from_slice(&other.ip);
         self.terminal_evals = other.terminal_evals;
     }
-
 }
 
 impl TerminalAccumulator {
@@ -4727,6 +4983,17 @@ fn combine_acting_flat_values(
             value += strategies[combo * actions + action] * action_values[action * combos + combo];
         }
         out[combo] = value;
+    }
+}
+
+fn combine_best_response_flat_values(out: &mut [f32], action_values: &[f32], actions: usize) {
+    let combos = out.len();
+    for combo in 0..combos {
+        let mut best = f32::NEG_INFINITY;
+        for action in 0..actions {
+            best = best.max(action_values[action * combos + combo]);
+        }
+        out[combo] = best;
     }
 }
 
