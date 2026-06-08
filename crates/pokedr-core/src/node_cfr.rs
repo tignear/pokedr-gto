@@ -1121,24 +1121,17 @@ impl NodeLocalCfrSolver {
                     config.average_strategy,
                 );
                 let node_mut = self.nodes[node_index].get_mut();
-                for combo in 0..acting_combos {
-                    let node_value = out[combo];
-                    for action in 0..actions {
-                        let local_slot = action * acting_combos + combo;
-                        let action_value = action_values[action * target_len + combo];
-                        apply_node_local_update(
-                            &mut node_mut.regrets[local_slot],
-                            &mut node_mut.strategy_sum[local_slot],
-                            action_value - node_value,
-                            average_strategy_delta(
-                                config.average_strategy,
-                                own_reach[combo],
-                                strategies[local_slot],
-                            ),
-                            &factors,
-                        );
-                    }
-                }
+                apply_node_local_updates_action_major(
+                    &mut node_mut.regrets,
+                    &mut node_mut.strategy_sum,
+                    &action_values,
+                    out,
+                    &strategies,
+                    own_reach,
+                    acting_combos,
+                    actions,
+                    &factors,
+                );
                 scratch.action_values = action_values;
                 scratch.strategies = strategies;
                 scratch.denominators = denominators;
@@ -1784,6 +1777,7 @@ fn add_permuted_scaled_slice(
 #[derive(Debug, Clone, Copy)]
 struct NodeLocalUpdateFactors {
     variant: RealCfrVariant,
+    average_strategy: RealCfrAverageStrategy,
     positive_regret_discount: f32,
     negative_regret_discount: f32,
     strategy_discount: f32,
@@ -1794,7 +1788,7 @@ impl NodeLocalUpdateFactors {
     fn new(
         variant: RealCfrVariant,
         iteration_weight: f32,
-        _average_strategy: RealCfrAverageStrategy,
+        average_strategy: RealCfrAverageStrategy,
     ) -> Self {
         let (positive_regret_discount, negative_regret_discount, strategy_discount) = match variant
         {
@@ -1812,6 +1806,7 @@ impl NodeLocalUpdateFactors {
         };
         Self {
             variant,
+            average_strategy,
             positive_regret_discount,
             negative_regret_discount,
             strategy_discount,
@@ -1820,42 +1815,152 @@ impl NodeLocalUpdateFactors {
     }
 }
 
-fn apply_node_local_update(
-    regret: &mut f32,
-    strategy_sum: &mut f32,
-    regret_delta: f32,
-    average_delta: f32,
+#[allow(clippy::too_many_arguments)]
+fn apply_node_local_updates_action_major(
+    regrets: &mut [f32],
+    strategy_sum: &mut [f32],
+    action_values: &[f32],
+    node_values: &[f32],
+    strategies: &[f32],
+    own_reach: &[f32],
+    combos: usize,
+    actions: usize,
     factors: &NodeLocalUpdateFactors,
 ) {
     match factors.variant {
         RealCfrVariant::CfrPlus => {
-            *regret = (*regret + regret_delta).max(0.0);
-            *strategy_sum += factors.iteration_weight * average_delta;
+            for action in 0..actions {
+                let offset = action * combos;
+                let regret_row = &mut regrets[offset..offset + combos];
+                let strategy_sum_row = &mut strategy_sum[offset..offset + combos];
+                let action_value_row = &action_values[offset..offset + combos];
+                let strategy_row = &strategies[offset..offset + combos];
+                match factors.average_strategy {
+                    RealCfrAverageStrategy::ReachWeighted => {
+                        for (
+                            (((regret, strategy_sum), &action_value), &node_value),
+                            (&strategy, &reach),
+                        ) in regret_row
+                            .iter_mut()
+                            .zip(strategy_sum_row)
+                            .zip(action_value_row)
+                            .zip(node_values)
+                            .zip(strategy_row.iter().zip(own_reach))
+                        {
+                            *regret = (*regret + action_value - node_value).max(0.0);
+                            *strategy_sum += factors.iteration_weight * reach * strategy;
+                        }
+                    }
+                    RealCfrAverageStrategy::Local => {
+                        for ((((regret, strategy_sum), &action_value), &node_value), &strategy) in
+                            regret_row
+                                .iter_mut()
+                                .zip(strategy_sum_row)
+                                .zip(action_value_row)
+                                .zip(node_values)
+                                .zip(strategy_row)
+                        {
+                            *regret = (*regret + action_value - node_value).max(0.0);
+                            *strategy_sum += factors.iteration_weight * strategy;
+                        }
+                    }
+                }
+            }
         }
         RealCfrVariant::Dcfr { .. } => {
-            let regret_discount = if *regret >= 0.0 {
-                factors.positive_regret_discount
-            } else {
-                factors.negative_regret_discount
-            };
-            *regret = *regret * regret_discount + regret_delta;
-            *strategy_sum = *strategy_sum * factors.strategy_discount + average_delta;
+            for action in 0..actions {
+                let offset = action * combos;
+                let regret_row = &mut regrets[offset..offset + combos];
+                let strategy_sum_row = &mut strategy_sum[offset..offset + combos];
+                let action_value_row = &action_values[offset..offset + combos];
+                let strategy_row = &strategies[offset..offset + combos];
+                match factors.average_strategy {
+                    RealCfrAverageStrategy::ReachWeighted => {
+                        for (
+                            (((regret, strategy_sum), &action_value), &node_value),
+                            (&strategy, &reach),
+                        ) in regret_row
+                            .iter_mut()
+                            .zip(strategy_sum_row)
+                            .zip(action_value_row)
+                            .zip(node_values)
+                            .zip(strategy_row.iter().zip(own_reach))
+                        {
+                            let regret_discount = if *regret >= 0.0 {
+                                factors.positive_regret_discount
+                            } else {
+                                factors.negative_regret_discount
+                            };
+                            *regret = *regret * regret_discount + action_value - node_value;
+                            *strategy_sum =
+                                *strategy_sum * factors.strategy_discount + reach * strategy;
+                        }
+                    }
+                    RealCfrAverageStrategy::Local => {
+                        for ((((regret, strategy_sum), &action_value), &node_value), &strategy) in
+                            regret_row
+                                .iter_mut()
+                                .zip(strategy_sum_row)
+                                .zip(action_value_row)
+                                .zip(node_values)
+                                .zip(strategy_row)
+                        {
+                            let regret_discount = if *regret >= 0.0 {
+                                factors.positive_regret_discount
+                            } else {
+                                factors.negative_regret_discount
+                            };
+                            *regret = *regret * regret_discount + action_value - node_value;
+                            *strategy_sum = *strategy_sum * factors.strategy_discount + strategy;
+                        }
+                    }
+                }
+            }
         }
         RealCfrVariant::DcfrPlus { .. } => {
-            *regret = (*regret * factors.positive_regret_discount + regret_delta).max(0.0);
-            *strategy_sum = *strategy_sum * factors.strategy_discount + average_delta;
+            for action in 0..actions {
+                let offset = action * combos;
+                let regret_row = &mut regrets[offset..offset + combos];
+                let strategy_sum_row = &mut strategy_sum[offset..offset + combos];
+                let action_value_row = &action_values[offset..offset + combos];
+                let strategy_row = &strategies[offset..offset + combos];
+                match factors.average_strategy {
+                    RealCfrAverageStrategy::ReachWeighted => {
+                        for (
+                            (((regret, strategy_sum), &action_value), &node_value),
+                            (&strategy, &reach),
+                        ) in regret_row
+                            .iter_mut()
+                            .zip(strategy_sum_row)
+                            .zip(action_value_row)
+                            .zip(node_values)
+                            .zip(strategy_row.iter().zip(own_reach))
+                        {
+                            *regret = (*regret * factors.positive_regret_discount + action_value
+                                - node_value)
+                                .max(0.0);
+                            *strategy_sum =
+                                *strategy_sum * factors.strategy_discount + reach * strategy;
+                        }
+                    }
+                    RealCfrAverageStrategy::Local => {
+                        for ((((regret, strategy_sum), &action_value), &node_value), &strategy) in
+                            regret_row
+                                .iter_mut()
+                                .zip(strategy_sum_row)
+                                .zip(action_value_row)
+                                .zip(node_values)
+                                .zip(strategy_row)
+                        {
+                            *regret = (*regret * factors.positive_regret_discount + action_value
+                                - node_value)
+                                .max(0.0);
+                            *strategy_sum = *strategy_sum * factors.strategy_discount + strategy;
+                        }
+                    }
+                }
+            }
         }
-    }
-}
-
-fn average_strategy_delta(
-    mode: RealCfrAverageStrategy,
-    own_reach: f32,
-    strategy_probability: f32,
-) -> f32 {
-    match mode {
-        RealCfrAverageStrategy::ReachWeighted => own_reach * strategy_probability,
-        RealCfrAverageStrategy::Local => strategy_probability,
     }
 }
 

@@ -1173,3 +1173,38 @@ retrying similar ideas, so attempts stay in chronological order.
   did not improve (`~10.6s/16iter` before, `~10.8-10.9s/16iter` after). The
   added target footprint likely hurt cache locality enough to erase the
   instruction-count win, so the change was not kept.
+
+## 2026-06-08: Opponent-branch accumulator reduce experiment
+
+- Tried replacing the node-local opponent decision parallel branch's
+  `collect::<Vec<(child_values, terminal_evals)>>` with a worker-local
+  accumulator/reduce, and reused `next_oop`/`next_ip` scratch buffers in the
+  current-player parallel branch instead of allocating a reach vector per
+  action.
+- Result on the current `As7h2c` node-local CLI smoke, OOP/IP ranges from
+  `/tmp/oop_range.txt` and `/tmp/ip_range.txt`, 16 release iterations:
+  `node_cfr elapsed_ms=13315.308`. This is worse than the current baseline
+  range of about `10.6-10.9s/16iter`.
+- Takeaway: with the current tree's small action counts, the accumulator path
+  adds more zeroing/reduce/add traffic than it removes from per-action
+  allocation. The reference solver's `spare_capacity_mut` row writing is not
+  reproduced by this accumulator shape. A useful change here needs direct
+  row-oriented storage for action CFVs or a larger traversal rewrite, not a
+  parallel reduce wrapper around the existing layout.
+
+## 2026-06-08: Node-local tight regret/strategy update loop
+
+- Changed the node-local current-player update from a per-slot helper call with
+  inner `match`es to action-major slice loops. The update now branches once on
+  CFR variant and average-strategy mode, then walks each regret/strategy row
+  directly.
+- Correctness smoke: `cargo check -p pokedr-core -p pokedr-cli` and
+  `cargo test -p pokedr-core node_local_cfr -- --nocapture` pass.
+- Result on the current `As7h2c` node-local CLI smoke, OOP/IP ranges from
+  `/tmp/oop_range.txt` and `/tmp/ip_range.txt`, 16 release iterations:
+  first run `node_cfr elapsed_ms=10292.951`, second run
+  `node_cfr elapsed_ms=10054.099`. The previous current baseline was about
+  `10.6-10.9s/16iter`.
+- Takeaway: this is a modest but real exact improvement. It confirms that part
+  of the gap to the reference solver is still in update-loop layout and
+  branch/function-call overhead, not only terminal CFV.
