@@ -269,6 +269,14 @@ struct PreparedComboTarget {
 }
 
 #[derive(Debug, Clone, Copy)]
+struct PreparedRiverTarget {
+    strength: u64,
+    range_index: u16,
+    first_card: u8,
+    second_card: u8,
+}
+
+#[derive(Debug, Clone, Copy)]
 struct PreparedLiveTarget {
     range_index: u16,
     first_card: u8,
@@ -297,6 +305,8 @@ struct NodeLocalTerminalCache {
     ip_targets: Vec<PreparedComboTarget>,
     oop_targets_sorted: Vec<PreparedComboTarget>,
     ip_targets_sorted: Vec<PreparedComboTarget>,
+    oop_river_targets_sorted: Vec<PreparedRiverTarget>,
+    ip_river_targets_sorted: Vec<PreparedRiverTarget>,
     oop_board_targets_sorted: Vec<u16>,
     ip_board_targets_sorted: Vec<u16>,
 }
@@ -445,6 +455,8 @@ impl NodeLocalCfrSolver {
             let mut ip_targets_sorted = ip_targets.clone();
             sort_combo_targets_by_strength(&prepared, &mut oop_targets_sorted);
             sort_combo_targets_by_strength(&prepared, &mut ip_targets_sorted);
+            let oop_river_targets_sorted = prepared_river_targets(&prepared, &oop_targets_sorted);
+            let ip_river_targets_sorted = prepared_river_targets(&prepared, &ip_targets_sorted);
             let mut oop_board_targets_sorted = prepared_board_targets(&oop_targets);
             let mut ip_board_targets_sorted = prepared_board_targets(&ip_targets);
             prepared.sort_indices_by_strength(&mut oop_board_targets_sorted);
@@ -456,6 +468,8 @@ impl NodeLocalCfrSolver {
                 ip_targets,
                 oop_targets_sorted,
                 ip_targets_sorted,
+                oop_river_targets_sorted,
+                ip_river_targets_sorted,
                 oop_board_targets_sorted,
                 ip_board_targets_sorted,
             });
@@ -2331,45 +2345,87 @@ impl NodeLocalCfrSolver {
                 }
             }
         } else {
-            for cache_index in cache_indices {
-                let cache = &self.terminal_cache[*cache_index];
-                let prepared = &cache.prepared;
+            if node.board.cards().len() == 5 {
+                let cache_index = cache_indices
+                    .first()
+                    .copied()
+                    .ok_or_else(|| "river terminal node is missing terminal cache".to_string())?;
+                let cache = &self.terminal_cache[cache_index];
                 match update_player {
                     Player::Oop => {
-                        terminal_side_range_targets_sorted_accumulate(
-                            prepared,
-                            &cache.ip_targets_sorted,
+                        terminal_side_river_targets_sorted_accumulate(
+                            &cache.ip_river_targets_sorted,
                             ip_reach,
-                            &cache.oop_targets_sorted,
+                            &cache.oop_river_targets_sorted,
                             outcome_scale,
                             out,
                         );
-                        add_terminal_net_offset(
-                            prepared,
+                        add_terminal_river_net_offset(
                             ip_reach,
-                            &cache.ip_targets,
-                            &cache.oop_targets,
+                            &cache.ip_river_targets_sorted,
+                            &cache.oop_river_targets_sorted,
                             net_offset,
                             out,
                         );
                     }
                     Player::Ip => {
-                        terminal_side_range_targets_sorted_accumulate(
-                            prepared,
-                            &cache.oop_targets_sorted,
+                        terminal_side_river_targets_sorted_accumulate(
+                            &cache.oop_river_targets_sorted,
                             oop_reach,
-                            &cache.ip_targets_sorted,
+                            &cache.ip_river_targets_sorted,
                             outcome_scale,
                             out,
                         );
-                        add_terminal_net_offset(
-                            prepared,
+                        add_terminal_river_net_offset(
                             oop_reach,
-                            &cache.oop_targets,
-                            &cache.ip_targets,
+                            &cache.oop_river_targets_sorted,
+                            &cache.ip_river_targets_sorted,
                             net_offset,
                             out,
                         );
+                    }
+                }
+            } else {
+                for cache_index in cache_indices {
+                    let cache = &self.terminal_cache[*cache_index];
+                    let prepared = &cache.prepared;
+                    match update_player {
+                        Player::Oop => {
+                            terminal_side_range_targets_sorted_accumulate(
+                                prepared,
+                                &cache.ip_targets_sorted,
+                                ip_reach,
+                                &cache.oop_targets_sorted,
+                                outcome_scale,
+                                out,
+                            );
+                            add_terminal_net_offset(
+                                prepared,
+                                ip_reach,
+                                &cache.ip_targets,
+                                &cache.oop_targets,
+                                net_offset,
+                                out,
+                            );
+                        }
+                        Player::Ip => {
+                            terminal_side_range_targets_sorted_accumulate(
+                                prepared,
+                                &cache.oop_targets_sorted,
+                                oop_reach,
+                                &cache.ip_targets_sorted,
+                                outcome_scale,
+                                out,
+                            );
+                            add_terminal_net_offset(
+                                prepared,
+                                oop_reach,
+                                &cache.oop_targets,
+                                &cache.ip_targets,
+                                net_offset,
+                                out,
+                            );
+                        }
                     }
                 }
             }
@@ -2904,6 +2960,35 @@ fn sort_combo_targets_by_strength(
     targets.sort_unstable_by_key(|target| prepared.strength(target.board_index as usize));
 }
 
+fn prepared_river_targets(
+    prepared: &PreparedTerminalBoard,
+    targets_sorted: &[PreparedComboTarget],
+) -> Vec<PreparedRiverTarget> {
+    targets_sorted
+        .iter()
+        .map(|target| {
+            let combo = prepared.combo(target.board_index as usize);
+            PreparedRiverTarget {
+                strength: prepared.strength(target.board_index as usize),
+                range_index: target
+                    .range_index
+                    .try_into()
+                    .expect("range has more than u16::MAX private combos"),
+                first_card: combo
+                    .first
+                    .index()
+                    .try_into()
+                    .expect("card index does not fit in u8"),
+                second_card: combo
+                    .second
+                    .index()
+                    .try_into()
+                    .expect("card index does not fit in u8"),
+            }
+        })
+        .collect()
+}
+
 fn reach_on_targets_into(targets: &[PreparedComboTarget], reach: &[f32], out: &mut [f32]) {
     out.fill(0.0);
     for target in targets {
@@ -2972,6 +3057,56 @@ fn terminal_side_range_targets_sorted_accumulate(
     }
 }
 
+fn terminal_side_river_targets_sorted_accumulate(
+    opponent_targets_sorted: &[PreparedRiverTarget],
+    opponent_reach: &[f32],
+    own_targets_sorted: &[PreparedRiverTarget],
+    pot: f32,
+    out: &mut [f32],
+) {
+    let mut reach_sum = 0.0f32;
+    let mut card_sums = [0.0f32; 52];
+    let mut opponent_cursor = 0usize;
+    for own_target in own_targets_sorted {
+        while opponent_cursor < opponent_targets_sorted.len() {
+            let opponent_target = opponent_targets_sorted[opponent_cursor];
+            if opponent_target.strength >= own_target.strength {
+                break;
+            }
+            add_river_target_reach_to_card_sums(
+                opponent_target,
+                opponent_reach,
+                &mut reach_sum,
+                &mut card_sums,
+            );
+            opponent_cursor += 1;
+        }
+        out[own_target.range_index as usize] +=
+            non_blocked_river_target_reach(*own_target, reach_sum, &card_sums) * pot;
+    }
+
+    reach_sum = 0.0;
+    card_sums = [0.0f32; 52];
+    opponent_cursor = opponent_targets_sorted.len();
+    for own_target in own_targets_sorted.iter().rev() {
+        while opponent_cursor > 0 {
+            let opponent_target = opponent_targets_sorted[opponent_cursor - 1];
+            if opponent_target.strength <= own_target.strength {
+                break;
+            }
+            add_river_target_reach_to_card_sums(
+                opponent_target,
+                opponent_reach,
+                &mut reach_sum,
+                &mut card_sums,
+            );
+            opponent_cursor -= 1;
+        }
+        out[own_target.range_index as usize] -=
+            non_blocked_river_target_reach(*own_target, reach_sum, &card_sums) * pot;
+    }
+}
+
 fn add_target_reach_to_card_sums(
     prepared: &PreparedTerminalBoard,
     target: PreparedComboTarget,
@@ -2987,6 +3122,21 @@ fn add_target_reach_to_card_sums(
     *reach_sum += value;
     card_sums[combo.first.index()] += value;
     card_sums[combo.second.index()] += value;
+}
+
+fn add_river_target_reach_to_card_sums(
+    target: PreparedRiverTarget,
+    reach: &[f32],
+    reach_sum: &mut f32,
+    card_sums: &mut [f32; 52],
+) {
+    let value = reach[target.range_index as usize];
+    if value == 0.0 {
+        return;
+    }
+    *reach_sum += value;
+    card_sums[target.first_card as usize] += value;
+    card_sums[target.second_card as usize] += value;
 }
 
 fn add_terminal_net_offset(
@@ -3017,12 +3167,46 @@ fn add_terminal_net_offset(
     }
 }
 
+fn add_terminal_river_net_offset(
+    opponent_reach: &[f32],
+    opponent_targets: &[PreparedRiverTarget],
+    own_targets: &[PreparedRiverTarget],
+    offset: f32,
+    out: &mut [f32],
+) {
+    if offset == 0.0 {
+        return;
+    }
+    let mut reach_sum = 0.0;
+    let mut card_sums = [0.0f32; 52];
+    for target in opponent_targets {
+        add_river_target_reach_to_card_sums(
+            *target,
+            opponent_reach,
+            &mut reach_sum,
+            &mut card_sums,
+        );
+    }
+    for target in own_targets {
+        out[target.range_index as usize] +=
+            non_blocked_river_target_reach(*target, reach_sum, &card_sums) * offset;
+    }
+}
+
 fn non_blocked_target_reach(
     combo: crate::terminal_cfv::PrivateCombo,
     reach_sum: f32,
     card_sums: &[f32; 52],
 ) -> f32 {
     reach_sum - card_sums[combo.first.index()] - card_sums[combo.second.index()]
+}
+
+fn non_blocked_river_target_reach(
+    target: PreparedRiverTarget,
+    reach_sum: f32,
+    card_sums: &[f32; 52],
+) -> f32 {
+    reach_sum - card_sums[target.first_card as usize] - card_sums[target.second_card as usize]
 }
 
 fn terminal_runout_count_for_live_combo(board_cards: usize) -> f32 {
@@ -3318,6 +3502,107 @@ mod tests {
             &mut out,
         );
         assert_eq!(out[0], (fold_node.pot - fold_node.oop_total_commit) as f32);
+    }
+
+    #[test]
+    fn river_fast_path_matches_sorted_terminal_path() {
+        let board = Board::from_str("As7h2cTd9d").unwrap();
+        let oop_range = RangeSpec::from_str("AcAd,KcKd,QcQd,JcJd,8c8d").unwrap();
+        let ip_range = RangeSpec::from_str("AhKh,QhQs,JhJs,8h8s,6c6d").unwrap();
+        let prepared = PreparedTerminalBoard::new(&board).unwrap();
+        let oop_combos = oop_range.combos();
+        let ip_combos = ip_range.combos();
+        let oop_targets = prepared_combo_targets(&prepared, &oop_combos);
+        let ip_targets = prepared_combo_targets(&prepared, &ip_combos);
+        let mut oop_targets_sorted = oop_targets.clone();
+        let mut ip_targets_sorted = ip_targets.clone();
+        sort_combo_targets_by_strength(&prepared, &mut oop_targets_sorted);
+        sort_combo_targets_by_strength(&prepared, &mut ip_targets_sorted);
+        let oop_river_targets_sorted = prepared_river_targets(&prepared, &oop_targets_sorted);
+        let ip_river_targets_sorted = prepared_river_targets(&prepared, &ip_targets_sorted);
+        let oop_reach = oop_combos
+            .iter()
+            .enumerate()
+            .map(|(index, combo)| combo.weight * (1.0 + index as f32 * 0.17))
+            .collect::<Vec<_>>();
+        let ip_reach = ip_combos
+            .iter()
+            .enumerate()
+            .map(|(index, combo)| combo.weight * (0.9 + index as f32 * 0.11))
+            .collect::<Vec<_>>();
+
+        let mut generic_oop = vec![0.0; oop_combos.len()];
+        terminal_side_range_targets_sorted_accumulate(
+            &prepared,
+            &ip_targets_sorted,
+            &ip_reach,
+            &oop_targets_sorted,
+            123.0,
+            &mut generic_oop,
+        );
+        add_terminal_net_offset(
+            &prepared,
+            &ip_reach,
+            &ip_targets,
+            &oop_targets,
+            -17.0,
+            &mut generic_oop,
+        );
+        let mut fast_oop = vec![0.0; oop_combos.len()];
+        terminal_side_river_targets_sorted_accumulate(
+            &ip_river_targets_sorted,
+            &ip_reach,
+            &oop_river_targets_sorted,
+            123.0,
+            &mut fast_oop,
+        );
+        add_terminal_river_net_offset(
+            &ip_reach,
+            &ip_river_targets_sorted,
+            &oop_river_targets_sorted,
+            -17.0,
+            &mut fast_oop,
+        );
+
+        let mut generic_ip = vec![0.0; ip_combos.len()];
+        terminal_side_range_targets_sorted_accumulate(
+            &prepared,
+            &oop_targets_sorted,
+            &oop_reach,
+            &ip_targets_sorted,
+            77.0,
+            &mut generic_ip,
+        );
+        add_terminal_net_offset(
+            &prepared,
+            &oop_reach,
+            &oop_targets,
+            &ip_targets,
+            23.0,
+            &mut generic_ip,
+        );
+        let mut fast_ip = vec![0.0; ip_combos.len()];
+        terminal_side_river_targets_sorted_accumulate(
+            &oop_river_targets_sorted,
+            &oop_reach,
+            &ip_river_targets_sorted,
+            77.0,
+            &mut fast_ip,
+        );
+        add_terminal_river_net_offset(
+            &oop_reach,
+            &oop_river_targets_sorted,
+            &ip_river_targets_sorted,
+            23.0,
+            &mut fast_ip,
+        );
+
+        for (generic, fast) in generic_oop.iter().zip(&fast_oop) {
+            assert!((generic - fast).abs() < 0.001, "{generic} != {fast}");
+        }
+        for (generic, fast) in generic_ip.iter().zip(&fast_ip) {
+            assert!((generic - fast).abs() < 0.001, "{generic} != {fast}");
+        }
     }
 
     #[test]

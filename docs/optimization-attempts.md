@@ -1305,3 +1305,30 @@ retrying similar ideas, so attempts stay in chronological order.
 - Takeaway: exact BR checks are no longer the dominant cost for the current
   1BB/100 timing. The next speed work has to target the 48 CFR iterations
   themselves or solver construction.
+
+## 2026-06-09: River fast path preservation check
+
+- Rechecked the suspected lost exact fast paths after viewer/tree changes made
+  solves look much slower. The fold live-target path was still present. The
+  river terminal fast path was present as an uncommitted diff and was kept.
+- Added `river_fast_path_matches_sorted_terminal_path`, comparing the compact
+  river target path against the generic sorted terminal path with non-uniform
+  reaches and non-zero net offsets for both sides.
+- Validation:
+  `cargo test -p pokedr-core river_fast_path_matches_sorted_terminal_path`,
+  `cargo check -p pokedr-cli`, and `git diff --check` passed.
+- Reference-comparison rerun on `Td9d6h`, `postflop-basic`, pot `200`,
+  effective stack `900`, ranges from `/tmp/oop_range.txt` and
+  `/tmp/ip_range.txt`, `16` release iterations, no exact BR interval:
+  `node_cfr elapsed_ms=1263.603`. The old recorded fold-fast-path result was
+  `1213.419`, so the exact fast paths are still roughly in the same range.
+- Viewer config rerun on `As7h2c`, pot `650`, effective stack `9700`, narrower
+  text ranges but much larger tree/state, `16` release iterations, no exact BR
+  interval: `node_cfr elapsed_ms=5672.327`. With profiling enabled it reported
+  `showdown_ms=47177.182` thread-summed, including
+  `showdown_only_ms=17664.637`, `allin_turn_ms=9052.285`, and
+  `allin_river_ms=20021.245`.
+- Takeaway: the current big slowdown is mostly the larger deep-stack viewer
+  tree and terminal call volume, not a fully missing old fast path. The next
+  useful optimization target remains reducing terminal calls/work in the
+  larger tree rather than re-trying removed prefix/table experiments.

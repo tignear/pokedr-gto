@@ -983,6 +983,28 @@ fn solve_flop(
         ip_pass_value = summary.ip_update_pass_value,
         "node_cfr_summary"
     );
+    if summary.terminal_calls > 0 {
+        info!(
+            scratch_allocations = summary.scratch_allocations,
+            terminal_calls = summary.terminal_calls,
+            terminal_ms = ns_to_ms(summary.terminal_ns),
+            fold_calls = summary.fold_calls,
+            fold_ms = ns_to_ms(summary.fold_ns),
+            showdown_calls = summary.showdown_calls,
+            showdown_ms = ns_to_ms(summary.showdown_ns),
+            showdown_only_calls = summary.showdown_only_calls,
+            showdown_only_ms = ns_to_ms(summary.showdown_only_ns),
+            allin_calls = summary.allin_calls,
+            allin_ms = ns_to_ms(summary.allin_ns),
+            allin_flop_calls = summary.allin_flop_calls,
+            allin_flop_ms = ns_to_ms(summary.allin_flop_ns),
+            allin_turn_calls = summary.allin_turn_calls,
+            allin_turn_ms = ns_to_ms(summary.allin_turn_ns),
+            allin_river_calls = summary.allin_river_calls,
+            allin_river_ms = ns_to_ms(summary.allin_river_ns),
+            "node_cfr_profile"
+        );
+    }
     info!(
         state_allocated = true,
         storage_gib = summary.storage_gib,
@@ -990,6 +1012,10 @@ fn solve_flop(
         "node_cfr_finish"
     );
     Ok(())
+}
+
+fn ns_to_ms(ns: u64) -> f64 {
+    ns as f64 / 1_000_000.0
 }
 
 fn solve_for_viewer(
