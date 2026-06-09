@@ -10,9 +10,9 @@ use pokedr_agent::{FlopTreeRequest, build_flop_tree};
 use pokedr_core::terminal_cfv::PreparedTerminalBoard;
 use pokedr_core::{
     ActionAbstraction, ActionKind, Board, Card, CfrStorageConfig, ChanceExpansion, ComboWeight,
-    NodeLocalCfrSolver, NodeLocalSolutionNodeKind, NodeLocalSolutionSnapshot, Player,
-    PublicNodeKind, PublicTree, RaisePolicy, RangeSpec, RealCfrAverageStrategy, RealCfrConfig,
-    RealCfrVariant, Spot, Street, StreetTemplate, TreeBuilder, TreeTemplate,
+    NodeLocalCfrSolver, NodeLocalSolutionNodeKind, NodeLocalSolutionSnapshot, NodeLocalStrategyEv,
+    Player, PublicNodeKind, PublicTree, RaisePolicy, RangeSpec, RealCfrAverageStrategy,
+    RealCfrConfig, RealCfrVariant, Spot, Street, StreetTemplate, TreeBuilder, TreeTemplate,
     fixed_flop_future_board_isomorphism, full_deck_future_board_isomorphism_survey, plan_cfr_work,
 };
 use rusqlite::{Connection, params};
@@ -1076,6 +1076,7 @@ fn export_solution_db(
             DROP TABLE IF EXISTS nodes;
             DROP TABLE IF EXISTS actions;
             DROP TABLE IF EXISTS edges;
+            DROP TABLE IF EXISTS strategy_evs;
 
             CREATE TABLE metadata (
                 key TEXT PRIMARY KEY,
@@ -1124,6 +1125,17 @@ fn export_solution_db(
                 PRIMARY KEY (parent_id, edge_index)
             );
 
+            CREATE TABLE strategy_evs (
+                node_id INTEGER PRIMARY KEY,
+                board TEXT NOT NULL,
+                pot_bb REAL NOT NULL,
+                oop_ev_bb REAL NOT NULL,
+                ip_ev_bb REAL NOT NULL,
+                oop_weight REAL NOT NULL,
+                ip_weight REAL NOT NULL,
+                terminal_evals INTEGER NOT NULL
+            );
+
             CREATE INDEX idx_nodes_public_node ON nodes(public_node);
             CREATE INDEX idx_nodes_street ON nodes(street);
             CREATE INDEX idx_nodes_board ON nodes(board);
@@ -1138,7 +1150,7 @@ fn export_solution_db(
     insert_metadata(
         &transaction,
         &[
-            ("schema_version", "1".to_string()),
+            ("schema_version", "2".to_string()),
             ("flop", request.board.to_string()),
             ("pot", request.pot.to_string()),
             ("effective_stack", request.effective_stack.to_string()),
@@ -1185,12 +1197,15 @@ fn export_solution_db(
     for node in &snapshot.nodes {
         insert_solution_edges(&transaction, &node_ids, &nodes_by_id, node)?;
     }
+    let strategy_evs =
+        insert_solution_strategy_evs(&transaction, solver, &snapshot, max_strategy_street)?;
     transaction
         .commit()
         .map_err(|error| format!("failed to commit solution database: {error}"))?;
     info!(
         path = %path.display(),
         nodes = snapshot.nodes.len(),
+        strategy_evs,
         max_strategy_street = format_street(max_strategy_street),
         "solution_db_written"
     );
@@ -1338,6 +1353,66 @@ fn insert_solution_edges(
                 )
             })?;
     }
+    Ok(())
+}
+
+fn insert_solution_strategy_evs(
+    connection: &Connection,
+    solver: &NodeLocalCfrSolver,
+    snapshot: &NodeLocalSolutionSnapshot,
+    max_strategy_street: Street,
+) -> Result<usize, String> {
+    let mut inserted = 0usize;
+    for node in &snapshot.nodes {
+        if !should_store_strategy_ev(node, max_strategy_street) {
+            continue;
+        }
+        let ev = solver.strategy_ev_at_node(node.id).map_err(|error| {
+            format!(
+                "failed to calculate strategy EV for node {}: {error}",
+                node.id
+            )
+        })?;
+        insert_strategy_ev(connection, node.id, &ev)?;
+        inserted += 1;
+    }
+    Ok(inserted)
+}
+
+fn should_store_strategy_ev(
+    node: &pokedr_core::NodeLocalSolutionNode,
+    max_strategy_street: Street,
+) -> bool {
+    node.id == 0
+        || node.strategy.is_some() && node.street <= max_strategy_street
+        || matches!(node.kind, NodeLocalSolutionNodeKind::Chance)
+            && node.street <= max_strategy_street
+}
+
+fn insert_strategy_ev(
+    connection: &Connection,
+    node_id: usize,
+    ev: &NodeLocalStrategyEv,
+) -> Result<(), String> {
+    connection
+        .execute(
+            r#"
+            INSERT INTO strategy_evs
+                (node_id, board, pot_bb, oop_ev_bb, ip_ev_bb, oop_weight, ip_weight, terminal_evals)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            "#,
+            params![
+                node_id as i64,
+                ev.board.to_string(),
+                ev.pot as f32 / 100.0,
+                ev.oop_value / 100.0,
+                ev.ip_value / 100.0,
+                ev.oop_weight,
+                ev.ip_weight,
+                ev.terminal_evals as i64,
+            ],
+        )
+        .map_err(|error| format!("failed to insert strategy EV for node {node_id}: {error}"))?;
     Ok(())
 }
 
@@ -1505,6 +1580,7 @@ fn solve_for_viewer(
         solution,
         solver: Some(solver),
         resolver: None,
+        strategy_evs: HashMap::new(),
     })
 }
 
@@ -1524,6 +1600,7 @@ struct ViewerBundle {
     solution: ViewerSolution,
     solver: Option<NodeLocalCfrSolver>,
     resolver: Option<ViewerDbResolver>,
+    strategy_evs: HashMap<usize, ViewerStrategyEv>,
 }
 
 #[derive(Debug, Clone)]
@@ -1773,19 +1850,55 @@ fn combo_class(combo: &ComboWeight) -> String {
 }
 
 fn load_viewer_from_db(path: &PathBuf) -> Result<ViewerBundle, String> {
+    let started = Instant::now();
     let connection = Connection::open(path).map_err(|error| {
         format!(
             "failed to open solution database {}: {error}",
             path.display()
         )
     })?;
+    let phase = Instant::now();
     let metadata = load_db_metadata(&connection)?;
+    info!(
+        db = %path.display(),
+        elapsed_ms = phase.elapsed().as_secs_f64() * 1000.0,
+        "viewer_db_load_metadata"
+    );
+    let phase = Instant::now();
     let oop_weights = load_db_combo_weights(&connection, "oop")?;
     let ip_weights = load_db_combo_weights(&connection, "ip")?;
     let oop_combos = viewer_combos(&oop_weights);
     let ip_combos = viewer_combos(&ip_weights);
+    info!(
+        db = %path.display(),
+        oop_combos = oop_combos.len(),
+        ip_combos = ip_combos.len(),
+        elapsed_ms = phase.elapsed().as_secs_f64() * 1000.0,
+        "viewer_db_load_combos"
+    );
+    let phase = Instant::now();
     let mut nodes = load_db_nodes(&connection)?;
+    info!(
+        db = %path.display(),
+        nodes = nodes.len(),
+        elapsed_ms = phase.elapsed().as_secs_f64() * 1000.0,
+        "viewer_db_load_nodes"
+    );
+    let phase = Instant::now();
     attach_db_edges(&connection, &mut nodes)?;
+    info!(
+        db = %path.display(),
+        elapsed_ms = phase.elapsed().as_secs_f64() * 1000.0,
+        "viewer_db_attach_edges"
+    );
+    let phase = Instant::now();
+    let strategy_evs = load_db_strategy_evs(&connection)?;
+    info!(
+        db = %path.display(),
+        strategy_evs = strategy_evs.len(),
+        elapsed_ms = phase.elapsed().as_secs_f64() * 1000.0,
+        "viewer_db_load_strategy_evs"
+    );
     let board = metadata_required(&metadata, "flop")?.to_string();
     let pot = metadata_u32(&metadata, "pot")?;
     let effective_stack = metadata_u32(&metadata, "effective_stack")?;
@@ -1823,6 +1936,15 @@ fn load_viewer_from_db(path: &PathBuf) -> Result<ViewerBundle, String> {
                 .unwrap_or("reach-weighted"),
         )?,
     };
+    let node_count = nodes.len();
+    let strategy_ev_count = strategy_evs.len();
+    info!(
+        db = %path.display(),
+        nodes = node_count,
+        strategy_evs = strategy_ev_count,
+        elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+        "viewer_db_loaded"
+    );
     let solution = ViewerSolution {
         summary: ViewerSummary {
             board,
@@ -1856,6 +1978,7 @@ fn load_viewer_from_db(path: &PathBuf) -> Result<ViewerBundle, String> {
                 .get("enumerate_chance")
                 .is_some_and(|value| value == "true"),
         }),
+        strategy_evs,
     })
 }
 
@@ -2068,6 +2191,58 @@ fn attach_db_edges(connection: &Connection, nodes: &mut [ViewerNode]) -> Result<
     Ok(())
 }
 
+fn load_db_strategy_evs(
+    connection: &Connection,
+) -> Result<HashMap<usize, ViewerStrategyEv>, String> {
+    let mut statement = match connection.prepare(
+        r#"
+        SELECT node_id, board, pot_bb, oop_ev_bb, ip_ev_bb, oop_weight, ip_weight, terminal_evals
+        FROM strategy_evs
+        "#,
+    ) {
+        Ok(statement) => statement,
+        Err(error) => {
+            if matches!(error, rusqlite::Error::SqliteFailure(_, Some(ref message)) if message.contains("no such table"))
+            {
+                return Ok(HashMap::new());
+            }
+            return Err(format!("failed to prepare strategy EV query: {error}"));
+        }
+    };
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, f32>(2)?,
+                row.get::<_, f32>(3)?,
+                row.get::<_, f32>(4)?,
+                row.get::<_, f32>(5)?,
+                row.get::<_, f32>(6)?,
+                row.get::<_, i64>(7)?,
+            ))
+        })
+        .map_err(|error| format!("failed to query strategy EV rows: {error}"))?;
+    let mut values = HashMap::new();
+    for row in rows {
+        let (node_id, board, pot_bb, oop_ev_bb, ip_ev_bb, oop_weight, ip_weight, terminal_evals) =
+            row.map_err(|error| format!("failed to load strategy EV row: {error}"))?;
+        values.insert(
+            db_usize(node_id, "strategy_evs.node_id")?,
+            ViewerStrategyEv {
+                board,
+                pot_bb,
+                oop_ev_bb,
+                ip_ev_bb,
+                oop_weight,
+                ip_weight,
+                terminal_evals: db_usize(terminal_evals, "strategy_evs.terminal_evals")?,
+            },
+        );
+    }
+    Ok(values)
+}
+
 fn db_usize(value: i64, field: &str) -> Result<usize, String> {
     usize::try_from(value).map_err(|_| format!("{field} value {value} is negative or too large"))
 }
@@ -2120,7 +2295,7 @@ fn serve_viewer(
         resolver: viewer.resolver,
         resolved_strategy_cache: Arc::new(Mutex::new(HashMap::new())),
         equity_cache: Arc::new(Mutex::new(HashMap::new())),
-        strategy_ev_cache: Arc::new(Mutex::new(HashMap::new())),
+        strategy_ev_cache: Arc::new(Mutex::new(viewer.strategy_evs)),
         action_ev_cache: Arc::new(Mutex::new(HashMap::new())),
         reach_cache: Arc::new(Mutex::new(HashMap::new())),
     };
