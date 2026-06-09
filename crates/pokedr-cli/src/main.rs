@@ -2413,22 +2413,32 @@ fn resolve_viewer_node_strategy(
     state: &ViewerState,
     id: usize,
 ) -> Result<Option<ViewerStrategy>, String> {
-    let mut solver = ensure_viewer_solver(state)?;
-    let snapshot = solver
-        .as_mut()
-        .expect("viewer solver must be initialized")
-        .solution_snapshot_until_street(Some(Street::River));
-    let Some(node) = snapshot.nodes.into_iter().find(|node| node.id == id) else {
-        return Ok(None);
+    let value = if let Some(resolver) = &state.resolver {
+        let Some(node) = state.solution.nodes.get(id) else {
+            return Ok(None);
+        };
+        solve_viewer_subtree_root_strategy(resolver, node.public_node)?
+    } else {
+        let mut solver = ensure_viewer_solver(state)?;
+        let snapshot = solver
+            .as_mut()
+            .expect("viewer solver must be initialized")
+            .solution_snapshot_until_street(Some(Street::River));
+        let Some(node) = snapshot.nodes.into_iter().find(|node| node.id == id) else {
+            return Ok(None);
+        };
+        let Some(strategy) = node.strategy else {
+            return Ok(None);
+        };
+        Some(ViewerStrategy {
+            player: format_player(strategy.player),
+            combos: strategy.combos,
+            actions: strategy.actions,
+            action_major: strategy.action_major,
+        })
     };
-    let Some(strategy) = node.strategy else {
+    let Some(value) = value else {
         return Ok(None);
-    };
-    let value = ViewerStrategy {
-        player: format_player(strategy.player),
-        combos: strategy.combos,
-        actions: strategy.actions,
-        action_major: strategy.action_major,
     };
     state
         .resolved_strategy_cache
@@ -2436,6 +2446,104 @@ fn resolve_viewer_node_strategy(
         .expect("resolved strategy cache poisoned")
         .insert(id, value.clone());
     Ok(Some(value))
+}
+
+fn solve_viewer_subtree_root_strategy(
+    resolver: &ViewerDbResolver,
+    root_public_node: usize,
+) -> Result<Option<ViewerStrategy>, String> {
+    info!(
+        db = %resolver.db_path.display(),
+        root_public_node,
+        iterations = resolver.options.iterations,
+        "viewer_lazy_subtree_solver_start"
+    );
+    let full_tree = build_tree(resolver.request.clone(), resolver.enumerate_chance)?;
+    let subtree = public_subtree_from(&full_tree, root_public_node)?;
+    let mut solver = NodeLocalCfrSolver::new(
+        subtree,
+        resolver.request.oop_range.clone(),
+        resolver.request.ip_range.clone(),
+    )?;
+    solver.run_with_progress(
+        RealCfrConfig {
+            iterations: resolver.options.iterations,
+            variant: resolver.options.variant,
+            average_strategy: resolver.options.average_strategy,
+        },
+        |_| {},
+    )?;
+    let snapshot = solver.solution_snapshot_until_street(Some(Street::River));
+    let strategy = snapshot
+        .nodes
+        .into_iter()
+        .next()
+        .and_then(|node| node.strategy);
+    info!(
+        db = %resolver.db_path.display(),
+        root_public_node,
+        "viewer_lazy_subtree_solver_finish"
+    );
+    Ok(strategy.map(|strategy| ViewerStrategy {
+        player: format_player(strategy.player),
+        combos: strategy.combos,
+        actions: strategy.actions,
+        action_major: strategy.action_major,
+    }))
+}
+
+fn public_subtree_from(tree: &PublicTree, root: usize) -> Result<PublicTree, String> {
+    let root_node = tree
+        .nodes
+        .get(root)
+        .ok_or_else(|| format!("public node {root} is out of bounds"))?;
+    let mut old_to_new = HashMap::new();
+    let mut order = Vec::new();
+    collect_public_subtree_order(tree, root, &mut old_to_new, &mut order)?;
+    let mut nodes = Vec::with_capacity(order.len());
+    for (new_id, old_id) in order.iter().copied().enumerate() {
+        let old_node = &tree.nodes[old_id];
+        let mut node = old_node.clone();
+        node.id = new_id;
+        node.children = old_node
+            .children
+            .iter()
+            .map(|child| {
+                old_to_new
+                    .get(child)
+                    .copied()
+                    .ok_or_else(|| format!("subtree child {child} was not collected"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        nodes.push(node);
+    }
+    let mut spot = tree.spot.clone();
+    spot.board = root_node.state.board.clone();
+    spot.pot = root_node.state.pot;
+    spot.first_player = root_node.state.player;
+    Ok(PublicTree { spot, nodes })
+}
+
+fn collect_public_subtree_order(
+    tree: &PublicTree,
+    node: usize,
+    old_to_new: &mut HashMap<usize, usize>,
+    order: &mut Vec<usize>,
+) -> Result<(), String> {
+    if old_to_new.contains_key(&node) {
+        return Ok(());
+    }
+    let new_id = order.len();
+    old_to_new.insert(node, new_id);
+    order.push(node);
+    let public = tree
+        .nodes
+        .get(node)
+        .ok_or_else(|| format!("public node {node} is out of bounds"))?;
+    for child in &public.children {
+        collect_public_subtree_order(tree, *child, old_to_new, order)?;
+    }
+    Ok(())
 }
 
 fn raw_range_equity(

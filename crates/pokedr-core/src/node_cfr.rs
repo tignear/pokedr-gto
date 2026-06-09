@@ -444,7 +444,7 @@ impl NodeLocalCfrSolver {
             .collect::<BTreeMap<_, _>>();
         let oop_same_ip_combo_indices = same_combo_indices(&oop_combos, &ip_combos);
         let ip_same_oop_combo_indices = same_combo_indices(&ip_combos, &oop_combos);
-        let terminal_boards = unordered_river_boards_from_flop(&tree.spot.board)?;
+        let terminal_boards = terminal_boards(&tree.spot.board)?;
         let mut terminal_cache_index_by_key = BTreeMap::new();
         let mut terminal_cache = Vec::with_capacity(terminal_boards.len());
         for board in &terminal_boards {
@@ -3319,20 +3319,6 @@ fn terminal_boards(board: &Board) -> Result<Vec<Board>, String> {
         }
         other => Err(format!("terminal board has invalid length {other}")),
     }
-}
-
-fn unordered_river_boards_from_flop(flop: &Board) -> Result<Vec<Board>, String> {
-    if flop.cards().len() != 3 {
-        return Err("node-local CFR solver must start from a flop board".to_string());
-    }
-    let deck = flop.remaining_deck();
-    let mut boards = Vec::with_capacity(deck.len() * (deck.len() - 1) / 2);
-    for turn in 0..deck.len() {
-        for river in turn + 1..deck.len() {
-            boards.push(flop.push(deck[turn])?.push(deck[river])?);
-        }
-    }
-    Ok(boards)
 }
 
 fn unordered_board_key(board: &Board) -> u64 {
