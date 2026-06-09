@@ -2237,11 +2237,12 @@ async fn api_reach(Path(id): Path<usize>, State(state): State<ViewerState>) -> i
                 return Json(value).into_response();
             }
             Err(error) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({ "error": error })),
-                )
-                    .into_response();
+                let status = if error.contains("not stored in this database") {
+                    StatusCode::CONFLICT
+                } else {
+                    StatusCode::INTERNAL_SERVER_ERROR
+                };
+                return (status, Json(serde_json::json!({ "error": error }))).into_response();
             }
         }
     }
@@ -2288,11 +2289,23 @@ async fn api_strategy_ev(
             .expect("viewer solver poisoned")
             .is_none()
     {
-        return (
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({ "error": "strategy EV is not stored in this database" })),
-        )
-            .into_response();
+        match resolve_db_viewer_strategy_ev(&state, id) {
+            Ok(value) => {
+                state
+                    .strategy_ev_cache
+                    .lock()
+                    .expect("strategy EV cache poisoned")
+                    .insert(id, value.clone());
+                return Json(value).into_response();
+            }
+            Err(error) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "error": error })),
+                )
+                    .into_response();
+            }
+        }
     }
     let result = ensure_viewer_solver(&state).and_then(|mut solver| {
         solver
@@ -2499,6 +2512,53 @@ fn resolve_viewer_node_strategy(
     Ok(Some(value))
 }
 
+fn resolve_db_viewer_strategy_ev(
+    state: &ViewerState,
+    id: usize,
+) -> Result<ViewerStrategyEv, String> {
+    let resolver = state
+        .resolver
+        .as_ref()
+        .ok_or_else(|| "viewer database resolver is not available".to_string())?;
+    let Some(node) = state.solution.nodes.get(id) else {
+        return Err(format!("unknown node {id}"));
+    };
+    if id == 0 || (node.street != "river" && node.kind != "chance") {
+        return Err(format!(
+            "strategy EV for node {id} is not stored in this database"
+        ));
+    }
+    solve_viewer_subtree_strategy_ev(resolver, node.public_node)
+}
+
+fn solve_viewer_subtree_strategy_ev(
+    resolver: &ViewerDbResolver,
+    root_public_node: usize,
+) -> Result<ViewerStrategyEv, String> {
+    info!(
+        db = %resolver.db_path.display(),
+        root_public_node,
+        iterations = resolver.options.iterations,
+        "viewer_lazy_subtree_strategy_ev_start"
+    );
+    let solver = solve_viewer_subtree_solver(resolver, root_public_node)?;
+    let ev = solver.strategy_ev_at_node(0)?;
+    info!(
+        db = %resolver.db_path.display(),
+        root_public_node,
+        "viewer_lazy_subtree_strategy_ev_finish"
+    );
+    Ok(ViewerStrategyEv {
+        board: ev.board.to_string(),
+        pot_bb: ev.pot as f32 / 100.0,
+        oop_ev_bb: ev.oop_value / 100.0,
+        ip_ev_bb: ev.ip_value / 100.0,
+        oop_weight: ev.oop_weight,
+        ip_weight: ev.ip_weight,
+        terminal_evals: ev.terminal_evals,
+    })
+}
+
 fn db_viewer_reach_at_node(state: &ViewerState, id: usize) -> Result<ViewerReach, String> {
     let mut path = Vec::new();
     if !find_viewer_path(&state.solution.nodes, 0, id, &mut path) {
@@ -2616,21 +2676,7 @@ fn solve_viewer_subtree_root_strategy(
         iterations = resolver.options.iterations,
         "viewer_lazy_subtree_solver_start"
     );
-    let full_tree = build_tree(resolver.request.clone(), resolver.enumerate_chance)?;
-    let subtree = public_subtree_from(&full_tree, root_public_node)?;
-    let mut solver = NodeLocalCfrSolver::new(
-        subtree,
-        resolver.request.oop_range.clone(),
-        resolver.request.ip_range.clone(),
-    )?;
-    solver.run_with_progress(
-        RealCfrConfig {
-            iterations: resolver.options.iterations,
-            variant: resolver.options.variant,
-            average_strategy: resolver.options.average_strategy,
-        },
-        |_| {},
-    )?;
+    let solver = solve_viewer_subtree_solver(resolver, root_public_node)?;
     let snapshot = solver.solution_snapshot_until_street(Some(Street::River));
     let oop_combos = snapshot.oop_combos.clone();
     let ip_combos = snapshot.ip_combos.clone();
@@ -2647,6 +2693,28 @@ fn solve_viewer_subtree_root_strategy(
     strategy
         .map(|strategy| expand_subtree_strategy(resolver, strategy, &oop_combos, &ip_combos))
         .transpose()
+}
+
+fn solve_viewer_subtree_solver(
+    resolver: &ViewerDbResolver,
+    root_public_node: usize,
+) -> Result<NodeLocalCfrSolver, String> {
+    let full_tree = build_tree(resolver.request.clone(), resolver.enumerate_chance)?;
+    let subtree = public_subtree_from(&full_tree, root_public_node)?;
+    let mut solver = NodeLocalCfrSolver::new(
+        subtree,
+        resolver.request.oop_range.clone(),
+        resolver.request.ip_range.clone(),
+    )?;
+    solver.run_with_progress(
+        RealCfrConfig {
+            iterations: resolver.options.iterations,
+            variant: resolver.options.variant,
+            average_strategy: resolver.options.average_strategy,
+        },
+        |_| {},
+    )?;
+    Ok(solver)
 }
 
 fn expand_subtree_strategy(
