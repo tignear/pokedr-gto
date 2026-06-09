@@ -9,11 +9,11 @@ use clap::{Parser, Subcommand};
 use pokedr_agent::{FlopTreeRequest, build_flop_tree};
 use pokedr_core::terminal_cfv::PreparedTerminalBoard;
 use pokedr_core::{
-    ActionAbstraction, ActionKind, Board, CfrStorageConfig, ChanceExpansion, ComboWeight,
+    ActionAbstraction, ActionKind, Board, Card, CfrStorageConfig, ChanceExpansion, ComboWeight,
     NodeLocalCfrSolver, NodeLocalSolutionNodeKind, NodeLocalSolutionSnapshot, Player,
-    PublicNodeKind, PublicTree, RangeSpec, RealCfrAverageStrategy, RealCfrConfig, RealCfrVariant,
-    Spot, Street, TreeBuilder, TreeTemplate, fixed_flop_future_board_isomorphism,
-    full_deck_future_board_isomorphism_survey, plan_cfr_work,
+    PublicNodeKind, PublicTree, RaisePolicy, RangeSpec, RealCfrAverageStrategy, RealCfrConfig,
+    RealCfrVariant, Spot, Street, StreetTemplate, TreeBuilder, TreeTemplate,
+    fixed_flop_future_board_isomorphism, full_deck_future_board_isomorphism_survey, plan_cfr_work,
 };
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
@@ -123,10 +123,15 @@ enum Command {
     },
     #[command(about = "Solve a fixed flop and serve an interactive solution viewer")]
     Viewer {
-        #[arg(required_unless_present = "config")]
+        #[arg(required_unless_present_any = ["config", "db"])]
         flop: Option<String>,
         #[arg(long)]
         config: Vec<PathBuf>,
+        #[arg(
+            long,
+            help = "Serve an existing SQLite solution database instead of solving"
+        )]
+        db: Option<PathBuf>,
         #[arg(long)]
         pot: Option<u32>,
         #[arg(long)]
@@ -306,7 +311,14 @@ fn main() -> Result<(), String> {
             )?;
             if let Some(path) = db {
                 let max_street = parse_street(&db_max_street)?;
-                export_solution_db(&path, &solver, &request, &solver_options, max_street)?;
+                export_solution_db(
+                    &path,
+                    &solver,
+                    &request,
+                    &solver_options,
+                    tree_options.enumerate_chance,
+                    max_street,
+                )?;
             }
         }
         Command::Viewer {
@@ -329,12 +341,18 @@ fn main() -> Result<(), String> {
             dcfr_alpha,
             dcfr_beta,
             dcfr_gamma,
+            db,
             host,
             port,
             assets,
         } => {
             let config = load_config(&config)?;
             init_logging(log_level.as_deref(), &config)?;
+            if let Some(path) = db {
+                let viewer = load_viewer_from_db(&path)?;
+                serve_viewer(viewer, host, port, assets)?;
+                return Ok(());
+            }
             let spot = resolve_spot_options(
                 &config,
                 SpotCliOverrides {
@@ -679,7 +697,7 @@ struct TreeOptions {
     action_abstraction: ActionAbstraction,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct SolverOptions {
     iterations: u32,
     threads: usize,
@@ -1038,6 +1056,7 @@ fn export_solution_db(
     solver: &NodeLocalCfrSolver,
     request: &FlopTreeRequest,
     options: &SolverOptions,
+    enumerate_chance: bool,
     max_strategy_street: Street,
 ) -> Result<(), String> {
     let summary = solver.summary();
@@ -1133,6 +1152,7 @@ fn export_solution_db(
                 format_average_strategy(options.average_strategy).to_string(),
             ),
             ("threads", options.threads.to_string()),
+            ("enumerate_chance", enumerate_chance.to_string()),
             (
                 "max_strategy_street",
                 format_street(max_strategy_street).to_string(),
@@ -1481,7 +1501,11 @@ fn solve_for_viewer(
         exploitability.map(|value| value.exploitability_bb_per_100),
         started.elapsed().as_secs_f64() * 1000.0,
     );
-    Ok(ViewerBundle { solution, solver })
+    Ok(ViewerBundle {
+        solution,
+        solver: Some(solver),
+        resolver: None,
+    })
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1498,7 +1522,16 @@ struct ViewerSolution {
 
 struct ViewerBundle {
     solution: ViewerSolution,
-    solver: NodeLocalCfrSolver,
+    solver: Option<NodeLocalCfrSolver>,
+    resolver: Option<ViewerDbResolver>,
+}
+
+#[derive(Debug, Clone)]
+struct ViewerDbResolver {
+    db_path: PathBuf,
+    request: FlopTreeRequest,
+    options: SolverOptions,
+    enumerate_chance: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1739,10 +1772,336 @@ fn combo_class(combo: &ComboWeight) -> String {
     }
 }
 
+fn load_viewer_from_db(path: &PathBuf) -> Result<ViewerBundle, String> {
+    let connection = Connection::open(path).map_err(|error| {
+        format!(
+            "failed to open solution database {}: {error}",
+            path.display()
+        )
+    })?;
+    let metadata = load_db_metadata(&connection)?;
+    let oop_weights = load_db_combo_weights(&connection, "oop")?;
+    let ip_weights = load_db_combo_weights(&connection, "ip")?;
+    let oop_combos = viewer_combos(&oop_weights);
+    let ip_combos = viewer_combos(&ip_weights);
+    let mut nodes = load_db_nodes(&connection)?;
+    attach_db_edges(&connection, &mut nodes)?;
+    let board = metadata_required(&metadata, "flop")?.to_string();
+    let pot = metadata_u32(&metadata, "pot")?;
+    let effective_stack = metadata_u32(&metadata, "effective_stack")?;
+    let first_player = metadata_required(&metadata, "first_player")?.to_string();
+    let iterations = metadata_u32(&metadata, "iterations")?;
+    let storage_gib = metadata_f64(&metadata, "storage_gib").unwrap_or(0.0);
+    let request = FlopTreeRequest {
+        board: Board::from_str(&board)?,
+        pot,
+        effective_stack,
+        oop_range: RangeSpec::new(oop_weights.clone())?,
+        ip_range: RangeSpec::new(ip_weights.clone())?,
+        first_player: parse_player(&first_player)?,
+        action_abstraction: parse_action_abstraction_json(metadata_required(
+            &metadata,
+            "action_abstraction_json",
+        )?)?,
+    };
+    let options = SolverOptions {
+        iterations,
+        threads: metadata_usize(&metadata, "threads").unwrap_or_else(default_thread_count),
+        log_interval: 0,
+        exploitability_interval: 0,
+        target_exploitability_bb100: None,
+        variant: parse_formatted_cfr_variant(
+            metadata
+                .get("variant")
+                .map(String::as_str)
+                .unwrap_or("dcfr-plus(alpha=1.5,gamma=2)"),
+        )?,
+        average_strategy: parse_average_strategy(
+            metadata
+                .get("average_strategy")
+                .map(String::as_str)
+                .unwrap_or("reach-weighted"),
+        )?,
+    };
+    let solution = ViewerSolution {
+        summary: ViewerSummary {
+            board,
+            pot_bb: pot as f32 / 100.0,
+            effective_stack_bb: effective_stack as f32 / 100.0,
+            first_player,
+            iterations,
+            solver_elapsed_ms: 0.0,
+            storage_gib,
+            exploitability_bb_per_100: None,
+            nodes: nodes.len(),
+            decision_states: metadata_usize(&metadata, "decision_states").unwrap_or(0),
+            action_slots: metadata_usize(&metadata, "action_slots").unwrap_or(0),
+            oop_combos: oop_combos.len(),
+            ip_combos: ip_combos.len(),
+        },
+        oop_combos,
+        ip_combos,
+        nodes,
+        oop_weights,
+        ip_weights,
+    };
+    Ok(ViewerBundle {
+        solution,
+        solver: None,
+        resolver: Some(ViewerDbResolver {
+            db_path: path.clone(),
+            request,
+            options,
+            enumerate_chance: metadata
+                .get("enumerate_chance")
+                .is_some_and(|value| value == "true"),
+        }),
+    })
+}
+
+fn load_db_metadata(connection: &Connection) -> Result<HashMap<String, String>, String> {
+    let mut statement = connection
+        .prepare("SELECT key, value FROM metadata")
+        .map_err(|error| format!("failed to read metadata: {error}"))?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|error| format!("failed to query metadata: {error}"))?;
+    let mut metadata = HashMap::new();
+    for row in rows {
+        let (key, value) = row.map_err(|error| format!("failed to load metadata row: {error}"))?;
+        metadata.insert(key, value);
+    }
+    Ok(metadata)
+}
+
+fn load_db_combo_weights(
+    connection: &Connection,
+    player: &str,
+) -> Result<Vec<ComboWeight>, String> {
+    let mut statement = connection
+        .prepare(
+            r#"
+            SELECT first_card, second_card, weight
+            FROM combos
+            WHERE player = ?1
+            ORDER BY combo_index
+            "#,
+        )
+        .map_err(|error| format!("failed to prepare {player} combo query: {error}"))?;
+    let rows = statement
+        .query_map(params![player], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, f32>(2)?,
+            ))
+        })
+        .map_err(|error| format!("failed to query {player} combos: {error}"))?;
+    let mut combos = Vec::new();
+    for row in rows {
+        let (first, second, weight) =
+            row.map_err(|error| format!("failed to load {player} combo row: {error}"))?;
+        combos.push(ComboWeight {
+            first: Card::from_str(&first)?,
+            second: Card::from_str(&second)?,
+            weight,
+        });
+    }
+    Ok(combos)
+}
+
+fn load_db_nodes(connection: &Connection) -> Result<Vec<ViewerNode>, String> {
+    let mut statement = connection
+        .prepare(
+            r#"
+            SELECT id, public_node, street, board, pot_bb, player, kind, terminal_reason,
+                   strategy_player, strategy_combos, strategy_actions, strategy_action_major_json
+            FROM nodes
+            ORDER BY id
+            "#,
+        )
+        .map_err(|error| format!("failed to prepare node query: {error}"))?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, f32>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, Option<String>>(8)?,
+                row.get::<_, Option<i64>>(9)?,
+                row.get::<_, Option<i64>>(10)?,
+                row.get::<_, Option<String>>(11)?,
+            ))
+        })
+        .map_err(|error| format!("failed to query nodes: {error}"))?;
+    let mut nodes = Vec::new();
+    for row in rows {
+        let (
+            id,
+            public_node,
+            street,
+            board,
+            pot_bb,
+            player,
+            kind,
+            terminal_reason,
+            strategy_player,
+            strategy_combos,
+            strategy_actions,
+            strategy_json,
+        ) = row.map_err(|error| format!("failed to load node row: {error}"))?;
+        let id = db_usize(id, "nodes.id")?;
+        let public_node = db_usize(public_node, "nodes.public_node")?;
+        let strategy_combos = strategy_combos
+            .map(|value| db_usize(value, "nodes.strategy_combos"))
+            .transpose()?;
+        let strategy_actions = strategy_actions
+            .map(|value| db_usize(value, "nodes.strategy_actions"))
+            .transpose()?;
+        if id != nodes.len() {
+            return Err(format!(
+                "solution database node ids must be contiguous; expected {}, got {id}",
+                nodes.len()
+            ));
+        }
+        let kind = if kind == "terminal" {
+            terminal_reason
+                .map(|reason| format!("terminal:{reason}"))
+                .unwrap_or_else(|| "terminal".to_string())
+        } else {
+            kind
+        };
+        let strategy = match (
+            strategy_player,
+            strategy_combos,
+            strategy_actions,
+            strategy_json,
+        ) {
+            (Some(player), Some(combos), Some(actions), Some(json)) => Some(ViewerStrategy {
+                player,
+                combos,
+                actions,
+                action_major: serde_json::from_str(&json)
+                    .map_err(|error| format!("failed to parse strategy for node {id}: {error}"))?,
+            }),
+            _ => None,
+        };
+        nodes.push(ViewerNode {
+            id,
+            public_node,
+            board,
+            street,
+            pot_bb,
+            player,
+            kind,
+            children: Vec::new(),
+            actions: Vec::new(),
+            choices: Vec::new(),
+            strategy,
+        });
+    }
+    Ok(nodes)
+}
+
+fn attach_db_edges(connection: &Connection, nodes: &mut [ViewerNode]) -> Result<(), String> {
+    let mut statement = connection
+        .prepare("SELECT parent_id, child_id, label FROM edges ORDER BY parent_id, edge_index")
+        .map_err(|error| format!("failed to prepare edge query: {error}"))?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(|error| format!("failed to query edges: {error}"))?;
+    for row in rows {
+        let (parent, child, label) =
+            row.map_err(|error| format!("failed to load edge row: {error}"))?;
+        let parent = db_usize(parent, "edges.parent_id")?;
+        let child = db_usize(child, "edges.child_id")?;
+        let Some(node) = nodes.get_mut(parent) else {
+            return Err(format!("edge references unknown parent node {parent}"));
+        };
+        node.children.push(child);
+        node.choices.push(ViewerBranch { label, child });
+    }
+
+    let mut statement = connection
+        .prepare("SELECT node_id, action_index, label, child_id FROM actions ORDER BY node_id, action_index")
+        .map_err(|error| format!("failed to prepare action query: {error}"))?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<i64>>(3)?,
+            ))
+        })
+        .map_err(|error| format!("failed to query actions: {error}"))?;
+    for row in rows {
+        let (node_id, index, label, child) =
+            row.map_err(|error| format!("failed to load action row: {error}"))?;
+        let node_id = db_usize(node_id, "actions.node_id")?;
+        let index = db_usize(index, "actions.action_index")?;
+        let child = child
+            .map(|value| db_usize(value, "actions.child_id"))
+            .transpose()?;
+        let Some(node) = nodes.get_mut(node_id) else {
+            return Err(format!("action references unknown node {node_id}"));
+        };
+        node.actions.push(ViewerAction {
+            index,
+            label,
+            child,
+        });
+    }
+    Ok(())
+}
+
+fn db_usize(value: i64, field: &str) -> Result<usize, String> {
+    usize::try_from(value).map_err(|_| format!("{field} value {value} is negative or too large"))
+}
+
+fn metadata_required<'a>(
+    metadata: &'a HashMap<String, String>,
+    key: &str,
+) -> Result<&'a str, String> {
+    metadata
+        .get(key)
+        .map(String::as_str)
+        .ok_or_else(|| format!("solution database missing metadata {key:?}"))
+}
+
+fn metadata_u32(metadata: &HashMap<String, String>, key: &str) -> Result<u32, String> {
+    metadata_required(metadata, key)?
+        .parse::<u32>()
+        .map_err(|error| format!("metadata {key:?} is not a u32: {error}"))
+}
+
+fn metadata_usize(metadata: &HashMap<String, String>, key: &str) -> Option<usize> {
+    metadata.get(key).and_then(|value| value.parse().ok())
+}
+
+fn metadata_f64(metadata: &HashMap<String, String>, key: &str) -> Option<f64> {
+    metadata.get(key).and_then(|value| value.parse().ok())
+}
+
 #[derive(Clone)]
 struct ViewerState {
     solution: Arc<ViewerSolution>,
-    solver: Arc<Mutex<NodeLocalCfrSolver>>,
+    solver: Arc<Mutex<Option<NodeLocalCfrSolver>>>,
+    resolver: Option<ViewerDbResolver>,
+    resolved_strategy_cache: Arc<Mutex<HashMap<usize, ViewerStrategy>>>,
     equity_cache: Arc<Mutex<HashMap<usize, ViewerEquity>>>,
     strategy_ev_cache: Arc<Mutex<HashMap<usize, ViewerStrategyEv>>>,
     action_ev_cache: Arc<Mutex<HashMap<usize, ViewerActionEv>>>,
@@ -1758,6 +2117,8 @@ fn serve_viewer(
     let state = ViewerState {
         solution: Arc::new(viewer.solution),
         solver: Arc::new(Mutex::new(viewer.solver)),
+        resolver: viewer.resolver,
+        resolved_strategy_cache: Arc::new(Mutex::new(HashMap::new())),
         equity_cache: Arc::new(Mutex::new(HashMap::new())),
         strategy_ev_cache: Arc::new(Mutex::new(HashMap::new())),
         action_ev_cache: Arc::new(Mutex::new(HashMap::new())),
@@ -1859,12 +2220,13 @@ async fn api_reach(Path(id): Path<usize>, State(state): State<ViewerState>) -> i
     {
         return Json(cached.clone()).into_response();
     }
-    match state
-        .solver
-        .lock()
-        .expect("viewer solver poisoned")
-        .display_reach_at_node(id)
-    {
+    let result = ensure_viewer_solver(&state).and_then(|mut solver| {
+        solver
+            .as_mut()
+            .expect("viewer solver must be initialized")
+            .display_reach_at_node(id)
+    });
+    match result {
         Ok((oop, ip)) => {
             let value = ViewerReach { oop, ip };
             state
@@ -1894,12 +2256,13 @@ async fn api_strategy_ev(
     {
         return Json(cached.clone()).into_response();
     }
-    match state
-        .solver
-        .lock()
-        .expect("viewer solver poisoned")
-        .strategy_ev_at_node(id)
-    {
+    let result = ensure_viewer_solver(&state).and_then(|mut solver| {
+        solver
+            .as_mut()
+            .expect("viewer solver must be initialized")
+            .strategy_ev_at_node(id)
+    });
+    match result {
         Ok(ev) => {
             let value = ViewerStrategyEv {
                 board: ev.board.to_string(),
@@ -1937,12 +2300,13 @@ async fn api_action_ev(
     {
         return Json(cached.clone()).into_response();
     }
-    match state
-        .solver
-        .lock()
-        .expect("viewer solver poisoned")
-        .action_ev_at_node(id)
-    {
+    let result = ensure_viewer_solver(&state).and_then(|mut solver| {
+        solver
+            .as_mut()
+            .expect("viewer solver must be initialized")
+            .action_ev_at_node(id)
+    });
+    match result {
         Ok(ev) => {
             let value = ViewerActionEv {
                 board: ev.board.to_string(),
@@ -1973,15 +2337,105 @@ async fn api_action_ev(
 }
 
 async fn api_node(Path(id): Path<usize>, State(state): State<ViewerState>) -> impl IntoResponse {
-    if let Some(node) = state.solution.nodes.get(id) {
-        Json(node.clone()).into_response()
-    } else {
-        (
+    let Some(source_node) = state.solution.nodes.get(id) else {
+        return (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({ "error": format!("unknown node {id}") })),
         )
-            .into_response()
+            .into_response();
+    };
+    let mut node = source_node.clone();
+    if node.strategy.is_none() && node.kind == "decision" {
+        if let Some(strategy) = state
+            .resolved_strategy_cache
+            .lock()
+            .expect("resolved strategy cache poisoned")
+            .get(&id)
+            .cloned()
+        {
+            node.strategy = Some(strategy);
+        } else {
+            match resolve_viewer_node_strategy(&state, id) {
+                Ok(Some(strategy)) => {
+                    node.strategy = Some(strategy);
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({ "error": error })),
+                    )
+                        .into_response();
+                }
+            }
+        }
     }
+    Json(node).into_response()
+}
+
+type ViewerSolverGuard<'a> = std::sync::MutexGuard<'a, Option<NodeLocalCfrSolver>>;
+
+fn ensure_viewer_solver(state: &ViewerState) -> Result<ViewerSolverGuard<'_>, String> {
+    let mut guard = state.solver.lock().expect("viewer solver poisoned");
+    if guard.is_none() {
+        let resolver = state
+            .resolver
+            .as_ref()
+            .ok_or_else(|| "viewer solver is not available for this database".to_string())?;
+        info!(
+            db = %resolver.db_path.display(),
+            iterations = resolver.options.iterations,
+            "viewer_lazy_solver_start"
+        );
+        let tree = build_tree(resolver.request.clone(), resolver.enumerate_chance)?;
+        let solver = solve_flop(
+            tree,
+            resolver.request.oop_range.clone(),
+            resolver.request.ip_range.clone(),
+            resolver.options.iterations,
+            resolver.options.threads,
+            0,
+            0,
+            None,
+            RealCfrConfig {
+                iterations: resolver.options.iterations,
+                variant: resolver.options.variant,
+                average_strategy: resolver.options.average_strategy,
+            },
+        )?;
+        *guard = Some(solver);
+        info!(db = %resolver.db_path.display(), "viewer_lazy_solver_finish");
+    }
+    Ok(guard)
+}
+
+fn resolve_viewer_node_strategy(
+    state: &ViewerState,
+    id: usize,
+) -> Result<Option<ViewerStrategy>, String> {
+    let mut solver = ensure_viewer_solver(state)?;
+    let snapshot = solver
+        .as_mut()
+        .expect("viewer solver must be initialized")
+        .solution_snapshot_until_street(Some(Street::River));
+    let Some(node) = snapshot.nodes.into_iter().find(|node| node.id == id) else {
+        return Ok(None);
+    };
+    let Some(strategy) = node.strategy else {
+        return Ok(None);
+    };
+    let value = ViewerStrategy {
+        player: format_player(strategy.player),
+        combos: strategy.combos,
+        actions: strategy.actions,
+        action_major: strategy.action_major,
+    };
+    state
+        .resolved_strategy_cache
+        .lock()
+        .expect("resolved strategy cache poisoned")
+        .insert(id, value.clone());
+    Ok(Some(value))
 }
 
 fn raw_range_equity(
@@ -2315,6 +2769,13 @@ fn parse_bet_size(field: &str, value: &str) -> Result<BetSizeSpec, String> {
             streets: 0,
             max_pot_fraction: f32::INFINITY,
         }),
+        _ if normalized.starts_with("geo:") => {
+            let (streets, max_pot_fraction) = parse_geometric_size(field, &normalized)?;
+            Ok(BetSizeSpec::Geometric {
+                streets,
+                max_pot_fraction,
+            })
+        }
         _ => parse_pot_fraction(field, value).map(BetSizeSpec::PotFraction),
     }
 }
@@ -2327,6 +2788,13 @@ fn parse_raise_size(field: &str, value: &str) -> Result<RaiseSizeSpec, String> {
             streets: 0,
             max_pot_fraction: f32::INFINITY,
         }),
+        _ if normalized.starts_with("geo:") => {
+            let (streets, max_pot_fraction) = parse_geometric_size(field, &normalized)?;
+            Ok(RaiseSizeSpec::Geometric {
+                streets,
+                max_pot_fraction,
+            })
+        }
         _ if normalized.ends_with('x') => {
             let multiplier = parse_positive_f32(field, normalized.trim_end_matches('x'))?;
             if multiplier <= 1.0 {
@@ -2338,6 +2806,116 @@ fn parse_raise_size(field: &str, value: &str) -> Result<RaiseSizeSpec, String> {
         }
         _ => parse_pot_fraction(field, value).map(RaiseSizeSpec::PotFraction),
     }
+}
+
+fn parse_geometric_size(field: &str, value: &str) -> Result<(u8, f32), String> {
+    let mut parts = value.split(':');
+    let _geo = parts.next();
+    let streets = parts
+        .next()
+        .ok_or_else(|| format!("{field} geometric size {value:?} missing street count"))?
+        .parse::<u8>()
+        .map_err(|_| format!("{field} geometric size {value:?} has invalid street count"))?;
+    let raw_max_pot_fraction = parts
+        .next()
+        .ok_or_else(|| format!("{field} geometric size {value:?} missing max pot fraction"))?;
+    let max_pot_fraction = if raw_max_pot_fraction == "inf" || raw_max_pot_fraction == "infinity" {
+        f32::INFINITY
+    } else {
+        raw_max_pot_fraction
+            .parse::<f32>()
+            .map_err(|_| format!("{field} geometric size {value:?} has invalid max pot fraction"))?
+    };
+    if parts.next().is_some() || max_pot_fraction.is_nan() || max_pot_fraction <= 0.0 {
+        return Err(format!("{field} geometric size {value:?} is invalid"));
+    }
+    Ok((streets, max_pot_fraction))
+}
+
+fn parse_action_abstraction_json(value: &str) -> Result<ActionAbstraction, String> {
+    let root: serde_json::Value = serde_json::from_str(value)
+        .map_err(|error| format!("failed to parse action abstraction metadata: {error}"))?;
+    let min_bet = json_u32(&root, "min_bet")?;
+    let flop = parse_street_template_json(&root, "flop")?;
+    let turn = parse_street_template_json(&root, "turn")?;
+    let river = parse_street_template_json(&root, "river")?;
+    let raise = root
+        .get("raise")
+        .ok_or_else(|| "action abstraction missing raise section".to_string())?;
+    Ok(ActionAbstraction {
+        min_bet,
+        flop,
+        turn,
+        river,
+        raise: RaisePolicy {
+            raise_multiplier: json_f32(raise, "raise_multiplier")?,
+            raise_sizes: json_string_array(raise, "raise_sizes")?
+                .iter()
+                .map(|value| {
+                    parse_raise_size("metadata.action_abstraction_json.raise_sizes", value)
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+            max_raises_per_street: json_u32(raise, "max_raises_per_street")? as u8,
+            shove_spr_threshold: json_f32(raise, "shove_spr_threshold")?,
+            shove_commit_fraction: json_f32(raise, "shove_commit_fraction")?,
+            add_all_in_threshold: json_f32(raise, "add_all_in_threshold")?,
+            force_all_in_threshold: json_f32(raise, "force_all_in_threshold")?,
+            merging_threshold: json_f32(raise, "merging_threshold")?,
+        },
+    })
+}
+
+fn parse_street_template_json(
+    root: &serde_json::Value,
+    key: &str,
+) -> Result<StreetTemplate, String> {
+    let value = root
+        .get(key)
+        .ok_or_else(|| format!("action abstraction missing {key} section"))?;
+    Ok(StreetTemplate {
+        first_bet_sizes: json_string_array(value, "first_bet_sizes")?
+            .iter()
+            .map(|value| parse_bet_size("metadata.action_abstraction_json.first_bet_sizes", value))
+            .collect::<Result<Vec<_>, _>>()?,
+        donk_bet_sizes: json_string_array(value, "donk_bet_sizes")?
+            .iter()
+            .map(|value| parse_bet_size("metadata.action_abstraction_json.donk_bet_sizes", value))
+            .collect::<Result<Vec<_>, _>>()?,
+    })
+}
+
+fn json_string_array(value: &serde_json::Value, key: &str) -> Result<Vec<String>, String> {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| format!("action abstraction field {key:?} must be an array"))?
+        .iter()
+        .map(|entry| {
+            entry
+                .as_str()
+                .map(str::to_string)
+                .ok_or_else(|| format!("action abstraction field {key:?} must contain strings"))
+        })
+        .collect()
+}
+
+fn json_u32(value: &serde_json::Value, key: &str) -> Result<u32, String> {
+    let raw = value
+        .get(key)
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| format!("action abstraction field {key:?} must be an unsigned integer"))?;
+    u32::try_from(raw).map_err(|_| format!("action abstraction field {key:?} exceeds u32"))
+}
+
+fn json_f32(value: &serde_json::Value, key: &str) -> Result<f32, String> {
+    let raw = value
+        .get(key)
+        .and_then(serde_json::Value::as_f64)
+        .ok_or_else(|| format!("action abstraction field {key:?} must be a number"))?;
+    if !raw.is_finite() {
+        return Err(format!("action abstraction field {key:?} must be finite"));
+    }
+    Ok(raw as f32)
 }
 
 fn parse_pot_fraction(field: &str, value: &str) -> Result<f32, String> {
@@ -2482,6 +3060,39 @@ fn parse_cfr_variant(
             "invalid CFR variant {value:?}; expected cfr-plus, dcfr, or dcfr-plus"
         )),
     }
+}
+
+fn parse_formatted_cfr_variant(value: &str) -> Result<RealCfrVariant, String> {
+    let normalized = value.trim().to_ascii_lowercase();
+    if normalized == "cfr-plus" || normalized == "cfr+" {
+        return Ok(RealCfrVariant::CfrPlus);
+    }
+    if normalized.starts_with("dcfr-plus(") {
+        let alpha = parse_named_f32(&normalized, "alpha").unwrap_or(1.5);
+        let gamma = parse_named_f32(&normalized, "gamma").unwrap_or(2.0);
+        return parse_cfr_variant("dcfr-plus", alpha, 0.0, gamma);
+    }
+    if normalized.starts_with("dcfr(") {
+        let alpha = parse_named_f32(&normalized, "alpha").unwrap_or(1.5);
+        let beta = parse_named_f32(&normalized, "beta").unwrap_or(0.0);
+        let gamma = parse_named_f32(&normalized, "gamma").unwrap_or(2.0);
+        return parse_cfr_variant("dcfr", alpha, beta, gamma);
+    }
+    parse_cfr_variant(&normalized, 1.5, 0.0, 2.0)
+}
+
+fn parse_named_f32(value: &str, name: &str) -> Option<f32> {
+    value
+        .trim_end_matches(')')
+        .split(['(', ','])
+        .find_map(|part| {
+            let (key, raw) = part.split_once('=')?;
+            if key.trim() == name {
+                raw.trim().parse::<f32>().ok()
+            } else {
+                None
+            }
+        })
 }
 
 fn format_cfr_variant(variant: RealCfrVariant) -> String {
