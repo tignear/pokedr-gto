@@ -1,14 +1,18 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import {
+  fetchActionEv,
   fetchNode,
   fetchSummary,
   fetchCombos,
   fetchEquity,
+  fetchReach,
   fetchStrategyEv,
   type ViewerBranch,
+  type ViewerActionEv,
   type ViewerCombo,
   type ViewerEquity,
+  type ViewerReach,
   type ViewerStrategyEv,
   type ViewerNodeListItem,
   type ViewerNode,
@@ -18,28 +22,18 @@ import "./styles.css";
 
 const ranks = ["A", "K", "Q", "J", "T", "9", "8", "7", "6", "5", "4", "3", "2"];
 const actionHues = [204, 142, 36, 0, 278, 318];
+const displayReachEpsilon = 1e-6;
 
 type SelectedCell = {
   className: string;
   combos: ComboAggregate[];
+  actions: ViewerNode["actions"];
 };
 
 type ComboAggregate = {
   combo: ViewerCombo;
   frequency: number;
-};
-
-type ChanceBucket = {
-  label: string;
-  count: number;
-};
-
-type ChanceAnalysis = {
-  total: number;
-  ranks: ChanceBucket[];
-  suits: ChanceBucket[];
-  pairing: ChanceBucket[];
-  textures: ChanceBucket[];
+  actionMix: number[];
 };
 
 function App() {
@@ -50,7 +44,9 @@ function App() {
   const [selectedAction, setSelectedAction] = useState(0);
   const [selectedCell, setSelectedCell] = useState<SelectedCell | null>(null);
   const [equity, setEquity] = useState<ViewerEquity | null>(null);
+  const [reach, setReach] = useState<ViewerReach | null>(null);
   const [strategyEv, setStrategyEv] = useState<ViewerStrategyEv | null>(null);
+  const [actionEv, setActionEv] = useState<ViewerActionEv | null>(null);
   const [chanceEquities, setChanceEquities] = useState<Map<number, ViewerEquity>>(new Map());
   const [chanceStrategyEvs, setChanceStrategyEvs] = useState<Map<number, ViewerStrategyEv>>(
     new Map()
@@ -77,6 +73,25 @@ function App() {
 
   useEffect(() => {
     let cancelled = false;
+    setReach(null);
+    fetchReach(selectedNodeId)
+      .then((value) => {
+        if (!cancelled) {
+          setReach(value);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setReach(null);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedNodeId]);
+
+  useEffect(() => {
+    let cancelled = false;
     setStrategyEv(null);
     fetchStrategyEv(selectedNodeId)
       .then((value) => {
@@ -87,6 +102,25 @@ function App() {
       .catch(() => {
         if (!cancelled) {
           setStrategyEv(null);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedNodeId]);
+
+  useEffect(() => {
+    let cancelled = false;
+    setActionEv(null);
+    fetchActionEv(selectedNodeId)
+      .then((value) => {
+        if (!cancelled) {
+          setActionEv(value);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setActionEv(null);
         }
       });
     return () => {
@@ -165,13 +199,14 @@ function App() {
   const solutionCombos = useSolutionCombos();
   const allActingCombos =
     selectedNode?.strategy?.player === "oop" ? solutionCombos.oop : solutionCombos.ip;
+  const actingReach = selectedNode?.strategy?.player === "oop" ? reach?.oop : reach?.ip;
   const actingCombos = useMemo(
-    () => liveCombosForBoard(allActingCombos, selectedNode?.board ?? ""),
-    [allActingCombos, selectedNode?.board]
+    () => (actingReach ? liveCombosForBoard(allActingCombos, selectedNode?.board ?? "") : []),
+    [actingReach, allActingCombos, selectedNode?.board]
   );
   const actionBreakdown = useMemo(
-    () => actionFrequencies(selectedNode, actingCombos),
-    [actingCombos, selectedNode]
+    () => actionFrequencies(selectedNode, actingCombos, actingReach ?? null),
+    [actingCombos, actingReach, selectedNode]
   );
 
   if (error) {
@@ -219,13 +254,14 @@ function App() {
         <section className="matrixPanel">
           <div className="panelHeader">
             <div>
-              <h2>
-                node {selectedNode.id} · {selectedNode.kind}
-              </h2>
-              <p>
-                {selectedNode.street} · board {selectedNode.board} · pot{" "}
-                {selectedNode.pot_bb.toFixed(2)}bb · acting {selectedNode.player}
-              </p>
+              <h2>{selectedNode.kind}</h2>
+              <div className="boardLine">
+                <CardPair label={selectedNode.board} preserveOrder />
+                <span>
+                  {selectedNode.street} · pot {selectedNode.pot_bb.toFixed(2)}bb · acting{" "}
+                  {selectedNode.player}
+                </span>
+              </div>
             </div>
             <div className="actionTabs">
               {selectedNode.actions.map((candidate) => (
@@ -250,13 +286,22 @@ function App() {
             </div>
           </div>
 
-          {selectedNode.strategy ? (
+          {selectedNode.kind === "chance" ? (
+            <ChanceMatrixReplacement
+              node={selectedNode}
+              parentEquity={equity}
+              parentStrategyEv={strategyEv}
+              childEquities={chanceEquities}
+              childStrategyEvs={chanceStrategyEvs}
+              onSelect={setSelectedNodeId}
+            />
+          ) : selectedNode.strategy ? (
             <div className="matrixShell">
               <HandMatrix
                 node={selectedNode}
                 combos={actingCombos}
-                actionIndex={selectedAction}
-                actionHue={actionHue(selectedAction)}
+                reach={actingReach ?? null}
+                selectedAction={selectedAction}
                 onSelect={setSelectedCell}
               />
             </div>
@@ -275,7 +320,7 @@ function App() {
               <div className="actionLabel">{action.label}</div>
               {action.child !== null && (
                 <button className="follow" onClick={() => setSelectedNodeId(action.child!)}>
-                  follow to node {action.child}
+                  follow action
                 </button>
               )}
             </>
@@ -288,10 +333,38 @@ function App() {
             <div>
               <div className="handClass">{selectedCell.className}</div>
               <div className="comboList">
-                {selectedCell.combos.map(({ combo, frequency }) => (
+                {selectedCell.combos.map(({ combo, actionMix }) => (
                   <div key={combo.index} className="comboRow">
                     <CardPair label={combo.label} />
-                    <span>{(frequency * 100).toFixed(1)}%</span>
+                    <div className="comboStrategy">
+                      <StrategyBar mix={actionMix} actions={selectedCell.actions} />
+                      <div className="comboActions">
+                        {selectedCell.actions.map((action) => (
+                          <span key={action.index}>
+                            <i
+                              style={
+                                {
+                                  background: `hsl(${actionHue(action.index)} 82% 54% / 0.9)`
+                                } as React.CSSProperties
+                              }
+                            />
+                            <em>{action.label}</em>
+                            <strong>{((actionMix[action.index] ?? 0) * 100).toFixed(1)}%</strong>
+                            {actionEv &&
+                              actionEv.player === selectedNode.strategy?.player &&
+                              action.index < actionEv.actions && (
+                                <b>
+                                  {formatSignedBb(
+                                    actionEv.action_major_bb[
+                                      action.index * actionEv.combos + combo.index
+                                    ] ?? 0
+                                  )}
+                                </b>
+                              )}
+                          </span>
+                        ))}
+                      </div>
+                    </div>
                   </div>
                 ))}
               </div>
@@ -302,6 +375,24 @@ function App() {
         </aside>
       </section>
     </main>
+  );
+}
+
+function StrategyBar({ mix, actions }: { mix: number[]; actions: ViewerNode["actions"] }) {
+  return (
+    <div className="strategyBar" aria-hidden="true">
+      {actions.map((action) => (
+        <i
+          key={action.index}
+          style={
+            {
+              width: `${Math.max(0, mix[action.index] ?? 0) * 100}%`,
+              background: `hsl(${actionHue(action.index)} 82% 54% / 0.9)`
+            } as React.CSSProperties
+          }
+        />
+      ))}
+    </div>
   );
 }
 
@@ -400,12 +491,12 @@ function formatSignedBb(value: number) {
   return `${value >= 0 ? "+" : ""}${value.toFixed(2)}bb`;
 }
 
-function actionFrequencies(node: ViewerNode | null, combos: ViewerCombo[]) {
+function actionFrequencies(node: ViewerNode | null, combos: ViewerCombo[], reach: number[] | null) {
   const strategy = node?.strategy;
-  if (!node || !strategy || combos.length === 0) {
+  if (!node || !strategy || combos.length === 0 || !reach) {
     return [];
   }
-  const totalWeight = combos.reduce((sum, combo) => sum + combo.weight, 0);
+  const totalWeight = combos.reduce((sum, combo) => sum + (reach[combo.index] ?? 0), 0);
   if (totalWeight <= 0) {
     return [];
   }
@@ -413,7 +504,7 @@ function actionFrequencies(node: ViewerNode | null, combos: ViewerCombo[]) {
     let weighted = 0;
     for (const combo of combos) {
       const value = strategy.action_major[action.index * strategy.combos + combo.index] ?? 0;
-      weighted += value * combo.weight;
+      weighted += value * (reach[combo.index] ?? 0);
     }
     return weighted / totalWeight;
   });
@@ -452,6 +543,12 @@ function TreePanel({
   onSelect: (id: number) => void;
   onReset: () => void;
 }) {
+  const selectedPathItem = useRef<HTMLButtonElement | null>(null);
+
+  useEffect(() => {
+    selectedPathItem.current?.scrollIntoView({ block: "nearest" });
+  }, [path, selected]);
+
   return (
     <aside className="nodes">
       <h2>Tree</h2>
@@ -459,21 +556,29 @@ function TreePanel({
         root
       </button>
       <div className="pathStack">
-        {path.map((node) => (
-          <button
-            key={node.id}
-            className={node.id === selected ? "selected" : ""}
-            onClick={() => onSelect(node.id)}
-          >
-            <span>#{node.id}</span>
-            <span>{node.kind}</span>
-            <span>{node.board}</span>
-          </button>
-        ))}
+        {path.map((node, index) => {
+          const previous = index > 0 ? path[index - 1] : null;
+          const step = previous ? pathStepLabel(previous, node) : "root";
+          const addedCards = previous?.kind === "chance" ? addedBoardCards(previous.board, step) : [];
+          const actingPlayer = previous?.kind === "decision" ? previous.player : null;
+          return (
+            <button
+              ref={node.id === selected ? selectedPathItem : null}
+              key={node.id}
+              className={node.id === selected ? "selected" : ""}
+              onClick={() => onSelect(node.id)}
+            >
+              <span className="pathStep">
+                {actingPlayer && <PlayerBadge player={actingPlayer} />}
+                {addedCards.length > 0 ? <CardPair label={addedCards.join("")} /> : step}
+              </span>
+            </button>
+          );
+        })}
       </div>
       <h2 className="branchTitle">Branches</h2>
-      <ChanceAnalysisPanel analysis={analyzeChanceChoices(node)} />
       <BranchList
+        node={node}
         choices={node.choices}
         parentEquity={equity}
         parentStrategyEv={strategyEv}
@@ -485,43 +590,12 @@ function TreePanel({
   );
 }
 
-function ChanceAnalysisPanel({ analysis }: { analysis: ChanceAnalysis | null }) {
-  if (!analysis) {
-    return null;
-  }
-  return (
-    <section className="chanceAnalysis" aria-label="chance node set analysis">
-      <div className="chanceSummary">
-        <span>chance set</span>
-        <strong>{analysis.total}</strong>
-      </div>
-      <BucketRow title="rank" buckets={analysis.ranks} />
-      <BucketRow title="suit" buckets={analysis.suits} />
-      <BucketRow title="pairing" buckets={analysis.pairing} />
-      <BucketRow title="texture" buckets={analysis.textures} />
-    </section>
-  );
-}
-
-function BucketRow({ title, buckets }: { title: string; buckets: ChanceBucket[] }) {
-  if (buckets.length === 0) {
-    return null;
-  }
-  return (
-    <div className="bucketRow">
-      <span>{title}</span>
-      <div>
-        {buckets.map((bucket) => (
-          <small key={bucket.label}>
-            {bucket.label} <strong>{bucket.count}</strong>
-          </small>
-        ))}
-      </div>
-    </div>
-  );
+function pathStepLabel(previous: ViewerNodeListItem, node: ViewerNodeListItem) {
+  return previous.choices.find((choice) => choice.child === node.id)?.label ?? "unknown";
 }
 
 function BranchList({
+  node,
   choices,
   parentEquity,
   parentStrategyEv,
@@ -529,6 +603,7 @@ function BranchList({
   childStrategyEvs,
   onSelect
 }: {
+  node: ViewerNode;
   choices: ViewerBranch[];
   parentEquity: ViewerEquity | null;
   parentStrategyEv: ViewerStrategyEv | null;
@@ -543,7 +618,7 @@ function BranchList({
     <div className="branchList">
       {choices.map((choice) => (
         <button key={choice.child} onClick={() => onSelect(choice.child)}>
-          <span>{choice.label}</span>
+          <BranchLabel node={node} choice={choice} />
           {(childEquities.has(choice.child) || childStrategyEvs.has(choice.child)) && (
             <span className="branchEquity">
               {childEquities.has(choice.child) && (
@@ -573,10 +648,128 @@ function BranchList({
               )}
             </span>
           )}
-          <small>#{choice.child}</small>
         </button>
       ))}
     </div>
+  );
+}
+
+function BranchLabel({ node, choice }: { node: ViewerNode; choice: ViewerBranch }) {
+  const addedCards = node.kind === "chance" ? addedBoardCards(node.board, choice.label) : [];
+  if (addedCards.length === 0) {
+    return (
+      <span className="branchActionLabel">
+        {node.kind === "decision" && <PlayerBadge player={node.player} />}
+        <span>{choice.label}</span>
+      </span>
+    );
+  }
+  return (
+    <span className="branchCardLabel" title={choice.label}>
+      <CardPair label={addedCards.join("")} />
+    </span>
+  );
+}
+
+function PlayerBadge({ player }: { player: "oop" | "ip" }) {
+  return <em className={`playerBadge ${player}`}>{player.toUpperCase()}</em>;
+}
+
+function ChanceMatrixReplacement({
+  node,
+  parentEquity,
+  parentStrategyEv,
+  childEquities,
+  childStrategyEvs,
+  onSelect
+}: {
+  node: ViewerNode;
+  parentEquity: ViewerEquity | null;
+  parentStrategyEv: ViewerStrategyEv | null;
+  childEquities: Map<number, ViewerEquity>;
+  childStrategyEvs: Map<number, ViewerStrategyEv>;
+  onSelect: (id: number) => void;
+}) {
+  const rows = useMemo(
+    () =>
+      node.choices
+        .map((choice) => {
+          const added = addedBoardCards(node.board, choice.label);
+          const card = added[0] ?? choice.label;
+          const equity = childEquities.get(choice.child) ?? null;
+          const strategyEv = childStrategyEvs.get(choice.child) ?? null;
+          return {
+            choice,
+            card,
+            equity,
+            strategyEv,
+            oopEquityDelta:
+              equity && parentEquity ? equity.oop_equity - parentEquity.oop_equity : null,
+            ipEquityDelta: equity && parentEquity ? equity.ip_equity - parentEquity.ip_equity : null,
+            oopEvDelta:
+              strategyEv && parentStrategyEv
+                ? strategyEv.oop_ev_bb - parentStrategyEv.oop_ev_bb
+                : null,
+            ipEvDelta:
+              strategyEv && parentStrategyEv ? strategyEv.ip_ev_bb - parentStrategyEv.ip_ev_bb : null
+          };
+        })
+        .sort((left, right) => {
+          const leftValue = left.oopEvDelta ?? left.oopEquityDelta ?? 0;
+          const rightValue = right.oopEvDelta ?? right.oopEquityDelta ?? 0;
+          return rightValue - leftValue || cardSortValue(right.card) - cardSortValue(left.card);
+        }),
+    [childEquities, childStrategyEvs, node.board, node.choices, parentEquity, parentStrategyEv]
+  );
+  const evScale = Math.max(0.01, ...rows.map((row) => Math.abs(row.oopEvDelta ?? 0)));
+
+  return (
+    <section className="chanceBoardPanel">
+      <div className="chanceListHeader">
+        <span>card {node.choices.length}</span>
+        <span>OOP EV</span>
+        <span>OOP EQ</span>
+      </div>
+      <div className="chanceCardGrid">
+        {rows.map((row) => (
+          <button key={row.choice.child} onClick={() => onSelect(row.choice.child)}>
+            <CardPair label={row.card} />
+            <span className="chanceEvCell">
+              <strong>OOP EV</strong>
+              {row.oopEvDelta !== null ? (
+                <>
+                  <ChanceDeltaBar value={row.oopEvDelta} scale={evScale} />
+                  <em>{formatSignedBb(row.oopEvDelta)}</em>
+                </>
+              ) : (
+                "loading"
+              )}
+            </span>
+            <span>
+              <strong>OOP EQ</strong>
+              {row.oopEquityDelta !== null ? formatSignedPercent(row.oopEquityDelta) : "loading"}
+            </span>
+          </button>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function ChanceDeltaBar({ value, scale }: { value: number; scale: number }) {
+  const width = `${Math.min(50, (Math.abs(value) / scale) * 50)}%`;
+  return (
+    <i className="chanceDeltaBar" aria-hidden="true">
+      <b
+        className={value >= 0 ? "positive" : "negative"}
+        style={
+          {
+            left: value >= 0 ? "50%" : `calc(50% - ${width})`,
+            width
+          } as React.CSSProperties
+        }
+      />
+    </i>
   );
 }
 
@@ -588,62 +781,128 @@ function formatSignedPercent(value: number) {
 function HandMatrix({
   node,
   combos,
-  actionIndex,
-  actionHue,
+  reach,
+  selectedAction,
   onSelect
 }: {
   node: ViewerNode;
   combos: ViewerCombo[];
-  actionIndex: number;
-  actionHue: number;
+  reach: number[] | null;
+  selectedAction: number;
   onSelect: (cell: SelectedCell) => void;
 }) {
   const cells = useMemo(() => {
-    const byClass = new Map<string, ComboAggregate[]>();
+    const byClass = new Map<
+      string,
+      {
+        selectedCombos: ComboAggregate[];
+        actionMix: number[];
+        totalWeight: number;
+        baseWeight: number;
+      }
+    >();
     const strategy = node.strategy;
-    if (!strategy) {
+    if (!strategy || !reach) {
       return byClass;
     }
+    const actions = node.actions.length;
     for (const combo of combos) {
-      const frequency = strategy.action_major[actionIndex * strategy.combos + combo.index] ?? 0;
-      const list = byClass.get(combo.class) ?? [];
-      list.push({ combo, frequency });
-      byClass.set(combo.class, list);
+      const comboReach = reach[combo.index] ?? 0;
+      if (comboReach <= displayReachEpsilon) {
+        continue;
+      }
+      const entry =
+        byClass.get(combo.class) ?? {
+          selectedCombos: [],
+          actionMix: Array.from({ length: actions }, () => 0),
+          totalWeight: 0,
+          baseWeight: 0
+        };
+      entry.baseWeight += combo.weight;
+      entry.totalWeight += comboReach;
+      const selectedFrequency =
+        strategy.action_major[selectedAction * strategy.combos + combo.index] ?? 0;
+      if (comboReach > displayReachEpsilon) {
+        const comboActionMix = Array.from({ length: actions }, (_, actionIndex) =>
+          node.actions.some((action) => action.index === actionIndex)
+            ? (strategy.action_major[actionIndex * strategy.combos + combo.index] ?? 0)
+            : 0
+        );
+        entry.selectedCombos.push({
+          combo,
+          frequency: selectedFrequency,
+          actionMix: comboActionMix
+        });
+        for (const action of node.actions) {
+          const frequency = strategy.action_major[action.index * strategy.combos + combo.index] ?? 0;
+          entry.actionMix[action.index] += frequency * comboReach;
+        }
+      }
+      byClass.set(combo.class, entry);
+    }
+    for (const entry of byClass.values()) {
+      if (entry.totalWeight > 0) {
+        for (const action of node.actions) {
+          entry.actionMix[action.index] /= entry.totalWeight;
+        }
+      }
     }
     return byClass;
-  }, [actionIndex, combos, node.strategy]);
+  }, [combos, node.actions, node.strategy, reach, selectedAction]);
 
   return (
     <div className="matrix">
       {ranks.map((row, rowIndex) =>
         ranks.map((col, colIndex) => {
           const className = handClass(row, col, rowIndex, colIndex);
-          const entries = cells.get(className) ?? [];
-          const totalWeight = entries.reduce((sum, entry) => sum + entry.combo.weight, 0);
-          const average =
-            totalWeight === 0
-              ? 0
-              : entries.reduce((sum, entry) => sum + entry.frequency * entry.combo.weight, 0) /
-                totalWeight;
+          const entry = cells.get(className) ?? null;
+          const entries = entry?.selectedCombos ?? [];
+          const reachFraction =
+            entry?.baseWeight && entry.baseWeight > 0
+              ? Math.min(1, Math.max(0, entry.totalWeight / entry.baseWeight))
+              : 0;
+          const selectedAverage =
+            entry?.totalWeight && entry.totalWeight > 0
+              ? entries.reduce(
+                  (sum, combo) => sum + combo.frequency * (reach?.[combo.combo.index] ?? 0),
+                  0
+                ) /
+                entry.totalWeight
+              : 0;
           return (
             <button
               key={className}
               className={entries.length === 0 ? "cell empty" : "cell"}
               disabled={entries.length === 0}
-              style={
-                {
-                  "--freq": average,
-                  "--action-hue": actionHue
-                } as React.CSSProperties
-              }
               onClick={() => {
                 if (entries.length > 0) {
-                  onSelect({ className, combos: entries });
+                  onSelect({ className, combos: entries, actions: node.actions });
                 }
               }}
             >
+              {entry && (
+                <i
+                  className="cellMix"
+                  aria-hidden="true"
+                  style={{ height: `${reachFraction * 100}%` } as React.CSSProperties}
+                >
+                  {node.actions.map((action) => (
+                    <b
+                      key={action.index}
+                      style={
+                        {
+                          width: `${Math.max(0, entry.actionMix[action.index] ?? 0) * 100}%`,
+                          background: `hsl(${actionHue(action.index)} 82% 54% / 0.78)`
+                        } as React.CSSProperties
+                      }
+                    />
+                  ))}
+                </i>
+              )}
               <span>{className}</span>
-              <strong>{entries.length === 0 ? "dead" : `${(average * 100).toFixed(0)}%`}</strong>
+              <strong>
+                {entries.length === 0 ? "dead" : `${(selectedAverage * 100).toFixed(0)}%`}
+              </strong>
             </button>
           );
         })
@@ -662,89 +921,10 @@ function handClass(row: string, col: string, rowIndex: number, colIndex: number)
   return `${col}${row}o`;
 }
 
-function analyzeChanceChoices(node: ViewerNode): ChanceAnalysis | null {
-  if (node.kind !== "chance" || node.choices.length === 0) {
-    return null;
-  }
-
-  const parentCards = splitCards(node.board);
-  const parentSet = new Set(parentCards);
-  const rankCounts = new Map<string, number>();
-  const suitCounts = new Map<string, number>();
-  const pairingCounts = new Map<string, number>();
-  const textureCounts = new Map<string, number>();
-
-  for (const choice of node.choices) {
-    const childCards = splitCards(choice.label);
-    const added = childCards.filter((card) => !parentSet.has(card));
-    if (added.length === 0) {
-      continue;
-    }
-
-    for (const card of added) {
-      increment(rankCounts, card[0]);
-      increment(suitCounts, suitSymbol(card));
-      increment(pairingCounts, pairingLabel(parentCards, card));
-    }
-    increment(textureCounts, boardTextureLabel(childCards));
-  }
-
-  return {
-    total: node.choices.length,
-    ranks: orderedBuckets(rankCounts, ranks),
-    suits: orderedBuckets(suitCounts, ["♠", "♥", "♦", "♣"]),
-    pairing: orderedBuckets(pairingCounts, ["blank", "pairs board", "trips board", "quads board"]),
-    textures: orderedBuckets(textureCounts, ["rainbow", "two-tone", "three-tone", "monotone"])
-  };
-}
-
-function pairingLabel(board: string[], card: string) {
-  const rankMatches = board.filter((boardCard) => boardCard[0] === card[0]).length;
-  if (rankMatches === 0) {
-    return "blank";
-  }
-  if (rankMatches === 1) {
-    return "pairs board";
-  }
-  if (rankMatches === 2) {
-    return "trips board";
-  }
-  return "quads board";
-}
-
-function boardTextureLabel(cards: string[]) {
-  const maxSuitCount = Math.max(...["s", "h", "d", "c"].map((suit) => cards.filter((card) => card[1]?.toLowerCase() === suit).length));
-  if (maxSuitCount >= 4) {
-    return "monotone";
-  }
-  if (maxSuitCount === 3) {
-    return "three-tone";
-  }
-  if (maxSuitCount === 2) {
-    return "two-tone";
-  }
-  return "rainbow";
-}
-
-function orderedBuckets(counts: Map<string, number>, order: string[]) {
-  return [...counts.entries()]
-    .map(([label, count]) => ({ label, count }))
-    .sort((left, right) => {
-      const leftOrder = order.indexOf(left.label);
-      const rightOrder = order.indexOf(right.label);
-      if (leftOrder >= 0 || rightOrder >= 0) {
-        return (leftOrder < 0 ? Number.MAX_SAFE_INTEGER : leftOrder) - (rightOrder < 0 ? Number.MAX_SAFE_INTEGER : rightOrder);
-      }
-      return right.count - left.count || left.label.localeCompare(right.label);
-    });
-}
-
-function increment(counts: Map<string, number>, key: string) {
-  counts.set(key, (counts.get(key) ?? 0) + 1);
-}
-
-function CardPair({ label }: { label: string }) {
-  const cards = splitCards(label).sort((left, right) => cardSortValue(right) - cardSortValue(left));
+function CardPair({ label, preserveOrder = false }: { label: string; preserveOrder?: boolean }) {
+  const cards = preserveOrder
+    ? splitCards(label)
+    : splitCards(label).sort((left, right) => cardSortValue(right) - cardSortValue(left));
   return (
     <span className="cardPair" aria-label={label}>
       {cards.map((card) => (
@@ -765,6 +945,11 @@ function splitCards(label: string) {
   return cards;
 }
 
+function addedBoardCards(parentBoard: string, childBoard: string) {
+  const parent = new Set(splitCards(parentBoard));
+  return splitCards(childBoard).filter((card) => !parent.has(card));
+}
+
 function cardSortValue(card: string) {
   const rankIndex = ranks.indexOf(card[0]);
   return rankIndex < 0 ? 0 : 14 - rankIndex;
@@ -772,7 +957,18 @@ function cardSortValue(card: string) {
 
 function cardSuit(card: string) {
   const suit = card[1]?.toLowerCase();
-  return suit === "h" || suit === "d" ? "red" : "black";
+  switch (suit) {
+    case "c":
+      return "clubs";
+    case "d":
+      return "diamonds";
+    case "h":
+      return "hearts";
+    case "s":
+      return "spades";
+    default:
+      return "unknown";
+  }
 }
 
 function suitSymbol(card: string) {

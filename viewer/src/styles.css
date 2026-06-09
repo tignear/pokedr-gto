@@ -87,8 +87,9 @@ p {
 }
 
 .nodes {
-  display: flex;
-  flex-direction: column;
+  display: grid;
+  grid-template-rows: auto auto minmax(220px, 0.34fr) auto minmax(0, 0.66fr);
+  gap: 10px;
 }
 
 .detail {
@@ -98,7 +99,6 @@ p {
 }
 
 .rootButton {
-  margin-top: 12px;
   width: 100%;
   padding: 8px;
   color: #d8dee9;
@@ -109,17 +109,17 @@ p {
 }
 
 .pathStack {
-  margin-top: 12px;
-  max-height: 34vh;
+  min-height: 0;
   overflow: auto;
   display: grid;
+  align-content: start;
   gap: 5px;
 }
 
 .pathStack button {
   display: grid;
-  grid-template-columns: 54px 1fr 74px;
-  gap: 6px;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 4px;
   width: 100%;
   padding: 7px;
   color: #cbd5df;
@@ -130,79 +130,48 @@ p {
   cursor: pointer;
 }
 
+.pathStep {
+  min-width: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  overflow: hidden;
+  color: #e6edf3;
+  font-weight: 700;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pathStep .playingCard {
+  width: 26px;
+  height: 34px;
+  font-size: 12px;
+}
+
+.pathStep .playingCard small {
+  font-size: 11px;
+}
+
 .pathStack button.selected {
   border-color: #6ca1ff;
   background: #223047;
 }
 
 .branchTitle {
-  margin-top: 18px;
-}
-
-.chanceAnalysis {
-  margin-top: 10px;
-  padding: 10px;
-  border: 1px solid #2f3944;
-  border-radius: 6px;
-  background: #1b2026;
-}
-
-.chanceSummary,
-.bucketRow {
-  display: grid;
-  grid-template-columns: 64px minmax(0, 1fr);
-  gap: 8px;
-  align-items: start;
-}
-
-.chanceSummary {
-  margin-bottom: 8px;
-}
-
-.chanceSummary span,
-.bucketRow > span {
-  color: #9aa7b5;
-  font-size: 12px;
-}
-
-.chanceSummary strong {
-  color: #e6edf3;
-}
-
-.bucketRow {
-  margin-top: 7px;
-}
-
-.bucketRow div {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 4px;
-}
-
-.bucketRow small {
-  padding: 2px 5px;
-  border: 1px solid #35404b;
-  border-radius: 4px;
-  background: #20262d;
-  color: #cbd5df;
-  white-space: nowrap;
-}
-
-.bucketRow strong {
-  color: #e6edf3;
+  margin: 4px 0 0;
 }
 
 .branchList {
-  margin-top: 12px;
   min-height: 0;
   overflow: auto;
   display: grid;
+  align-content: start;
   gap: 6px;
 }
 
 .branchList button {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto 48px;
+  grid-template-columns: minmax(0, 1fr) auto;
   align-items: center;
   gap: 8px;
   width: 100%;
@@ -219,6 +188,51 @@ p {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.branchCardLabel {
+  display: inline-flex;
+  align-items: center;
+  min-width: 0;
+}
+
+.branchActionLabel {
+  min-width: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.branchActionLabel > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.playerBadge {
+  flex: 0 0 auto;
+  padding: 2px 5px;
+  border-radius: 4px;
+  font-size: 10px;
+  font-style: normal;
+  font-weight: 800;
+  line-height: 1;
+  letter-spacing: 0;
+}
+
+.playerBadge.oop {
+  color: #ffd7a1;
+  background: #4a3217;
+}
+
+.playerBadge.ip {
+  color: #bde2ff;
+  background: #18364f;
+}
+
+.branchCardLabel .playingCard {
+  width: 30px;
+  height: 40px;
 }
 
 .branchEquity {
@@ -269,6 +283,36 @@ p {
   gap: 16px;
   min-height: 0;
   overflow: hidden;
+}
+
+.boardLine {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  margin-top: 6px;
+  color: #9aa7b5;
+}
+
+.boardLine .cardPair {
+  flex: 0 0 auto;
+}
+
+.boardLine .playingCard {
+  width: 32px;
+  height: 42px;
+  font-size: 14px;
+}
+
+.boardLine .playingCard small {
+  font-size: 12px;
+}
+
+.boardLine span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .actionTabs {
@@ -334,6 +378,118 @@ p {
   overflow: hidden;
 }
 
+.chanceBoardPanel {
+  min-height: 0;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  gap: 10px;
+  overflow: hidden;
+}
+
+.chanceListHeader span,
+.chanceCardGrid strong {
+  color: #9aa7b5;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.chanceListHeader {
+  display: grid;
+  grid-template-columns: 72px minmax(220px, 1.2fr) minmax(0, 0.8fr);
+  gap: 10px;
+  padding: 0 10px;
+}
+
+.chanceCardGrid {
+  min-height: 0;
+  overflow: auto;
+  display: grid;
+  align-content: start;
+  gap: 5px;
+}
+
+.chanceCardGrid button {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: 72px minmax(220px, 1.2fr) minmax(0, 0.8fr);
+  gap: 10px;
+  align-items: center;
+  padding: 6px 10px;
+  color: #e6edf3;
+  border: 1px solid #2f3944;
+  border-radius: 6px;
+  background: #1b2026;
+  text-align: left;
+  cursor: pointer;
+}
+
+.chanceCardGrid button:hover {
+  border-color: #69d2a0;
+  background: #1f3a32;
+}
+
+.chanceCardGrid button > span {
+  min-width: 0;
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.chanceCardGrid .chanceEvCell {
+  display: grid;
+  grid-template-columns: auto minmax(120px, 1fr) auto;
+  align-items: center;
+}
+
+.chanceDeltaBar {
+  position: relative;
+  height: 10px;
+  overflow: hidden;
+  border: 1px solid #303a45;
+  border-radius: 999px;
+  background:
+    linear-gradient(90deg, transparent calc(50% - 1px), #526172 calc(50% - 1px), #526172 calc(50% + 1px), transparent calc(50% + 1px)),
+    #12171c;
+}
+
+.chanceDeltaBar b {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+}
+
+.chanceDeltaBar b.positive {
+  background: #69d2a0;
+}
+
+.chanceDeltaBar b.negative {
+  background: #d06472;
+}
+
+.chanceCardGrid em {
+  color: #9aa7b5;
+  font-style: normal;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.chanceCardGrid button > span:not(em),
+.chanceCardGrid strong {
+  min-width: 0;
+}
+
+.chanceCardGrid .playingCard {
+  width: 24px;
+  height: 32px;
+  font-size: 12px;
+}
+
+.chanceCardGrid .playingCard small {
+  font-size: 11px;
+}
+
 .matrix {
   display: grid;
   grid-template-columns: repeat(13, 1fr);
@@ -345,6 +501,7 @@ p {
 }
 
 .cell {
+  position: relative;
   aspect-ratio: 1;
   min-width: 0;
   min-height: 0;
@@ -352,16 +509,9 @@ p {
   border: 1px solid #2f3944;
   border-radius: 4px;
   color: #e6edf3;
-  background:
-    linear-gradient(
-      to top,
-      hsl(var(--action-hue) 82% 54% / calc(0.16 + var(--freq) * 0.82)) 0%,
-      hsl(var(--action-hue) 82% 54% / calc(0.16 + var(--freq) * 0.82))
-        calc(var(--freq) * 100%),
-      #1b2026 calc(var(--freq) * 100%),
-      #1b2026 100%
-    );
+  background: #1b2026;
   cursor: pointer;
+  overflow: hidden;
 }
 
 .cell.empty {
@@ -374,7 +524,24 @@ p {
 
 .cell span,
 .cell strong {
+  position: relative;
+  z-index: 1;
   display: block;
+  text-shadow: 0 1px 2px rgb(0 0 0 / 0.64);
+}
+
+.cellMix {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  display: flex;
+  opacity: 0.92;
+}
+
+.cellMix b {
+  min-width: 0;
+  height: 100%;
 }
 
 .cell span {
@@ -491,12 +658,67 @@ p {
 }
 
 .comboRow {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: start;
   gap: 10px;
-  padding: 5px 0;
+  padding: 8px 0;
   border-bottom: 1px solid #252d36;
+}
+
+.comboStrategy {
+  min-width: 0;
+  display: grid;
+  gap: 6px;
+}
+
+.strategyBar {
+  height: 10px;
+  display: flex;
+  overflow: hidden;
+  border: 1px solid #35404b;
+  border-radius: 3px;
+  background: #14181d;
+}
+
+.strategyBar i {
+  min-width: 0;
+}
+
+.comboActions {
+  display: grid;
+  gap: 4px;
+}
+
+.comboActions span {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: 8px minmax(0, 1fr) auto auto;
+  gap: 6px;
+  align-items: center;
+  color: #cbd5df;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.comboActions i {
+  width: 8px;
+  height: 8px;
+  border-radius: 2px;
+}
+
+.comboActions em {
+  min-width: 0;
+  overflow: hidden;
+  color: #9aa7b5;
+  font-style: normal;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.comboActions b {
+  color: #e6edf3;
+  font-weight: 800;
 }
 
 .cardPair {
@@ -510,6 +732,7 @@ p {
   display: grid;
   place-items: center;
   border: 1px solid #d7dee8;
+  border-left-width: 4px;
   border-radius: 4px;
   background: #f5f7fa;
   color: #14181d;
@@ -520,15 +743,37 @@ p {
 
 .playingCard small {
   margin-top: -3px;
+  color: currentColor;
   font-size: 13px;
+  font-weight: 900;
 }
 
-.playingCard.red {
-  color: #c92f43;
+.playingCard.clubs {
+  border-left-color: #208454;
+  background: #eef8f2;
+  color: #208454;
 }
 
-.playingCard.black {
-  color: #171b20;
+.playingCard.diamonds {
+  border-left-color: #2a6fe8;
+  background: #eef4ff;
+  color: #1f61d0;
+}
+
+.playingCard.hearts {
+  border-left-color: #df3548;
+  background: #fff0f2;
+  color: #cc2539;
+}
+
+.playingCard.spades {
+  border-left-color: #252a31;
+  background: #f1f3f5;
+  color: #252a31;
+}
+
+.playingCard.unknown {
+  color: #14181d;
 }
 
 .loading,

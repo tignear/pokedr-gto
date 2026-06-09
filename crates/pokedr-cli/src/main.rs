@@ -1193,6 +1193,23 @@ struct ViewerStrategyEv {
     terminal_evals: usize,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct ViewerActionEv {
+    board: String,
+    pot_bb: f32,
+    player: String,
+    combos: usize,
+    actions: usize,
+    action_major_bb: Vec<f32>,
+    terminal_evals: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ViewerReach {
+    oop: Vec<f32>,
+    ip: Vec<f32>,
+}
+
 fn viewer_solution_from_snapshot(
     snapshot: NodeLocalSolutionSnapshot,
     request: FlopTreeRequest,
@@ -1329,6 +1346,8 @@ struct ViewerState {
     solver: Arc<Mutex<NodeLocalCfrSolver>>,
     equity_cache: Arc<Mutex<HashMap<usize, ViewerEquity>>>,
     strategy_ev_cache: Arc<Mutex<HashMap<usize, ViewerStrategyEv>>>,
+    action_ev_cache: Arc<Mutex<HashMap<usize, ViewerActionEv>>>,
+    reach_cache: Arc<Mutex<HashMap<usize, ViewerReach>>>,
 }
 
 fn serve_viewer(
@@ -1342,11 +1361,15 @@ fn serve_viewer(
         solver: Arc::new(Mutex::new(viewer.solver)),
         equity_cache: Arc::new(Mutex::new(HashMap::new())),
         strategy_ev_cache: Arc::new(Mutex::new(HashMap::new())),
+        action_ev_cache: Arc::new(Mutex::new(HashMap::new())),
+        reach_cache: Arc::new(Mutex::new(HashMap::new())),
     };
     let api = Router::new()
         .route("/combos", get(api_combos))
         .route("/equity/{id}", get(api_equity))
+        .route("/reach/{id}", get(api_reach))
         .route("/strategy-ev/{id}", get(api_strategy_ev))
+        .route("/action-ev/{id}", get(api_action_ev))
         .route("/summary", get(api_summary))
         .route("/node/{id}", get(api_node))
         .with_state(state);
@@ -1428,6 +1451,38 @@ async fn api_equity(Path(id): Path<usize>, State(state): State<ViewerState>) -> 
     }
 }
 
+async fn api_reach(Path(id): Path<usize>, State(state): State<ViewerState>) -> impl IntoResponse {
+    if let Some(cached) = state
+        .reach_cache
+        .lock()
+        .expect("reach cache poisoned")
+        .get(&id)
+    {
+        return Json(cached.clone()).into_response();
+    }
+    match state
+        .solver
+        .lock()
+        .expect("viewer solver poisoned")
+        .display_reach_at_node(id)
+    {
+        Ok((oop, ip)) => {
+            let value = ViewerReach { oop, ip };
+            state
+                .reach_cache
+                .lock()
+                .expect("reach cache poisoned")
+                .insert(id, value.clone());
+            Json(value).into_response()
+        }
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": error })),
+        )
+            .into_response(),
+    }
+}
+
 async fn api_strategy_ev(
     Path(id): Path<usize>,
     State(state): State<ViewerState>,
@@ -1460,6 +1515,53 @@ async fn api_strategy_ev(
                 .strategy_ev_cache
                 .lock()
                 .expect("strategy EV cache poisoned")
+                .insert(id, value.clone());
+            Json(value).into_response()
+        }
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": error })),
+        )
+            .into_response(),
+    }
+}
+
+async fn api_action_ev(
+    Path(id): Path<usize>,
+    State(state): State<ViewerState>,
+) -> impl IntoResponse {
+    if let Some(cached) = state
+        .action_ev_cache
+        .lock()
+        .expect("action EV cache poisoned")
+        .get(&id)
+    {
+        return Json(cached.clone()).into_response();
+    }
+    match state
+        .solver
+        .lock()
+        .expect("viewer solver poisoned")
+        .action_ev_at_node(id)
+    {
+        Ok(ev) => {
+            let value = ViewerActionEv {
+                board: ev.board.to_string(),
+                pot_bb: ev.pot as f32 / 100.0,
+                player: format_player(ev.player),
+                combos: ev.combos,
+                actions: ev.actions,
+                action_major_bb: ev
+                    .action_major
+                    .into_iter()
+                    .map(|value| value / 100.0)
+                    .collect(),
+                terminal_evals: ev.terminal_evals,
+            };
+            state
+                .action_ev_cache
+                .lock()
+                .expect("action EV cache poisoned")
                 .insert(id, value.clone());
             Json(value).into_response()
         }

@@ -82,6 +82,21 @@ export type ViewerStrategyEv = {
   terminal_evals: number;
 };
 
+export type ViewerActionEv = {
+  board: string;
+  pot_bb: number;
+  player: "oop" | "ip";
+  combos: number;
+  actions: number;
+  action_major_bb: number[];
+  terminal_evals: number;
+};
+
+export type ViewerReach = {
+  oop: number[];
+  ip: number[];
+};
+
 export async function fetchSummary(): Promise<ViewerSummary> {
   return fetchJson("/api/summary");
 }
@@ -100,6 +115,14 @@ export async function fetchEquity(id: number): Promise<ViewerEquity> {
 
 export async function fetchStrategyEv(id: number): Promise<ViewerStrategyEv> {
   return fetchJson(`/api/strategy-ev/${id}`);
+}
+
+export async function fetchActionEv(id: number): Promise<ViewerActionEv> {
+  return fetchJson(`/api/action-ev/${id}`);
+}
+
+export async function fetchReach(id: number): Promise<ViewerReach> {
+  return fetchJson(`/api/reach/${id}`);
 }
 
 async function fetchJson<T>(url: string): Promise<T> {

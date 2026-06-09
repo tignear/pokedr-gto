@@ -376,8 +376,8 @@ impl TreeBuilder {
                     let child = self.build_state(tree, next, depth + 1);
                     tree.nodes[id].children.push(child);
                 }
-                Transition::Terminal(reason) => {
-                    let child = self.push_terminal(tree, state.clone(), reason);
+                Transition::Terminal(terminal_state, reason) => {
+                    let child = self.push_terminal(tree, terminal_state, reason);
                     tree.nodes[id].children.push(child);
                 }
                 Transition::Chance(next_state) => {
@@ -669,7 +669,7 @@ impl TreeBuilder {
 
     fn apply_action(&self, state: &PublicState, action: ActionKind) -> Transition {
         match action {
-            ActionKind::Fold => Transition::Terminal(TerminalReason::Fold),
+            ActionKind::Fold => Transition::Terminal(state.clone(), TerminalReason::Fold),
             ActionKind::Check => {
                 if state.checks_this_street >= 1 {
                     return self.close_street(state, false);
@@ -712,7 +712,7 @@ impl TreeBuilder {
                 let opponent_commit = commit_for(&next, state.player.other());
                 let actor_commit = commit_for(&next, state.player);
                 if opponent_commit == actor_commit {
-                    Transition::Terminal(TerminalReason::AllIn)
+                    Transition::Terminal(next, TerminalReason::AllIn)
                 } else {
                     next.raises_this_street += 1;
                     next.can_donk = false;
@@ -725,10 +725,10 @@ impl TreeBuilder {
 
     fn close_street(&self, state: &PublicState, can_donk_next_street: bool) -> Transition {
         if state.oop_stack == 0 || state.ip_stack == 0 {
-            return Transition::Terminal(TerminalReason::AllIn);
+            return Transition::Terminal(state.clone(), TerminalReason::AllIn);
         }
         let Some(next_street) = state.street.next() else {
-            return Transition::Terminal(TerminalReason::Showdown);
+            return Transition::Terminal(state.clone(), TerminalReason::Showdown);
         };
         let mut next = state.clone();
         next.street = next_street;
@@ -777,7 +777,7 @@ impl PublicTree {
 enum Transition {
     State(PublicState),
     Chance(PublicState),
-    Terminal(TerminalReason),
+    Terminal(PublicState, TerminalReason),
 }
 
 fn to_call(state: &PublicState) -> u32 {
@@ -1193,5 +1193,56 @@ mod tests {
                 .iter()
                 .any(|action| matches!(action, ActionKind::Call { amount: 900 }))
         );
+    }
+
+    #[test]
+    fn all_in_call_terminal_keeps_called_pot_and_commits() {
+        let builder = TreeBuilder::new(TreeTemplate {
+            action_abstraction: ActionAbstraction::postflop_solver_basic(),
+            chance_expansion: ChanceExpansion::TemplateOnly,
+        })
+        .unwrap();
+        let tree = builder
+            .build(Spot {
+                board: Board::from_str("Td9d6h").unwrap(),
+                pot: 200,
+                effective_stack: 900,
+                oop_range: RangeSpec::full_deck_uniform(),
+                ip_range: RangeSpec::full_deck_uniform(),
+                first_player: Player::Oop,
+            })
+            .unwrap();
+        let root = &tree.nodes[0];
+        let PublicNodeKind::Decision { actions, .. } = &root.kind else {
+            panic!("root must be decision");
+        };
+        let all_in_child = actions
+            .iter()
+            .position(|action| matches!(action, ActionKind::AllIn { to: 900 }))
+            .and_then(|index| root.children.get(index))
+            .copied()
+            .expect("root should include all-in");
+        let response = &tree.nodes[all_in_child];
+        let PublicNodeKind::Decision { actions, .. } = &response.kind else {
+            panic!("all-in open must give the opponent a response");
+        };
+        let call_terminal = actions
+            .iter()
+            .position(|action| matches!(action, ActionKind::Call { amount: 900 }))
+            .and_then(|index| response.children.get(index))
+            .copied()
+            .expect("all-in response should include call");
+        let terminal = &tree.nodes[call_terminal];
+        assert!(matches!(
+            terminal.kind,
+            PublicNodeKind::Terminal {
+                reason: TerminalReason::AllIn
+            }
+        ));
+        assert_eq!(terminal.state.pot, 2000);
+        assert_eq!(terminal.state.oop_stack, 0);
+        assert_eq!(terminal.state.ip_stack, 0);
+        assert_eq!(terminal.state.oop_street_commit, 900);
+        assert_eq!(terminal.state.ip_street_commit, 900);
     }
 }
