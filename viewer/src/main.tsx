@@ -112,6 +112,16 @@ function App() {
   useEffect(() => {
     let cancelled = false;
     setActionEv(null);
+    if (
+      !selectedCell ||
+      !selectedNode ||
+      selectedNode.id !== selectedNodeId ||
+      selectedNode.kind !== "decision"
+    ) {
+      return () => {
+        cancelled = true;
+      };
+    }
     fetchActionEv(selectedNodeId)
       .then((value) => {
         if (!cancelled) {
@@ -126,7 +136,7 @@ function App() {
     return () => {
       cancelled = true;
     };
-  }, [selectedNodeId]);
+  }, [selectedNodeId, selectedNode, selectedCell]);
 
   useEffect(() => {
     let cancelled = false;

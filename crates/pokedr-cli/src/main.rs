@@ -7,6 +7,7 @@ use axum::{
 };
 use clap::{Parser, Subcommand};
 use pokedr_agent::{FlopTreeRequest, build_flop_tree};
+use pokedr_core::node_cfr::NodeLocalActionEv;
 use pokedr_core::terminal_cfv::PreparedTerminalBoard;
 use pokedr_core::{
     ActionAbstraction, ActionKind, Board, Card, CfrStorageConfig, ChanceExpansion, ComboWeight,
@@ -2561,11 +2562,23 @@ async fn api_action_ev(
             .expect("viewer solver poisoned")
             .is_none()
     {
-        return (
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({ "error": "action EV is not stored in this database" })),
-        )
-            .into_response();
+        match resolve_db_viewer_action_ev(&state, id) {
+            Ok(value) => {
+                state
+                    .action_ev_cache
+                    .lock()
+                    .expect("action EV cache poisoned")
+                    .insert(id, value.clone());
+                return Json(value).into_response();
+            }
+            Err(error) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "error": error })),
+                )
+                    .into_response();
+            }
+        }
     }
     let result = ensure_viewer_solver(&state).and_then(|mut solver| {
         solver
@@ -2601,6 +2614,16 @@ async fn api_action_ev(
         )
             .into_response(),
     }
+}
+
+fn resolve_db_viewer_action_ev(state: &ViewerState, id: usize) -> Result<ViewerActionEv, String> {
+    let resolver = state
+        .resolver
+        .as_ref()
+        .ok_or_else(|| "viewer database resolver is not configured".to_string())?;
+    let node = viewer_node_for_state(state, id)?;
+    let ev = solve_viewer_subtree_action_ev(state, resolver, &node)?;
+    Ok(ev)
 }
 
 async fn api_node(Path(id): Path<usize>, State(state): State<ViewerState>) -> impl IntoResponse {
@@ -2684,7 +2707,7 @@ fn resolve_viewer_node_strategy(
 ) -> Result<Option<ViewerStrategy>, String> {
     let value = if let Some(resolver) = &state.resolver {
         let node = viewer_node_for_state(state, id)?;
-        solve_viewer_subtree_root_strategy(resolver, node.public_node)?
+        solve_viewer_subtree_root_strategy(state, resolver, &node)?
     } else {
         let mut solver = ensure_viewer_solver(state)?;
         let snapshot = solver
@@ -2729,24 +2752,27 @@ fn resolve_db_viewer_strategy_ev(
             "strategy EV for node {id} is not stored in this database"
         ));
     }
-    solve_viewer_subtree_strategy_ev(resolver, node.public_node)
+    solve_viewer_subtree_strategy_ev(state, resolver, &node)
 }
 
 fn solve_viewer_subtree_strategy_ev(
+    state: &ViewerState,
     resolver: &ViewerDbResolver,
-    root_public_node: usize,
+    root_node: &ViewerNode,
 ) -> Result<ViewerStrategyEv, String> {
     info!(
         db = %resolver.db_path.display(),
-        root_public_node,
+        root_public_node = root_node.public_node,
+        root_node = root_node.id,
         iterations = resolver.options.iterations,
         "viewer_lazy_subtree_strategy_ev_start"
     );
-    let solver = solve_viewer_subtree_solver(resolver, root_public_node)?;
+    let solver = solve_viewer_subtree_solver(state, resolver, root_node)?;
     let ev = solver.strategy_ev_at_node(0)?;
     info!(
         db = %resolver.db_path.display(),
-        root_public_node,
+        root_public_node = root_node.public_node,
+        root_node = root_node.id,
         "viewer_lazy_subtree_strategy_ev_finish"
     );
     Ok(ViewerStrategyEv {
@@ -2756,6 +2782,43 @@ fn solve_viewer_subtree_strategy_ev(
         ip_ev_bb: ev.ip_value / 100.0,
         oop_weight: ev.oop_weight,
         ip_weight: ev.ip_weight,
+        terminal_evals: ev.terminal_evals,
+    })
+}
+
+fn solve_viewer_subtree_action_ev(
+    state: &ViewerState,
+    resolver: &ViewerDbResolver,
+    root_node: &ViewerNode,
+) -> Result<ViewerActionEv, String> {
+    info!(
+        db = %resolver.db_path.display(),
+        root_public_node = root_node.public_node,
+        root_node = root_node.id,
+        iterations = resolver.options.iterations,
+        "viewer_lazy_subtree_action_ev_start"
+    );
+    let solver = solve_viewer_subtree_solver(state, resolver, root_node)?;
+    let snapshot = solver.solution_snapshot_until_street(Some(Street::River));
+    let ev = solver.action_ev_at_node(0)?;
+    info!(
+        db = %resolver.db_path.display(),
+        root_public_node = root_node.public_node,
+        root_node = root_node.id,
+        "viewer_lazy_subtree_action_ev_finish"
+    );
+    let action_major_bb =
+        expand_subtree_action_ev(resolver, &ev, &snapshot.oop_combos, &snapshot.ip_combos)?;
+    Ok(ViewerActionEv {
+        board: ev.board.to_string(),
+        pot_bb: ev.pot as f32 / 100.0,
+        player: format_player(ev.player),
+        combos: match ev.player {
+            Player::Oop => resolver.request.oop_range.combos().len(),
+            Player::Ip => resolver.request.ip_range.combos().len(),
+        },
+        actions: ev.actions,
+        action_major_bb,
         terminal_evals: ev.terminal_evals,
     })
 }
@@ -2896,16 +2959,18 @@ fn zero_viewer_board_conflicts(reach: &mut [f32], combos: &[ComboWeight], board:
 }
 
 fn solve_viewer_subtree_root_strategy(
+    state: &ViewerState,
     resolver: &ViewerDbResolver,
-    root_public_node: usize,
+    root_node: &ViewerNode,
 ) -> Result<Option<ViewerStrategy>, String> {
     info!(
         db = %resolver.db_path.display(),
-        root_public_node,
+        root_public_node = root_node.public_node,
+        root_node = root_node.id,
         iterations = resolver.options.iterations,
         "viewer_lazy_subtree_solver_start"
     );
-    let solver = solve_viewer_subtree_solver(resolver, root_public_node)?;
+    let solver = solve_viewer_subtree_solver(state, resolver, root_node)?;
     let snapshot = solver.solution_snapshot_until_street(Some(Street::River));
     let oop_combos = snapshot.oop_combos.clone();
     let ip_combos = snapshot.ip_combos.clone();
@@ -2916,7 +2981,8 @@ fn solve_viewer_subtree_root_strategy(
         .and_then(|node| node.strategy);
     info!(
         db = %resolver.db_path.display(),
-        root_public_node,
+        root_public_node = root_node.public_node,
+        root_node = root_node.id,
         "viewer_lazy_subtree_solver_finish"
     );
     strategy
@@ -2925,16 +2991,20 @@ fn solve_viewer_subtree_root_strategy(
 }
 
 fn solve_viewer_subtree_solver(
+    state: &ViewerState,
     resolver: &ViewerDbResolver,
-    root_public_node: usize,
+    root_node: &ViewerNode,
 ) -> Result<NodeLocalCfrSolver, String> {
     let full_tree = build_tree(resolver.request.clone(), resolver.enumerate_chance)?;
-    let subtree = public_subtree_from(&full_tree, root_public_node)?;
-    let mut solver = NodeLocalCfrSolver::new(
-        subtree,
-        resolver.request.oop_range.clone(),
-        resolver.request.ip_range.clone(),
-    )?;
+    let mut subtree = public_subtree_from(&full_tree, root_node.public_node)?;
+    if root_node.kind == "decision" && root_node.street == "river" {
+        let exact_board = Board::from_str(&root_node.board)?;
+        force_subtree_board(&mut subtree, exact_board);
+    }
+    let reach = db_viewer_reach_at_node(state, root_node.id)?;
+    let oop_range = range_from_reach(&state.solution.oop_weights, &reach.oop)?;
+    let ip_range = range_from_reach(&state.solution.ip_weights, &reach.ip)?;
+    let mut solver = NodeLocalCfrSolver::new(subtree, oop_range, ip_range)?;
     solver.run_with_progress(
         RealCfrConfig {
             iterations: resolver.options.iterations,
@@ -2944,6 +3014,13 @@ fn solve_viewer_subtree_solver(
         |_| {},
     )?;
     Ok(solver)
+}
+
+fn force_subtree_board(tree: &mut PublicTree, board: Board) {
+    tree.spot.board = board.clone();
+    for node in &mut tree.nodes {
+        node.state.board = board.clone();
+    }
 }
 
 fn expand_subtree_strategy(
@@ -2988,6 +3065,71 @@ fn expand_subtree_strategy(
         actions: strategy.actions,
         action_major,
     })
+}
+
+fn expand_subtree_action_ev(
+    resolver: &ViewerDbResolver,
+    ev: &NodeLocalActionEv,
+    oop_subtree_combos: &[ComboWeight],
+    ip_subtree_combos: &[ComboWeight],
+) -> Result<Vec<f32>, String> {
+    let (source_combos, target_combos) = match ev.player {
+        Player::Oop => (oop_subtree_combos, resolver.request.oop_range.combos()),
+        Player::Ip => (ip_subtree_combos, resolver.request.ip_range.combos()),
+    };
+    let mut target_by_combo = HashMap::with_capacity(target_combos.len());
+    for (index, combo) in target_combos.iter().enumerate() {
+        target_by_combo.insert(combo_key(combo), index);
+    }
+    let mut source_to_target = Vec::with_capacity(source_combos.len());
+    for combo in source_combos {
+        let target = target_by_combo
+            .get(&combo_key(combo))
+            .copied()
+            .ok_or_else(|| {
+                format!(
+                    "subtree combo {}{} is missing from viewer range",
+                    combo.first, combo.second
+                )
+            })?;
+        source_to_target.push(target);
+    }
+    let mut action_major = vec![0.0; ev.actions * target_combos.len()];
+    for action in 0..ev.actions {
+        let source_base = action * ev.combos;
+        let target_base = action * target_combos.len();
+        for (source_index, target_index) in source_to_target.iter().copied().enumerate() {
+            action_major[target_base + target_index] =
+                ev.action_major[source_base + source_index] / 100.0;
+        }
+    }
+    Ok(action_major)
+}
+
+fn range_from_reach(combos: &[ComboWeight], reach: &[f32]) -> Result<RangeSpec, String> {
+    if combos.len() != reach.len() {
+        return Err(format!(
+            "reach length {} does not match combo length {}",
+            reach.len(),
+            combos.len()
+        ));
+    }
+    let reached = combos
+        .iter()
+        .zip(reach)
+        .filter_map(|(combo, weight)| {
+            if *weight > 0.0 {
+                Some(ComboWeight {
+                    first: combo.first,
+                    second: combo.second,
+                    weight: *weight,
+                })
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    RangeSpec::new(reached)
 }
 
 fn combo_key(combo: &ComboWeight) -> (u8, u8) {

@@ -3020,6 +3020,7 @@ fn terminal_side_range_targets_sorted_accumulate(
 ) {
     let mut reach_sum = 0.0f32;
     let mut card_sums = [0.0f32; 52];
+    let mut pair_sums = [0.0f32; 52 * 52];
     let mut opponent_cursor = 0usize;
     for own_target in own_targets_sorted {
         let own_board_index = own_target.board_index as usize;
@@ -3036,16 +3037,18 @@ fn terminal_side_range_targets_sorted_accumulate(
                 opponent_reach,
                 &mut reach_sum,
                 &mut card_sums,
+                &mut pair_sums,
             );
             opponent_cursor += 1;
         }
         let own_combo = prepared.combo(own_board_index);
         out[own_target.range_index] +=
-            non_blocked_target_reach(own_combo, reach_sum, &card_sums) * pot;
+            non_blocked_target_reach(own_combo, reach_sum, &card_sums, &pair_sums) * pot;
     }
 
     reach_sum = 0.0;
     card_sums = [0.0f32; 52];
+    pair_sums = [0.0f32; 52 * 52];
     opponent_cursor = opponent_targets_sorted.len();
     for own_target in own_targets_sorted.iter().rev() {
         let own_board_index = own_target.board_index as usize;
@@ -3062,12 +3065,13 @@ fn terminal_side_range_targets_sorted_accumulate(
                 opponent_reach,
                 &mut reach_sum,
                 &mut card_sums,
+                &mut pair_sums,
             );
             opponent_cursor -= 1;
         }
         let own_combo = prepared.combo(own_board_index);
         out[own_target.range_index] -=
-            non_blocked_target_reach(own_combo, reach_sum, &card_sums) * pot;
+            non_blocked_target_reach(own_combo, reach_sum, &card_sums, &pair_sums) * pot;
     }
 }
 
@@ -3080,6 +3084,7 @@ fn terminal_side_river_targets_sorted_accumulate(
 ) {
     let mut reach_sum = 0.0f32;
     let mut card_sums = [0.0f32; 52];
+    let mut pair_sums = [0.0f32; 52 * 52];
     let mut opponent_cursor = 0usize;
     for own_target in own_targets_sorted {
         while opponent_cursor < opponent_targets_sorted.len() {
@@ -3092,15 +3097,17 @@ fn terminal_side_river_targets_sorted_accumulate(
                 opponent_reach,
                 &mut reach_sum,
                 &mut card_sums,
+                &mut pair_sums,
             );
             opponent_cursor += 1;
         }
         out[own_target.range_index as usize] +=
-            non_blocked_river_target_reach(*own_target, reach_sum, &card_sums) * pot;
+            non_blocked_river_target_reach(*own_target, reach_sum, &card_sums, &pair_sums) * pot;
     }
 
     reach_sum = 0.0;
     card_sums = [0.0f32; 52];
+    pair_sums = [0.0f32; 52 * 52];
     opponent_cursor = opponent_targets_sorted.len();
     for own_target in own_targets_sorted.iter().rev() {
         while opponent_cursor > 0 {
@@ -3113,11 +3120,12 @@ fn terminal_side_river_targets_sorted_accumulate(
                 opponent_reach,
                 &mut reach_sum,
                 &mut card_sums,
+                &mut pair_sums,
             );
             opponent_cursor -= 1;
         }
         out[own_target.range_index as usize] -=
-            non_blocked_river_target_reach(*own_target, reach_sum, &card_sums) * pot;
+            non_blocked_river_target_reach(*own_target, reach_sum, &card_sums, &pair_sums) * pot;
     }
 }
 
@@ -3127,6 +3135,7 @@ fn add_target_reach_to_card_sums(
     reach: &[f32],
     reach_sum: &mut f32,
     card_sums: &mut [f32; 52],
+    pair_sums: &mut [f32; 52 * 52],
 ) {
     let value = reach[target.range_index as usize];
     if value == 0.0 {
@@ -3134,8 +3143,11 @@ fn add_target_reach_to_card_sums(
     }
     let combo = prepared.combo(target.board_index as usize);
     *reach_sum += value;
-    card_sums[combo.first.index()] += value;
-    card_sums[combo.second.index()] += value;
+    let first = combo.first.index();
+    let second = combo.second.index();
+    card_sums[first] += value;
+    card_sums[second] += value;
+    pair_sums[card_pair_index(first, second)] += value;
 }
 
 fn add_river_target_reach_to_card_sums(
@@ -3143,14 +3155,18 @@ fn add_river_target_reach_to_card_sums(
     reach: &[f32],
     reach_sum: &mut f32,
     card_sums: &mut [f32; 52],
+    pair_sums: &mut [f32; 52 * 52],
 ) {
     let value = reach[target.range_index as usize];
     if value == 0.0 {
         return;
     }
     *reach_sum += value;
-    card_sums[target.first_card as usize] += value;
-    card_sums[target.second_card as usize] += value;
+    let first = target.first_card as usize;
+    let second = target.second_card as usize;
+    card_sums[first] += value;
+    card_sums[second] += value;
+    pair_sums[card_pair_index(first, second)] += value;
 }
 
 fn add_terminal_net_offset(
@@ -3166,6 +3182,7 @@ fn add_terminal_net_offset(
     }
     let mut reach_sum = 0.0;
     let mut card_sums = [0.0f32; 52];
+    let mut pair_sums = [0.0f32; 52 * 52];
     for target in opponent_targets {
         add_target_reach_to_card_sums(
             prepared,
@@ -3173,11 +3190,13 @@ fn add_terminal_net_offset(
             opponent_reach,
             &mut reach_sum,
             &mut card_sums,
+            &mut pair_sums,
         );
     }
     for target in own_targets {
         let combo = prepared.combo(target.board_index as usize);
-        out[target.range_index] += non_blocked_target_reach(combo, reach_sum, &card_sums) * offset;
+        out[target.range_index] +=
+            non_blocked_target_reach(combo, reach_sum, &card_sums, &pair_sums) * offset;
     }
 }
 
@@ -3193,17 +3212,19 @@ fn add_terminal_river_net_offset(
     }
     let mut reach_sum = 0.0;
     let mut card_sums = [0.0f32; 52];
+    let mut pair_sums = [0.0f32; 52 * 52];
     for target in opponent_targets {
         add_river_target_reach_to_card_sums(
             *target,
             opponent_reach,
             &mut reach_sum,
             &mut card_sums,
+            &mut pair_sums,
         );
     }
     for target in own_targets {
         out[target.range_index as usize] +=
-            non_blocked_river_target_reach(*target, reach_sum, &card_sums) * offset;
+            non_blocked_river_target_reach(*target, reach_sum, &card_sums, &pair_sums) * offset;
     }
 }
 
@@ -3211,16 +3232,31 @@ fn non_blocked_target_reach(
     combo: crate::terminal_cfv::PrivateCombo,
     reach_sum: f32,
     card_sums: &[f32; 52],
+    pair_sums: &[f32; 52 * 52],
 ) -> f32 {
-    reach_sum - card_sums[combo.first.index()] - card_sums[combo.second.index()]
+    let first = combo.first.index();
+    let second = combo.second.index();
+    reach_sum - card_sums[first] - card_sums[second] + pair_sums[card_pair_index(first, second)]
 }
 
 fn non_blocked_river_target_reach(
     target: PreparedRiverTarget,
     reach_sum: f32,
     card_sums: &[f32; 52],
+    pair_sums: &[f32; 52 * 52],
 ) -> f32 {
-    reach_sum - card_sums[target.first_card as usize] - card_sums[target.second_card as usize]
+    let first = target.first_card as usize;
+    let second = target.second_card as usize;
+    reach_sum - card_sums[first] - card_sums[second] + pair_sums[card_pair_index(first, second)]
+}
+
+fn card_pair_index(first: usize, second: usize) -> usize {
+    let (low, high) = if first <= second {
+        (first, second)
+    } else {
+        (second, first)
+    };
+    low * 52 + high
 }
 
 fn terminal_runout_count_for_live_combo(board_cards: usize) -> f32 {
@@ -3603,6 +3639,118 @@ mod tests {
         for (generic, fast) in generic_ip.iter().zip(&fast_ip) {
             assert!((generic - fast).abs() < 0.001, "{generic} != {fast}");
         }
+    }
+
+    #[test]
+    fn river_fast_path_matches_bruteforce_with_overlapping_ranges() {
+        let board = Board::from_str("As7h2cTd9d").unwrap();
+        let oop_range = RangeSpec::from_str("AcAd,KcKd,QcQd,JcJd").unwrap();
+        let ip_range = RangeSpec::from_str("AcAd,KcKd,QhQs,JhJs").unwrap();
+        let prepared = PreparedTerminalBoard::new(&board).unwrap();
+        let oop_combos = oop_range.combos();
+        let ip_combos = ip_range.combos();
+        let oop_targets = prepared_combo_targets(&prepared, &oop_combos);
+        let ip_targets = prepared_combo_targets(&prepared, &ip_combos);
+        let mut oop_targets_sorted = oop_targets.clone();
+        let mut ip_targets_sorted = ip_targets.clone();
+        sort_combo_targets_by_strength(&prepared, &mut oop_targets_sorted);
+        sort_combo_targets_by_strength(&prepared, &mut ip_targets_sorted);
+        let oop_river_targets_sorted = prepared_river_targets(&prepared, &oop_targets_sorted);
+        let ip_river_targets_sorted = prepared_river_targets(&prepared, &ip_targets_sorted);
+        let oop_reach = vec![1.0, 0.7, 0.4, 0.2];
+        let ip_reach = vec![0.9, 0.6, 0.5, 0.3];
+
+        let mut fast_oop = vec![0.0; oop_combos.len()];
+        terminal_side_river_targets_sorted_accumulate(
+            &ip_river_targets_sorted,
+            &ip_reach,
+            &oop_river_targets_sorted,
+            100.0,
+            &mut fast_oop,
+        );
+        add_terminal_river_net_offset(
+            &ip_reach,
+            &ip_river_targets_sorted,
+            &oop_river_targets_sorted,
+            -12.0,
+            &mut fast_oop,
+        );
+        let brute_oop = brute_force_terminal_side_values(
+            &prepared,
+            &oop_targets,
+            &ip_targets,
+            &ip_reach,
+            100.0,
+            -12.0,
+            oop_combos.len(),
+        );
+        for (brute, fast) in brute_oop.iter().zip(&fast_oop) {
+            assert!((brute - fast).abs() < 0.001, "{brute} != {fast}");
+        }
+
+        let mut fast_ip = vec![0.0; ip_combos.len()];
+        terminal_side_river_targets_sorted_accumulate(
+            &oop_river_targets_sorted,
+            &oop_reach,
+            &ip_river_targets_sorted,
+            80.0,
+            &mut fast_ip,
+        );
+        add_terminal_river_net_offset(
+            &oop_reach,
+            &oop_river_targets_sorted,
+            &ip_river_targets_sorted,
+            9.0,
+            &mut fast_ip,
+        );
+        let brute_ip = brute_force_terminal_side_values(
+            &prepared,
+            &ip_targets,
+            &oop_targets,
+            &oop_reach,
+            80.0,
+            9.0,
+            ip_combos.len(),
+        );
+        for (brute, fast) in brute_ip.iter().zip(&fast_ip) {
+            assert!((brute - fast).abs() < 0.001, "{brute} != {fast}");
+        }
+    }
+
+    fn brute_force_terminal_side_values(
+        prepared: &PreparedTerminalBoard,
+        own_targets: &[PreparedComboTarget],
+        opponent_targets: &[PreparedComboTarget],
+        opponent_reach: &[f32],
+        pot: f32,
+        offset: f32,
+        out_len: usize,
+    ) -> Vec<f32> {
+        let mut out = vec![0.0; out_len];
+        for own in own_targets {
+            let own_combo = prepared.combo(own.board_index as usize);
+            let own_strength = prepared.strength(own.board_index as usize);
+            for opponent in opponent_targets {
+                let opponent_combo = prepared.combo(opponent.board_index as usize);
+                if own_combo.first == opponent_combo.first
+                    || own_combo.first == opponent_combo.second
+                    || own_combo.second == opponent_combo.first
+                    || own_combo.second == opponent_combo.second
+                {
+                    continue;
+                }
+                let opponent_strength = prepared.strength(opponent.board_index as usize);
+                let showdown = if own_strength > opponent_strength {
+                    pot
+                } else if own_strength < opponent_strength {
+                    -pot
+                } else {
+                    0.0
+                };
+                out[own.range_index] += opponent_reach[opponent.range_index] * (showdown + offset);
+            }
+        }
+        out
     }
 
     #[test]
