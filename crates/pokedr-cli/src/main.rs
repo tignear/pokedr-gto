@@ -1877,21 +1877,6 @@ fn load_viewer_from_db(path: &PathBuf) -> Result<ViewerBundle, String> {
         "viewer_db_load_combos"
     );
     let phase = Instant::now();
-    let mut nodes = load_db_nodes(&connection)?;
-    info!(
-        db = %path.display(),
-        nodes = nodes.len(),
-        elapsed_ms = phase.elapsed().as_secs_f64() * 1000.0,
-        "viewer_db_load_nodes"
-    );
-    let phase = Instant::now();
-    attach_db_edges(&connection, &mut nodes)?;
-    info!(
-        db = %path.display(),
-        elapsed_ms = phase.elapsed().as_secs_f64() * 1000.0,
-        "viewer_db_attach_edges"
-    );
-    let phase = Instant::now();
     let strategy_evs = load_db_strategy_evs(&connection)?;
     info!(
         db = %path.display(),
@@ -1936,7 +1921,7 @@ fn load_viewer_from_db(path: &PathBuf) -> Result<ViewerBundle, String> {
                 .unwrap_or("reach-weighted"),
         )?,
     };
-    let node_count = nodes.len();
+    let node_count = metadata_usize(&metadata, "states").unwrap_or(0);
     let strategy_ev_count = strategy_evs.len();
     info!(
         db = %path.display(),
@@ -1955,7 +1940,7 @@ fn load_viewer_from_db(path: &PathBuf) -> Result<ViewerBundle, String> {
             solver_elapsed_ms: 0.0,
             storage_gib,
             exploitability_bb_per_100: None,
-            nodes: nodes.len(),
+            nodes: node_count,
             decision_states: metadata_usize(&metadata, "decision_states").unwrap_or(0),
             action_slots: metadata_usize(&metadata, "action_slots").unwrap_or(0),
             oop_combos: oop_combos.len(),
@@ -1963,7 +1948,7 @@ fn load_viewer_from_db(path: &PathBuf) -> Result<ViewerBundle, String> {
         },
         oop_combos,
         ip_combos,
-        nodes,
+        nodes: Vec::new(),
         oop_weights,
         ip_weights,
     };
@@ -2035,158 +2020,162 @@ fn load_db_combo_weights(
     Ok(combos)
 }
 
-fn load_db_nodes(connection: &Connection) -> Result<Vec<ViewerNode>, String> {
+fn load_db_node(connection: &Connection, id: usize) -> Result<ViewerNode, String> {
     let mut statement = connection
         .prepare(
             r#"
             SELECT id, public_node, street, board, pot_bb, player, kind, terminal_reason,
                    strategy_player, strategy_combos, strategy_actions, strategy_action_major_json
             FROM nodes
-            ORDER BY id
+            WHERE id = ?1
             "#,
         )
-        .map_err(|error| format!("failed to prepare node query: {error}"))?;
-    let rows = statement
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, f32>(4)?,
-                row.get::<_, String>(5)?,
-                row.get::<_, String>(6)?,
-                row.get::<_, Option<String>>(7)?,
-                row.get::<_, Option<String>>(8)?,
-                row.get::<_, Option<i64>>(9)?,
-                row.get::<_, Option<i64>>(10)?,
-                row.get::<_, Option<String>>(11)?,
-            ))
-        })
-        .map_err(|error| format!("failed to query nodes: {error}"))?;
-    let mut nodes = Vec::new();
-    for row in rows {
-        let (
-            id,
-            public_node,
-            street,
-            board,
-            pot_bb,
-            player,
-            kind,
-            terminal_reason,
-            strategy_player,
-            strategy_combos,
-            strategy_actions,
-            strategy_json,
-        ) = row.map_err(|error| format!("failed to load node row: {error}"))?;
-        let id = db_usize(id, "nodes.id")?;
-        let public_node = db_usize(public_node, "nodes.public_node")?;
-        let strategy_combos = strategy_combos
-            .map(|value| db_usize(value, "nodes.strategy_combos"))
-            .transpose()?;
-        let strategy_actions = strategy_actions
-            .map(|value| db_usize(value, "nodes.strategy_actions"))
-            .transpose()?;
-        if id != nodes.len() {
-            return Err(format!(
-                "solution database node ids must be contiguous; expected {}, got {id}",
-                nodes.len()
-            ));
-        }
-        let kind = if kind == "terminal" {
-            terminal_reason
-                .map(|reason| format!("terminal:{reason}"))
-                .unwrap_or_else(|| "terminal".to_string())
-        } else {
-            kind
-        };
-        let strategy = match (
-            strategy_player,
-            strategy_combos,
-            strategy_actions,
-            strategy_json,
-        ) {
-            (Some(player), Some(combos), Some(actions), Some(json)) => Some(ViewerStrategy {
-                player,
-                combos,
-                actions,
-                action_major: serde_json::from_str(&json)
-                    .map_err(|error| format!("failed to parse strategy for node {id}: {error}"))?,
-            }),
-            _ => None,
-        };
-        nodes.push(ViewerNode {
-            id,
-            public_node,
-            board,
-            street,
-            pot_bb,
-            player,
-            kind,
-            children: Vec::new(),
-            actions: Vec::new(),
-            choices: Vec::new(),
-            strategy,
-        });
-    }
-    Ok(nodes)
+        .map_err(|error| format!("failed to prepare node {id} query: {error}"))?;
+    let mut rows = statement
+        .query(params![id as i64])
+        .map_err(|error| format!("failed to query node {id}: {error}"))?;
+    let Some(row) = rows
+        .next()
+        .map_err(|error| format!("failed to load node {id}: {error}"))?
+    else {
+        return Err(format!("unknown node {id}"));
+    };
+    let mut node = viewer_node_from_row(row)?;
+    attach_db_node_edges(connection, &mut node)?;
+    Ok(node)
 }
 
-fn attach_db_edges(connection: &Connection, nodes: &mut [ViewerNode]) -> Result<(), String> {
+fn viewer_node_from_row(row: &rusqlite::Row<'_>) -> Result<ViewerNode, String> {
+    let id = row
+        .get::<_, i64>(0)
+        .map_err(|error| format!("failed to read node id: {error}"))?;
+    let public_node = row
+        .get::<_, i64>(1)
+        .map_err(|error| format!("failed to read node public id: {error}"))?;
+    let street = row
+        .get::<_, String>(2)
+        .map_err(|error| format!("failed to read node street: {error}"))?;
+    let board = row
+        .get::<_, String>(3)
+        .map_err(|error| format!("failed to read node board: {error}"))?;
+    let pot_bb = row
+        .get::<_, f32>(4)
+        .map_err(|error| format!("failed to read node pot: {error}"))?;
+    let player = row
+        .get::<_, String>(5)
+        .map_err(|error| format!("failed to read node player: {error}"))?;
+    let kind = row
+        .get::<_, String>(6)
+        .map_err(|error| format!("failed to read node kind: {error}"))?;
+    let terminal_reason = row
+        .get::<_, Option<String>>(7)
+        .map_err(|error| format!("failed to read node terminal reason: {error}"))?;
+    let strategy_player = row
+        .get::<_, Option<String>>(8)
+        .map_err(|error| format!("failed to read node strategy player: {error}"))?;
+    let strategy_combos = row
+        .get::<_, Option<i64>>(9)
+        .map_err(|error| format!("failed to read node strategy combos: {error}"))?
+        .map(|value| db_usize(value, "nodes.strategy_combos"))
+        .transpose()?;
+    let strategy_actions = row
+        .get::<_, Option<i64>>(10)
+        .map_err(|error| format!("failed to read node strategy actions: {error}"))?
+        .map(|value| db_usize(value, "nodes.strategy_actions"))
+        .transpose()?;
+    let strategy_json = row
+        .get::<_, Option<String>>(11)
+        .map_err(|error| format!("failed to read node strategy: {error}"))?;
+    let id = db_usize(id, "nodes.id")?;
+    let kind = if kind == "terminal" {
+        terminal_reason
+            .map(|reason| format!("terminal:{reason}"))
+            .unwrap_or_else(|| "terminal".to_string())
+    } else {
+        kind
+    };
+    let strategy = match (
+        strategy_player,
+        strategy_combos,
+        strategy_actions,
+        strategy_json,
+    ) {
+        (Some(player), Some(combos), Some(actions), Some(json)) => Some(ViewerStrategy {
+            player,
+            combos,
+            actions,
+            action_major: serde_json::from_str(&json)
+                .map_err(|error| format!("failed to parse strategy for node {id}: {error}"))?,
+        }),
+        _ => None,
+    };
+    Ok(ViewerNode {
+        id,
+        public_node: db_usize(public_node, "nodes.public_node")?,
+        board,
+        street,
+        pot_bb,
+        player,
+        kind,
+        children: Vec::new(),
+        actions: Vec::new(),
+        choices: Vec::new(),
+        strategy,
+    })
+}
+
+fn attach_db_node_edges(connection: &Connection, node: &mut ViewerNode) -> Result<(), String> {
     let mut statement = connection
-        .prepare("SELECT parent_id, child_id, label FROM edges ORDER BY parent_id, edge_index")
-        .map_err(|error| format!("failed to prepare edge query: {error}"))?;
+        .prepare("SELECT child_id, label FROM edges WHERE parent_id = ?1 ORDER BY edge_index")
+        .map_err(|error| format!("failed to prepare edge query for node {}: {error}", node.id))?;
     let rows = statement
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, String>(2)?,
-            ))
+        .query_map(params![node.id as i64], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
         })
-        .map_err(|error| format!("failed to query edges: {error}"))?;
+        .map_err(|error| format!("failed to query edges for node {}: {error}", node.id))?;
     for row in rows {
-        let (parent, child, label) =
-            row.map_err(|error| format!("failed to load edge row: {error}"))?;
-        let parent = db_usize(parent, "edges.parent_id")?;
+        let (child, label) =
+            row.map_err(|error| format!("failed to load edge for node {}: {error}", node.id))?;
         let child = db_usize(child, "edges.child_id")?;
-        let Some(node) = nodes.get_mut(parent) else {
-            return Err(format!("edge references unknown parent node {parent}"));
-        };
         node.children.push(child);
         node.choices.push(ViewerBranch { label, child });
     }
 
     let mut statement = connection
-        .prepare("SELECT node_id, action_index, label, child_id FROM actions ORDER BY node_id, action_index")
-        .map_err(|error| format!("failed to prepare action query: {error}"))?;
+        .prepare(
+            "SELECT action_index, label, child_id FROM actions WHERE node_id = ?1 ORDER BY action_index",
+        )
+        .map_err(|error| format!("failed to prepare action query for node {}: {error}", node.id))?;
     let rows = statement
-        .query_map([], |row| {
+        .query_map(params![node.id as i64], |row| {
             Ok((
                 row.get::<_, i64>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, Option<i64>>(3)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<i64>>(2)?,
             ))
         })
-        .map_err(|error| format!("failed to query actions: {error}"))?;
+        .map_err(|error| format!("failed to query actions for node {}: {error}", node.id))?;
+    let mut action_choices = Vec::new();
     for row in rows {
-        let (node_id, index, label, child) =
-            row.map_err(|error| format!("failed to load action row: {error}"))?;
-        let node_id = db_usize(node_id, "actions.node_id")?;
-        let index = db_usize(index, "actions.action_index")?;
+        let (index, label, child) =
+            row.map_err(|error| format!("failed to load action for node {}: {error}", node.id))?;
         let child = child
             .map(|value| db_usize(value, "actions.child_id"))
             .transpose()?;
-        let Some(node) = nodes.get_mut(node_id) else {
-            return Err(format!("action references unknown node {node_id}"));
-        };
+        if let Some(child) = child {
+            action_choices.push(ViewerBranch {
+                label: label.clone(),
+                child,
+            });
+        }
         node.actions.push(ViewerAction {
-            index,
+            index: db_usize(index, "actions.action_index")?,
             label,
             child,
         });
+    }
+    if !action_choices.is_empty() {
+        node.choices = action_choices;
     }
     Ok(())
 }
@@ -2276,6 +2265,7 @@ struct ViewerState {
     solution: Arc<ViewerSolution>,
     solver: Arc<Mutex<Option<NodeLocalCfrSolver>>>,
     resolver: Option<ViewerDbResolver>,
+    node_cache: Arc<Mutex<HashMap<usize, ViewerNode>>>,
     resolved_strategy_cache: Arc<Mutex<HashMap<usize, ViewerStrategy>>>,
     equity_cache: Arc<Mutex<HashMap<usize, ViewerEquity>>>,
     strategy_ev_cache: Arc<Mutex<HashMap<usize, ViewerStrategyEv>>>,
@@ -2293,6 +2283,7 @@ fn serve_viewer(
         solution: Arc::new(viewer.solution),
         solver: Arc::new(Mutex::new(viewer.solver)),
         resolver: viewer.resolver,
+        node_cache: Arc::new(Mutex::new(HashMap::new())),
         resolved_strategy_cache: Arc::new(Mutex::new(HashMap::new())),
         equity_cache: Arc::new(Mutex::new(HashMap::new())),
         strategy_ev_cache: Arc::new(Mutex::new(viewer.strategy_evs)),
@@ -2338,6 +2329,40 @@ async fn api_combos(State(state): State<ViewerState>) -> Json<ViewerCombos> {
     })
 }
 
+fn viewer_node_for_state(state: &ViewerState, id: usize) -> Result<ViewerNode, String> {
+    if let Some(cached) = state
+        .node_cache
+        .lock()
+        .expect("node cache poisoned")
+        .get(&id)
+        .cloned()
+    {
+        return Ok(cached);
+    }
+    let node = if let Some(resolver) = &state.resolver {
+        let connection = Connection::open(&resolver.db_path).map_err(|error| {
+            format!(
+                "failed to open solution database {}: {error}",
+                resolver.db_path.display()
+            )
+        })?;
+        load_db_node(&connection, id)?
+    } else {
+        state
+            .solution
+            .nodes
+            .get(id)
+            .cloned()
+            .ok_or_else(|| format!("unknown node {id}"))?
+    };
+    state
+        .node_cache
+        .lock()
+        .expect("node cache poisoned")
+        .insert(id, node.clone());
+    Ok(node)
+}
+
 async fn api_equity(Path(id): Path<usize>, State(state): State<ViewerState>) -> impl IntoResponse {
     if let Some(cached) = state
         .equity_cache
@@ -2347,12 +2372,15 @@ async fn api_equity(Path(id): Path<usize>, State(state): State<ViewerState>) -> 
     {
         return Json(cached.clone()).into_response();
     }
-    let Some(node) = state.solution.nodes.get(id) else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "error": format!("unknown node {id}") })),
-        )
-            .into_response();
+    let node = match viewer_node_for_state(&state, id) {
+        Ok(node) => node,
+        Err(error) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": error })),
+            )
+                .into_response();
+        }
     };
     let board = match Board::from_str(&node.board) {
         Ok(board) => board,
@@ -2576,14 +2604,16 @@ async fn api_action_ev(
 }
 
 async fn api_node(Path(id): Path<usize>, State(state): State<ViewerState>) -> impl IntoResponse {
-    let Some(source_node) = state.solution.nodes.get(id) else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "error": format!("unknown node {id}") })),
-        )
-            .into_response();
+    let mut node = match viewer_node_for_state(&state, id) {
+        Ok(node) => node,
+        Err(error) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": error })),
+            )
+                .into_response();
+        }
     };
-    let mut node = source_node.clone();
     if node.strategy.is_none() && node.kind == "decision" {
         if let Some(strategy) = state
             .resolved_strategy_cache
@@ -2653,9 +2683,7 @@ fn resolve_viewer_node_strategy(
     id: usize,
 ) -> Result<Option<ViewerStrategy>, String> {
     let value = if let Some(resolver) = &state.resolver {
-        let Some(node) = state.solution.nodes.get(id) else {
-            return Ok(None);
-        };
+        let node = viewer_node_for_state(state, id)?;
         solve_viewer_subtree_root_strategy(resolver, node.public_node)?
     } else {
         let mut solver = ensure_viewer_solver(state)?;
@@ -2695,9 +2723,7 @@ fn resolve_db_viewer_strategy_ev(
         .resolver
         .as_ref()
         .ok_or_else(|| "viewer database resolver is not available".to_string())?;
-    let Some(node) = state.solution.nodes.get(id) else {
-        return Err(format!("unknown node {id}"));
-    };
+    let node = viewer_node_for_state(state, id)?;
     if id == 0 || (node.street != "river" && node.kind != "chance") {
         return Err(format!(
             "strategy EV for node {id} is not stored in this database"
@@ -2735,10 +2761,15 @@ fn solve_viewer_subtree_strategy_ev(
 }
 
 fn db_viewer_reach_at_node(state: &ViewerState, id: usize) -> Result<ViewerReach, String> {
-    let mut path = Vec::new();
-    if !find_viewer_path(&state.solution.nodes, 0, id, &mut path) {
-        return Err(format!("node {id} is not reachable from root"));
-    }
+    let path = if let Some(resolver) = &state.resolver {
+        db_viewer_path(&resolver.db_path, id)?
+    } else {
+        let mut path = Vec::new();
+        if !find_viewer_path(&state.solution.nodes, 0, id, &mut path) {
+            return Err(format!("node {id} is not reachable from root"));
+        }
+        path
+    };
     let mut oop = state
         .solution
         .oop_weights
@@ -2751,16 +2782,15 @@ fn db_viewer_reach_at_node(state: &ViewerState, id: usize) -> Result<ViewerReach
         .iter()
         .map(|combo| combo.weight)
         .collect::<Vec<_>>();
-    if let Some(root) = state.solution.nodes.first() {
-        let board = Board::from_str(&root.board)?;
-        zero_viewer_board_conflicts(&mut oop, &state.solution.oop_weights, &board);
-        zero_viewer_board_conflicts(&mut ip, &state.solution.ip_weights, &board);
-    }
+    let root = viewer_node_for_state(state, 0)?;
+    let board = Board::from_str(&root.board)?;
+    zero_viewer_board_conflicts(&mut oop, &state.solution.oop_weights, &board);
+    zero_viewer_board_conflicts(&mut ip, &state.solution.ip_weights, &board);
     for pair in path.windows(2) {
         let parent_id = pair[0];
         let child_id = pair[1];
-        let parent = &state.solution.nodes[parent_id];
-        let child = &state.solution.nodes[child_id];
+        let parent = viewer_node_for_state(state, parent_id)?;
+        let child = viewer_node_for_state(state, child_id)?;
         if parent.kind == "chance" {
             let board = Board::from_str(&child.board)?;
             zero_viewer_board_conflicts(&mut oop, &state.solution.oop_weights, &board);
@@ -2808,6 +2838,30 @@ fn db_viewer_reach_at_node(state: &ViewerState, id: usize) -> Result<ViewerReach
         }
     }
     Ok(ViewerReach { oop, ip })
+}
+
+fn db_viewer_path(path: &PathBuf, target: usize) -> Result<Vec<usize>, String> {
+    let connection = Connection::open(path).map_err(|error| {
+        format!(
+            "failed to open solution database {}: {error}",
+            path.display()
+        )
+    })?;
+    let mut reversed = vec![target];
+    let mut current = target;
+    while current != 0 {
+        let parent = connection
+            .query_row(
+                "SELECT parent_id FROM edges WHERE child_id = ?1 LIMIT 1",
+                params![current as i64],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|error| format!("node {target} is not reachable from root: {error}"))?;
+        current = db_usize(parent, "edges.parent_id")?;
+        reversed.push(current);
+    }
+    reversed.reverse();
+    Ok(reversed)
 }
 
 fn find_viewer_path(
