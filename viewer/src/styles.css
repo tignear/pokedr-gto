@@ -70,7 +70,7 @@ p {
 
 .layout {
   display: grid;
-  grid-template-columns: 260px minmax(0, 1fr) 300px;
+  grid-template-columns: 260px minmax(0, 1fr) minmax(440px, 30vw);
   gap: 0;
   height: calc(100vh - 73px);
   min-height: 0;
@@ -655,6 +655,150 @@ p {
   margin-top: 10px;
   display: grid;
   gap: 5px;
+}
+
+.comboGrid {
+  margin-top: 10px;
+  display: grid;
+  gap: 5px;
+}
+
+.comboGridHeader {
+  min-width: 0;
+  display: grid;
+  place-items: center;
+  color: #9aa7b5;
+  font-size: 13px;
+  font-weight: 900;
+}
+
+.comboGridHeader.clubs {
+  color: #55c58b;
+}
+
+.comboGridHeader.diamonds {
+  color: #6ca1ff;
+}
+
+.comboGridHeader.hearts {
+  color: #ff6978;
+}
+
+.comboGridHeader.spades {
+  color: #d8dee9;
+}
+
+.comboGridCell {
+  min-width: 0;
+  display: grid;
+  gap: 5px;
+  padding: 7px;
+  border: 1px solid #303a45;
+  border-radius: 6px;
+  background: #1a1f25;
+}
+
+.comboGridCell.unavailable {
+  min-height: 88px;
+  border-style: dashed;
+  background: #13171c;
+}
+
+.comboGridCell.deadCombo {
+  opacity: 0.48;
+}
+
+.comboGridTop {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 5px;
+}
+
+.comboGridTop .cardPair {
+  gap: 2px;
+  flex: 0 0 auto;
+}
+
+.comboGridTop .playingCard {
+  width: 24px;
+  height: 32px;
+  border-left-width: 3px;
+  border-radius: 3px;
+  font-size: 11px;
+}
+
+.comboGridTop .playingCard small {
+  font-size: 10px;
+}
+
+.comboGridTop span {
+  min-width: 0;
+  overflow: hidden;
+  color: #9aa7b5;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.comboGridActions {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 4px;
+}
+
+.comboGridActions span {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  color: #cbd5df;
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+}
+
+.comboGridActions i {
+  width: 6px;
+  height: 6px;
+  flex: 0 0 auto;
+  border-radius: 2px;
+}
+
+.comboGridActions b {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: clip;
+}
+
+.comboGridEv {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  gap: 3px 5px;
+  align-items: center;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+.comboGridEv em {
+  min-width: 0;
+  overflow: hidden;
+  color: #9aa7b5;
+  font-style: normal;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.comboGridEv strong,
+.comboGridEv b {
+  color: #e6edf3;
+  font-weight: 800;
+}
+
+.comboGridEv b {
+  grid-column: auto;
 }
 
 .comboRow {

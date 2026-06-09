@@ -21,6 +21,7 @@ import {
 import "./styles.css";
 
 const ranks = ["A", "K", "Q", "J", "T", "9", "8", "7", "6", "5", "4", "3", "2"];
+const suits = ["c", "d", "h", "s"];
 const actionHues = [204, 142, 36, 0, 278, 318];
 const displayReachEpsilon = 1e-6;
 
@@ -34,6 +35,7 @@ type ComboAggregate = {
   combo: ViewerCombo;
   frequency: number;
   actionMix: number[];
+  reach: number;
 };
 
 function App() {
@@ -340,45 +342,11 @@ function App() {
 
           <h2>Hand Detail</h2>
           {selectedCell ? (
-            <div>
-              <div className="handClass">{selectedCell.className}</div>
-              <div className="comboList">
-                {selectedCell.combos.map(({ combo, actionMix }) => (
-                  <div key={combo.index} className="comboRow">
-                    <CardPair label={combo.label} />
-                    <div className="comboStrategy">
-                      <StrategyBar mix={actionMix} actions={selectedCell.actions} />
-                      <div className="comboActions">
-                        {selectedCell.actions.map((action) => (
-                          <span key={action.index}>
-                            <i
-                              style={
-                                {
-                                  background: `hsl(${actionHue(action.index)} 82% 54% / 0.9)`
-                                } as React.CSSProperties
-                              }
-                            />
-                            <em>{action.label}</em>
-                            <strong>{((actionMix[action.index] ?? 0) * 100).toFixed(1)}%</strong>
-                            {actionEv &&
-                              actionEv.player === selectedNode.strategy?.player &&
-                              action.index < actionEv.actions && (
-                                <b>
-                                  {formatSignedBb(
-                                    actionEv.action_major_bb[
-                                      action.index * actionEv.combos + combo.index
-                                    ] ?? 0
-                                  )}
-                                </b>
-                              )}
-                          </span>
-                        ))}
-                      </div>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            </div>
+            <HandDetailGrid
+              cell={selectedCell}
+              actionEv={actionEv}
+              strategyPlayer={selectedNode.strategy?.player ?? null}
+            />
           ) : (
             <p>Select a matrix cell.</p>
           )}
@@ -402,6 +370,134 @@ function StrategyBar({ mix, actions }: { mix: number[]; actions: ViewerNode["act
           }
         />
       ))}
+    </div>
+  );
+}
+
+function HandDetailGrid({
+  cell,
+  actionEv,
+  strategyPlayer
+}: {
+  cell: SelectedCell;
+  actionEv: ViewerActionEv | null;
+  strategyPlayer: ViewerNode["player"] | null;
+}) {
+  const comboBySlot = useMemo(() => {
+    const map = new Map<string, ComboAggregate>();
+    for (const combo of cell.combos) {
+      const slot = comboSuitSlot(combo.combo.label, cell.className);
+      if (slot) {
+        map.set(slot, combo);
+      }
+    }
+    return map;
+  }, [cell]);
+  const pair = isPairClass(cell.className);
+  const suited = cell.className.endsWith("s");
+  const rows = pair ? suits.slice(0, -1) : suits;
+  const cols = pair ? suits.slice(1) : suits;
+
+  return (
+    <div>
+      <div className="handClass">{cell.className}</div>
+      <div
+        className="comboGrid"
+        style={{ gridTemplateColumns: `20px repeat(${cols.length}, minmax(0, 1fr))` }}
+      >
+        <div className="comboGridHeader" />
+        {cols.map((suit) => (
+          <div key={suit} className={`comboGridHeader ${cardSuit(`A${suit}`)}`}>
+            {suitSymbol(`A${suit}`)}
+          </div>
+        ))}
+        {rows.map((rowSuit, rowIndex) => (
+          <React.Fragment key={rowSuit}>
+            <div className={`comboGridHeader ${cardSuit(`A${rowSuit}`)}`}>
+              {suitSymbol(`A${rowSuit}`)}
+            </div>
+            {cols.map((colSuit, colIndex) => {
+              const invalidPairSlot = pair && colIndex < rowIndex;
+              const invalidSuitedSlot = suited && rowSuit !== colSuit;
+              const invalidOffsuitSlot = !pair && !suited && rowSuit === colSuit;
+              const combo = invalidPairSlot || invalidSuitedSlot || invalidOffsuitSlot
+                ? null
+                : comboBySlot.get(`${rowSuit}${colSuit}`) ?? null;
+              return (
+                <ComboGridCell
+                  key={`${rowSuit}${colSuit}`}
+                  combo={combo}
+                  actions={cell.actions}
+                  actionEv={actionEv}
+                  strategyPlayer={strategyPlayer}
+                />
+              );
+            })}
+          </React.Fragment>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function ComboGridCell({
+  combo,
+  actions,
+  actionEv,
+  strategyPlayer
+}: {
+  combo: ComboAggregate | null;
+  actions: ViewerNode["actions"];
+  actionEv: ViewerActionEv | null;
+  strategyPlayer: ViewerNode["player"] | null;
+}) {
+  if (!combo) {
+    return <div className="comboGridCell unavailable" />;
+  }
+  const live = combo.reach > displayReachEpsilon;
+  const selectedAction =
+    actions.length > 0
+      ? actions.reduce(
+          (best, action) =>
+            (combo.actionMix[action.index] ?? 0) > (combo.actionMix[best.index] ?? 0)
+              ? action
+              : best,
+          actions[0]
+        )
+      : null;
+  const selectedFrequency = selectedAction ? combo.actionMix[selectedAction.index] ?? 0 : 0;
+  const selectedEv =
+    actionEv && selectedAction && actionEv.player === strategyPlayer
+      ? actionEv.action_major_bb[selectedAction.index * actionEv.combos + combo.combo.index]
+      : null;
+  return (
+    <div className={live ? "comboGridCell" : "comboGridCell deadCombo"}>
+      <div className="comboGridTop">
+        <CardPair label={combo.combo.label} />
+        <span>{live ? `${(combo.reach * 100).toFixed(1)}%` : "dead"}</span>
+      </div>
+      <StrategyBar mix={combo.actionMix} actions={actions} />
+      <div className="comboGridActions">
+        {actions.map((action) => (
+          <span key={action.index}>
+            <i
+              style={
+                {
+                  background: `hsl(${actionHue(action.index)} 82% 54% / 0.9)`
+                } as React.CSSProperties
+              }
+            />
+            <b>{((combo.actionMix[action.index] ?? 0) * 100).toFixed(0)}%</b>
+          </span>
+        ))}
+      </div>
+      {selectedAction && (
+        <div className="comboGridEv">
+          <em>{selectedAction.label}</em>
+          <strong>{(selectedFrequency * 100).toFixed(1)}%</strong>
+          {selectedEv !== null && <b>{formatSignedBb(selectedEv)}</b>}
+        </div>
+      )}
     </div>
   );
 }
@@ -818,9 +914,6 @@ function HandMatrix({
     const actions = node.actions.length;
     for (const combo of combos) {
       const comboReach = reach[combo.index] ?? 0;
-      if (comboReach <= displayReachEpsilon) {
-        continue;
-      }
       const entry =
         byClass.get(combo.class) ?? {
           selectedCombos: [],
@@ -829,20 +922,21 @@ function HandMatrix({
           baseWeight: 0
         };
       entry.baseWeight += combo.weight;
-      entry.totalWeight += comboReach;
       const selectedFrequency =
         strategy.action_major[selectedAction * strategy.combos + combo.index] ?? 0;
+      const comboActionMix = Array.from({ length: actions }, (_, actionIndex) =>
+        node.actions.some((action) => action.index === actionIndex)
+          ? (strategy.action_major[actionIndex * strategy.combos + combo.index] ?? 0)
+          : 0
+      );
+      entry.selectedCombos.push({
+        combo,
+        frequency: selectedFrequency,
+        actionMix: comboActionMix,
+        reach: comboReach
+      });
       if (comboReach > displayReachEpsilon) {
-        const comboActionMix = Array.from({ length: actions }, (_, actionIndex) =>
-          node.actions.some((action) => action.index === actionIndex)
-            ? (strategy.action_major[actionIndex * strategy.combos + combo.index] ?? 0)
-            : 0
-        );
-        entry.selectedCombos.push({
-          combo,
-          frequency: selectedFrequency,
-          actionMix: comboActionMix
-        });
+        entry.totalWeight += comboReach;
         for (const action of node.actions) {
           const frequency = strategy.action_major[action.index * strategy.combos + combo.index] ?? 0;
           entry.actionMix[action.index] += frequency * comboReach;
@@ -929,6 +1023,35 @@ function handClass(row: string, col: string, rowIndex: number, colIndex: number)
     return `${row}${col}s`;
   }
   return `${col}${row}o`;
+}
+
+function isPairClass(className: string) {
+  return className.length === 2 && className[0] === className[1];
+}
+
+function comboSuitSlot(label: string, className: string) {
+  const cards = splitCards(label);
+  if (cards.length !== 2) {
+    return null;
+  }
+  if (isPairClass(className)) {
+    const first = suits.indexOf(cards[0][1]?.toLowerCase());
+    const second = suits.indexOf(cards[1][1]?.toLowerCase());
+    if (first < 0 || second < 0 || first === second) {
+      return null;
+    }
+    const low = Math.min(first, second);
+    const high = Math.max(first, second);
+    return `${suits[low]}${suits[high]}`;
+  }
+  const firstRank = className[0];
+  const secondRank = className[1];
+  const firstCard = cards.find((card) => card[0] === firstRank);
+  const secondCard = cards.find((card) => card[0] === secondRank);
+  if (!firstCard || !secondCard) {
+    return null;
+  }
+  return `${firstCard[1]?.toLowerCase()}${secondCard[1]?.toLowerCase()}`;
 }
 
 function CardPair({ label, preserveOrder = false }: { label: string; preserveOrder?: boolean }) {
