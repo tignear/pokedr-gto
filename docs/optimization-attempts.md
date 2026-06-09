@@ -1332,3 +1332,19 @@ retrying similar ideas, so attempts stay in chronological order.
   tree and terminal call volume, not a fully missing old fast path. The next
   useful optimization target remains reducing terminal calls/work in the
   larger tree rather than re-trying removed prefix/table experiments.
+## 2026-06-09: Postflop per-combo CFV extraction
+
+- Added `NodeLocalCfrSolver::private_values_at_node`, returning normalized
+  per-combo OOP/IP profile values and reaches at a public node. This is the
+  data shape needed by callers that consume hand-level postflop CFVs; aggregate
+  root EV is not enough.
+- Important correction: raw side evaluations are not directly the same as the
+  zero-sum strategy EV reported by `strategy_ev_at_node`. The new API applies
+  the same aggregate zero-sum offset after per-combo opponent-reach
+  normalization.
+- Validation:
+  `cargo test -p pokedr-core node_local` confirms the per-combo reach-weighted
+  average matches `strategy_ev_at_node`, and the existing strategy EV zero-sum
+  test still passes.
+- Result: kept. The API makes it possible to inspect whether a public node has
+  meaningful hand-level CFVs before wiring it into a larger solver.

@@ -79,6 +79,17 @@ pub struct NodeLocalActionEv {
     pub terminal_evals: usize,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct NodeLocalPrivateValues {
+    pub board: Board,
+    pub pot: u32,
+    pub oop_values: Vec<f32>,
+    pub ip_values: Vec<f32>,
+    pub oop_reach: Vec<f32>,
+    pub ip_reach: Vec<f32>,
+    pub terminal_evals: usize,
+}
+
 #[derive(Debug, Clone)]
 struct NodeLocalStrategyEvComponents {
     board: Board,
@@ -954,6 +965,101 @@ impl NodeLocalCfrSolver {
             actions,
             action_major,
             terminal_evals,
+        })
+    }
+
+    pub fn private_values_at_node(
+        &self,
+        node_index: usize,
+    ) -> Result<NodeLocalPrivateValues, String> {
+        let node = self
+            .nodes
+            .get(node_index)
+            .ok_or_else(|| format!("unknown node {node_index}"))?
+            .get();
+        let (oop_reach, ip_reach) = self.profile_reach_at_node(node_index)?;
+        let mut scratch = NodeLocalScratch::new(self);
+        let mut oop_values = vec![0.0; self.oop_combos.len()];
+        let mut ip_values = vec![0.0; self.ip_combos.len()];
+        let oop_terminal_evals = self.evaluate_side_into(
+            node_index,
+            Player::Oop,
+            &ip_reach,
+            NodeLocalEvaluationMode::Profile,
+            &mut oop_values,
+            &mut scratch,
+        )?;
+        scratch.side_cache.entries.clear();
+        let ip_terminal_evals = self.evaluate_side_into(
+            node_index,
+            Player::Ip,
+            &oop_reach,
+            NodeLocalEvaluationMode::Profile,
+            &mut ip_values,
+            &mut scratch,
+        )?;
+        let mut oop_opponent_weights = vec![0.0; self.oop_combos.len()];
+        opponent_weights_for_fast_into(
+            &ip_reach,
+            &self.oop_same_ip_combo_indices,
+            &live_combo_targets(&self.oop_combos, &node.board),
+            &live_combo_targets(&self.ip_combos, &node.board),
+            1.0,
+            &mut oop_opponent_weights,
+        );
+        let mut ip_opponent_weights = vec![0.0; self.ip_combos.len()];
+        opponent_weights_for_fast_into(
+            &oop_reach,
+            &self.ip_same_oop_combo_indices,
+            &live_combo_targets(&self.ip_combos, &node.board),
+            &live_combo_targets(&self.oop_combos, &node.board),
+            1.0,
+            &mut ip_opponent_weights,
+        );
+        for (value, weight) in oop_values.iter_mut().zip(&oop_opponent_weights) {
+            if *weight > 0.0 {
+                *value /= *weight;
+            }
+        }
+        for (value, weight) in ip_values.iter_mut().zip(&ip_opponent_weights) {
+            if *weight > 0.0 {
+                *value /= *weight;
+            }
+        }
+        let oop_weight = oop_reach.iter().sum::<f32>();
+        let ip_weight = ip_reach.iter().sum::<f32>();
+        if oop_weight > 0.0 && ip_weight > 0.0 {
+            let oop_average = oop_values
+                .iter()
+                .zip(&oop_reach)
+                .map(|(value, reach)| value * reach)
+                .sum::<f32>()
+                / oop_weight;
+            let ip_average = ip_values
+                .iter()
+                .zip(&ip_reach)
+                .map(|(value, reach)| value * reach)
+                .sum::<f32>()
+                / ip_weight;
+            let zero_sum_oop = (oop_average - ip_average) * 0.5;
+            let zero_sum_ip = -zero_sum_oop;
+            let oop_offset = zero_sum_oop - oop_average;
+            let ip_offset = zero_sum_ip - ip_average;
+            for value in &mut oop_values {
+                *value += oop_offset;
+            }
+            for value in &mut ip_values {
+                *value += ip_offset;
+            }
+        }
+        Ok(NodeLocalPrivateValues {
+            board: node.board.clone(),
+            pot: node.pot,
+            oop_values,
+            ip_values,
+            oop_reach,
+            ip_reach,
+            terminal_evals: oop_terminal_evals + ip_terminal_evals,
         })
     }
 
@@ -3913,6 +4019,60 @@ mod tests {
         );
         assert!(action_ev.terminal_evals > 0);
         assert!(action_ev.action_major.iter().all(|value| value.is_finite()));
+    }
+
+    #[test]
+    fn node_local_private_values_average_to_strategy_ev() {
+        let board = Board::from_str("As7h2c").unwrap();
+        let oop_range = RangeSpec::from_str("AcAd,KcKd").unwrap();
+        let ip_range = RangeSpec::from_str("QcQd,JcJd").unwrap();
+        let tree = TreeBuilder::new(TreeTemplate {
+            action_abstraction: two_street_bet_fold_abstraction(),
+            chance_expansion: ChanceExpansion::Enumerate,
+        })
+        .unwrap()
+        .build(Spot {
+            board,
+            pot: 200,
+            effective_stack: 900,
+            oop_range: oop_range.clone(),
+            ip_range: ip_range.clone(),
+            first_player: Player::Oop,
+        })
+        .unwrap();
+        let mut solver = NodeLocalCfrSolver::new(tree, oop_range, ip_range).unwrap();
+        solver
+            .run_with_progress(
+                RealCfrConfig {
+                    iterations: 2,
+                    variant: RealCfrVariant::CfrPlus,
+                    average_strategy: RealCfrAverageStrategy::ReachWeighted,
+                },
+                |_| {},
+            )
+            .unwrap();
+        let ev = solver.strategy_ev_at_node(0).unwrap();
+        let private = solver.private_values_at_node(0).unwrap();
+        let oop_weight = private.oop_reach.iter().sum::<f32>();
+        let ip_weight = private.ip_reach.iter().sum::<f32>();
+        let oop_average = private
+            .oop_values
+            .iter()
+            .zip(&private.oop_reach)
+            .map(|(value, reach)| value * reach)
+            .sum::<f32>()
+            / oop_weight;
+        let ip_average = private
+            .ip_values
+            .iter()
+            .zip(&private.ip_reach)
+            .map(|(value, reach)| value * reach)
+            .sum::<f32>()
+            / ip_weight;
+        assert!((oop_average - ev.oop_value).abs() < 0.001);
+        assert!((ip_average - ev.ip_value).abs() < 0.001);
+        assert_eq!(private.oop_values.len(), solver.oop_combos.len());
+        assert_eq!(private.ip_values.len(), solver.ip_combos.len());
     }
 
     #[test]
