@@ -2769,6 +2769,7 @@ fn solve_viewer_subtree_strategy_ev(
     );
     let solver = solve_viewer_subtree_solver(state, resolver, root_node)?;
     let ev = solver.strategy_ev_at_node(0)?;
+    ensure_viewer_ev_board_matches(root_node, &ev.board)?;
     info!(
         db = %resolver.db_path.display(),
         root_public_node = root_node.public_node,
@@ -2801,6 +2802,7 @@ fn solve_viewer_subtree_action_ev(
     let solver = solve_viewer_subtree_solver(state, resolver, root_node)?;
     let snapshot = solver.solution_snapshot_until_street(Some(Street::River));
     let ev = solver.action_ev_at_node(0)?;
+    ensure_viewer_ev_board_matches(root_node, &ev.board)?;
     info!(
         db = %resolver.db_path.display(),
         root_public_node = root_node.public_node,
@@ -3001,6 +3003,7 @@ fn solve_viewer_subtree_solver(
         let exact_board = Board::from_str(&root_node.board)?;
         force_subtree_board(&mut subtree, exact_board);
     }
+    validate_subtree_root_matches_viewer_node(&subtree, root_node)?;
     let reach = db_viewer_reach_at_node(state, root_node.id)?;
     let oop_range = range_from_reach(&state.solution.oop_weights, &reach.oop)?;
     let ip_range = range_from_reach(&state.solution.ip_weights, &reach.ip)?;
@@ -3014,6 +3017,49 @@ fn solve_viewer_subtree_solver(
         |_| {},
     )?;
     Ok(solver)
+}
+
+fn validate_subtree_root_matches_viewer_node(
+    subtree: &PublicTree,
+    root_node: &ViewerNode,
+) -> Result<(), String> {
+    let root = subtree
+        .nodes
+        .first()
+        .ok_or_else(|| "subtree is empty".to_string())?;
+    let root_board = root.state.board.to_string();
+    if root_board != root_node.board {
+        return Err(format!(
+            "subtree root board mismatch for node {}: viewer={} subtree={}",
+            root_node.id, root_node.board, root_board
+        ));
+    }
+    let root_street = format_street(root.state.street);
+    if root_street != root_node.street {
+        return Err(format!(
+            "subtree root street mismatch for node {}: viewer={} subtree={}",
+            root_node.id, root_node.street, root_street
+        ));
+    }
+    let root_player = format_player(root.state.player);
+    if root_player != root_node.player {
+        return Err(format!(
+            "subtree root player mismatch for node {}: viewer={} subtree={}",
+            root_node.id, root_node.player, root_player
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_viewer_ev_board_matches(root_node: &ViewerNode, board: &Board) -> Result<(), String> {
+    let ev_board = board.to_string();
+    if ev_board != root_node.board {
+        return Err(format!(
+            "lazy subtree EV board mismatch for node {}: viewer={} ev={}",
+            root_node.id, root_node.board, ev_board
+        ));
+    }
+    Ok(())
 }
 
 fn force_subtree_board(tree: &mut PublicTree, board: Board) {
@@ -3033,6 +3079,21 @@ fn expand_subtree_strategy(
         Player::Oop => (oop_subtree_combos, resolver.request.oop_range.combos()),
         Player::Ip => (ip_subtree_combos, resolver.request.ip_range.combos()),
     };
+    if strategy.combos != source_combos.len() {
+        return Err(format!(
+            "subtree strategy combo count mismatch: strategy={} source={}",
+            strategy.combos,
+            source_combos.len()
+        ));
+    }
+    if strategy.action_major.len() != strategy.actions * strategy.combos {
+        return Err(format!(
+            "subtree strategy length mismatch: len={} actions={} combos={}",
+            strategy.action_major.len(),
+            strategy.actions,
+            strategy.combos
+        ));
+    }
     let mut target_by_combo = HashMap::with_capacity(target_combos.len());
     for (index, combo) in target_combos.iter().enumerate() {
         target_by_combo.insert(combo_key(combo), index);
@@ -3077,6 +3138,21 @@ fn expand_subtree_action_ev(
         Player::Oop => (oop_subtree_combos, resolver.request.oop_range.combos()),
         Player::Ip => (ip_subtree_combos, resolver.request.ip_range.combos()),
     };
+    if ev.combos != source_combos.len() {
+        return Err(format!(
+            "subtree action EV combo count mismatch: ev={} source={}",
+            ev.combos,
+            source_combos.len()
+        ));
+    }
+    if ev.action_major.len() != ev.actions * ev.combos {
+        return Err(format!(
+            "subtree action EV length mismatch: len={} actions={} combos={}",
+            ev.action_major.len(),
+            ev.actions,
+            ev.combos
+        ));
+    }
     let mut target_by_combo = HashMap::with_capacity(target_combos.len());
     for (index, combo) in target_combos.iter().enumerate() {
         target_by_combo.insert(combo_key(combo), index);
