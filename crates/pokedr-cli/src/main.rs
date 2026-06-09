@@ -1163,7 +1163,7 @@ fn export_solution_db(
     insert_metadata(
         &transaction,
         &[
-            ("schema_version", "3".to_string()),
+            ("schema_version", "4".to_string()),
             ("flop", request.board.to_string()),
             ("pot", request.pot.to_string()),
             ("effective_stack", request.effective_stack.to_string()),
@@ -1212,7 +1212,8 @@ fn export_solution_db(
     }
     let strategy_evs =
         insert_solution_strategy_evs(&transaction, solver, &snapshot, max_strategy_street)?;
-    let action_evs = insert_solution_action_evs(&transaction, solver, &snapshot)?;
+    let action_evs =
+        insert_solution_action_evs(&transaction, solver, &snapshot, max_strategy_street)?;
     transaction
         .commit()
         .map_err(|error| format!("failed to commit solution database: {error}"))?;
@@ -1398,10 +1399,11 @@ fn insert_solution_action_evs(
     connection: &Connection,
     solver: &NodeLocalCfrSolver,
     snapshot: &NodeLocalSolutionSnapshot,
+    max_strategy_street: Street,
 ) -> Result<usize, String> {
     let mut inserted = 0usize;
     for node in &snapshot.nodes {
-        if !should_store_action_ev(node) {
+        if !should_store_action_ev(node, max_strategy_street) {
             continue;
         }
         let ev = solver.action_ev_at_node(node.id).map_err(|error| {
@@ -1426,8 +1428,11 @@ fn should_store_strategy_ev(
             && node.street <= max_strategy_street
 }
 
-fn should_store_action_ev(node: &pokedr_core::NodeLocalSolutionNode) -> bool {
-    node.id == 0 && node.strategy.is_some()
+fn should_store_action_ev(
+    node: &pokedr_core::NodeLocalSolutionNode,
+    max_strategy_street: Street,
+) -> bool {
+    node.strategy.is_some() && node.street <= max_strategy_street
 }
 
 fn insert_strategy_ev(
