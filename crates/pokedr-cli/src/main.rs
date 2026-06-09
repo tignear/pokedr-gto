@@ -2220,6 +2220,31 @@ async fn api_reach(Path(id): Path<usize>, State(state): State<ViewerState>) -> i
     {
         return Json(cached.clone()).into_response();
     }
+    if state.resolver.is_some()
+        && state
+            .solver
+            .lock()
+            .expect("viewer solver poisoned")
+            .is_none()
+    {
+        match db_viewer_reach_at_node(&state, id) {
+            Ok(value) => {
+                state
+                    .reach_cache
+                    .lock()
+                    .expect("reach cache poisoned")
+                    .insert(id, value.clone());
+                return Json(value).into_response();
+            }
+            Err(error) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "error": error })),
+                )
+                    .into_response();
+            }
+        }
+    }
     let result = ensure_viewer_solver(&state).and_then(|mut solver| {
         solver
             .as_mut()
@@ -2255,6 +2280,19 @@ async fn api_strategy_ev(
         .get(&id)
     {
         return Json(cached.clone()).into_response();
+    }
+    if state.resolver.is_some()
+        && state
+            .solver
+            .lock()
+            .expect("viewer solver poisoned")
+            .is_none()
+    {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": "strategy EV is not stored in this database" })),
+        )
+            .into_response();
     }
     let result = ensure_viewer_solver(&state).and_then(|mut solver| {
         solver
@@ -2299,6 +2337,19 @@ async fn api_action_ev(
         .get(&id)
     {
         return Json(cached.clone()).into_response();
+    }
+    if state.resolver.is_some()
+        && state
+            .solver
+            .lock()
+            .expect("viewer solver poisoned")
+            .is_none()
+    {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": "action EV is not stored in this database" })),
+        )
+            .into_response();
     }
     let result = ensure_viewer_solver(&state).and_then(|mut solver| {
         solver
@@ -2448,6 +2499,113 @@ fn resolve_viewer_node_strategy(
     Ok(Some(value))
 }
 
+fn db_viewer_reach_at_node(state: &ViewerState, id: usize) -> Result<ViewerReach, String> {
+    let mut path = Vec::new();
+    if !find_viewer_path(&state.solution.nodes, 0, id, &mut path) {
+        return Err(format!("node {id} is not reachable from root"));
+    }
+    let mut oop = state
+        .solution
+        .oop_weights
+        .iter()
+        .map(|combo| combo.weight)
+        .collect::<Vec<_>>();
+    let mut ip = state
+        .solution
+        .ip_weights
+        .iter()
+        .map(|combo| combo.weight)
+        .collect::<Vec<_>>();
+    if let Some(root) = state.solution.nodes.first() {
+        let board = Board::from_str(&root.board)?;
+        zero_viewer_board_conflicts(&mut oop, &state.solution.oop_weights, &board);
+        zero_viewer_board_conflicts(&mut ip, &state.solution.ip_weights, &board);
+    }
+    for pair in path.windows(2) {
+        let parent_id = pair[0];
+        let child_id = pair[1];
+        let parent = &state.solution.nodes[parent_id];
+        let child = &state.solution.nodes[child_id];
+        if parent.kind == "chance" {
+            let board = Board::from_str(&child.board)?;
+            zero_viewer_board_conflicts(&mut oop, &state.solution.oop_weights, &board);
+            zero_viewer_board_conflicts(&mut ip, &state.solution.ip_weights, &board);
+            continue;
+        }
+        if parent.kind != "decision" {
+            continue;
+        }
+        let Some(action_index) = parent
+            .actions
+            .iter()
+            .find(|action| action.child == Some(child_id))
+            .map(|action| action.index)
+        else {
+            return Err(format!(
+                "node {parent_id} has no action leading to child {child_id}"
+            ));
+        };
+        let strategy = parent.strategy.clone().or_else(|| {
+            state
+                .resolved_strategy_cache
+                .lock()
+                .expect("resolved strategy cache poisoned")
+                .get(&parent_id)
+                .cloned()
+        });
+        let Some(strategy) = strategy else {
+            return Err(format!(
+                "node {parent_id} strategy is not available for DB reach propagation"
+            ));
+        };
+        let reach = if strategy.player == "oop" {
+            &mut oop
+        } else {
+            &mut ip
+        };
+        for (combo_index, value) in reach.iter_mut().enumerate() {
+            let frequency = strategy
+                .action_major
+                .get(action_index * strategy.combos + combo_index)
+                .copied()
+                .unwrap_or(0.0);
+            *value *= frequency;
+        }
+    }
+    Ok(ViewerReach { oop, ip })
+}
+
+fn find_viewer_path(
+    nodes: &[ViewerNode],
+    current: usize,
+    target: usize,
+    path: &mut Vec<usize>,
+) -> bool {
+    path.push(current);
+    if current == target {
+        return true;
+    }
+    let Some(node) = nodes.get(current) else {
+        path.pop();
+        return false;
+    };
+    for child in &node.children {
+        if find_viewer_path(nodes, *child, target, path) {
+            return true;
+        }
+    }
+    path.pop();
+    false
+}
+
+fn zero_viewer_board_conflicts(reach: &mut [f32], combos: &[ComboWeight], board: &Board) {
+    for (value, combo) in reach.iter_mut().zip(combos) {
+        if board.contains(combo.first) || board.contains(combo.second) {
+            *value = 0.0;
+        }
+    }
+}
+
 fn solve_viewer_subtree_root_strategy(
     resolver: &ViewerDbResolver,
     root_public_node: usize,
@@ -2474,6 +2632,8 @@ fn solve_viewer_subtree_root_strategy(
         |_| {},
     )?;
     let snapshot = solver.solution_snapshot_until_street(Some(Street::River));
+    let oop_combos = snapshot.oop_combos.clone();
+    let ip_combos = snapshot.ip_combos.clone();
     let strategy = snapshot
         .nodes
         .into_iter()
@@ -2484,12 +2644,63 @@ fn solve_viewer_subtree_root_strategy(
         root_public_node,
         "viewer_lazy_subtree_solver_finish"
     );
-    Ok(strategy.map(|strategy| ViewerStrategy {
+    strategy
+        .map(|strategy| expand_subtree_strategy(resolver, strategy, &oop_combos, &ip_combos))
+        .transpose()
+}
+
+fn expand_subtree_strategy(
+    resolver: &ViewerDbResolver,
+    strategy: pokedr_core::NodeLocalStrategySnapshot,
+    oop_subtree_combos: &[ComboWeight],
+    ip_subtree_combos: &[ComboWeight],
+) -> Result<ViewerStrategy, String> {
+    let (source_combos, target_combos) = match strategy.player {
+        Player::Oop => (oop_subtree_combos, resolver.request.oop_range.combos()),
+        Player::Ip => (ip_subtree_combos, resolver.request.ip_range.combos()),
+    };
+    let mut target_by_combo = HashMap::with_capacity(target_combos.len());
+    for (index, combo) in target_combos.iter().enumerate() {
+        target_by_combo.insert(combo_key(combo), index);
+    }
+    let mut source_to_target = Vec::with_capacity(source_combos.len());
+    for combo in source_combos {
+        let target = target_by_combo
+            .get(&combo_key(combo))
+            .copied()
+            .ok_or_else(|| {
+                format!(
+                    "subtree combo {}{} is missing from viewer range",
+                    combo.first, combo.second
+                )
+            })?;
+        source_to_target.push(target);
+    }
+    let mut action_major = vec![0.0; strategy.actions * target_combos.len()];
+    for action in 0..strategy.actions {
+        let source_base = action * strategy.combos;
+        let target_base = action * target_combos.len();
+        for (source_index, target_index) in source_to_target.iter().copied().enumerate() {
+            action_major[target_base + target_index] =
+                strategy.action_major[source_base + source_index];
+        }
+    }
+    Ok(ViewerStrategy {
         player: format_player(strategy.player),
-        combos: strategy.combos,
+        combos: target_combos.len(),
         actions: strategy.actions,
-        action_major: strategy.action_major,
-    }))
+        action_major,
+    })
+}
+
+fn combo_key(combo: &ComboWeight) -> (u8, u8) {
+    let first = combo.first.index() as u8;
+    let second = combo.second.index() as u8;
+    if first <= second {
+        (first, second)
+    } else {
+        (second, first)
+    }
 }
 
 fn public_subtree_from(tree: &PublicTree, root: usize) -> Result<PublicTree, String> {
