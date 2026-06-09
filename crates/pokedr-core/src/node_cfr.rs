@@ -552,6 +552,13 @@ impl NodeLocalCfrSolver {
     }
 
     pub fn solution_snapshot(&self) -> NodeLocalSolutionSnapshot {
+        self.solution_snapshot_until_street(None)
+    }
+
+    pub fn solution_snapshot_until_street(
+        &self,
+        max_street: Option<Street>,
+    ) -> NodeLocalSolutionSnapshot {
         let mut nodes = Vec::with_capacity(self.nodes.len());
         for (id, node_cell) in self.nodes.iter().enumerate() {
             let node = node_cell.get();
@@ -562,32 +569,39 @@ impl NodeLocalCfrSolver {
                         PublicNodeKind::Decision { actions, .. } => actions.clone(),
                         _ => Vec::new(),
                     };
-                    let combos = match player {
-                        Player::Oop => self.oop_combos.len(),
-                        Player::Ip => self.ip_combos.len(),
-                    };
-                    let mut action_major = Vec::new();
-                    if *actions == 1 {
-                        action_major.resize(combos, 1.0);
+                    let strategy = if max_street
+                        .is_some_and(|max_street| public_node.state.street > max_street)
+                    {
+                        None
                     } else {
-                        let mut denominators = Vec::new();
-                        average_strategies_action_major_into(
-                            &node.strategy_sum,
-                            combos,
-                            *actions,
-                            &mut action_major,
-                            &mut denominators,
-                        );
-                    }
-                    (
-                        NodeLocalSolutionNodeKind::Decision,
-                        public_actions,
+                        let combos = match player {
+                            Player::Oop => self.oop_combos.len(),
+                            Player::Ip => self.ip_combos.len(),
+                        };
+                        let mut action_major = Vec::new();
+                        if *actions == 1 {
+                            action_major.resize(combos, 1.0);
+                        } else {
+                            let mut denominators = Vec::new();
+                            average_strategies_action_major_into(
+                                &node.strategy_sum,
+                                combos,
+                                *actions,
+                                &mut action_major,
+                                &mut denominators,
+                            );
+                        }
                         Some(NodeLocalStrategySnapshot {
                             player: *player,
                             combos,
                             actions: *actions,
                             action_major,
-                        }),
+                        })
+                    };
+                    (
+                        NodeLocalSolutionNodeKind::Decision,
+                        public_actions,
+                        strategy,
                     )
                 }
                 NodeLocalKind::Chance => (NodeLocalSolutionNodeKind::Chance, Vec::new(), None),
@@ -3759,7 +3773,10 @@ mod tests {
         let action_ev = solver.action_ev_at_node(0).unwrap();
         assert_eq!(action_ev.player, Player::Oop);
         assert_eq!(action_ev.combos, solver.oop_combos.len());
-        assert_eq!(action_ev.action_major.len(), action_ev.actions * action_ev.combos);
+        assert_eq!(
+            action_ev.action_major.len(),
+            action_ev.actions * action_ev.combos
+        );
         assert!(action_ev.terminal_evals > 0);
         assert!(action_ev.action_major.iter().all(|value| value.is_finite()));
     }

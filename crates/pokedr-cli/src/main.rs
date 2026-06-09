@@ -15,8 +15,10 @@ use pokedr_core::{
     Spot, Street, TreeBuilder, TreeTemplate, fixed_flop_future_board_isomorphism,
     full_deck_future_board_isomorphism_survey, plan_cfr_work,
 };
+use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
@@ -107,6 +109,17 @@ enum Command {
         dcfr_beta: Option<f32>,
         #[arg(long)]
         dcfr_gamma: Option<f32>,
+        #[arg(
+            long,
+            help = "Write the solved public tree and strategies to a SQLite database"
+        )]
+        db: Option<PathBuf>,
+        #[arg(
+            long,
+            default_value = "turn",
+            help = "Maximum street whose strategy payload is written to --db: flop, turn, or river"
+        )]
+        db_max_street: String,
     },
     #[command(about = "Solve a fixed flop and serve an interactive solution viewer")]
     Viewer {
@@ -239,6 +252,8 @@ fn main() -> Result<(), String> {
             dcfr_alpha,
             dcfr_beta,
             dcfr_gamma,
+            db,
+            db_max_street,
         } => {
             let config = load_config(&config)?;
             init_logging(log_level.as_deref(), &config)?;
@@ -274,10 +289,10 @@ fn main() -> Result<(), String> {
             log_solver_config(&solver_options);
             let tree = build_tree(request.clone(), tree_options.enumerate_chance)?;
             log_tree_summary(&tree, &request);
-            solve_flop(
+            let solver = solve_flop(
                 tree,
-                request.oop_range,
-                request.ip_range,
+                request.oop_range.clone(),
+                request.ip_range.clone(),
                 solver_options.iterations,
                 solver_options.threads,
                 solver_options.log_interval,
@@ -289,6 +304,10 @@ fn main() -> Result<(), String> {
                     average_strategy: solver_options.average_strategy,
                 },
             )?;
+            if let Some(path) = db {
+                let max_street = parse_street(&db_max_street)?;
+                export_solution_db(&path, &solver, &request, &solver_options, max_street)?;
+            }
         }
         Command::Viewer {
             flop,
@@ -897,7 +916,7 @@ fn solve_flop(
     exploitability_interval: u32,
     target_exploitability_bb100: Option<f32>,
     config: RealCfrConfig,
-) -> Result<(), String> {
+) -> Result<NodeLocalCfrSolver, String> {
     info!(
         flop = %tree.spot.board,
         variant = %format_cfr_variant(config.variant),
@@ -1011,7 +1030,361 @@ fn solve_flop(
         total_elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
         "node_cfr_finish"
     );
+    Ok(solver)
+}
+
+fn export_solution_db(
+    path: &PathBuf,
+    solver: &NodeLocalCfrSolver,
+    request: &FlopTreeRequest,
+    options: &SolverOptions,
+    max_strategy_street: Street,
+) -> Result<(), String> {
+    let summary = solver.summary();
+    let snapshot = solver.solution_snapshot_until_street(Some(max_strategy_street));
+    let mut connection = Connection::open(path).map_err(|error| {
+        format!(
+            "failed to open solution database {}: {error}",
+            path.display()
+        )
+    })?;
+    connection
+        .execute_batch(
+            r#"
+            PRAGMA foreign_keys = OFF;
+            DROP TABLE IF EXISTS metadata;
+            DROP TABLE IF EXISTS combos;
+            DROP TABLE IF EXISTS nodes;
+            DROP TABLE IF EXISTS actions;
+            DROP TABLE IF EXISTS edges;
+
+            CREATE TABLE metadata (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+
+            CREATE TABLE combos (
+                player TEXT NOT NULL,
+                combo_index INTEGER NOT NULL,
+                label TEXT NOT NULL,
+                class TEXT NOT NULL,
+                first_card TEXT NOT NULL,
+                second_card TEXT NOT NULL,
+                weight REAL NOT NULL,
+                PRIMARY KEY (player, combo_index)
+            );
+
+            CREATE TABLE nodes (
+                id INTEGER PRIMARY KEY,
+                public_node INTEGER NOT NULL,
+                street TEXT NOT NULL,
+                board TEXT NOT NULL,
+                pot_bb REAL NOT NULL,
+                player TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                terminal_reason TEXT,
+                strategy_player TEXT,
+                strategy_combos INTEGER,
+                strategy_actions INTEGER,
+                strategy_action_major_json TEXT
+            );
+
+            CREATE TABLE actions (
+                node_id INTEGER NOT NULL,
+                action_index INTEGER NOT NULL,
+                label TEXT NOT NULL,
+                child_id INTEGER,
+                PRIMARY KEY (node_id, action_index)
+            );
+
+            CREATE TABLE edges (
+                parent_id INTEGER NOT NULL,
+                edge_index INTEGER NOT NULL,
+                child_id INTEGER NOT NULL,
+                label TEXT NOT NULL,
+                PRIMARY KEY (parent_id, edge_index)
+            );
+
+            CREATE INDEX idx_nodes_public_node ON nodes(public_node);
+            CREATE INDEX idx_nodes_street ON nodes(street);
+            CREATE INDEX idx_nodes_board ON nodes(board);
+            CREATE INDEX idx_edges_child ON edges(child_id);
+            "#,
+        )
+        .map_err(|error| format!("failed to initialize solution database: {error}"))?;
+
+    let transaction = connection
+        .transaction()
+        .map_err(|error| format!("failed to start solution database transaction: {error}"))?;
+    insert_metadata(
+        &transaction,
+        &[
+            ("schema_version", "1".to_string()),
+            ("flop", request.board.to_string()),
+            ("pot", request.pot.to_string()),
+            ("effective_stack", request.effective_stack.to_string()),
+            ("first_player", format_player(request.first_player)),
+            ("oop_range", format_exact_range(&snapshot.oop_combos)),
+            ("ip_range", format_exact_range(&snapshot.ip_combos)),
+            ("iterations", snapshot.iterations.to_string()),
+            ("variant", format_cfr_variant(options.variant)),
+            (
+                "average_strategy",
+                format_average_strategy(options.average_strategy).to_string(),
+            ),
+            ("threads", options.threads.to_string()),
+            (
+                "max_strategy_street",
+                format_street(max_strategy_street).to_string(),
+            ),
+            ("states", summary.states.to_string()),
+            ("decision_states", summary.decision_states.to_string()),
+            ("action_slots", summary.action_slots.to_string()),
+            ("storage_gib", summary.storage_gib.to_string()),
+            (
+                "action_abstraction_json",
+                action_abstraction_json(&request.action_abstraction).to_string(),
+            ),
+        ],
+    )?;
+    insert_combos(&transaction, "oop", &snapshot.oop_combos)?;
+    insert_combos(&transaction, "ip", &snapshot.ip_combos)?;
+    let node_ids = snapshot
+        .nodes
+        .iter()
+        .map(|node| node.id)
+        .collect::<HashSet<_>>();
+    let nodes_by_id = snapshot
+        .nodes
+        .iter()
+        .map(|node| (node.id, node))
+        .collect::<HashMap<_, _>>();
+    for node in &snapshot.nodes {
+        insert_solution_node(&transaction, node)?;
+    }
+    for node in &snapshot.nodes {
+        insert_solution_edges(&transaction, &node_ids, &nodes_by_id, node)?;
+    }
+    transaction
+        .commit()
+        .map_err(|error| format!("failed to commit solution database: {error}"))?;
+    info!(
+        path = %path.display(),
+        nodes = snapshot.nodes.len(),
+        max_strategy_street = format_street(max_strategy_street),
+        "solution_db_written"
+    );
     Ok(())
+}
+
+fn insert_metadata(connection: &Connection, values: &[(&str, String)]) -> Result<(), String> {
+    for (key, value) in values {
+        connection
+            .execute(
+                "INSERT INTO metadata (key, value) VALUES (?1, ?2)",
+                params![key, value],
+            )
+            .map_err(|error| format!("failed to insert metadata {key}: {error}"))?;
+    }
+    Ok(())
+}
+
+fn insert_combos(
+    connection: &Connection,
+    player: &str,
+    combos: &[ComboWeight],
+) -> Result<(), String> {
+    for (index, combo) in combos.iter().enumerate() {
+        connection
+            .execute(
+                r#"
+                INSERT INTO combos
+                    (player, combo_index, label, class, first_card, second_card, weight)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                "#,
+                params![
+                    player,
+                    index as i64,
+                    format!("{}{}", combo.first, combo.second),
+                    combo_class(combo),
+                    combo.first.to_string(),
+                    combo.second.to_string(),
+                    combo.weight,
+                ],
+            )
+            .map_err(|error| format!("failed to insert {player} combo {index}: {error}"))?;
+    }
+    Ok(())
+}
+
+fn insert_solution_node(
+    connection: &Connection,
+    node: &pokedr_core::NodeLocalSolutionNode,
+) -> Result<(), String> {
+    let (kind, terminal_reason) = match node.kind {
+        NodeLocalSolutionNodeKind::Decision => ("decision", None),
+        NodeLocalSolutionNodeKind::Chance => ("chance", None),
+        NodeLocalSolutionNodeKind::Terminal { reason } => {
+            ("terminal", Some(format!("{reason:?}").to_ascii_lowercase()))
+        }
+    };
+    let strategy_player = node
+        .strategy
+        .as_ref()
+        .map(|strategy| format_player(strategy.player));
+    let strategy_combos = node
+        .strategy
+        .as_ref()
+        .map(|strategy| strategy.combos as i64);
+    let strategy_actions = node
+        .strategy
+        .as_ref()
+        .map(|strategy| strategy.actions as i64);
+    let strategy_json = node
+        .strategy
+        .as_ref()
+        .map(|strategy| serde_json::to_string(&strategy.action_major))
+        .transpose()
+        .map_err(|error| format!("failed to serialize strategy for node {}: {error}", node.id))?;
+    connection
+        .execute(
+            r#"
+            INSERT INTO nodes
+                (id, public_node, street, board, pot_bb, player, kind, terminal_reason,
+                 strategy_player, strategy_combos, strategy_actions, strategy_action_major_json)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+            "#,
+            params![
+                node.id as i64,
+                node.public_node as i64,
+                format_street(node.street),
+                node.board.to_string(),
+                node.pot as f32 / 100.0,
+                format_player(node.player),
+                kind,
+                terminal_reason,
+                strategy_player,
+                strategy_combos,
+                strategy_actions,
+                strategy_json,
+            ],
+        )
+        .map_err(|error| format!("failed to insert node {}: {error}", node.id))?;
+    Ok(())
+}
+
+fn insert_solution_edges(
+    connection: &Connection,
+    node_ids: &HashSet<usize>,
+    nodes_by_id: &HashMap<usize, &pokedr_core::NodeLocalSolutionNode>,
+    node: &pokedr_core::NodeLocalSolutionNode,
+) -> Result<(), String> {
+    for (index, action) in node.actions.iter().enumerate() {
+        connection
+            .execute(
+                "INSERT INTO actions (node_id, action_index, label, child_id) VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    node.id as i64,
+                    index as i64,
+                    format_action(action),
+                    node.children.get(index).copied().map(|child| child as i64)
+                ],
+            )
+            .map_err(|error| format!("failed to insert action {index} for node {}: {error}", node.id))?;
+    }
+    for (index, child) in node.children.iter().copied().enumerate() {
+        if !node_ids.contains(&child) {
+            continue;
+        }
+        let label = node
+            .actions
+            .get(index)
+            .map(format_action)
+            .or_else(|| {
+                nodes_by_id
+                    .get(&child)
+                    .map(|child_node| child_node.board.to_string())
+            })
+            .unwrap_or_else(|| format!("next:{child}"));
+        connection
+            .execute(
+                "INSERT INTO edges (parent_id, edge_index, child_id, label) VALUES (?1, ?2, ?3, ?4)",
+                params![node.id as i64, index as i64, child as i64, label],
+            )
+            .map_err(|error| {
+                format!(
+                    "failed to insert edge {index} for node {} -> {child}: {error}",
+                    node.id
+                )
+            })?;
+    }
+    Ok(())
+}
+
+fn format_exact_range(combos: &[ComboWeight]) -> String {
+    combos
+        .iter()
+        .map(|combo| {
+            let label = format!("{}{}", combo.first, combo.second);
+            if (combo.weight - 1.0).abs() < f32::EPSILON {
+                label
+            } else {
+                format!("{label}:{}", combo.weight)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn action_abstraction_json(action: &ActionAbstraction) -> serde_json::Value {
+    serde_json::json!({
+        "min_bet": action.min_bet,
+        "flop": {
+            "first_bet_sizes": action.flop.first_bet_sizes.iter().map(format_bet_size_spec).collect::<Vec<_>>(),
+            "donk_bet_sizes": action.flop.donk_bet_sizes.iter().map(format_bet_size_spec).collect::<Vec<_>>(),
+        },
+        "turn": {
+            "first_bet_sizes": action.turn.first_bet_sizes.iter().map(format_bet_size_spec).collect::<Vec<_>>(),
+            "donk_bet_sizes": action.turn.donk_bet_sizes.iter().map(format_bet_size_spec).collect::<Vec<_>>(),
+        },
+        "river": {
+            "first_bet_sizes": action.river.first_bet_sizes.iter().map(format_bet_size_spec).collect::<Vec<_>>(),
+            "donk_bet_sizes": action.river.donk_bet_sizes.iter().map(format_bet_size_spec).collect::<Vec<_>>(),
+        },
+        "raise": {
+            "raise_multiplier": action.raise.raise_multiplier,
+            "raise_sizes": action.raise.raise_sizes.iter().map(format_raise_size_spec).collect::<Vec<_>>(),
+            "max_raises_per_street": action.raise.max_raises_per_street,
+            "shove_spr_threshold": action.raise.shove_spr_threshold,
+            "shove_commit_fraction": action.raise.shove_commit_fraction,
+            "add_all_in_threshold": action.raise.add_all_in_threshold,
+            "force_all_in_threshold": action.raise.force_all_in_threshold,
+            "merging_threshold": action.raise.merging_threshold,
+        },
+    })
+}
+
+fn format_bet_size_spec(value: &BetSizeSpec) -> String {
+    match value {
+        BetSizeSpec::PotFraction(fraction) => format!("{fraction}p"),
+        BetSizeSpec::Geometric {
+            streets,
+            max_pot_fraction,
+        } => format!("geo:{streets}:{max_pot_fraction}"),
+        BetSizeSpec::AllIn => "allin".to_string(),
+    }
+}
+
+fn format_raise_size_spec(value: &RaiseSizeSpec) -> String {
+    match value {
+        RaiseSizeSpec::PotFraction(fraction) => format!("{fraction}p"),
+        RaiseSizeSpec::PreviousBetMultiplier(multiplier) => format!("{multiplier}x"),
+        RaiseSizeSpec::Geometric {
+            streets,
+            max_pot_fraction,
+        } => format!("geo:{streets}:{max_pot_fraction}"),
+        RaiseSizeSpec::AllIn => "allin".to_string(),
+    }
 }
 
 fn ns_to_ms(ns: u64) -> f64 {
@@ -2059,6 +2432,25 @@ fn format_player(player: Player) -> String {
         Player::Ip => "ip",
     }
     .to_string()
+}
+
+fn parse_street(value: &str) -> Result<Street, String> {
+    match value.to_ascii_lowercase().as_str() {
+        "flop" => Ok(Street::Flop),
+        "turn" => Ok(Street::Turn),
+        "river" => Ok(Street::River),
+        _ => Err(format!(
+            "invalid street {value:?}; expected flop, turn, or river"
+        )),
+    }
+}
+
+fn format_street(street: Street) -> &'static str {
+    match street {
+        Street::Flop => "flop",
+        Street::Turn => "turn",
+        Street::River => "river",
+    }
 }
 
 fn parse_cfr_variant(
