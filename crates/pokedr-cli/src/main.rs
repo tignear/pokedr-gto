@@ -1212,8 +1212,12 @@ fn export_solution_db(
     }
     let strategy_evs =
         insert_solution_strategy_evs(&transaction, solver, &snapshot, max_strategy_street)?;
-    let action_evs =
-        insert_solution_action_evs(&transaction, solver, &snapshot, max_strategy_street)?;
+    let action_evs = insert_solution_action_evs(
+        &transaction,
+        solver,
+        &snapshot,
+        max_action_ev_street(max_strategy_street),
+    )?;
     transaction
         .commit()
         .map_err(|error| format!("failed to commit solution database: {error}"))?;
@@ -1433,6 +1437,13 @@ fn should_store_action_ev(
     max_strategy_street: Street,
 ) -> bool {
     node.strategy.is_some() && node.street <= max_strategy_street
+}
+
+fn max_action_ev_street(max_strategy_street: Street) -> Street {
+    match max_strategy_street {
+        Street::River => Street::Turn,
+        street => street,
+    }
 }
 
 fn insert_strategy_ev(
@@ -2416,6 +2427,7 @@ struct ViewerState {
     strategy_ev_cache: Arc<Mutex<HashMap<usize, ViewerStrategyEv>>>,
     action_ev_cache: Arc<Mutex<HashMap<usize, ViewerActionEv>>>,
     reach_cache: Arc<Mutex<HashMap<usize, ViewerReach>>>,
+    lazy_ev_lock: Arc<Mutex<()>>,
 }
 
 fn serve_viewer(
@@ -2434,6 +2446,7 @@ fn serve_viewer(
         strategy_ev_cache: Arc::new(Mutex::new(viewer.strategy_evs)),
         action_ev_cache: Arc::new(Mutex::new(viewer.action_evs)),
         reach_cache: Arc::new(Mutex::new(HashMap::new())),
+        lazy_ev_lock: Arc::new(Mutex::new(())),
     };
     let api = Router::new()
         .route("/combos", get(api_combos))
@@ -2637,6 +2650,15 @@ async fn api_strategy_ev(
             .expect("viewer solver poisoned")
             .is_none()
     {
+        let _lazy_guard = state.lazy_ev_lock.lock().expect("lazy EV lock poisoned");
+        if let Some(cached) = state
+            .strategy_ev_cache
+            .lock()
+            .expect("strategy EV cache poisoned")
+            .get(&id)
+        {
+            return Json(cached.clone()).into_response();
+        }
         match resolve_db_viewer_strategy_ev(&state, id) {
             Ok(value) => {
                 state
@@ -2896,7 +2918,24 @@ fn resolve_db_viewer_strategy_ev(
             "strategy EV for node {id} is not stored in this database"
         ));
     }
+    if node.kind == "chance" {
+        return Err(format!(
+            "strategy EV for chance node {id} is not stored in this database"
+        ));
+    }
     solve_viewer_subtree_strategy_ev(state, resolver, &node)
+}
+
+fn viewer_strategy_ev_from_node_local(ev: &NodeLocalStrategyEv) -> ViewerStrategyEv {
+    ViewerStrategyEv {
+        board: ev.board.to_string(),
+        pot_bb: ev.pot as f32 / 100.0,
+        oop_ev_bb: ev.oop_value / 100.0,
+        ip_ev_bb: ev.ip_value / 100.0,
+        oop_weight: ev.oop_weight,
+        ip_weight: ev.ip_weight,
+        terminal_evals: ev.terminal_evals,
+    }
 }
 
 fn solve_viewer_subtree_strategy_ev(
@@ -2920,15 +2959,7 @@ fn solve_viewer_subtree_strategy_ev(
         root_node = root_node.id,
         "viewer_lazy_subtree_strategy_ev_finish"
     );
-    Ok(ViewerStrategyEv {
-        board: ev.board.to_string(),
-        pot_bb: ev.pot as f32 / 100.0,
-        oop_ev_bb: ev.oop_value / 100.0,
-        ip_ev_bb: ev.ip_value / 100.0,
-        oop_weight: ev.oop_weight,
-        ip_weight: ev.ip_weight,
-        terminal_evals: ev.terminal_evals,
-    })
+    Ok(viewer_strategy_ev_from_node_local(&ev))
 }
 
 fn solve_viewer_subtree_action_ev(
@@ -3197,6 +3228,13 @@ fn validate_subtree_root_matches_viewer_node(
 
 fn ensure_viewer_ev_board_matches(root_node: &ViewerNode, board: &Board) -> Result<(), String> {
     let ev_board = board.to_string();
+    ensure_viewer_strategy_ev_board_matches(root_node, &ev_board)
+}
+
+fn ensure_viewer_strategy_ev_board_matches(
+    root_node: &ViewerNode,
+    ev_board: &str,
+) -> Result<(), String> {
     if ev_board != root_node.board {
         return Err(format!(
             "lazy subtree EV board mismatch for node {}: viewer={} ev={}",
