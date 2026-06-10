@@ -300,34 +300,46 @@ The current `plan-full-game` estimate still makes the river explosion visible:
 for the largest 15bb HU boundary with `postflop-basic`, one representative flop
 has `148,532` decisions, of which `146,568` are river decisions.
 
-That means the immediate gap is not just "use smaller stacks." It is:
+This should not be read as "the existing node-local CFR is naively expanding
+all chance events." It is not. The current `NodeLocalCfrSolver` already uses
+representative chance children plus private-combo permutation maps:
+
+- `PublicNodeKind::Chance` carries representative child cards and
+  `child_permutation_codes`.
+- `NodeLocalKind::Chance` stores `chance_concrete_events` and
+  `chance_permutation_codes`.
+- chance backup evaluates representative children and adds eliminated
+  isomorphic concrete events back with `add_permuted_scaled_slice`.
+
+The immediate gap is therefore more specific:
 
 - river raise-chain generation is too permissive for small-pot/high-SPR
   boundaries;
-- full-game planning multiplies representative postflop storage across
-  `(preflop boundary, flop class)` chunks;
-- the full-game engine does not yet have the same compact schematic arena that
-  stores one chance-agnostic action skeleton plus isomorphic chance coefficients;
-- regret/strategy state is still counted as if each representative subgame owns
-  its full action-slot arrays.
+- full-game planning multiplies one node-local representative-flop storage
+  estimate across `(preflop boundary, flop class)` chunks;
+- full-game solving has not yet been specified as shared node-local postflop
+  skeletons plus streamed per-boundary/per-flop regret chunks;
+- regret/strategy state is still planned as independent per representative
+  subgame, even though static action skeletons, terminal tables, and chance
+  permutation maps should be shared.
 
 ### Direct Implementation Lessons
 
-Before designing a disk streamer, the next full-game prototype should mirror the
-public reference's structure more closely:
+Before designing a disk streamer, the next full-game prototype should reuse the
+existing node-local structure instead of inventing a parallel design:
 
-1. Store one postflop action skeleton per `(pot, effective stack, abstraction
-   template)` boundary, not per concrete board.
-2. Attach flop/turn/river isomorphism representatives to chance nodes with combo
-   swap maps.
-3. Apply all-in forcing and close-action merging before children are allocated.
+1. Store/share one postflop action skeleton per `(pot, effective stack,
+   abstraction template)` boundary.
+2. Reuse the existing representative chance children and combo permutation maps.
+3. Apply all-in forcing and close-action merging before children are allocated;
+   verify this matches node-local tree generation.
 4. Add diagnostics that print how many river nodes are removed by:
    - action deduplication;
    - Pio-style close-size merging;
    - force-all-in conversion;
    - turn/river isomorphism.
-5. Only after the schematic arena is in place, decide whether regret/strategy
-   chunks must be streamed from disk.
+5. Only after shared skeleton/static data is in place, decide whether
+   regret/strategy chunks must be streamed from disk.
 
 Disk streaming is still likely needed for full-game 30bb-scale solves, but it
 should stream compact schematic chunks. Streaming a naively expanded river tree
