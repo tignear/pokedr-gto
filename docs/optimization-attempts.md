@@ -1365,3 +1365,40 @@ retrying similar ideas, so attempts stay in chronological order.
   different paired ranks; full-deck flop canonicalization is still responsible
   for choosing representative flops across the original `22,100` concrete
   flops.
+
+## 2026-06-10: Node-local chance permutation direct table
+
+- Tried: replace the hot `BTreeMap<u8, ComboPermutationMaps>` lookup in
+  node-local chance backup with a 256-entry direct table indexed by
+  `SuitPermutation::code()`.
+- Expected: reduce per-chance permutation lookup overhead after chance
+  isomorphism was restricted to root-live private ranges.
+- Result: slower/noisy in practice. On `As7h2c` with
+  `docs/solver-config.viewer.toml`, `16` release iterations, and no exact BR
+  interval, the warmed run moved from about `6749ms` before the attempt to
+  about `7426ms` after the direct table version.
+- Decision: reverted. The chance map lookup is not the meaningful bottleneck;
+  terminal side evaluation still dominates.
+
+## 2026-06-10: Remove pair table from strict terminal scans
+
+- Changed node-local terminal side evaluation so strict showdown win/loss scans
+  use only total reach plus per-card blocker sums. The old path also allocated
+  and zeroed a `52 * 52` pair table for each scan.
+- Reason: on a fixed terminal board, the exact same two-card private combo has
+  the same hand strength. Because the sorted scans use strict `<` and `>`
+  strength comparisons, the same-combo blocker correction can never be needed
+  in those win/loss scans. The only place that still needs same-combo
+  correction is the net-offset term, where the existing same-combo range maps
+  provide the exact opponent reach directly.
+- Validation: `cargo check --workspace`, `cargo test -p pokedr-core node_cfr`,
+  and the river fast-path brute-force overlap test passed.
+- Result: kept. On `As7h2c` with `docs/solver-config.viewer.toml`, `16`
+  release iterations, and no exact BR interval, the post-isomorphism-fix
+  baseline was about `6749ms` in `node_cfr_summary`. Removing the pair table
+  brought warmed runs to about `6076ms`; adding inline hints to the tiny
+  terminal helpers produced runs around `5874ms` to `6128ms`.
+- Profile confirmation: with `POKEDR_NODE_CFR_PROFILE=1`, terminal thread-summed
+  time moved from about `83808ms` to `72485ms`; showdown moved from about
+  `63098ms` to `49262ms`; river all-in moved from about `27824ms` to
+  `21433ms`.
