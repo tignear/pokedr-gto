@@ -491,7 +491,22 @@ fn card_pair_index(first: Card, second: Card) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::range::ComboWeight;
     use std::str::FromStr;
+
+    fn exact_range(tokens: &[&str]) -> RangeSpec {
+        RangeSpec::new(
+            tokens
+                .iter()
+                .map(|token| ComboWeight {
+                    first: Card::from_str(&token[0..2]).unwrap(),
+                    second: Card::from_str(&token[2..4]).unwrap(),
+                    weight: 1.0,
+                })
+                .collect(),
+        )
+        .unwrap()
+    }
 
     #[test]
     fn monotone_full_ranges_collapse_empty_suits_on_turn() {
@@ -518,7 +533,7 @@ mod tests {
     fn exact_suit_range_reduces_collapse() {
         let flop = Board::from_str("AsKsQs").unwrap();
         let full = RangeSpec::full_deck_uniform();
-        let exact = RangeSpec::from_str("AhAd").unwrap();
+        let exact = exact_range(&["AhAd"]);
 
         let symmetric = fixed_flop_future_board_isomorphism(&flop, &full, &full).unwrap();
         let asymmetric = fixed_flop_future_board_isomorphism(&flop, &exact, &full).unwrap();
@@ -572,7 +587,7 @@ mod tests {
     #[test]
     fn suit_symmetric_range_check_rejects_exact_suit_combos() {
         let pair_class = RangeSpec::from_str("AA").unwrap();
-        let exact = RangeSpec::from_str("AsAh").unwrap();
+        let exact = exact_range(&["AsAh"]);
 
         assert!(ranges_preserve_all_suit_permutations(
             &pair_class,

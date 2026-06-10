@@ -3494,11 +3494,25 @@ mod tests {
     };
     use std::str::FromStr;
 
+    fn exact_range(tokens: &[&str]) -> RangeSpec {
+        RangeSpec::new(
+            tokens
+                .iter()
+                .map(|token| ComboWeight {
+                    first: Card::from_str(&token[0..2]).unwrap(),
+                    second: Card::from_str(&token[2..4]).unwrap(),
+                    weight: 1.0,
+                })
+                .collect(),
+        )
+        .unwrap()
+    }
+
     #[test]
     fn node_local_cfr_allocates_slots_for_isomorphic_tree() {
         let board = Board::from_str("As7h2c").unwrap();
-        let oop_range = RangeSpec::from_str("AcAd,KcKd").unwrap();
-        let ip_range = RangeSpec::from_str("QcQd,JcJd").unwrap();
+        let oop_range = exact_range(&["AcAd", "KcKd"]);
+        let ip_range = exact_range(&["QcQd", "JcJd"]);
         let tree = TreeBuilder::new(TreeTemplate {
             action_abstraction: two_street_bet_fold_abstraction(),
             chance_expansion: ChanceExpansion::Isomorphic,
@@ -3533,8 +3547,8 @@ mod tests {
     #[test]
     fn node_local_cfr_filters_public_board_dead_combos() {
         let board = Board::from_str("As7h2c").unwrap();
-        let oop_range = RangeSpec::from_str("AsAh,AcAd,KcKd").unwrap();
-        let ip_range = RangeSpec::from_str("AsKh,QcQd,JcJd").unwrap();
+        let oop_range = exact_range(&["AsAh", "AcAd", "KcKd"]);
+        let ip_range = exact_range(&["AsKh", "QcQd", "JcJd"]);
         let tree = TreeBuilder::new(TreeTemplate {
             action_abstraction: tiny_checkdown_abstraction(),
             chance_expansion: ChanceExpansion::Enumerate,
@@ -3572,8 +3586,8 @@ mod tests {
     #[test]
     fn fold_payoff_subtracts_total_commit_across_streets() {
         let board = Board::from_str("As7h2c").unwrap();
-        let oop_range = RangeSpec::from_str("AcAd").unwrap();
-        let ip_range = RangeSpec::from_str("QcQd").unwrap();
+        let oop_range = exact_range(&["AcAd"]);
+        let ip_range = exact_range(&["QcQd"]);
         let tree = TreeBuilder::new(TreeTemplate {
             action_abstraction: two_street_bet_fold_abstraction(),
             chance_expansion: ChanceExpansion::Enumerate,
@@ -3624,8 +3638,8 @@ mod tests {
     #[test]
     fn river_fast_path_matches_sorted_terminal_path() {
         let board = Board::from_str("As7h2cTd9d").unwrap();
-        let oop_range = RangeSpec::from_str("AcAd,KcKd,QcQd,JcJd,8c8d").unwrap();
-        let ip_range = RangeSpec::from_str("AhKh,QhQs,JhJs,8h8s,6c6d").unwrap();
+        let oop_range = exact_range(&["AcAd", "KcKd", "QcQd", "JcJd", "8c8d"]);
+        let ip_range = exact_range(&["AhKh", "QhQs", "JhJs", "8h8s", "6c6d"]);
         let prepared = PreparedTerminalBoard::new(&board).unwrap();
         let oop_combos = oop_range.combos();
         let ip_combos = ip_range.combos();
@@ -3703,8 +3717,8 @@ mod tests {
     #[test]
     fn river_fast_path_matches_bruteforce_with_overlapping_ranges() {
         let board = Board::from_str("As7h2cTd9d").unwrap();
-        let oop_range = RangeSpec::from_str("AcAd,KcKd,QcQd,JcJd").unwrap();
-        let ip_range = RangeSpec::from_str("AcAd,KcKd,QhQs,JhJs").unwrap();
+        let oop_range = exact_range(&["AcAd", "KcKd", "QcQd", "JcJd"]);
+        let ip_range = exact_range(&["AcAd", "KcKd", "QhQs", "JhJs"]);
         let prepared = PreparedTerminalBoard::new(&board).unwrap();
         let oop_combos = oop_range.combos();
         let ip_combos = ip_range.combos();
@@ -3808,8 +3822,8 @@ mod tests {
     #[test]
     fn node_local_cfr_runs_one_iteration_on_small_ranges() {
         let board = Board::from_str("As7h2c").unwrap();
-        let oop_range = RangeSpec::from_str("AcAd,KcKd").unwrap();
-        let ip_range = RangeSpec::from_str("QcQd,JcJd").unwrap();
+        let oop_range = exact_range(&["AcAd", "KcKd"]);
+        let ip_range = exact_range(&["QcQd", "JcJd"]);
         let tree = TreeBuilder::new(TreeTemplate {
             action_abstraction: tiny_checkdown_abstraction(),
             chance_expansion: ChanceExpansion::Enumerate,
@@ -3844,8 +3858,8 @@ mod tests {
     #[test]
     fn node_local_exploitability_runs_on_small_ranges() {
         let board = Board::from_str("As7h2c").unwrap();
-        let oop_range = RangeSpec::from_str("AcAd,KcKd").unwrap();
-        let ip_range = RangeSpec::from_str("QcQd,JcJd").unwrap();
+        let oop_range = exact_range(&["AcAd", "KcKd"]);
+        let ip_range = exact_range(&["QcQd", "JcJd"]);
         let tree = TreeBuilder::new(TreeTemplate {
             action_abstraction: tiny_checkdown_abstraction(),
             chance_expansion: ChanceExpansion::Enumerate,
@@ -3882,8 +3896,8 @@ mod tests {
     #[test]
     fn node_local_strategy_ev_at_node_is_zero_sum() {
         let board = Board::from_str("As7h2c").unwrap();
-        let oop_range = RangeSpec::from_str("AcAd,KcKd").unwrap();
-        let ip_range = RangeSpec::from_str("QcQd,JcJd").unwrap();
+        let oop_range = exact_range(&["AcAd", "KcKd"]);
+        let ip_range = exact_range(&["QcQd", "JcJd"]);
         let tree = TreeBuilder::new(TreeTemplate {
             action_abstraction: tiny_checkdown_abstraction(),
             chance_expansion: ChanceExpansion::Enumerate,
@@ -3929,8 +3943,8 @@ mod tests {
     #[test]
     fn node_local_action_ev_at_node_returns_action_major_combo_values() {
         let board = Board::from_str("As7h2c").unwrap();
-        let oop_range = RangeSpec::from_str("AcAd,KcKd").unwrap();
-        let ip_range = RangeSpec::from_str("QcQd,JcJd").unwrap();
+        let oop_range = exact_range(&["AcAd", "KcKd"]);
+        let ip_range = exact_range(&["QcQd", "JcJd"]);
         let tree = TreeBuilder::new(TreeTemplate {
             action_abstraction: two_street_bet_fold_abstraction(),
             chance_expansion: ChanceExpansion::Enumerate,
@@ -3970,8 +3984,8 @@ mod tests {
     #[test]
     fn node_local_private_values_average_to_strategy_ev() {
         let board = Board::from_str("As7h2c").unwrap();
-        let oop_range = RangeSpec::from_str("AcAd,KcKd").unwrap();
-        let ip_range = RangeSpec::from_str("QcQd,JcJd").unwrap();
+        let oop_range = exact_range(&["AcAd", "KcKd"]);
+        let ip_range = exact_range(&["QcQd", "JcJd"]);
         let tree = TreeBuilder::new(TreeTemplate {
             action_abstraction: two_street_bet_fold_abstraction(),
             chance_expansion: ChanceExpansion::Enumerate,
@@ -4024,8 +4038,8 @@ mod tests {
     #[test]
     fn node_local_profile_reach_at_node_uses_action_reach() {
         let board = Board::from_str("As7h2c").unwrap();
-        let oop_range = RangeSpec::from_str("AcAd,KcKd").unwrap();
-        let ip_range = RangeSpec::from_str("QcQd,JcJd").unwrap();
+        let oop_range = exact_range(&["AcAd", "KcKd"]);
+        let ip_range = exact_range(&["QcQd", "JcJd"]);
         let tree = TreeBuilder::new(TreeTemplate {
             action_abstraction: two_street_bet_fold_abstraction(),
             chance_expansion: ChanceExpansion::Enumerate,

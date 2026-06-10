@@ -76,9 +76,9 @@ impl FromStr for RangeSpec {
                     (cards, weight.parse::<f32>().unwrap_or(f32::NAN))
                 });
             if is_exact_combo_token(cards) {
-                let first = Card::from_str(&cards[0..2])?;
-                let second = Card::from_str(&cards[2..4])?;
-                push_combo(&mut combos, first, second, weight);
+                return Err(format!(
+                    "exact suit combo token {cards:?} is not accepted in range input; use rank-class tokens like AA, AKs, or AKo"
+                ));
             } else {
                 expand_range_token(cards, weight, &mut combos)?;
             }
@@ -301,8 +301,8 @@ mod tests {
     }
 
     #[test]
-    fn parses_mixed_exact_and_traditional_ranges_with_weights() {
-        let range = RangeSpec::from_str("AhAd,99+:0.5,AKs").unwrap();
+    fn parses_mixed_traditional_ranges_with_weights() {
+        let range = RangeSpec::from_str("99+:0.5,AKs").unwrap();
         assert_eq!(range.combos().len(), 6 * 6 + 4);
         assert!(
             range
@@ -312,6 +312,12 @@ mod tests {
                     && combo.second == Card::from_str("9d").unwrap()
                     && combo.weight == 0.5)
         );
+    }
+
+    #[test]
+    fn rejects_exact_suit_combo_tokens() {
+        let error = RangeSpec::from_str("AhAd,99+").unwrap_err();
+        assert!(error.contains("exact suit combo token"));
     }
 
     #[test]
