@@ -1,4 +1,5 @@
 pub mod cards;
+pub mod cfr_config;
 pub mod isomorphism;
 pub mod node_cfr;
 pub mod plan;
@@ -6,18 +7,16 @@ pub mod range;
 pub mod terminal_cfv;
 pub mod tree;
 
-mod legacy;
-
 pub use cards::{Board, Card, Rank, Suit};
+pub use cfr_config::{
+    RealCfrAverageStrategy, RealCfrConfig, RealCfrExploitability, RealCfrVariant,
+};
 pub use isomorphism::{
     ChanceClass, ChanceClassMember, ComboSwap, FutureBoardIsomorphismReport,
     FutureBoardIsomorphismSurvey, NextCardIsomorphism, SuitPermutation, TerminalBoardClass,
     TerminalBoardClassMember, all_suit_permutations, fixed_flop_future_board_isomorphism,
     full_deck_future_board_isomorphism_survey, next_card_isomorphism,
     private_combo_permutation_indices, private_combo_swap_list, terminal_board_isomorphism,
-};
-pub use legacy::real_cfr::{
-    RealCfrAverageStrategy, RealCfrConfig, RealCfrExploitability, RealCfrVariant,
 };
 pub use node_cfr::{
     NodeLocalCfrSolver, NodeLocalCfrSummary, NodeLocalSolutionNode, NodeLocalSolutionNodeKind,

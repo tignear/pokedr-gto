@@ -3516,7 +3516,6 @@ fn live_reach_for_board(combos: &[ComboWeight], board: &Board) -> Vec<f32> {
 mod tests {
     use super::*;
     use crate::RealCfrAverageStrategy;
-    use crate::legacy::real_cfr::ArenaAlternatingCfrSolver;
     use crate::tree::{
         ActionAbstraction, BetSizeSpec, ChanceExpansion, RaisePolicy, Spot, StreetTemplate,
         TreeBuilder, TreeTemplate,
@@ -3524,12 +3523,12 @@ mod tests {
     use std::str::FromStr;
 
     #[test]
-    fn node_local_cfr_allocates_same_slots_as_arena_on_small_ranges() {
+    fn node_local_cfr_allocates_slots_for_isomorphic_tree() {
         let board = Board::from_str("As7h2c").unwrap();
         let oop_range = RangeSpec::from_str("AcAd,KcKd").unwrap();
         let ip_range = RangeSpec::from_str("QcQd,JcJd").unwrap();
         let tree = TreeBuilder::new(TreeTemplate {
-            action_abstraction: tiny_checkdown_abstraction(),
+            action_abstraction: two_street_bet_fold_abstraction(),
             chance_expansion: ChanceExpansion::Isomorphic,
         })
         .unwrap()
@@ -3542,12 +3541,21 @@ mod tests {
             first_player: Player::Oop,
         })
         .unwrap();
-        let arena =
-            ArenaAlternatingCfrSolver::new(tree.clone(), oop_range.clone(), ip_range.clone())
-                .unwrap();
-        let node = NodeLocalCfrSolver::new(tree, oop_range, ip_range).unwrap();
-        assert_eq!(node.summary().states, arena.state_count());
-        assert_eq!(node.summary().action_slots, arena.regret_len());
+        let mut solver = NodeLocalCfrSolver::new(tree, oop_range, ip_range).unwrap();
+        let summary = solver.summary();
+        assert!(summary.states > 0);
+        assert!(summary.decision_states > 0);
+        assert!(summary.action_slots > 0);
+        solver
+            .run_with_progress(
+                RealCfrConfig {
+                    iterations: 1,
+                    variant: RealCfrVariant::CfrPlus,
+                    average_strategy: RealCfrAverageStrategy::ReachWeighted,
+                },
+                |_| {},
+            )
+            .unwrap();
     }
 
     #[test]
