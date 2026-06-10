@@ -46,9 +46,12 @@ CLI configuration:
 Range input:
 
 - `full` still means all 1326 private combos.
-- Exact combos such as `AhAd` and comma-separated combo lists are supported.
 - Traditional poker range tokens are supported: `TT+`, `99+:0.7`, `ATo+`,
   `A2s+`, `KQs`, `AK`, etc.
+- Exact suit combo tokens such as `AhAd` are rejected in user-facing range
+  input. Internals and tests may still construct concrete combos with
+  `RangeSpec::new`, but configs should stay rank-class based so public-card
+  suit isomorphism remains effective.
 - A `:weight` suffix applies only to newly introduced combos. If tokens overlap,
   the first token keeps ownership of that combo. For example `TT+,88+:0.7`
   keeps TT+ at weight `1.0` and adds only 88-99 at weight `0.7`.
