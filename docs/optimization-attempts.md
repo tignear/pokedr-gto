@@ -1402,3 +1402,25 @@ retrying similar ideas, so attempts stay in chronological order.
   time moved from about `83808ms` to `72485ms`; showdown moved from about
   `63098ms` to `49262ms`; river all-in moved from about `27824ms` to
   `21433ms`.
+
+## 2026-06-10: Fuse terminal scans and precompute target fields
+
+- Changed terminal side evaluation from separate strict-win, strict-loss, and
+  net-offset passes to a single sorted pass using
+  `loss = total - win - tie`. The tie bucket is needed for exact zero-showdown
+  handling; same-combo correction remains exact through the existing
+  same-combo range maps.
+- Added terminal strength and private card indices to `PreparedComboTarget`, so
+  generic flop/turn all-in terminal scans no longer repeatedly query
+  `PreparedTerminalBoard` for strength and combo cards. `range_index` was
+  narrowed to `u16`, matching the existing compact river/live targets.
+- Validation: `cargo check --workspace` and `cargo test -p pokedr-core node_cfr`
+  passed.
+- Result: kept. On `As7h2c` with `docs/solver-config.viewer.toml`, `16`
+  release iterations, and no exact BR interval, the previous optimized warmed
+  runs were about `5874ms` to `6128ms`. The fused/target-precomputed path
+  measured about `5027ms` warmed, with a best run of `4984ms`.
+- Profile confirmation: with `POKEDR_NODE_CFR_PROFILE=1`, terminal thread-summed
+  time moved from about `72485ms` to `57314ms`; showdown moved from about
+  `49262ms` to `35595ms`; river all-in moved from about `21433ms` to
+  `16572ms`; turn all-in moved from about `9349ms` to `4978ms`.
