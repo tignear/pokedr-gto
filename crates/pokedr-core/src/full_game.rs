@@ -38,6 +38,7 @@ pub struct HuFullGamePlan {
     pub flop_concrete: usize,
     pub representative_subgames: u128,
     pub postflop: Vec<BoundaryPostflopPlan>,
+    pub streaming: HuFullGameStreamingPlan,
     pub total_action_slots: u128,
     pub total_storage_bytes: u128,
     pub compact_strategy_storage_bytes: u128,
@@ -79,11 +80,24 @@ pub struct RepresentativePostflopPlan {
     pub terminal_pair_upper_bound: u128,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HuFullGameStreamingPlan {
+    pub chunk_target_bytes: u128,
+    pub postflop_chunks: u128,
+    pub max_postflop_chunk_bytes: u128,
+    pub max_resident_bytes: u128,
+    pub disk_state_bytes: u128,
+    pub read_write_bytes_per_iteration: u128,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct BoundaryPostflopPlan {
     pub boundary: HuPostflopBoundaryGroup,
     pub representative_flop: RepresentativePostflopPlan,
     pub representative_subgames: u128,
+    pub chunks_per_representative: u128,
+    pub total_chunks: u128,
+    pub max_chunk_bytes: u128,
     pub action_slots: u128,
     pub storage_bytes: u128,
     pub terminal_cfv_calls: u128,
@@ -140,6 +154,24 @@ impl HuPreflopPlan {
     }
 }
 
+impl HuFullGameStreamingPlan {
+    pub fn max_postflop_chunk_mib(&self) -> f64 {
+        bytes_to_mib(self.max_postflop_chunk_bytes)
+    }
+
+    pub fn max_resident_gib(&self) -> f64 {
+        bytes_to_gib(self.max_resident_bytes)
+    }
+
+    pub fn disk_state_gib(&self) -> f64 {
+        bytes_to_gib(self.disk_state_bytes)
+    }
+
+    pub fn read_write_gib_per_iteration(&self) -> f64 {
+        bytes_to_gib(self.read_write_bytes_per_iteration)
+    }
+}
+
 impl RepresentativePostflopPlan {
     pub fn storage_gib(&self) -> f64 {
         bytes_to_gib(self.storage_bytes)
@@ -154,6 +186,8 @@ pub fn plan_hu_full_game(config: &HuFullGameConfig) -> Result<HuFullGamePlan, St
     let mut representative_subgames = 0u128;
     let mut postflop_action_slots = 0u128;
     let mut postflop_storage_bytes = 0u128;
+    let mut postflop_chunks = 0u128;
+    let mut max_postflop_chunk_bytes = 0u128;
     let mut terminal_cfv_calls_per_iteration = 0u128;
     let mut terminal_pair_upper_bound_per_iteration = 0u128;
     for boundary in &preflop.postflop_boundaries {
@@ -169,10 +203,33 @@ pub fn plan_hu_full_game(config: &HuFullGameConfig) -> Result<HuFullGamePlan, St
         postflop_storage_bytes += storage_bytes;
         terminal_cfv_calls_per_iteration += terminal_cfv_calls;
         terminal_pair_upper_bound_per_iteration += terminal_pair_upper_bound;
+        let chunks_per_representative = ceil_div(
+            representative_flop.storage_bytes,
+            config
+                .storage
+                .chunk_target_bytes
+                .max(config.storage.regret_bytes + config.storage.strategy_sum_bytes),
+        )
+        .max(if representative_flop.storage_bytes == 0 {
+            0
+        } else {
+            1
+        });
+        let max_chunk_bytes = if chunks_per_representative == 0 {
+            0
+        } else {
+            ceil_div(representative_flop.storage_bytes, chunks_per_representative)
+        };
+        let total_chunks = chunks_per_representative * boundary_subgames;
+        postflop_chunks += total_chunks;
+        max_postflop_chunk_bytes = max_postflop_chunk_bytes.max(max_chunk_bytes);
         postflop.push(BoundaryPostflopPlan {
             boundary: boundary.clone(),
             representative_flop,
             representative_subgames: boundary_subgames,
+            chunks_per_representative,
+            total_chunks,
+            max_chunk_bytes,
             action_slots,
             storage_bytes,
             terminal_cfv_calls,
@@ -183,6 +240,14 @@ pub fn plan_hu_full_game(config: &HuFullGameConfig) -> Result<HuFullGamePlan, St
     let total_action_slots = preflop.action_slots + postflop_action_slots;
     let total_storage_bytes = preflop.storage_bytes + postflop_storage_bytes;
     let compact_strategy_storage_bytes = total_action_slots * (config.storage.regret_bytes + 2);
+    let streaming = HuFullGameStreamingPlan {
+        chunk_target_bytes: config.storage.chunk_target_bytes,
+        postflop_chunks,
+        max_postflop_chunk_bytes,
+        max_resident_bytes: preflop.storage_bytes + max_postflop_chunk_bytes,
+        disk_state_bytes: postflop_storage_bytes,
+        read_write_bytes_per_iteration: postflop_storage_bytes * 2,
+    };
 
     Ok(HuFullGamePlan {
         preflop,
@@ -190,6 +255,7 @@ pub fn plan_hu_full_game(config: &HuFullGameConfig) -> Result<HuFullGamePlan, St
         flop_concrete: flop_survey.concrete_flops,
         representative_subgames,
         postflop,
+        streaming,
         total_action_slots,
         total_storage_bytes,
         compact_strategy_storage_bytes,
@@ -691,6 +757,18 @@ fn bytes_to_gib(bytes: u128) -> f64 {
     bytes as f64 / (1024.0 * 1024.0 * 1024.0)
 }
 
+fn bytes_to_mib(bytes: u128) -> f64 {
+    bytes as f64 / (1024.0 * 1024.0)
+}
+
+fn ceil_div(value: u128, divisor: u128) -> u128 {
+    if value == 0 {
+        0
+    } else {
+        (value - 1) / divisor + 1
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -712,6 +790,12 @@ mod tests {
         assert_eq!(
             plan.representative_subgames,
             plan.preflop.postflop_boundaries.len() as u128 * 1755
+        );
+        assert!(plan.streaming.postflop_chunks >= plan.representative_subgames);
+        assert!(plan.streaming.max_resident_bytes < plan.total_storage_bytes);
+        assert_eq!(
+            plan.streaming.disk_state_bytes,
+            plan.total_storage_bytes - plan.preflop.storage_bytes
         );
     }
 

@@ -3785,10 +3785,13 @@ fn print_full_game_plan(config: &HuFullGameConfig, plan: &HuFullGamePlan) {
     );
     for (index, postflop) in plan.postflop.iter().enumerate() {
         println!(
-            "postflop_boundary_plan index={} count={} representative_subgames={} sample_nodes={} sample_decisions={} flop_decisions={} turn_decisions={} river_decisions={} sample_chances={} sample_terminals={} sample_action_slots={} flop_action_slots={} turn_action_slots={} river_action_slots={} sample_storage_gib={:.4} total_storage_gib={:.4} terminal_cfv_calls={} terminal_pair_upper_bound={}",
+            "postflop_boundary_plan index={} count={} representative_subgames={} chunks_per_representative={} total_chunks={} max_chunk_mib={:.2} sample_nodes={} sample_decisions={} flop_decisions={} turn_decisions={} river_decisions={} sample_chances={} sample_terminals={} sample_action_slots={} flop_action_slots={} turn_action_slots={} river_action_slots={} sample_storage_gib={:.4} total_storage_gib={:.4} terminal_cfv_calls={} terminal_pair_upper_bound={}",
             index,
             postflop.boundary.count,
             postflop.representative_subgames,
+            postflop.chunks_per_representative,
+            postflop.total_chunks,
+            postflop.max_chunk_bytes as f64 / (1024.0 * 1024.0),
             postflop.representative_flop.nodes,
             postflop.representative_flop.decisions,
             postflop.representative_flop.decisions_by_street[0],
@@ -3812,6 +3815,15 @@ fn print_full_game_plan(config: &HuFullGameConfig, plan: &HuFullGamePlan) {
         plan.total_action_slots,
         plan.storage_gib(),
         plan.compact_strategy_storage_gib(),
+    );
+    println!(
+        "full_game_streaming chunk_target_mib={:.2} postflop_chunks={} max_postflop_chunk_mib={:.2} max_resident_gib={:.4} disk_state_gib={:.3} read_write_gib_per_iter={:.3}",
+        plan.streaming.chunk_target_bytes as f64 / (1024.0 * 1024.0),
+        plan.streaming.postflop_chunks,
+        plan.streaming.max_postflop_chunk_mib(),
+        plan.streaming.max_resident_gib(),
+        plan.streaming.disk_state_gib(),
+        plan.streaming.read_write_gib_per_iteration(),
     );
     println!(
         "full_game_work terminal_cfv_calls_per_iter={} terminal_pair_upper_bound_per_iter={}",

@@ -13,8 +13,9 @@ pub use cfr_config::{
     RealCfrAverageStrategy, RealCfrConfig, RealCfrExploitability, RealCfrVariant,
 };
 pub use full_game::{
-    BoundaryPostflopPlan, HuFullGameConfig, HuFullGamePlan, HuPostflopBoundaryGroup,
-    HuPreflopActionTemplate, HuPreflopPlan, RepresentativePostflopPlan, plan_hu_full_game,
+    BoundaryPostflopPlan, HuFullGameConfig, HuFullGamePlan, HuFullGameStreamingPlan,
+    HuPostflopBoundaryGroup, HuPreflopActionTemplate, HuPreflopPlan, RepresentativePostflopPlan,
+    plan_hu_full_game,
 };
 pub use isomorphism::{
     ChanceClass, ChanceClassMember, ComboSwap, FutureBoardIsomorphismReport,
