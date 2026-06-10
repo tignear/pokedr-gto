@@ -19,31 +19,6 @@
 			"source": "devcontainer-codex-home-${devcontainerId}",
 			"target": "/home/vscode/.codex",
 			"type": "volume"
-		},
-		{
-			"source": "\\\\wsl.localhost\\Ubuntu-24.04\\usr\\lib\\wsl\\lib\\libdxcore.so",
-			"target": "/usr/lib/libdxcore.so",
-			"type": "bind"
-		},
-		{
-			"source": "\\\\wsl.localhost\\Ubuntu-24.04\\usr\\lib\\wsl\\lib",
-			"target": "/usr/lib/wsl/lib",
-			"type": "bind"
-		},
-		{
-			"source": "\\\\wsl.localhost\\Ubuntu-24.04\\usr\\lib\\wsl\\drivers",
-			"target": "/usr/lib/wsl/drivers",
-			"type": "bind"
-		},
-		{
-			"source": "\\\\wsl.localhost\\Ubuntu-24.04\\usr\\lib\\x86_64-linux-gnu\\libvulkan_dzn.so",
-			"target": "/usr/lib/x86_64-linux-gnu/libvulkan_dzn.so",
-			"type": "bind"
-		},
-		{
-			"source": "\\\\wsl.localhost\\Ubuntu-24.04\\usr\\lib\\x86_64-linux-gnu\\libspirv_to_dxil.so",
-			"target": "/usr/lib/x86_64-linux-gnu/libspirv_to_dxil.so",
-			"type": "bind"
 		}
 	],
 
