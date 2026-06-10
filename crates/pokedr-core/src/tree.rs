@@ -1,5 +1,7 @@
 use crate::cards::{Board, Card};
-use crate::isomorphism::{SuitPermutation, next_card_isomorphism};
+use crate::isomorphism::{
+    SuitPermutation, next_card_isomorphism_with_permutations, suit_permutations_preserving_ranges,
+};
 use crate::range::RangeSpec;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -348,7 +350,18 @@ impl TreeBuilder {
             spot: summary,
             nodes: Vec::new(),
         };
-        self.build_state(&mut tree, root, 0, &spot.oop_range, &spot.ip_range);
+        let oop_live_range = spot.oop_range.without_board_conflicts(&root.board);
+        let ip_live_range = spot.ip_range.without_board_conflicts(&root.board);
+        let chance_permutations =
+            suit_permutations_preserving_ranges(&oop_live_range, &ip_live_range);
+        self.build_state(
+            &mut tree,
+            root,
+            0,
+            &spot.oop_range,
+            &spot.ip_range,
+            &chance_permutations,
+        );
         Ok(tree)
     }
 
@@ -359,6 +372,7 @@ impl TreeBuilder {
         depth: usize,
         oop_range: &RangeSpec,
         ip_range: &RangeSpec,
+        chance_permutations: &[SuitPermutation],
     ) -> usize {
         let id = tree.nodes.len();
         tree.nodes.push(PublicNode {
@@ -384,7 +398,14 @@ impl TreeBuilder {
         for action in actions {
             match self.apply_action(&state, action) {
                 Transition::State(next) => {
-                    let child = self.build_state(tree, next, depth + 1, oop_range, ip_range);
+                    let child = self.build_state(
+                        tree,
+                        next,
+                        depth + 1,
+                        oop_range,
+                        ip_range,
+                        chance_permutations,
+                    );
                     tree.nodes[id].children.push(child);
                 }
                 Transition::Terminal(terminal_state, reason) => {
@@ -392,7 +413,14 @@ impl TreeBuilder {
                     tree.nodes[id].children.push(child);
                 }
                 Transition::Chance(next_state) => {
-                    let child = self.push_chance(tree, next_state, depth + 1, oop_range, ip_range);
+                    let child = self.push_chance(
+                        tree,
+                        next_state,
+                        depth + 1,
+                        oop_range,
+                        ip_range,
+                        chance_permutations,
+                    );
                     tree.nodes[id].children.push(child);
                 }
             }
@@ -423,6 +451,7 @@ impl TreeBuilder {
         depth: usize,
         oop_range: &RangeSpec,
         ip_range: &RangeSpec,
+        chance_permutations: &[SuitPermutation],
     ) -> usize {
         let id = tree.nodes.len();
         let next_street = state.street;
@@ -435,7 +464,8 @@ impl TreeBuilder {
                     vec![vec![SuitPermutation::identity().code()]],
                 ),
                 ChanceExpansion::Isomorphic => {
-                    let iso = next_card_isomorphism(&state.board, oop_range, ip_range);
+                    let iso =
+                        next_card_isomorphism_with_permutations(&state.board, chance_permutations);
                     (
                         iso.classes
                             .iter()
@@ -483,7 +513,14 @@ impl TreeBuilder {
                 .board
                 .push(card)
                 .expect("chance card must not duplicate board");
-            let child = self.build_state(tree, child_state, depth + 1, oop_range, ip_range);
+            let child = self.build_state(
+                tree,
+                child_state,
+                depth + 1,
+                oop_range,
+                ip_range,
+                chance_permutations,
+            );
             tree.nodes[id].children.push(child);
         }
         id

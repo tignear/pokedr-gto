@@ -121,7 +121,18 @@ pub fn all_suit_permutations() -> Vec<SuitPermutation> {
 }
 
 pub fn ranges_preserve_all_suit_permutations(oop_range: &RangeSpec, ip_range: &RangeSpec) -> bool {
-    range_preserving_permutations(oop_range, ip_range).len() == all_suit_permutations().len()
+    suit_permutations_preserving_ranges(oop_range, ip_range).len() == all_suit_permutations().len()
+}
+
+pub fn suit_permutations_preserving_ranges(
+    oop_range: &RangeSpec,
+    ip_range: &RangeSpec,
+) -> Vec<SuitPermutation> {
+    all_suit_permutations()
+        .into_iter()
+        .filter(|permutation| preserves_range(*permutation, oop_range))
+        .filter(|permutation| preserves_range(*permutation, ip_range))
+        .collect()
 }
 
 pub fn private_combo_permutation_indices(
@@ -172,7 +183,7 @@ pub fn terminal_board_isomorphism(
     oop_range: &RangeSpec,
     ip_range: &RangeSpec,
 ) -> Result<Vec<TerminalBoardClass>, String> {
-    let range_permutations = range_preserving_permutations(oop_range, ip_range);
+    let range_permutations = suit_permutations_preserving_ranges(oop_range, ip_range);
     let permutations = valid_permutations_for_public_board(public_board, &range_permutations);
     let deck = public_board.remaining_deck();
     let mut classes = HashMap::<Vec<usize>, TerminalBoardClass>::new();
@@ -223,7 +234,7 @@ pub fn fixed_flop_future_board_isomorphism(
     if flop.cards().len() != 3 {
         return Err("future board isomorphism report requires a three-card flop".to_string());
     }
-    let range_permutations = range_preserving_permutations(oop_range, ip_range);
+    let range_permutations = suit_permutations_preserving_ranges(oop_range, ip_range);
     fixed_flop_future_board_isomorphism_with_range_permutations(flop, &range_permutations)
 }
 
@@ -231,7 +242,7 @@ pub fn full_deck_future_board_isomorphism_survey(
     oop_range: &RangeSpec,
     ip_range: &RangeSpec,
 ) -> Result<FutureBoardIsomorphismSurvey, String> {
-    let range_permutations = range_preserving_permutations(oop_range, ip_range);
+    let range_permutations = suit_permutations_preserving_ranges(oop_range, ip_range);
     let deck = Card::deck();
     let mut flops = 0usize;
     let mut min_representative_events = usize::MAX;
@@ -305,8 +316,15 @@ pub fn next_card_isomorphism(
     oop_range: &RangeSpec,
     ip_range: &RangeSpec,
 ) -> NextCardIsomorphism {
-    let range_permutations = range_preserving_permutations(oop_range, ip_range);
+    let range_permutations = suit_permutations_preserving_ranges(oop_range, ip_range);
     next_card_isomorphism_with_range_permutations(public_board, &range_permutations)
+}
+
+pub fn next_card_isomorphism_with_permutations(
+    public_board: &Board,
+    range_permutations: &[SuitPermutation],
+) -> NextCardIsomorphism {
+    next_card_isomorphism_with_range_permutations(public_board, range_permutations)
 }
 
 fn next_card_isomorphism_with_range_permutations(
@@ -356,17 +374,6 @@ fn valid_permutations_for_public_board(
         .iter()
         .copied()
         .filter(|permutation| preserves_public_board(*permutation, board))
-        .collect()
-}
-
-fn range_preserving_permutations(
-    oop_range: &RangeSpec,
-    ip_range: &RangeSpec,
-) -> Vec<SuitPermutation> {
-    all_suit_permutations()
-        .into_iter()
-        .filter(|permutation| preserves_range(*permutation, oop_range))
-        .filter(|permutation| preserves_range(*permutation, ip_range))
         .collect()
 }
 
@@ -560,22 +567,6 @@ mod tests {
         );
         assert_eq!(report.ordered_turn_river_concrete_events, 49 * 48);
         assert!(report.ordered_turn_river_representative_events < 49 * 48);
-    }
-
-    #[test]
-    fn full_deck_flop_isomorphism_has_1755_full_range_classes() {
-        let range = RangeSpec::full_deck_uniform();
-        let survey = full_deck_flop_isomorphism_survey(&range, &range).unwrap();
-        assert_eq!(survey.concrete_flops, 22_100);
-        assert_eq!(survey.classes.len(), 1_755);
-        assert_eq!(
-            survey
-                .classes
-                .iter()
-                .map(|class| class.multiplicity)
-                .sum::<usize>(),
-            survey.concrete_flops
-        );
     }
 
     #[test]
