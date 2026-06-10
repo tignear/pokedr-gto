@@ -468,6 +468,19 @@ It must print:
 The command should refuse obviously impossible configs unless `--force` is
 given.
 
+Current implementation status:
+
+- `pokedr-cli plan-full-game` exists.
+- It builds the HU preflop public action tree, groups equal postflop boundary
+  pot/stack states, surveys full-deck flop isomorphism, and estimates each
+  boundary's representative postflop tree using the current postflop builder.
+- It reports both per-boundary and total representative subgame action slots,
+  storage, and terminal work.
+- It does not solve CFR yet.
+- The current estimate deliberately counts each public preflop boundary path as
+  a distinct strategy state even if the pot/stack tuple is equal, because the
+  public history and reached ranges can differ.
+
 ## Implementation Order
 
 ### Phase 1: Static Planning
@@ -572,4 +585,3 @@ full-game `bb/100` per second worse.
   Discounted Regret Minimization", https://arxiv.org/abs/1809.04040
 - Matej Moravcik et al., "DeepStack: Expert-Level Artificial Intelligence in
   No-Limit Poker", https://arxiv.org/abs/1701.01724
-

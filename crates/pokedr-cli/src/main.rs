@@ -11,10 +11,11 @@ use pokedr_core::node_cfr::NodeLocalActionEv;
 use pokedr_core::terminal_cfv::PreparedTerminalBoard;
 use pokedr_core::{
     ActionAbstraction, ActionKind, Board, Card, CfrStorageConfig, ChanceExpansion, ComboWeight,
-    NodeLocalCfrSolver, NodeLocalSolutionNodeKind, NodeLocalSolutionSnapshot, NodeLocalStrategyEv,
-    Player, PublicNodeKind, PublicTree, RaisePolicy, RangeSpec, RealCfrAverageStrategy,
-    RealCfrConfig, RealCfrVariant, Spot, Street, StreetTemplate, TreeBuilder, TreeTemplate,
-    fixed_flop_future_board_isomorphism, full_deck_future_board_isomorphism_survey, plan_cfr_work,
+    HuFullGameConfig, HuFullGamePlan, NodeLocalCfrSolver, NodeLocalSolutionNodeKind,
+    NodeLocalSolutionSnapshot, NodeLocalStrategyEv, Player, PublicNodeKind, PublicTree,
+    RaisePolicy, RangeSpec, RealCfrAverageStrategy, RealCfrConfig, RealCfrVariant, Spot, Street,
+    StreetTemplate, TreeBuilder, TreeTemplate, fixed_flop_future_board_isomorphism,
+    full_deck_future_board_isomorphism_survey, plan_cfr_work, plan_hu_full_game,
 };
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
@@ -191,6 +192,32 @@ enum Command {
             help = "Survey every unordered flop instead of only the supplied flop"
         )]
         survey_all_flops: bool,
+    },
+    #[command(about = "Estimate the HU full-game preflop-to-river CFR tree and storage")]
+    PlanFullGame {
+        #[arg(long)]
+        config: Vec<PathBuf>,
+        #[arg(
+            long,
+            help = "SB/button preflop range; defaults to spot.ip_range or full"
+        )]
+        sb_range: Option<String>,
+        #[arg(long, help = "BB preflop range; defaults to spot.oop_range or full")]
+        bb_range: Option<String>,
+        #[arg(long, default_value_t = 50)]
+        small_blind: u32,
+        #[arg(long, default_value_t = 100)]
+        big_blind: u32,
+        #[arg(long, default_value_t = 0)]
+        ante: u32,
+        #[arg(long, default_value_t = 1500)]
+        sb_stack: u32,
+        #[arg(long, default_value_t = 1500)]
+        bb_stack: u32,
+        #[arg(long)]
+        tree_preset: Option<String>,
+        #[arg(long)]
+        chunk_mib: Option<u32>,
     },
 }
 
@@ -476,6 +503,47 @@ fn main() -> Result<(), String> {
                     river.concrete_events.saturating_sub(river.classes.len())
                 );
             }
+        }
+        Command::PlanFullGame {
+            config,
+            sb_range,
+            bb_range,
+            small_blind,
+            big_blind,
+            ante,
+            sb_stack,
+            bb_stack,
+            tree_preset,
+            chunk_mib,
+        } => {
+            let config = load_config(&config)?;
+            init_logging(log_level.as_deref(), &config)?;
+            let tree_options = resolve_tree_options(&config, tree_preset, false)?;
+            let spot = config.spot.as_ref();
+            let sb_range = RangeSpec::from_str(
+                &sb_range
+                    .or_else(|| spot.and_then(|spot| spot.ip_range.clone()))
+                    .unwrap_or_else(|| "full".to_string()),
+            )?;
+            let bb_range = RangeSpec::from_str(
+                &bb_range
+                    .or_else(|| spot.and_then(|spot| spot.oop_range.clone()))
+                    .unwrap_or_else(|| "full".to_string()),
+            )?;
+            let mut full_game =
+                HuFullGameConfig::hu_spin_15bb(sb_range, bb_range, tree_options.action_abstraction);
+            full_game.small_blind = small_blind;
+            full_game.big_blind = big_blind;
+            full_game.ante = ante;
+            full_game.sb_stack = sb_stack;
+            full_game.bb_stack = bb_stack;
+            if let Some(chunk_mib) =
+                chunk_mib.or(config.output.as_ref().and_then(|output| output.chunk_mib))
+            {
+                full_game.storage.chunk_target_bytes = chunk_mib as u128 * 1024 * 1024;
+            }
+            let plan = plan_hu_full_game(&full_game)?;
+            print_full_game_plan(&full_game, &plan);
         }
     }
     Ok(())
@@ -3671,6 +3739,78 @@ fn print_tree_report(
             }
         }
     }
+}
+
+fn print_full_game_plan(config: &HuFullGameConfig, plan: &HuFullGamePlan) {
+    println!("full_game_plan kind=hu-preflop-to-river");
+    println!(
+        "blinds sb={} bb={} ante={} stacks sb={:.2}bb bb={:.2}bb",
+        config.small_blind,
+        config.big_blind,
+        config.ante,
+        config.sb_stack as f32 / config.big_blind as f32,
+        config.bb_stack as f32 / config.big_blind as f32,
+    );
+    println!(
+        "ranges sb_combos={} bb_combos={}",
+        config.sb_range.combos().len(),
+        config.bb_range.combos().len()
+    );
+    println!(
+        "preflop nodes={} decisions={} folds={} allins={} boundary_groups={} action_slots={} storage_gib={:.4}",
+        plan.preflop.nodes,
+        plan.preflop.decisions,
+        plan.preflop.fold_terminals,
+        plan.preflop.all_in_terminals,
+        plan.preflop.postflop_boundaries.len(),
+        plan.preflop.action_slots,
+        plan.preflop.storage_gib(),
+    );
+    for (index, boundary) in plan.preflop.postflop_boundaries.iter().enumerate() {
+        println!(
+            "preflop_boundary index={} count={} pot={:.2}bb effective_stack={:.2}bb sb_commit={:.2}bb bb_commit={:.2}bb",
+            index,
+            boundary.count,
+            boundary.pot as f32 / config.big_blind as f32,
+            boundary.effective_stack as f32 / config.big_blind as f32,
+            boundary.sb_commit as f32 / config.big_blind as f32,
+            boundary.bb_commit as f32 / config.big_blind as f32,
+        );
+    }
+    println!(
+        "flop_isomorphism concrete_flops={} representative_flops={} compression={:.3}x",
+        plan.flop_concrete,
+        plan.flop_classes,
+        plan.flop_concrete as f64 / plan.flop_classes as f64,
+    );
+    for (index, postflop) in plan.postflop.iter().enumerate() {
+        println!(
+            "postflop_boundary_plan index={} count={} representative_subgames={} sample_nodes={} sample_decisions={} sample_chances={} sample_terminals={} sample_action_slots={} sample_storage_gib={:.4} total_storage_gib={:.4} terminal_cfv_calls={} terminal_pair_upper_bound={}",
+            index,
+            postflop.boundary.count,
+            postflop.representative_subgames,
+            postflop.representative_flop.nodes,
+            postflop.representative_flop.decisions,
+            postflop.representative_flop.chances,
+            postflop.representative_flop.terminals,
+            postflop.representative_flop.action_slots,
+            postflop.representative_flop.storage_gib(),
+            postflop.storage_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+            postflop.terminal_cfv_calls,
+            postflop.terminal_pair_upper_bound,
+        );
+    }
+    println!(
+        "full_game representative_subgames={} total_action_slots={} total_storage_gib={:.3} compact_strategy_storage_gib={:.3}",
+        plan.representative_subgames,
+        plan.total_action_slots,
+        plan.storage_gib(),
+        plan.compact_strategy_storage_gib(),
+    );
+    println!(
+        "full_game_work terminal_cfv_calls_per_iter={} terminal_pair_upper_bound_per_iter={}",
+        plan.terminal_cfv_calls_per_iteration, plan.terminal_pair_upper_bound_per_iteration,
+    );
 }
 
 fn flop_tree_request(

@@ -1,5 +1,6 @@
 pub mod cards;
 pub mod cfr_config;
+pub mod full_game;
 pub mod isomorphism;
 pub mod node_cfr;
 pub mod plan;
@@ -10,6 +11,10 @@ pub mod tree;
 pub use cards::{Board, Card, Rank, Suit};
 pub use cfr_config::{
     RealCfrAverageStrategy, RealCfrConfig, RealCfrExploitability, RealCfrVariant,
+};
+pub use full_game::{
+    BoundaryPostflopPlan, HuFullGameConfig, HuFullGamePlan, HuPostflopBoundaryGroup,
+    HuPreflopActionTemplate, HuPreflopPlan, RepresentativePostflopPlan, plan_hu_full_game,
 };
 pub use isomorphism::{
     ChanceClass, ChanceClassMember, ComboSwap, FutureBoardIsomorphismReport,
