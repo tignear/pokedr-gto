@@ -231,3 +231,104 @@ The most likely sources of large speedups are not micro-optimizations. They are:
 - streaming/schematic storage to avoid impossible resident memory;
 - possible future safe-solving or learned-value boundary once the exact path is
   trustworthy.
+
+## Concrete OSS Implementation: `b-inary/postflop-solver`
+
+The Rust `postflop-solver` implementation is the most useful public reference
+for the current river explosion problem. It does not solve river blowup by
+blindly materializing every public-board/action combination. The important
+implementation choices are:
+
+1. The `ActionTree` is schematic over chance events.
+
+   Its source says the action tree "does not distinguish between possible chance
+   events" and treats turn/river deals as the same action. Concrete chance cards
+   are expanded later in `PostFlopGame`, where isomorphic turn/river cards are
+   skipped.
+
+   Consequence: a river betting skeleton is not duplicated in the action tree
+   for every possible turn/river card. Storage is scaled by turn/river
+   coefficients only when the game arena is built.
+
+2. It applies three tree-normalization thresholds:
+
+   - `add_allin_threshold`: add all-in when the all-in size is close enough to
+     the pot.
+   - `force_allin_threshold`: convert a bet/raise into all-in when SPR after a
+     call would be small. The source comment recommends roughly `0.1` to `0.2`.
+   - `merging_threshold`: merge close bet actions using the same ratio test as
+     PioSOLVER. The source comment recommends around `0.1`.
+
+   These are not cosmetic. They directly reduce river raise chains by avoiding
+   separate non-all-in sizes that are strategically close to all-in.
+
+3. It sorts/deduplicates actions and then merges close bet/raise amounts.
+
+   This prevents generated geometric, pot-fraction, and all-in sizes from
+   creating multiple nearly identical branches.
+
+4. It uses exact turn/river suit isomorphism in the arena.
+
+   `PostFlopGame` stores `isomorphism_ref_turn`, `isomorphism_card_turn`,
+   `isomorphism_ref_river`, `isomorphism_card_river`, and corresponding private
+   hand swap lists. The solver evaluates representative chance children and
+   then applies combo swaps to add the eliminated isomorphic children back into
+   the counterfactual values.
+
+5. It has dedicated chance-value storage.
+
+   Chance nodes store CFVs for the player whose values are needed at that node,
+   with optional compression. That is different from keeping both players'
+   full action-slot state for every expanded public node.
+
+6. It still special-cases performance aggressively.
+
+   The crate-level docs explicitly mention multithreading, unsafe hot spots,
+   assembly/SIMD inspection, 32-bit storage with 64-bit temporary sums, optional
+   `i16` value compression, and a custom allocator feature.
+
+The most relevant source files:
+
+- `/tmp/postflop-solver/src/action_tree.rs`
+- `/tmp/postflop-solver/src/game/base.rs`
+- `/tmp/postflop-solver/src/solver.rs`
+- `/tmp/postflop-solver/src/lib.rs`
+
+### Difference From Current Full-Game Planning
+
+The current `plan-full-game` estimate still makes the river explosion visible:
+for the largest 15bb HU boundary with `postflop-basic`, one representative flop
+has `148,532` decisions, of which `146,568` are river decisions.
+
+That means the immediate gap is not just "use smaller stacks." It is:
+
+- river raise-chain generation is too permissive for small-pot/high-SPR
+  boundaries;
+- full-game planning multiplies representative postflop storage across
+  `(preflop boundary, flop class)` chunks;
+- the full-game engine does not yet have the same compact schematic arena that
+  stores one chance-agnostic action skeleton plus isomorphic chance coefficients;
+- regret/strategy state is still counted as if each representative subgame owns
+  its full action-slot arrays.
+
+### Direct Implementation Lessons
+
+Before designing a disk streamer, the next full-game prototype should mirror the
+public reference's structure more closely:
+
+1. Store one postflop action skeleton per `(pot, effective stack, abstraction
+   template)` boundary, not per concrete board.
+2. Attach flop/turn/river isomorphism representatives to chance nodes with combo
+   swap maps.
+3. Apply all-in forcing and close-action merging before children are allocated.
+4. Add diagnostics that print how many river nodes are removed by:
+   - action deduplication;
+   - Pio-style close-size merging;
+   - force-all-in conversion;
+   - turn/river isomorphism.
+5. Only after the schematic arena is in place, decide whether regret/strategy
+   chunks must be streamed from disk.
+
+Disk streaming is still likely needed for full-game 30bb-scale solves, but it
+should stream compact schematic chunks. Streaming a naively expanded river tree
+only moves the memory problem to IO and does not fix per-iteration work.
