@@ -3785,15 +3785,21 @@ fn print_full_game_plan(config: &HuFullGameConfig, plan: &HuFullGamePlan) {
     );
     for (index, postflop) in plan.postflop.iter().enumerate() {
         println!(
-            "postflop_boundary_plan index={} count={} representative_subgames={} sample_nodes={} sample_decisions={} sample_chances={} sample_terminals={} sample_action_slots={} sample_storage_gib={:.4} total_storage_gib={:.4} terminal_cfv_calls={} terminal_pair_upper_bound={}",
+            "postflop_boundary_plan index={} count={} representative_subgames={} sample_nodes={} sample_decisions={} flop_decisions={} turn_decisions={} river_decisions={} sample_chances={} sample_terminals={} sample_action_slots={} flop_action_slots={} turn_action_slots={} river_action_slots={} sample_storage_gib={:.4} total_storage_gib={:.4} terminal_cfv_calls={} terminal_pair_upper_bound={}",
             index,
             postflop.boundary.count,
             postflop.representative_subgames,
             postflop.representative_flop.nodes,
             postflop.representative_flop.decisions,
+            postflop.representative_flop.decisions_by_street[0],
+            postflop.representative_flop.decisions_by_street[1],
+            postflop.representative_flop.decisions_by_street[2],
             postflop.representative_flop.chances,
             postflop.representative_flop.terminals,
             postflop.representative_flop.action_slots,
+            postflop.representative_flop.action_slots_by_street[0],
+            postflop.representative_flop.action_slots_by_street[1],
+            postflop.representative_flop.action_slots_by_street[2],
             postflop.representative_flop.storage_gib(),
             postflop.storage_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
             postflop.terminal_cfv_calls,

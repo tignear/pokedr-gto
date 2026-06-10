@@ -69,9 +69,11 @@ pub struct HuPostflopBoundaryGroup {
 pub struct RepresentativePostflopPlan {
     pub nodes: u128,
     pub decisions: u128,
+    pub decisions_by_street: [u128; 3],
     pub chances: u128,
     pub terminals: u128,
     pub action_slots: u128,
+    pub action_slots_by_street: [u128; 3],
     pub storage_bytes: u128,
     pub terminal_cfv_calls: u128,
     pub terminal_pair_upper_bound: u128,
@@ -248,14 +250,18 @@ fn plan_representative_postflop(
     .build(spot)
     .map_err(format_tree_build_error)?;
     let stats = tree.stats();
-    let action_slots = postflop_action_slots(&tree, &config.bb_range, &config.sb_range);
+    let action_slots_by_street =
+        postflop_action_slots_by_street(&tree, &config.bb_range, &config.sb_range);
+    let action_slots = action_slots_by_street.iter().sum();
     let terminal_work = postflop_terminal_work(&tree, &config.bb_range, &config.sb_range);
     Ok(RepresentativePostflopPlan {
         nodes: stats.nodes as u128,
         decisions: stats.decisions as u128,
+        decisions_by_street: stats.decisions_by_street.map(|value| value as u128),
         chances: stats.chances as u128,
         terminals: stats.terminals as u128,
         action_slots,
+        action_slots_by_street,
         storage_bytes: action_slots
             * (config.storage.regret_bytes + config.storage.strategy_sum_bytes),
         terminal_cfv_calls: terminal_work.terminal_cfv_calls,
@@ -269,30 +275,33 @@ struct PostflopTerminalWork {
     private_pair_upper_bound: u128,
 }
 
-fn postflop_action_slots(
+fn postflop_action_slots_by_street(
     tree: &crate::PublicTree,
     oop_range: &RangeSpec,
     ip_range: &RangeSpec,
-) -> u128 {
-    tree.nodes
-        .iter()
-        .map(|node| match &node.kind {
-            PublicNodeKind::Decision { player, actions } => {
-                let combos = match player {
-                    Player::Oop => oop_range
-                        .without_board_conflicts(&node.state.board)
-                        .combos()
-                        .len(),
-                    Player::Ip => ip_range
-                        .without_board_conflicts(&node.state.board)
-                        .combos()
-                        .len(),
-                };
-                combos as u128 * actions.len() as u128
-            }
-            PublicNodeKind::Chance(_) | PublicNodeKind::Terminal { .. } => 0,
-        })
-        .sum()
+) -> [u128; 3] {
+    let mut slots = [0u128; 3];
+    for node in &tree.nodes {
+        if let PublicNodeKind::Decision { player, actions } = &node.kind {
+            let combos = match player {
+                Player::Oop => oop_range
+                    .without_board_conflicts(&node.state.board)
+                    .combos()
+                    .len(),
+                Player::Ip => ip_range
+                    .without_board_conflicts(&node.state.board)
+                    .combos()
+                    .len(),
+            };
+            let street = match node.state.street {
+                Street::Flop => 0,
+                Street::Turn => 1,
+                Street::River => 2,
+            };
+            slots[street] += combos as u128 * actions.len() as u128;
+        }
+    }
+    slots
 }
 
 fn postflop_terminal_work(
