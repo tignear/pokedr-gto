@@ -120,6 +120,10 @@ pub fn all_suit_permutations() -> Vec<SuitPermutation> {
     permutations
 }
 
+pub fn ranges_preserve_all_suit_permutations(oop_range: &RangeSpec, ip_range: &RangeSpec) -> bool {
+    range_preserving_permutations(oop_range, ip_range).len() == all_suit_permutations().len()
+}
+
 pub fn private_combo_permutation_indices(
     combos: &[crate::range::ComboWeight],
     permutation: SuitPermutation,
@@ -534,6 +538,34 @@ mod tests {
         assert_eq!(report.valid_permutations, 1);
         assert_eq!(report.turn.classes.len(), 49);
         assert!(report.ordered_turn_river_representative_events < 49 * 48);
+    }
+
+    #[test]
+    fn full_deck_flop_isomorphism_has_1755_full_range_classes() {
+        let range = RangeSpec::full_deck_uniform();
+        let survey = full_deck_flop_isomorphism_survey(&range, &range).unwrap();
+        assert_eq!(survey.concrete_flops, 22_100);
+        assert_eq!(survey.classes.len(), 1_755);
+        assert_eq!(
+            survey
+                .classes
+                .iter()
+                .map(|class| class.multiplicity)
+                .sum::<usize>(),
+            survey.concrete_flops
+        );
+    }
+
+    #[test]
+    fn suit_symmetric_range_check_rejects_exact_suit_combos() {
+        let pair_class = RangeSpec::from_str("AA").unwrap();
+        let exact = RangeSpec::from_str("AsAh").unwrap();
+
+        assert!(ranges_preserve_all_suit_permutations(
+            &pair_class,
+            &pair_class
+        ));
+        assert!(!ranges_preserve_all_suit_permutations(&exact, &pair_class));
     }
 
     #[test]

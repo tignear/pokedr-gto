@@ -1,4 +1,5 @@
 use crate::cards::{Board, Card};
+use crate::isomorphism::next_card_isomorphism;
 use crate::range::RangeSpec;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -28,6 +29,7 @@ pub enum ActionKind {
 pub struct ChanceSpec {
     pub next_street: Street,
     pub cards: Vec<Card>,
+    pub child_multiplicities: Vec<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -134,6 +136,7 @@ pub struct TreeTemplate {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChanceExpansion {
     TemplateOnly,
+    Isomorphic,
     Enumerate,
 }
 
@@ -344,11 +347,18 @@ impl TreeBuilder {
             spot: summary,
             nodes: Vec::new(),
         };
-        self.build_state(&mut tree, root, 0);
+        self.build_state(&mut tree, root, 0, &spot.oop_range, &spot.ip_range);
         Ok(tree)
     }
 
-    fn build_state(&self, tree: &mut PublicTree, state: PublicState, depth: usize) -> usize {
+    fn build_state(
+        &self,
+        tree: &mut PublicTree,
+        state: PublicState,
+        depth: usize,
+        oop_range: &RangeSpec,
+        ip_range: &RangeSpec,
+    ) -> usize {
         let id = tree.nodes.len();
         tree.nodes.push(PublicNode {
             id,
@@ -373,7 +383,7 @@ impl TreeBuilder {
         for action in actions {
             match self.apply_action(&state, action) {
                 Transition::State(next) => {
-                    let child = self.build_state(tree, next, depth + 1);
+                    let child = self.build_state(tree, next, depth + 1, oop_range, ip_range);
                     tree.nodes[id].children.push(child);
                 }
                 Transition::Terminal(terminal_state, reason) => {
@@ -381,7 +391,7 @@ impl TreeBuilder {
                     tree.nodes[id].children.push(child);
                 }
                 Transition::Chance(next_state) => {
-                    let child = self.push_chance(tree, next_state, depth + 1);
+                    let child = self.push_chance(tree, next_state, depth + 1, oop_range, ip_range);
                     tree.nodes[id].children.push(child);
                 }
             }
@@ -405,32 +415,54 @@ impl TreeBuilder {
         id
     }
 
-    fn push_chance(&self, tree: &mut PublicTree, state: PublicState, depth: usize) -> usize {
+    fn push_chance(
+        &self,
+        tree: &mut PublicTree,
+        state: PublicState,
+        depth: usize,
+        oop_range: &RangeSpec,
+        ip_range: &RangeSpec,
+    ) -> usize {
         let id = tree.nodes.len();
         let next_street = state.street;
-        let cards = state.board.remaining_deck();
+        let remaining = state.board.remaining_deck();
+        let (cards, child_multiplicities) = match self.template.chance_expansion {
+            ChanceExpansion::TemplateOnly => (
+                remaining.iter().copied().take(1).collect::<Vec<_>>(),
+                vec![1],
+            ),
+            ChanceExpansion::Isomorphic => {
+                let iso = next_card_isomorphism(&state.board, oop_range, ip_range);
+                (
+                    iso.classes
+                        .iter()
+                        .filter_map(|class| class.representative.first().copied())
+                        .collect::<Vec<_>>(),
+                    iso.classes
+                        .iter()
+                        .map(|class| class.multiplicity)
+                        .collect::<Vec<_>>(),
+                )
+            }
+            ChanceExpansion::Enumerate => (remaining.clone(), vec![1; remaining.len()]),
+        };
         tree.nodes.push(PublicNode {
             id,
             state: state.clone(),
-            kind: PublicNodeKind::Chance(ChanceSpec { next_street, cards }),
+            kind: PublicNodeKind::Chance(ChanceSpec {
+                next_street,
+                cards: cards.clone(),
+                child_multiplicities,
+            }),
             children: Vec::new(),
         });
-        let cards = match self.template.chance_expansion {
-            ChanceExpansion::TemplateOnly => state
-                .board
-                .remaining_deck()
-                .into_iter()
-                .take(1)
-                .collect::<Vec<_>>(),
-            ChanceExpansion::Enumerate => state.board.remaining_deck(),
-        };
         for card in cards {
             let mut child_state = state.clone();
             child_state.board = child_state
                 .board
                 .push(card)
                 .expect("chance card must not duplicate board");
-            let child = self.build_state(tree, child_state, depth + 1);
+            let child = self.build_state(tree, child_state, depth + 1, oop_range, ip_range);
             tree.nodes[id].children.push(child);
         }
         id
@@ -975,6 +1007,38 @@ mod tests {
         assert!(stats.decisions > 400, "{stats:?}");
         assert!(stats.chances > 0, "{stats:?}");
         assert!(stats.terminals > stats.decisions, "{stats:?}");
+    }
+
+    #[test]
+    fn isomorphic_chance_children_preserve_concrete_card_count() {
+        let builder = TreeBuilder::new(TreeTemplate {
+            action_abstraction: ActionAbstraction::postflop_solver_basic(),
+            chance_expansion: ChanceExpansion::Isomorphic,
+        })
+        .unwrap();
+        let tree = builder
+            .build(Spot {
+                board: Board::from_str("AsKsQs").unwrap(),
+                pot: 200,
+                effective_stack: 900,
+                oop_range: RangeSpec::full_deck_uniform(),
+                ip_range: RangeSpec::full_deck_uniform(),
+                first_player: Player::Oop,
+            })
+            .unwrap();
+        let chance = tree
+            .nodes
+            .iter()
+            .find(|node| matches!(node.kind, PublicNodeKind::Chance(_)))
+            .expect("tree should contain a turn chance");
+        let PublicNodeKind::Chance(chance) = &chance.kind else {
+            unreachable!();
+        };
+
+        assert_eq!(chance.next_street, Street::Turn);
+        assert_eq!(chance.cards.len(), chance.child_multiplicities.len());
+        assert_eq!(chance.child_multiplicities.iter().sum::<usize>(), 49);
+        assert!(chance.cards.len() < 49);
     }
 
     #[test]
