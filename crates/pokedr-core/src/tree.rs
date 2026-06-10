@@ -1,5 +1,5 @@
 use crate::cards::{Board, Card};
-use crate::isomorphism::next_card_isomorphism;
+use crate::isomorphism::{SuitPermutation, next_card_isomorphism};
 use crate::range::RangeSpec;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -30,6 +30,7 @@ pub struct ChanceSpec {
     pub next_street: Street,
     pub cards: Vec<Card>,
     pub child_multiplicities: Vec<usize>,
+    pub child_permutation_codes: Vec<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -426,26 +427,45 @@ impl TreeBuilder {
         let id = tree.nodes.len();
         let next_street = state.street;
         let remaining = state.board.remaining_deck();
-        let (cards, child_multiplicities) = match self.template.chance_expansion {
-            ChanceExpansion::TemplateOnly => (
-                remaining.iter().copied().take(1).collect::<Vec<_>>(),
-                vec![1],
-            ),
-            ChanceExpansion::Isomorphic => {
-                let iso = next_card_isomorphism(&state.board, oop_range, ip_range);
-                (
-                    iso.classes
+        let (cards, child_multiplicities, child_permutation_codes) =
+            match self.template.chance_expansion {
+                ChanceExpansion::TemplateOnly => (
+                    remaining.iter().copied().take(1).collect::<Vec<_>>(),
+                    vec![1],
+                    vec![vec![SuitPermutation::identity().code()]],
+                ),
+                ChanceExpansion::Isomorphic => {
+                    let iso = next_card_isomorphism(&state.board, oop_range, ip_range);
+                    (
+                        iso.classes
+                            .iter()
+                            .filter_map(|class| class.representative.first().copied())
+                            .collect::<Vec<_>>(),
+                        iso.classes
+                            .iter()
+                            .map(|class| class.multiplicity)
+                            .collect::<Vec<_>>(),
+                        iso.classes
+                            .iter()
+                            .map(|class| {
+                                class
+                                    .members
+                                    .iter()
+                                    .map(|member| member.permutation_to_representative.code())
+                                    .collect::<Vec<_>>()
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                }
+                ChanceExpansion::Enumerate => (
+                    remaining.clone(),
+                    vec![1; remaining.len()],
+                    remaining
                         .iter()
-                        .filter_map(|class| class.representative.first().copied())
+                        .map(|_| vec![SuitPermutation::identity().code()])
                         .collect::<Vec<_>>(),
-                    iso.classes
-                        .iter()
-                        .map(|class| class.multiplicity)
-                        .collect::<Vec<_>>(),
-                )
-            }
-            ChanceExpansion::Enumerate => (remaining.clone(), vec![1; remaining.len()]),
-        };
+                ),
+            };
         tree.nodes.push(PublicNode {
             id,
             state: state.clone(),
@@ -453,6 +473,7 @@ impl TreeBuilder {
                 next_street,
                 cards: cards.clone(),
                 child_multiplicities,
+                child_permutation_codes,
             }),
             children: Vec::new(),
         });
@@ -1037,7 +1058,16 @@ mod tests {
 
         assert_eq!(chance.next_street, Street::Turn);
         assert_eq!(chance.cards.len(), chance.child_multiplicities.len());
+        assert_eq!(chance.cards.len(), chance.child_permutation_codes.len());
         assert_eq!(chance.child_multiplicities.iter().sum::<usize>(), 49);
+        assert_eq!(
+            chance
+                .child_permutation_codes
+                .iter()
+                .map(Vec::len)
+                .sum::<usize>(),
+            49
+        );
         assert!(chance.cards.len() < 49);
     }
 

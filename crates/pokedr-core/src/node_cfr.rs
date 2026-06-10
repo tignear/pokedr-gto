@@ -1,7 +1,5 @@
 use crate::cards::{Board, Card};
-use crate::isomorphism::{
-    all_suit_permutations, next_card_isomorphism, private_combo_permutation_indices,
-};
+use crate::isomorphism::{all_suit_permutations, private_combo_permutation_indices};
 use crate::range::{ComboWeight, RangeSpec};
 use crate::terminal_cfv::{
     PreparedTerminalBoard, terminal_side_values_prefix_blocker_sorted_board_targets_into,
@@ -141,8 +139,6 @@ pub struct NodeLocalStrategySnapshot {
 #[derive(Debug)]
 pub struct NodeLocalCfrSolver {
     tree: PublicTree,
-    oop_range: RangeSpec,
-    ip_range: RangeSpec,
     oop_combos: Vec<ComboWeight>,
     ip_combos: Vec<ComboWeight>,
     nodes: Vec<NodeLocalNodeCell>,
@@ -487,8 +483,6 @@ impl NodeLocalCfrSolver {
         }
         let mut solver = Self {
             tree,
-            oop_range,
-            ip_range,
             oop_combos,
             ip_combos,
             nodes: Vec::new(),
@@ -2134,26 +2128,27 @@ impl NodeLocalCfrSolver {
                     }
                 }
             }
-            PublicNodeKind::Chance(_) => {
+            PublicNodeKind::Chance(chance) => {
                 kind = NodeLocalKind::Chance;
-                let Some(child) = public.children.first().copied() else {
-                    return Ok(index);
-                };
-                let chance = next_card_isomorphism(board, &self.oop_range, &self.ip_range);
-                chance_concrete_events = chance.concrete_events;
-                for class in chance.classes {
-                    let card = *class
-                        .representative
-                        .first()
-                        .ok_or_else(|| "chance class has no representative".to_string())?;
+                if public.children.len() != chance.cards.len()
+                    || chance.child_permutation_codes.len() != chance.cards.len()
+                {
+                    return Err("chance node has inconsistent child metadata".to_string());
+                }
+                chance_concrete_events = chance
+                    .child_permutation_codes
+                    .iter()
+                    .map(Vec::len)
+                    .sum::<usize>();
+                for ((child, card), permutation_codes) in public
+                    .children
+                    .iter()
+                    .copied()
+                    .zip(chance.cards.iter().copied())
+                    .zip(chance.child_permutation_codes)
+                {
                     children.push(self.collect_node(child, &board.push(card)?)?);
-                    chance_permutation_codes.push(
-                        class
-                            .members
-                            .iter()
-                            .map(|member| member.permutation_to_representative.code())
-                            .collect(),
-                    );
+                    chance_permutation_codes.push(permutation_codes);
                 }
             }
             PublicNodeKind::Decision { player, actions } => {
@@ -3535,7 +3530,7 @@ mod tests {
         let ip_range = RangeSpec::from_str("QcQd,JcJd").unwrap();
         let tree = TreeBuilder::new(TreeTemplate {
             action_abstraction: tiny_checkdown_abstraction(),
-            chance_expansion: ChanceExpansion::Enumerate,
+            chance_expansion: ChanceExpansion::Isomorphic,
         })
         .unwrap()
         .build(Spot {
