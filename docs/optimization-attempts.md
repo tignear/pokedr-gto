@@ -1348,3 +1348,20 @@ retrying similar ideas, so attempts stay in chronological order.
   test still passes.
 - Result: kept. The API makes it possible to inspect whether a public node has
   meaningful hand-level CFVs before wiring it into a larger solver.
+
+## 2026-06-10: Paired-board public-card isomorphism coverage
+
+- Added explicit paired-board tests for the public-card isomorphism path. The
+  tests cover both next-card chance classes and unordered terminal runout
+  classes, and assert that multiplicities still sum to the concrete event
+  counts.
+- Smoke command:
+  `cargo run --release -p pokedr-cli -- board-isomorphism AsAh7c --oop-range
+  full --ip-range full --print-turns 0`.
+- Result for paired flop `AsAh7c`: `valid_public_range_suit_permutations=2`,
+  turn cards collapse from `49` concrete events to `37` representative classes,
+  and ordered turn-river events collapse from `2352` to `2028`.
+- This is suit isomorphism only. It does not claim rank isomorphism between
+  different paired ranks; full-deck flop canonicalization is still responsible
+  for choosing representative flops across the original `22,100` concrete
+  flops.

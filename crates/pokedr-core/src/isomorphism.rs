@@ -541,6 +541,28 @@ mod tests {
     }
 
     #[test]
+    fn paired_flop_collapses_public_suit_symmetry() {
+        let flop = Board::from_str("AsAh7c").unwrap();
+        let range = RangeSpec::full_deck_uniform();
+        let report = fixed_flop_future_board_isomorphism(&flop, &range, &range).unwrap();
+
+        assert!(report.valid_permutations > 1);
+        assert_eq!(report.turn.concrete_events, 49);
+        assert!(report.turn.classes.len() < 49);
+        assert_eq!(
+            report
+                .turn
+                .classes
+                .iter()
+                .map(|class| class.multiplicity)
+                .sum::<usize>(),
+            49
+        );
+        assert_eq!(report.ordered_turn_river_concrete_events, 49 * 48);
+        assert!(report.ordered_turn_river_representative_events < 49 * 48);
+    }
+
+    #[test]
     fn full_deck_flop_isomorphism_has_1755_full_range_classes() {
         let range = RangeSpec::full_deck_uniform();
         let survey = full_deck_flop_isomorphism_survey(&range, &range).unwrap();
@@ -637,5 +659,22 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn paired_terminal_board_isomorphism_preserves_concrete_runout_count() {
+        let flop = Board::from_str("AsAh7c").unwrap();
+        let range = RangeSpec::full_deck_uniform();
+        let classes = terminal_board_isomorphism(&flop, &range, &range).unwrap();
+
+        assert!(classes.len() < 49 * 48 / 2);
+        assert_eq!(
+            classes
+                .iter()
+                .map(|class| class.multiplicity)
+                .sum::<usize>(),
+            49 * 48 / 2
+        );
+        assert!(classes.iter().any(|class| class.multiplicity > 1));
     }
 }
