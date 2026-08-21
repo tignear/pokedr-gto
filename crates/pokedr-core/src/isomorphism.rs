@@ -55,6 +55,18 @@ pub struct FutureBoardIsomorphismSurvey {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FlopIsomorphismClass {
+    pub representative_board: Board,
+    pub multiplicity: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FullDeckFlopIsomorphismSurvey {
+    pub concrete_flops: usize,
+    pub classes: Vec<FlopIsomorphismClass>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TerminalBoardClassMember {
     pub concrete_board: Board,
     pub permutation_to_representative: SuitPermutation,
@@ -279,6 +291,41 @@ pub fn full_deck_future_board_isomorphism_survey(
     })
 }
 
+pub fn full_deck_flop_isomorphism_survey(
+    oop_range: &RangeSpec,
+    ip_range: &RangeSpec,
+) -> Result<FullDeckFlopIsomorphismSurvey, String> {
+    let range_permutations = suit_permutations_preserving_ranges(oop_range, ip_range);
+    let deck = Card::deck();
+    let mut concrete_flops = 0usize;
+    let mut counts = HashMap::<Vec<usize>, usize>::new();
+    for first in 0..deck.len() {
+        for second in first + 1..deck.len() {
+            for third in second + 1..deck.len() {
+                let flop = [deck[first], deck[second], deck[third]];
+                let key = canonical_public_cards(&flop, &range_permutations);
+                *counts.entry(key).or_insert(0) += 1;
+                concrete_flops += 1;
+            }
+        }
+    }
+    let mut classes = counts
+        .into_iter()
+        .map(|(representative, multiplicity)| {
+            let cards = representative.into_iter().map(index_to_card).collect();
+            Board::new(cards).map(|representative_board| FlopIsomorphismClass {
+                representative_board,
+                multiplicity,
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    classes.sort_by_key(|class| card_indices_sorted(class.representative_board.cards()));
+    Ok(FullDeckFlopIsomorphismSurvey {
+        concrete_flops,
+        classes,
+    })
+}
+
 fn fixed_flop_future_board_isomorphism_with_range_permutations(
     flop: &Board,
     range_permutations: &[SuitPermutation],
@@ -402,6 +449,21 @@ fn canonical_future_cards(
         best.into_iter().map(index_to_card).collect(),
         best_permutation,
     )
+}
+
+fn canonical_public_cards(cards: &[Card], permutations: &[SuitPermutation]) -> Vec<usize> {
+    let mut best = card_indices_sorted(cards);
+    for permutation in permutations {
+        let permuted = cards
+            .iter()
+            .map(|card| permutation.apply_card(*card))
+            .collect::<Vec<_>>();
+        let indices = card_indices_sorted(&permuted);
+        if indices < best {
+            best = indices;
+        }
+    }
+    best
 }
 
 fn push_terminal_board_class(
