@@ -6,9 +6,8 @@ postflop solver structure previously inspected for this project, and the
 current `pokedr-gto` codebase.
 
 The purpose is not to document a finished preflop solver in this repository.
-The current crate no longer contains a production HU Spin/preflop solver. The
-active implementation surface is postflop public-tree CFR, range parsing, exact
-suit isomorphism, and terminal CFV. This document records what the next
+The active implementation surface is postflop public-tree CFR, range parsing,
+exact suit isomorphism, and terminal CFV. This document records what the next
 preflop implementation should look like.
 
 ## Short Answer
@@ -70,14 +69,14 @@ leaf values can be compared against that baseline.
 
 ### Pluribus / Multiplayer Systems
 
-Pluribus adds a useful warning for Spin/6-max work: multiplayer no-limit poker
-does not have the same clean zero-sum equilibrium guarantees as heads-up. It
-uses an offline blueprint and limited-depth search in play, but the theoretical
-guarantees are weaker than heads-up zero-sum solving.
+Pluribus adds a useful warning for multiplayer no-limit poker: it does not have
+the same clean zero-sum equilibrium guarantees as heads-up. It uses an offline
+blueprint and limited-depth search in play, but the theoretical guarantees are
+weaker than heads-up zero-sum solving.
 
-Implication: for Spin&Gold, heads-up after payouts are locked can be made much
-cleaner than 3+ player ICM. Multiway preflop ICM solving should be treated as a
-separate, harder problem.
+Implication: heads-up payout-adjusted solving can be made much cleaner than 3+
+player ICM. Multiway preflop ICM solving should be treated as a separate,
+harder problem.
 
 ## What Commercial Solver Docs Imply
 
@@ -256,7 +255,7 @@ For this repository, the recommended order is:
 3. safe boundary only after the full-game semantics are validated;
 4. learned/approximate values only after exact comparisons exist.
 
-## HU Spin / ICM Notes
+## HU Payout / ICM Notes
 
 Heads-up ICM has an important simplification. With two players and fixed total
 chips `T`, the hero's ICM value is affine in chips:
@@ -271,9 +270,9 @@ multiway ICM is nonlinear in stacks.
 
 Practical consequence:
 
-- HU Spin after the payout-relevant field is reduced to two players is a good
-  first target.
-- 3+ player Spin preflop ICM should not share the same implementation unless it
+- Heads-up payout-adjusted solving is a good first target when the payout model
+  is affine in chips.
+- 3+ player preflop ICM should not share the same implementation unless it
   treats chip EV and payout EV as different games.
 
 ## Isomorphism Requirements
@@ -375,7 +374,7 @@ trustworthy preflop solution.
    should a new unified solver own both preflop and postflop nodes?
 3. Can terminal CFV be reused across many boundary groups without invalid
    caching of path-dependent reaches?
-4. What is the smallest HU Spin tree that is both realistic and converges to
+4. What is the smallest HU short-stack tree that is both realistic and converges to
    `1bb/100` fast enough to iterate?
 5. How much exact memory is saved if strategy sums are compacted to `f16` or
    fixed-point while regrets stay `f32`?
@@ -421,4 +420,3 @@ trustworthy preflop solution.
   https://blog.gtowizard.com/how-solvers-work/
 - Carnegie Mellon University, "Carnegie Mellon Reveals Inner Workings of
   Victorious AI", https://www.cmu.edu/news/stories/archives/2017/december/ai-inner-workings.html
-

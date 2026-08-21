@@ -16,7 +16,7 @@ game.
 
 Initial target:
 
-- two-player zero-sum chip EV, then HU Spin ICM as an affine EV scale;
+- two-player zero-sum chip EV, then heads-up payout EV as an affine EV scale;
 - rank-class user ranges only;
 - exact private combos internally;
 - full-game public tree with exact public-card suit isomorphism;
@@ -66,7 +66,7 @@ independent postflop action tree per concrete flop/turn/river.
 
 Safe solving is the right tool when a blueprint already exists and a local
 subgame must be refined, especially for off-tree actions. It is not obviously
-faster for the first in-process HU Spin/preflop solver because it adds:
+faster for the first in-process HU short-stack preflop solver because it adds:
 
 - boundary constraint construction;
 - opponent CFV bounds;
@@ -568,7 +568,7 @@ full-game `bb/100` per second worse.
    parallel writes.
 5. Exploitability calculation may be more expensive than solve iteration; use
    intervals, but keep exact checks for validation.
-6. HU Spin ICM is easy; 3+ player ICM is not affine and should not be bolted
+6. HU payout EV is easy; 3+ player ICM is not affine and should not be bolted
    onto this path.
 
 ## References

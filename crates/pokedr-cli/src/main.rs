@@ -530,8 +530,11 @@ fn main() -> Result<(), String> {
                     .or_else(|| spot.and_then(|spot| spot.oop_range.clone()))
                     .unwrap_or_else(|| "full".to_string()),
             )?;
-            let mut full_game =
-                HuFullGameConfig::hu_spin_15bb(sb_range, bb_range, tree_options.action_abstraction);
+            let mut full_game = HuFullGameConfig::short_stack_15bb(
+                sb_range,
+                bb_range,
+                tree_options.action_abstraction,
+            );
             full_game.small_blind = small_blind;
             full_game.big_blind = big_blind;
             full_game.ante = ante;

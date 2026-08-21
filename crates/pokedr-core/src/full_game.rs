@@ -118,7 +118,7 @@ impl Default for HuPreflopActionTemplate {
 }
 
 impl HuFullGameConfig {
-    pub fn hu_spin_15bb(
+    pub fn short_stack_15bb(
         sb_range: RangeSpec,
         bb_range: RangeSpec,
         postflop: ActionAbstraction,
@@ -776,7 +776,7 @@ mod tests {
 
     #[test]
     fn default_preflop_template_has_postflop_boundaries() {
-        let config = HuFullGameConfig::hu_spin_15bb(
+        let config = HuFullGameConfig::short_stack_15bb(
             RangeSpec::from_str("AA").unwrap(),
             RangeSpec::from_str("KK").unwrap(),
             ActionAbstraction::postflop_solver_basic(),
@@ -801,7 +801,7 @@ mod tests {
 
     #[test]
     fn default_template_does_not_force_root_all_in() {
-        let config = HuFullGameConfig::hu_spin_15bb(
+        let config = HuFullGameConfig::short_stack_15bb(
             RangeSpec::from_str("AA").unwrap(),
             RangeSpec::from_str("KK").unwrap(),
             ActionAbstraction::postflop_solver_basic(),
